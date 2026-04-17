@@ -435,7 +435,8 @@ fn encode_block(
 
 /// JPEG category: `(size, bits)` where `size` = min bits to hold |v|, and
 /// `bits` is the value encoded per Annex F (positive → plain, negative →
-/// bitwise complement fitted to `size` bits).
+/// bitwise complement of |v| fitted to `size` bits, equivalently
+/// `v + (2^size - 1)`).
 fn category(v: i32) -> (u8, u32) {
     if v == 0 {
         return (0, 0);
@@ -446,13 +447,7 @@ fn category(v: i32) -> (u8, u32) {
     let bits = if v > 0 {
         abs
     } else {
-        (abs ^ ((1u32 << size) - 1)) & ((1u32 << size) - 1)
-    };
-    // For negative v, re-derive per spec: bits = v + ((1<<size) - 1) mod 2^size.
-    let bits = if v > 0 {
-        bits
-    } else {
-        (((1u32 << size).wrapping_sub(1)) as i32 + v) as u32
+        (1u32 << size).wrapping_sub(1).wrapping_add(v as u32)
     };
     (size as u8, bits)
 }

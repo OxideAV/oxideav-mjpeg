@@ -220,3 +220,43 @@ fn byte_stuffing_roundtrip() {
     assert_eq!(v.width, w);
     assert_eq!(v.height, h);
 }
+
+/// The decoder should treat an extended-sequential (SOF1) 8-bit JPEG the
+/// same as baseline (SOF0), since both share the Huffman sequential scan
+/// structure. We produce a baseline JPEG with our encoder and rewrite the
+/// SOF0 marker byte to SOF1, then verify the decoded frame matches.
+#[test]
+fn decode_sof1_extended_sequential() {
+    let w = 96u32;
+    let h = 48u32;
+    let pix = PixelFormat::Yuv422P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(pix);
+    let mut enc = oxideav_mjpeg::encoder::make_encoder(&enc_params).unwrap();
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+
+    let sof0_pos = pkt
+        .data
+        .windows(2)
+        .position(|x| x == [0xFF, 0xC0])
+        .expect("SOF0 present");
+    let mut sof1_bytes = pkt.data.clone();
+    sof1_bytes[sof0_pos + 1] = 0xC1;
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    let in_pkt = Packet::new(0, TimeBase::new(1, 30), sof1_bytes);
+    dec.send_packet(&in_pkt).unwrap();
+    let out = dec.receive_frame().expect("decode SOF1");
+    let Frame::Video(v) = out else { panic!() };
+    assert_eq!(v.width, w);
+    assert_eq!(v.height, h);
+    assert_eq!(v.format, pix);
+}

@@ -124,21 +124,27 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                 let p = walker.read_segment_payload()?;
                 state.restart_interval = parse_dri(p)?;
             }
-            SOF0 => {
+            // SOF0 (baseline) and SOF1 (extended sequential) share the same
+            // Huffman sequential scan structure; for 8-bit precision the
+            // decode path is identical, and the extended-sequential
+            // allowance of up to 4 DC/AC Huffman tables falls out of our
+            // existing 4-entry table arrays. Treat SOF1 as SOF0.
+            SOF0 | SOF1 => {
                 let p = walker.read_segment_payload()?;
                 state.sof = Some(parse_sof(p)?);
             }
             SOF2 => {
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                // Initialise the coefficient accumulator.
                 prog_coefs = init_progressive_coefs(&sof)?;
                 state.sof = Some(sof);
                 state.progressive = true;
             }
-            SOF1 | SOF3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+            SOF3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
-                return Err(Error::unsupported("non-baseline/progressive SOF"));
+                return Err(Error::unsupported(
+                    "JPEG: only baseline/extended-sequential/progressive SOFs are supported (no hierarchical, lossless, or arithmetic-coded variants)",
+                ));
             }
             SOS => {
                 let p = walker.read_segment_payload()?;

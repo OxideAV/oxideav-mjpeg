@@ -21,11 +21,11 @@ pub const COM: u8 = 0xFE;
 
 /// Baseline DCT sequential.
 pub const SOF0: u8 = 0xC0;
-/// Extended sequential DCT.
+/// Extended sequential DCT (same scan structure as SOF0 for 8-bit).
 pub const SOF1: u8 = 0xC1;
-/// Progressive DCT (unsupported).
+/// Progressive DCT.
 pub const SOF2: u8 = 0xC2;
-/// Lossless sequential (unsupported).
+/// Lossless sequential (not implemented — uses predictor+Huffman, not DCT).
 pub const SOF3: u8 = 0xC3;
 
 /// Application-specific markers APP0..APP15 (0xE0..0xEF).

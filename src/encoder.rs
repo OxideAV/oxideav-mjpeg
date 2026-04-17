@@ -2,8 +2,11 @@
 //!
 //! Produces a standalone, self-contained JPEG packet per video frame:
 //! SOI, JFIF APP0, DQT, SOF0, DHT (Annex K tables), SOS, entropy scan, EOI.
-//! Handles 4:2:0 / 4:2:2 / 4:4:4 YUV planar input. No restart markers are
-//! emitted (decoder still supports reading them).
+//! Handles 4:2:0 / 4:2:2 / 4:4:4 YUV planar input. Restart markers
+//! (DRI + `RSTn`) are emitted when [`MjpegEncoder::set_restart_interval`]
+//! (or [`encode_jpeg_with_opts`]) is called with a non-zero MCU count;
+//! by default the encoder matches the historical behaviour and emits
+//! none.
 
 use std::collections::VecDeque;
 
@@ -56,6 +59,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         height,
         pix,
         quality: DEFAULT_QUALITY,
+        restart_interval: 0,
         time_base: params
             .frame_rate
             .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
@@ -64,15 +68,35 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     }))
 }
 
-struct MjpegEncoder {
+/// Baseline-JPEG encoder. Emits one self-contained JPEG bitstream per
+/// video frame.
+pub struct MjpegEncoder {
     output_params: CodecParameters,
     width: u32,
     height: u32,
     pix: PixelFormat,
     quality: u8,
+    /// MCU-per-restart-interval count. 0 disables DRI / `RSTn` emission.
+    restart_interval: u16,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
+}
+
+impl MjpegEncoder {
+    /// Set the restart interval in MCUs (JPEG DRI field). `0` disables
+    /// restart marker emission (matches the default).
+    ///
+    /// Values are clamped to `u16::MAX` since the JPEG DRI field is a
+    /// 16-bit big-endian unsigned integer.
+    pub fn set_restart_interval(&mut self, mcus: u32) {
+        self.restart_interval = mcus.min(u16::MAX as u32) as u16;
+    }
+
+    /// Current restart interval (MCUs between `RSTn` markers; 0 = off).
+    pub fn restart_interval(&self) -> u16 {
+        self.restart_interval
+    }
 }
 
 impl Encoder for MjpegEncoder {
@@ -98,7 +122,7 @@ impl Encoder for MjpegEncoder {
                         v.format, self.pix
                     )));
                 }
-                let data = encode_jpeg(v, self.quality)?;
+                let data = encode_jpeg_with_opts(v, self.quality, self.restart_interval)?;
                 let mut pkt = Packet::new(0, self.time_base, data);
                 pkt.pts = v.pts;
                 pkt.dts = v.pts;
@@ -128,7 +152,22 @@ impl Encoder for MjpegEncoder {
 /// (e.g. `oxideav-amv`, which wraps the same bitstream with a custom
 /// container-level header) can reuse the encoder without going through the
 /// `Encoder` trait's stateful packet/frame plumbing.
+///
+/// Does not emit restart markers. For a restart-marker-aware variant see
+/// [`encode_jpeg_with_opts`].
 pub fn encode_jpeg(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
+    encode_jpeg_with_opts(frame, quality, 0)
+}
+
+/// Like [`encode_jpeg`] but also emits a DRI segment and cycles
+/// `RST0..=RST7` markers every `restart_interval` MCUs during the scan.
+/// Passing `0` disables restart marker emission (equivalent to
+/// [`encode_jpeg`]).
+pub fn encode_jpeg_with_opts(
+    frame: &VideoFrame,
+    quality: u8,
+    restart_interval: u16,
+) -> Result<Vec<u8>> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let (h_factor, v_factor) = match frame.format {
@@ -166,11 +205,24 @@ pub fn encode_jpeg(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
     write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
     write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
     write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+    // DRI — placed right before SOS per T.81 F.2.2.4.
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
     // SOS.
     write_sos(&mut out);
     // Scan data.
     write_scan(
-        &mut out, frame, width, height, h_factor, v_factor, &luma_q, &chroma_q, &huff,
+        &mut out,
+        frame,
+        width,
+        height,
+        h_factor,
+        v_factor,
+        &luma_q,
+        &chroma_q,
+        &huff,
+        restart_interval,
     )?;
     // EOI.
     out.push(0xFF);
@@ -238,6 +290,14 @@ fn write_dht(out: &mut Vec<u8>, class: u8, id: u8, bits: &[u8; 16], values: &[u8
     write_length_prefix(out, markers::DHT, &payload);
 }
 
+fn write_dri(out: &mut Vec<u8>, restart_interval: u16) {
+    out.push(0xFF);
+    out.push(markers::DRI);
+    out.push(0x00);
+    out.push(0x04);
+    out.extend_from_slice(&restart_interval.to_be_bytes());
+}
+
 fn write_sos(out: &mut Vec<u8>) {
     let payload: [u8; 10] = [
         3, // components
@@ -260,12 +320,13 @@ fn write_scan(
     luma_q: &[u16; 64],
     chroma_q: &[u16; 64],
     huff: &DefaultHuffman,
+    restart_interval: u16,
 ) -> Result<()> {
-    let mut bw = BitWriter::new(out);
     let mcu_w_px = 8 * h_factor as usize;
     let mcu_h_px = 8 * v_factor as usize;
     let mcus_x = width.div_ceil(mcu_w_px);
     let mcus_y = height.div_ceil(mcu_h_px);
+    let total_mcus = mcus_x.saturating_mul(mcus_y);
 
     let y_plane = &frame.planes[0];
     let cb_plane = &frame.planes[1];
@@ -281,6 +342,13 @@ fn write_scan(
     let mut prev_dc_y: i32 = 0;
     let mut prev_dc_cb: i32 = 0;
     let mut prev_dc_cr: i32 = 0;
+
+    let ri = restart_interval as usize;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: usize = 0;
+    let mut mcu_index: usize = 0;
+
+    let mut bw = BitWriter::new(out);
 
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
@@ -348,6 +416,21 @@ fn write_scan(
                 &huff.chroma_dc,
                 &huff.chroma_ac,
             );
+
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            // Emit a restart marker after every `ri` MCUs, but never after
+            // the very last MCU of the image (decoders expect EOI next).
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                prev_dc_y = 0;
+                prev_dc_cb = 0;
+                prev_dc_cr = 0;
+                mcus_since_restart = 0;
+            }
         }
     }
 
@@ -488,8 +571,14 @@ impl<'a> BitWriter<'a> {
     }
 
     fn finish(&mut self) {
+        self.flush_to_byte();
+    }
+
+    /// Byte-align the bitstream by padding any partial-byte with 1-bits
+    /// (T.81 Annex F.1.2.3), then emit the completed byte with 0xFF
+    /// stuffing. Used before writing `RSTn` markers.
+    fn flush_to_byte(&mut self) {
         if self.nbits > 0 {
-            // Pad with 1s per Annex F, then flush last byte.
             let pad = 8 - self.nbits;
             self.buf = (self.buf << pad) | ((1u32 << pad) - 1);
             self.nbits = 0;
@@ -499,6 +588,14 @@ impl<'a> BitWriter<'a> {
                 self.out.push(0x00);
             }
         }
+    }
+
+    /// Emit a raw two-byte `FF xx` marker (no 0-stuffing). Caller must
+    /// have byte-aligned the stream first via [`Self::flush_to_byte`].
+    fn emit_raw_marker(&mut self, marker: u8) {
+        debug_assert_eq!(self.nbits, 0);
+        self.out.push(0xFF);
+        self.out.push(marker);
     }
 }
 

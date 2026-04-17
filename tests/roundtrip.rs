@@ -221,6 +221,130 @@ fn byte_stuffing_roundtrip() {
     assert_eq!(v.height, h);
 }
 
+/// When restart markers are enabled, the bitstream must carry a DRI
+/// segment before SOS and cycle `FF D0..FF D7` markers inside the scan.
+/// Decoding must produce byte-identical pixels vs the no-restart encode
+/// (restart markers don't change coded coefficients, only add resync
+/// points).
+#[test]
+fn roundtrip_restart_interval_yuv420p() {
+    use oxideav_mjpeg::encoder::{encode_jpeg, encode_jpeg_with_opts};
+    let w = 64u32;
+    let h = 48u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    let base = encode_jpeg(&frame, 75).expect("base encode");
+    let with_rst = encode_jpeg_with_opts(&frame, 75, 4).expect("rst encode");
+
+    // DRI: FFDD 0004 0004 appears before SOS (FFDA).
+    let dri_pos = with_rst
+        .windows(6)
+        .position(|w| w == [0xFF, 0xDD, 0x00, 0x04, 0x00, 0x04])
+        .expect("DRI 4 present");
+    let sos_pos = with_rst
+        .windows(2)
+        .position(|w| w == [0xFF, 0xDA])
+        .expect("SOS present");
+    assert!(dri_pos < sos_pos, "DRI must precede SOS");
+    // Non-restart stream must not carry DRI.
+    assert!(!base.windows(2).any(|w| w == [0xFF, 0xDD]));
+
+    // Count RSTn markers in the scan. 4×3=12 MCUs total at 64×48 yuv420p;
+    // Ri=4 produces restart markers after MCU 4 and 8 (not after the last).
+    let scan = &with_rst[sos_pos + 2..with_rst.len() - 2];
+    let mut rst_bytes = Vec::new();
+    let mut i = 0;
+    while i + 1 < scan.len() {
+        if scan[i] == 0xFF && (0xD0..=0xD7).contains(&scan[i + 1]) {
+            rst_bytes.push(scan[i + 1]);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    assert_eq!(rst_bytes, vec![0xD0, 0xD1], "RSTn cycling wrong");
+
+    // Decode both and confirm identical output.
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec_a = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    let mut dec_b = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec_a
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), base))
+        .unwrap();
+    dec_b
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), with_rst))
+        .unwrap();
+    let Frame::Video(va) = dec_a.receive_frame().unwrap() else {
+        panic!()
+    };
+    let Frame::Video(vb) = dec_b.receive_frame().unwrap() else {
+        panic!()
+    };
+    for p in 0..3 {
+        assert_eq!(
+            va.planes[p].data, vb.planes[p].data,
+            "plane {p} mismatch between restart / non-restart encodes"
+        );
+    }
+
+    // Sanity: decoded Y PSNR vs source is still reasonable.
+    let sw = w as usize;
+    let sh = h as usize;
+    let mut orig = Vec::with_capacity(sw * sh);
+    let mut dec = Vec::with_capacity(sw * sh);
+    for j in 0..sh {
+        for i in 0..sw {
+            orig.push(frame.planes[0].data[j * frame.planes[0].stride + i]);
+            dec.push(vb.planes[0].data[j * vb.planes[0].stride + i]);
+        }
+    }
+    let p = psnr(&orig, &dec);
+    assert!(p >= 35.0, "restart-encode luma PSNR too low: {p}");
+}
+
+/// Exercise the "last MCU on restart boundary" edge case: with 12 MCUs
+/// and Ri=6 the second restart boundary lands exactly on the last MCU,
+/// which must NOT emit a trailing marker (EOI comes next).
+#[test]
+fn restart_interval_no_trailing_marker_on_last_mcu() {
+    use oxideav_mjpeg::encoder::encode_jpeg_with_opts;
+    let w = 64u32;
+    let h = 48u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+    let stream = encode_jpeg_with_opts(&frame, 75, 6).expect("encode");
+    let sos_pos = stream
+        .windows(2)
+        .position(|w| w == [0xFF, 0xDA])
+        .expect("SOS present");
+    let scan = &stream[sos_pos + 2..stream.len() - 2];
+    let mut rsts = 0;
+    let mut i = 0;
+    while i + 1 < scan.len() {
+        if scan[i] == 0xFF && (0xD0..=0xD7).contains(&scan[i + 1]) {
+            rsts += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // 12 MCUs / Ri=6 → single restart after MCU 6; none after MCU 12.
+    assert_eq!(rsts, 1);
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), stream))
+        .unwrap();
+    let Frame::Video(_) = dec.receive_frame().unwrap() else {
+        panic!()
+    };
+}
+
 /// The decoder should treat an extended-sequential (SOF1) 8-bit JPEG the
 /// same as baseline (SOF0), since both share the Huffman sequential scan
 /// structure. We produce a baseline JPEG with our encoder and rewrite the

@@ -68,11 +68,19 @@ let pkt = enc.receive_packet()?;
 
 The encoder accepts `Yuv444P`, `Yuv422P`, or `Yuv420P` planar input and
 emits a standalone baseline JPEG per frame: SOI, JFIF APP0, DQT, SOF0,
-DHT (Annex K typical tables), SOS, entropy scan, EOI. No restart
-markers are emitted (the decoder still honours them on input). Default
-quality factor is 75 (libjpeg style); `encoder::encode_jpeg(frame,
+DHT (Annex K typical tables), optional DRI, SOS, entropy scan, EOI.
+Default quality factor is 75 (libjpeg style); `encoder::encode_jpeg(frame,
 quality)` is also exposed for sibling crates that wrap the same
 bitstream in custom containers.
+
+Restart markers (`RSTn` + DRI) are supported for interop and bitstream
+resiliency. They are **off by default** — call
+`MjpegEncoder::set_restart_interval(n_mcus)` (or use
+`encoder::encode_jpeg_with_opts(frame, quality, n_mcus)`) to enable
+them. A non-zero value writes a DRI segment before SOS and cycles
+`RST0..=RST7` every `n_mcus` macroblocks in the scan, resetting DC
+predictors at each marker. Passing `0` preserves the historical
+no-restart behaviour.
 
 ### Codec / container IDs
 
@@ -103,6 +111,8 @@ Encoder:
 
 - SOF0 only, 8-bit Huffman, Annex K tables.
 - 4:4:4 / 4:2:2 / 4:2:0 input.
+- Optional DRI + `RSTn` emission (off by default; see the Encoder
+  section above).
 
 Not supported (decoder returns `Error::Unsupported`):
 

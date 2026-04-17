@@ -27,7 +27,7 @@ fn generate_red_jpeg(path: &Path) -> bool {
 
 #[test]
 fn decode_ffmpeg_red_jpeg() {
-    let path = std::env::temp_dir().join("oxideav_mjpeg_test_red.jpg");
+    let path = std::env::temp_dir().join("oxideav_mjpeg_test_red_baseline.jpg");
     if !generate_red_jpeg(&path) {
         eprintln!("ffmpeg not available — skipping");
         return;
@@ -73,10 +73,75 @@ fn decode_ffmpeg_red_jpeg() {
     );
 }
 
-/// Reject a progressive (SOF2) JPEG with Error::Unsupported.
+/// Decode a progressive (SOF2) JPEG produced by jpegtran -progressive from
+/// the ffmpeg-generated baseline red swatch. Check mean luma/chroma.
 #[test]
-fn reject_progressive_jpeg() {
-    let path = std::env::temp_dir().join("oxideav_mjpeg_test_prog.jpg");
+fn decode_progressive_red_jpeg() {
+    let base = std::env::temp_dir().join("oxideav_mjpeg_test_red_prog_src.jpg");
+    if !generate_red_jpeg(&base) {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+    let prog = std::env::temp_dir().join("oxideav_mjpeg_test_prog_red.jpg");
+    let status = Command::new("/usr/bin/jpegtran")
+        .args(["-progressive", "-outfile"])
+        .arg(&prog)
+        .arg(&base)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) || !prog.exists() {
+        eprintln!("jpegtran not available — skipping");
+        return;
+    }
+    let bytes = std::fs::read(&prog).unwrap();
+    // Sanity: confirm SOF2 is present.
+    assert!(
+        bytes.windows(2).any(|w| w == [0xFF, 0xC2]),
+        "jpegtran output is not progressive"
+    );
+
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.width = Some(64);
+    params.height = Some(64);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&params).expect("make decoder");
+    let pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
+    dec.send_packet(&pkt).expect("send");
+    let frame = dec.receive_frame().expect("decode");
+    let Frame::Video(v) = frame else {
+        panic!("expected video frame");
+    };
+
+    assert_eq!(v.width, 64);
+    assert_eq!(v.height, 64);
+
+    let y_mean: u64 =
+        v.planes[0].data.iter().map(|&b| b as u64).sum::<u64>() / v.planes[0].data.len() as u64;
+    let cb_mean: u64 =
+        v.planes[1].data.iter().map(|&b| b as u64).sum::<u64>() / v.planes[1].data.len() as u64;
+    let cr_mean: u64 =
+        v.planes[2].data.iter().map(|&b| b as u64).sum::<u64>() / v.planes[2].data.len() as u64;
+    eprintln!("progressive red means: Y={y_mean} Cb={cb_mean} Cr={cr_mean}");
+    // BT.601 red: Y≈76, Cb≈85, Cr≈255.
+    assert!(
+        (y_mean as i64 - 76).abs() < 12,
+        "luma mean = {y_mean}, want ≈76"
+    );
+    assert!(
+        (cb_mean as i64 - 85).abs() < 20,
+        "Cb mean = {cb_mean}, want ≈85"
+    );
+    assert!(
+        (cr_mean as i64 - 255).abs() < 25,
+        "Cr mean = {cr_mean}, want ≈255"
+    );
+}
+
+/// Decode a complex image (ffmpeg's `testsrc`) as both baseline and
+/// progressive and confirm the two decoders agree to within JPEG rounding
+/// noise across every component plane. `jpegtran -progressive` is a
+/// lossless re-encode, so the decoded outputs must match almost exactly.
+#[test]
+fn decode_progressive_testsrc_matches_baseline() {
+    let base = std::env::temp_dir().join("oxideav_mjpeg_test_testsrc.jpg");
     let status = Command::new("/usr/bin/ffmpeg")
         .args([
             "-y",
@@ -85,66 +150,145 @@ fn reject_progressive_jpeg() {
             "-f",
             "lavfi",
             "-i",
-            "color=c=green:s=64x64:d=1",
+            "testsrc=size=128x128:duration=1",
             "-frames:v",
             "1",
             "-update",
             "1",
-            "-vf",
-            "format=yuvj420p",
-            "-mjpeg_huffman_tables",
-            "0",
+            "-pix_fmt",
+            "yuvj420p",
         ])
-        .arg("-huffman")
-        .arg("0")
-        .arg("-progressive")
-        .arg("1")
-        .arg(&path)
+        .arg(&base)
         .status();
-    let _ = status; // ignore; some ffmpeg builds lack the flag.
-                    // Alternate strategy: try jpegtran if available. If neither method succeeds, skip.
-    if !path.exists() {
-        // Fallback: synthesise the SOF2 case by hand.
-        // JPEG header fragments: SOI + minimal APP0 + SOF2 marker → reader should
-        // reject.
-        let minimal = vec![
-            0xFF, 0xD8, // SOI
-            0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0xFF,
-            0xC2, // SOF2 (progressive)
-            0x00, 0x11, // length
-            0x08, 0x00, 0x40, 0x00, 0x40, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11,
-            0x01,
-        ];
+    if !matches!(status, Ok(s) if s.success()) || !base.exists() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    let prog = std::env::temp_dir().join("oxideav_mjpeg_test_testsrc_prog.jpg");
+    let status = Command::new("/usr/bin/jpegtran")
+        .args(["-progressive", "-outfile"])
+        .arg(&prog)
+        .arg(&base)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) || !prog.exists() {
+        eprintln!("jpegtran not available — skipping");
+        return;
+    }
+
+    let base_bytes = std::fs::read(&base).unwrap();
+    let prog_bytes = std::fs::read(&prog).unwrap();
+    if !prog_bytes.windows(2).any(|w| w == [0xFF, 0xC2]) {
+        eprintln!("jpegtran output is not progressive — skipping");
+        return;
+    }
+
+    let decode = |bytes: Vec<u8>, w: u32, h: u32| -> oxideav_core::VideoFrame {
         let mut params = CodecParameters::video(CodecId::new("mjpeg"));
-        let mut dec = oxideav_mjpeg::decoder::make_decoder(&params.clone()).unwrap();
+        params.width = Some(w);
+        params.height = Some(h);
+        let mut dec = oxideav_mjpeg::decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        v
+    };
+
+    let a = decode(base_bytes, 128, 128);
+    let b = decode(prog_bytes, 128, 128);
+    assert_eq!(a.width, b.width);
+    assert_eq!(a.height, b.height);
+    assert_eq!(a.format, b.format);
+    assert_eq!(a.planes.len(), b.planes.len());
+
+    for (pi, (pa, pb)) in a.planes.iter().zip(&b.planes).enumerate() {
+        assert_eq!(pa.data.len(), pb.data.len(), "plane {pi} size mismatch");
+        let mut max_diff = 0u8;
+        let mut sse = 0.0f64;
+        for (x, y) in pa.data.iter().zip(&pb.data) {
+            let d = (*x as i32 - *y as i32).unsigned_abs() as u8;
+            if d > max_diff {
+                max_diff = d;
+            }
+            let f = *x as f64 - *y as f64;
+            sse += f * f;
+        }
+        let mse = sse / pa.data.len() as f64;
+        let psnr = if mse == 0.0 {
+            99.0
+        } else {
+            20.0 * (255.0f64 / mse.sqrt()).log10()
+        };
+        eprintln!("plane {pi}: max_diff={max_diff} PSNR={psnr:.2} dB");
+        // `jpegtran -progressive` reorganises the scan structure without
+        // changing the quantised coefficients; IDCT is identical in both
+        // paths, so agreement should be exact up to floating-point noise.
+        assert!(max_diff <= 1, "plane {pi} diverges: max_diff = {max_diff}");
+        assert!(psnr >= 45.0, "plane {pi} PSNR too low: {psnr}");
+    }
+}
+
+/// Decode the same image as baseline and as progressive, then compare the
+/// decoded luma planes — they should agree within JPEG rounding noise.
+#[test]
+fn decode_progressive_vs_baseline_matches() {
+    let base = std::env::temp_dir().join("oxideav_mjpeg_test_red_cmp_src.jpg");
+    if !generate_red_jpeg(&base) {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+    let prog = std::env::temp_dir().join("oxideav_mjpeg_test_red_cmp_prog.jpg");
+    let status = Command::new("/usr/bin/jpegtran")
+        .args(["-progressive", "-outfile"])
+        .arg(&prog)
+        .arg(&base)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) || !prog.exists() {
+        eprintln!("jpegtran not available — skipping");
+        return;
+    }
+    let prog_bytes = std::fs::read(&prog).unwrap();
+    if !prog_bytes.windows(2).any(|w| w == [0xFF, 0xC2]) {
+        eprintln!("jpegtran output is not progressive — skipping");
+        return;
+    }
+    let base_bytes = std::fs::read(&base).unwrap();
+
+    let decode = |bytes: Vec<u8>| -> oxideav_core::VideoFrame {
+        let mut params = CodecParameters::video(CodecId::new("mjpeg"));
         params.width = Some(64);
         params.height = Some(64);
-        let pkt = Packet::new(0, TimeBase::new(1, 90_000), minimal);
+        let mut dec = oxideav_mjpeg::decoder::make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         dec.send_packet(&pkt).unwrap();
-        let err = dec.receive_frame().expect_err("should fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("progressive"),
-            "expected 'progressive' in error, got: {msg}"
-        );
-        return;
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        v
+    };
+
+    let a = decode(base_bytes);
+    let b = decode(prog_bytes);
+    assert_eq!(a.width, b.width);
+    assert_eq!(a.height, b.height);
+    assert_eq!(a.format, b.format);
+
+    // `jpegtran -progressive` is supposed to be a lossless re-encode: the
+    // same DCT coefficients, just different scan structure. PSNR should be
+    // essentially infinite.
+    let mut sse = 0.0f64;
+    assert_eq!(a.planes[0].data.len(), b.planes[0].data.len());
+    for (x, y) in a.planes[0].data.iter().zip(&b.planes[0].data) {
+        let d = *x as f64 - *y as f64;
+        sse += d * d;
     }
-    // If the file exists and is progressive, confirm rejection.
-    let bytes = std::fs::read(&path).unwrap();
-    if bytes.len() < 10 {
-        return;
-    }
-    // Quick signature check for SOF2 (0xFFC2); skip otherwise.
-    let has_sof2 = bytes.windows(2).any(|w| w == [0xFF, 0xC2]);
-    if !has_sof2 {
-        return;
-    }
-    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
-    params.width = Some(64);
-    params.height = Some(64);
-    let mut dec = oxideav_mjpeg::decoder::make_decoder(&params).unwrap();
-    let pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
-    dec.send_packet(&pkt).unwrap();
-    let err = dec.receive_frame().expect_err("should reject");
-    assert!(err.to_string().contains("progressive"));
+    let mse = sse / a.planes[0].data.len() as f64;
+    let psnr = if mse == 0.0 {
+        99.0
+    } else {
+        20.0 * (255.0f64 / mse.sqrt()).log10()
+    };
+    eprintln!("baseline vs progressive Y PSNR = {psnr:.2} dB");
+    assert!(psnr >= 35.0, "PSNR too low: {psnr}");
 }

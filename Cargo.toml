@@ -11,3 +11,4 @@ description = "Pure-Rust baseline JPEG / Motion-JPEG codec for oxideav"
 [dependencies]
 oxideav-core = { workspace = true }
 oxideav-codec = { workspace = true }
+oxideav-container = { workspace = true }

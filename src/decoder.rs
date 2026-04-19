@@ -154,6 +154,12 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                         "progressive JPEG: 4+ component scans not supported",
                     ));
                 }
+                if sof.precision != 8 {
+                    return Err(Error::unsupported(format!(
+                        "progressive JPEG: precision {} (only 8 is supported)",
+                        sof.precision
+                    )));
+                }
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
                 state.progressive = true;
@@ -177,12 +183,15 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                         .as_ref()
                         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
                     let fully_interleaved = sos.components.len() == sof.components.len();
-                    // decode_scan only knows 1-3 components (Gray8 / YuvXXXP).
-                    // Any 4-component scan (CMYK/YCCK) must take the
-                    // accumulator path, which understands the packed CMYK
-                    // output format.
-                    let fast_path_ok =
-                        fully_interleaved && !state.seq_accum && sof.components.len() <= 3;
+                    // decode_scan only knows 1-3 components at 8-bit
+                    // precision. 4-component (CMYK/YCCK) and 12-bit
+                    // sample precision must take the accumulator path,
+                    // where the wider output machinery (packed CMYK / u16
+                    // sample buffers) lives.
+                    let fast_path_ok = fully_interleaved
+                        && !state.seq_accum
+                        && sof.components.len() <= 3
+                        && sof.precision == 8;
                     if fast_path_ok {
                         return decode_scan(&state, &sos, scan, pts, time_base);
                     }
@@ -222,8 +231,11 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
 /// Shared by progressive (SOF2, multi-scan successive-approximation) and
 /// non-interleaved baseline (SOF0/SOF1 with ns < nf) code paths.
 fn init_coef_buffers(sof: &SofInfo) -> Result<Vec<Vec<[i32; 64]>>> {
-    if sof.precision != 8 {
-        return Err(Error::unsupported("coef accumulator: precision != 8"));
+    if sof.precision != 8 && sof.precision != 12 {
+        return Err(Error::unsupported(format!(
+            "coef accumulator: precision {} (only 8 and 12 are supported)",
+            sof.precision
+        )));
     }
     if sof.components.is_empty() {
         return Err(Error::invalid("SOF: no components"));
@@ -723,8 +735,11 @@ fn decode_sequential_scan_accum(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
-    if sof.precision != 8 {
-        return Err(Error::unsupported("precision != 8"));
+    if sof.precision != 8 && sof.precision != 12 {
+        return Err(Error::unsupported(format!(
+            "scan: unsupported precision {}",
+            sof.precision
+        )));
     }
 
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
@@ -1260,6 +1275,11 @@ fn render_from_coefs(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("render: EOI before SOF"))?;
+    // 12-bit precision JPEGs take their own render path — different level
+    // shift, different clamp range, 16-bit-LE output planes.
+    if sof.precision == 12 {
+        return render_from_coefs_12bit(state, coefs, pts, time_base);
+    }
     let n_comp = sof.components.len();
     let grayscale = n_comp == 1;
     let width = sof.width as usize;
@@ -1473,6 +1493,154 @@ fn render_from_coefs(
                 }
             }
             planes.push(VideoPlane { stride, data });
+        }
+        _ => unreachable!(),
+    }
+
+    Ok(VideoFrame {
+        format: out_format,
+        width: width as u32,
+        height: height as u32,
+        pts,
+        time_base,
+        planes,
+    })
+}
+
+/// 12-bit precision render path. Mirrors `render_from_coefs` but keeps
+/// sample buffers in `u16` and applies a level shift of 2048 (spec value
+/// for P=12). Only grayscale and YUV 4:2:0 are supported on output —
+/// there are no 12-bit planar-YUV 4:2:2/4:4:4 variants in the shared
+/// PixelFormat enum yet.
+fn render_from_coefs_12bit(
+    state: &JpegState,
+    coefs: &[Vec<[i32; 64]>],
+    pts: Option<i64>,
+    time_base: TimeBase,
+) -> Result<VideoFrame> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("render: EOI before SOF"))?;
+    let n_comp = sof.components.len();
+    let grayscale = n_comp == 1;
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    let mcus_x = width.div_ceil(8 * h_max);
+    let mcus_y = height.div_ceil(8 * v_max);
+
+    let out_format = if grayscale {
+        PixelFormat::Gray12Le
+    } else if n_comp == 3 {
+        let y = sof.components[0];
+        let cb = sof.components[1];
+        let cr = sof.components[2];
+        if cb.h_factor != cr.h_factor || cb.v_factor != cr.v_factor {
+            return Err(Error::unsupported(
+                "12-bit: chroma components have different sampling factors",
+            ));
+        }
+        if cb.h_factor != 1 || cb.v_factor != 1 {
+            return Err(Error::unsupported(
+                "12-bit: chroma components must have factor 1",
+            ));
+        }
+        match (y.h_factor, y.v_factor) {
+            (2, 2) => PixelFormat::Yuv420P12Le,
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "12-bit: only 4:2:0 chroma sampling supported (got {}x{})",
+                    y.h_factor, y.v_factor
+                )))
+            }
+        }
+    } else {
+        return Err(Error::unsupported(format!(
+            "12-bit: {n_comp}-component JPEGs not supported"
+        )));
+    };
+
+    let quant_tables: Vec<&QuantTable> = sof
+        .components
+        .iter()
+        .map(|c| {
+            state.quant[c.qt_id as usize]
+                .as_ref()
+                .ok_or_else(|| Error::invalid("quant table missing for component"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Per-component u16 sample buffer (full MCU coverage).
+    let mut comp_buf: Vec<Vec<u16>> = Vec::with_capacity(n_comp);
+    let mut comp_stride: Vec<usize> = Vec::with_capacity(n_comp);
+    for c in &sof.components {
+        let w_full = mcus_x * 8 * c.h_factor as usize;
+        let h_full = mcus_y * 8 * c.v_factor as usize;
+        comp_buf.push(vec![0u16; w_full * h_full]);
+        comp_stride.push(w_full);
+    }
+
+    for (ci, c) in sof.components.iter().enumerate() {
+        let blocks_x = mcus_x * c.h_factor as usize;
+        let blocks_y = mcus_y * c.v_factor as usize;
+        let qt = quant_tables[ci];
+        let stride = comp_stride[ci];
+        let buf = &mut comp_buf[ci];
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let block = &coefs[ci][by * blocks_x + bx];
+                let mut fblock = [0.0f32; 64];
+                for k in 0..64 {
+                    fblock[k] = (block[k] * qt.values[k] as i32) as f32;
+                }
+                idct8x8(&mut fblock);
+                let dst_x0 = bx * 8;
+                let dst_y0 = by * 8;
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let v = fblock[j * 8 + i] + 2048.0;
+                        let px = if v <= 0.0 {
+                            0
+                        } else if v >= 4095.0 {
+                            4095
+                        } else {
+                            v.round() as u16
+                        };
+                        buf[(dst_y0 + j) * stride + dst_x0 + i] = px;
+                    }
+                }
+            }
+        }
+    }
+
+    // Build output — all 12-bit variants store samples as little-endian u16
+    // (high 4 bits zero-padded). One plane per component.
+    let mut planes: Vec<VideoPlane> = Vec::new();
+    let emit_plane = |src: &[u16], src_stride: usize, w: usize, h: usize| -> VideoPlane {
+        let stride = w * 2;
+        let mut data = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = src[y * src_stride + x];
+                data[y * stride + x * 2] = (v & 0xFF) as u8;
+                data[y * stride + x * 2 + 1] = ((v >> 8) & 0xFF) as u8;
+            }
+        }
+        VideoPlane { stride, data }
+    };
+
+    match out_format {
+        PixelFormat::Gray12Le => {
+            planes.push(emit_plane(&comp_buf[0], comp_stride[0], width, height));
+        }
+        PixelFormat::Yuv420P12Le => {
+            planes.push(emit_plane(&comp_buf[0], comp_stride[0], width, height));
+            let c_w = width.div_ceil(2);
+            let c_h = height.div_ceil(2);
+            planes.push(emit_plane(&comp_buf[1], comp_stride[1], c_w, c_h));
+            planes.push(emit_plane(&comp_buf[2], comp_stride[2], c_w, c_h));
         }
         _ => unreachable!(),
     }
@@ -1994,5 +2162,60 @@ mod cmyk_tests {
         }
         let p = psnr(&k, &got_k);
         assert!(p >= 30.0, "YCCK K plane PSNR too low: {p:.2}");
+    }
+}
+
+#[cfg(test)]
+mod precision_12_tests {
+    use super::*;
+    use crate::encoder::encode_grayscale_jpeg_12bit;
+    use oxideav_core::PixelFormat;
+
+    /// Decoder should accept a 12-bit precision grayscale JPEG and output
+    /// `Gray12Le` with 16-bit LE samples. We feed a smooth gradient
+    /// centred near 2048 so Huffman categories stay small (we reuse the
+    /// 8-bit Annex K Huffman tables).
+    #[test]
+    fn gray_12bit_roundtrip() {
+        let w = 16u32;
+        let h = 16u32;
+        // Values in [2000, 2100] keep DC/AC categories well under 12.
+        let mut samples = vec![0u16; (w * h) as usize];
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                samples[j * w as usize + i] = 2000 + ((i + j) as u16);
+            }
+        }
+        let stride = w as usize;
+        let data =
+            encode_grayscale_jpeg_12bit(w, h, &samples, stride, 90).expect("encode 12-bit gray");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v.format, PixelFormat::Gray12Le);
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, (w * 2) as usize);
+
+        // Unpack LE u16 samples and check they're within a small tolerance
+        // of the originals (DCT + quant at Q=90 introduces a few LSBs of
+        // noise).
+        let mut got = Vec::with_capacity((w * h) as usize);
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let o = j * v.planes[0].stride + i * 2;
+                got.push(v.planes[0].data[o] as u16 | ((v.planes[0].data[o + 1] as u16) << 8));
+            }
+        }
+        for (orig, dec) in samples.iter().zip(got.iter()) {
+            let diff = (*orig as i32 - *dec as i32).abs();
+            assert!(diff < 16, "12-bit roundtrip diff too large: {diff}");
+        }
     }
 }

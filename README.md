@@ -103,6 +103,9 @@ Decoder:
 - **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
   component) — transparently routed through the shared coefficient
   accumulator.
+- **12-bit precision** sequential JPEGs (SOF0/SOF1, `P=12`) → 16-bit-LE
+  `Gray12Le` for grayscale and `Yuv420P12Le` for 4:2:0 YUV. Level shift
+  is 2048 as per the spec.
 - **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
   Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
@@ -126,7 +129,7 @@ Not supported (decoder returns `Error::Unsupported`):
 
 - Lossless JPEG (SOF3), hierarchical (SOF5+), arithmetic coding
   (SOF9..SOF15).
-- 12-bit precision.
+- 12-bit progressive (SOF2 with `P=12`), 12-bit 4:2:2 / 4:4:4 YUV.
 - Progressive 4-component JPEGs.
 
 ## License

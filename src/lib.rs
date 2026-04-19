@@ -24,11 +24,15 @@
 //! decoder inspects the APP14 Adobe transform flag to choose among plain
 //! CMYK, Adobe-inverted CMYK, and Adobe YCCK (which is colour-converted
 //! back to CMYK via BT.601 full-range YCbCr→RGB→CMY plus K inversion).
+//! 12-bit precision sequential JPEGs (SOF0/SOF1 with `P=12`) decode to
+//! `Gray12Le` or `Yuv420P12Le`; sample buffers stay 16-bit throughout the
+//! inverse DCT and the level shift uses 2048.
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Lossless JPEG (SOF3), hierarchical (SOF5+), arithmetic coding
 //!   (SOF9..SOF15)
-//! - 12-bit precision
+//! - 12-bit progressive (SOF2 with `P=12`)
+//! - 12-bit 4:2:2 / 4:4:4 YUV (no matching output `PixelFormat`)
 //! - Progressive 4-component JPEGs
 
 pub mod container;

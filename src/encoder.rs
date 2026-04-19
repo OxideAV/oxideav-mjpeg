@@ -896,6 +896,107 @@ fn write_sos_4comp(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+/// Test-only: emit a single-component, 12-bit precision baseline JPEG.
+/// `samples` carries u16 values in `[0, 4095]`. Caller must keep inputs
+/// moderate enough that per-block DC/AC Huffman categories stay ≤ 11 —
+/// we reuse the 8-bit Annex K tables rather than carrying a separate
+/// 12-bit table set.
+#[cfg(test)]
+pub(crate) fn encode_grayscale_jpeg_12bit(
+    width: u32,
+    height: u32,
+    samples: &[u16],
+    stride: usize,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "12-bit gray helper: samples buffer too short",
+        ));
+    }
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_sof_grayscale_12bit(&mut out, w as u16, h as u16);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_sos_grayscale(&mut out);
+
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let mut bw = BitWriter::new(&mut out);
+    let mut prev_dc: i32 = 0;
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            let mut blk = [0.0f32; 64];
+            fill_block_u16_levelshift_2048(&mut blk, samples, stride, w, h, mx * 8, my * 8);
+            encode_block(
+                &mut bw,
+                &mut blk,
+                &luma_q,
+                &mut prev_dc,
+                &huff.luma_dc,
+                &huff.luma_ac,
+            );
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn fill_block_u16_levelshift_2048(
+    dst: &mut [f32; 64],
+    plane: &[u16],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+) {
+    for j in 0..8 {
+        let y = (y0 + j).min(h.saturating_sub(1));
+        for i in 0..8 {
+            let x = (x0 + i).min(w.saturating_sub(1));
+            let v = plane[y * stride + x] as i32;
+            dst[j * 8 + i] = (v - 2048) as f32;
+        }
+    }
+}
+
+#[cfg(test)]
+fn write_sof_grayscale_12bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(12); // precision
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf
+    payload.push(1); // component id
+    payload.push(0x11); // H=1 V=1
+    payload.push(0); // qt = 0
+    write_length_prefix(out, markers::SOF0, &payload);
+}
+
+#[cfg(test)]
+fn write_sos_grayscale(out: &mut Vec<u8>) {
+    let payload: [u8; 6] = [
+        1, // Ns
+        1, 0x00, // comp 1 → DC=0 AC=0
+        0, 63, 0, // Ss, Se, Ah|Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

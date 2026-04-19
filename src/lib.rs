@@ -33,7 +33,7 @@ pub mod jpeg;
 
 use oxideav_codec::CodecRegistry;
 use oxideav_container::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "mjpeg";
 
@@ -43,7 +43,12 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(true)
         .with_max_size(16384, 16384);
-    reg.register_both(cid, caps, decoder::make_decoder, encoder::make_encoder);
+    reg.register_both(cid.clone(), caps, decoder::make_decoder, encoder::make_encoder);
+
+    // AVI FourCC claims — all unambiguous MJPEG variants.
+    for fcc in &[b"MJPG", b"AVRN", b"LJPG", b"JPGL"] {
+        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
+    }
 }
 
 /// Register the still-image JPEG container (`.jpg` / `.jpeg`). Must be

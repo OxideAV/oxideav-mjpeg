@@ -16,7 +16,7 @@ framework but usable standalone.
 oxideav-core = "0.1"
 oxideav-codec = "0.1"
 oxideav-container = "0.1"
-oxideav-mjpeg = "0.0"
+oxideav-mjpeg = "0.1"
 ```
 
 ## Quick use

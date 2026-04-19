@@ -19,7 +19,12 @@
 //! segments (JFIF, EXIF, ICC, XMP, …) are skipped without parsing. The
 //! encoder accepts the same pixel formats and produces a standalone
 //! baseline JPEG using the Annex K "typical" Huffman tables, so its
-//! output is interoperable with any compliant JPEG decoder.
+//! output is interoperable with any compliant JPEG decoder. A
+//! progressive (SOF2) output mode is available via
+//! `encoder::MjpegEncoder::set_progressive` or
+//! `encoder::encode_jpeg_progressive`; it emits a DC-first scan
+//! followed by two per-component AC band scans (spectral selection
+//! only, `Ah = Al = 0`).
 //!
 //! 4-component (CMYK / Adobe YCCK) JPEGs decode to packed `Cmyk` — the
 //! decoder inspects the APP14 Adobe transform flag to choose among plain

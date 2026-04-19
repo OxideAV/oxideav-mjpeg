@@ -2,9 +2,9 @@
 
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
 decodes baseline (SOF0), extended-sequential (SOF1) and progressive
-(SOF2) 8-bit JPEGs, encodes baseline JPEG using the Annex K "typical"
-Huffman tables. YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale.
-Zero C dependencies.
+(SOF2) 8-bit JPEGs, encodes baseline **and** progressive JPEG using the
+Annex K "typical" Huffman tables. YUV 4:4:4 / 4:2:2 / 4:2:0 and
+grayscale. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -82,6 +82,28 @@ them. A non-zero value writes a DRI segment before SOS and cycles
 predictors at each marker. Passing `0` preserves the historical
 no-restart behaviour.
 
+### Progressive (SOF2) encode
+
+Toggle progressive emission via `MjpegEncoder::set_progressive(true)`
+on the concrete encoder (construct it with
+`MjpegEncoder::from_params`), or call
+`encoder::encode_jpeg_progressive(frame, quality)` directly. The
+output is a standalone progressive JPEG with this scan decomposition:
+
+1. Interleaved DC-first scan (`Ss=0, Se=0, Ah=0, Al=0`) covering every
+   component.
+2. Per-component low-band AC scan (`Ss=1, Se=5, Ah=0, Al=0`) — luma,
+   Cb, Cr.
+3. Per-component high-band AC scan (`Ss=6, Se=63, Ah=0, Al=0`).
+
+That's 1 + 3 + 3 = 7 `SOS` segments. Successive-approximation
+refinement scans (`Ah ≥ 1`) are **not** emitted; coefficients reach
+the decoder in a single initial scan per band and round-trip through
+our own progressive decoder. Restart markers are not emitted on the
+progressive path. Compressed size is typically ~10% larger than the
+equivalent baseline encode due to the extra SOS/DHT overhead and
+per-scan EOB handling (no EOBn runs).
+
 ### Codec / container IDs
 
 - Codec: `"mjpeg"`. Decoder output / encoder input pixel formats:
@@ -124,10 +146,14 @@ Decoder:
 
 Encoder:
 
-- SOF0 only, 8-bit Huffman, Annex K tables.
+- **SOF0** (baseline sequential) — 8-bit Huffman, Annex K tables.
+- **SOF2** (progressive) — spectral-selection decomposition: one
+  interleaved DC-first scan + per-component AC scans over bands
+  `Ss=1..=5` and `Ss=6..=63` (Ah=0, Al=0). No successive-approximation
+  refinement.
 - 4:4:4 / 4:2:2 / 4:2:0 input.
-- Optional DRI + `RSTn` emission (off by default; see the Encoder
-  section above).
+- Optional DRI + `RSTn` emission on the baseline path (off by default;
+  see the Encoder section above).
 
 Not supported (decoder returns `Error::Unsupported`):
 

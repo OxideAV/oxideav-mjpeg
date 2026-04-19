@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-mjpeg"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG / Motion-JPEG codec for oxideav — baseline, extended-sequential, and progressive decode; baseline encode"
+description = "Pure-Rust JPEG / Motion-JPEG codec for oxideav — baseline, extended-sequential, and progressive decode; baseline and progressive encode"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-mjpeg"

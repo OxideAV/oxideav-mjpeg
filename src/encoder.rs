@@ -1,12 +1,27 @@
-//! Baseline-JPEG encoder.
+//! Baseline / progressive JPEG encoder.
 //!
-//! Produces a standalone, self-contained JPEG packet per video frame:
+//! The default path produces a standalone baseline JPEG per video frame:
 //! SOI, JFIF APP0, DQT, SOF0, DHT (Annex K tables), SOS, entropy scan, EOI.
 //! Handles 4:2:0 / 4:2:2 / 4:4:4 YUV planar input. Restart markers
 //! (DRI + `RSTn`) are emitted when [`MjpegEncoder::set_restart_interval`]
 //! (or [`encode_jpeg_with_opts`]) is called with a non-zero MCU count;
 //! by default the encoder matches the historical behaviour and emits
 //! none.
+//!
+//! Progressive (SOF2) emission is available via
+//! [`MjpegEncoder::set_progressive`] (or [`encode_jpeg_progressive`]). The
+//! simple three-scan decomposition used here is:
+//!   1. Interleaved DC-first scan (`Ss=0, Se=0, Ah=0, Al=0`) covering every
+//!      component.
+//!   2. A per-component AC scan over the low-frequency band
+//!      (`Ss=1, Se=5, Ah=0, Al=0`).
+//!   3. A per-component AC scan over the high-frequency band
+//!      (`Ss=6, Se=63, Ah=0, Al=0`).
+//!
+//! Successive-approximation refinement scans (`Ah >= 1`) are not emitted;
+//! the output is functionally equivalent to a single-pass progressive JPEG
+//! and round-trips losslessly against a spectral-selection-only decoder
+//! (including our own).
 
 use std::collections::VecDeque;
 
@@ -29,47 +44,11 @@ use crate::jpeg::zigzag::ZIGZAG;
 pub const DEFAULT_QUALITY: u8 = 75;
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    let width = params
-        .width
-        .ok_or_else(|| Error::invalid("MJPEG encoder: missing width"))?;
-    let height = params
-        .height
-        .ok_or_else(|| Error::invalid("MJPEG encoder: missing height"))?;
-    let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-    match pix {
-        PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P => {}
-        _ => {
-            return Err(Error::unsupported(format!(
-                "MJPEG encoder: pixel format {:?} not supported",
-                pix
-            )))
-        }
-    }
-
-    let mut output_params = params.clone();
-    output_params.media_type = MediaType::Video;
-    output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
-    output_params.width = Some(width);
-    output_params.height = Some(height);
-    output_params.pixel_format = Some(pix);
-
-    Ok(Box::new(MjpegEncoder {
-        output_params,
-        width,
-        height,
-        pix,
-        quality: DEFAULT_QUALITY,
-        restart_interval: 0,
-        time_base: params
-            .frame_rate
-            .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
-        pending: VecDeque::new(),
-        eof: false,
-    }))
+    Ok(MjpegEncoder::from_params(params)?)
 }
 
-/// Baseline-JPEG encoder. Emits one self-contained JPEG bitstream per
-/// video frame.
+/// JPEG encoder. Emits one self-contained JPEG bitstream (baseline SOF0
+/// or progressive SOF2) per video frame.
 pub struct MjpegEncoder {
     output_params: CodecParameters,
     width: u32,
@@ -77,18 +56,71 @@ pub struct MjpegEncoder {
     pix: PixelFormat,
     quality: u8,
     /// MCU-per-restart-interval count. 0 disables DRI / `RSTn` emission.
+    /// Restart intervals are only honoured on the baseline (SOF0) path
+    /// for now; progressive emission ignores this field.
     restart_interval: u16,
+    /// When true, emit SOF2 + multi-scan (spectral selection only).
+    progressive: bool,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
 }
 
 impl MjpegEncoder {
+    /// Build a concrete `MjpegEncoder` from video codec parameters.
+    /// Preferred over `make_encoder` when the caller wants to tweak
+    /// encoder-specific knobs (e.g. progressive mode, restart interval)
+    /// before feeding frames.
+    pub fn from_params(params: &CodecParameters) -> Result<Box<Self>> {
+        let width = params
+            .width
+            .ok_or_else(|| Error::invalid("MJPEG encoder: missing width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Error::invalid("MJPEG encoder: missing height"))?;
+        let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        match pix {
+            PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P => {}
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "MJPEG encoder: pixel format {:?} not supported",
+                    pix
+                )))
+            }
+        }
+
+        let mut output_params = params.clone();
+        output_params.media_type = MediaType::Video;
+        output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
+        output_params.width = Some(width);
+        output_params.height = Some(height);
+        output_params.pixel_format = Some(pix);
+
+        Ok(Box::new(Self {
+            output_params,
+            width,
+            height,
+            pix,
+            quality: DEFAULT_QUALITY,
+            restart_interval: 0,
+            progressive: false,
+            time_base: params
+                .frame_rate
+                .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
+            pending: VecDeque::new(),
+            eof: false,
+        }))
+    }
+
     /// Set the restart interval in MCUs (JPEG DRI field). `0` disables
     /// restart marker emission (matches the default).
     ///
     /// Values are clamped to `u16::MAX` since the JPEG DRI field is a
     /// 16-bit big-endian unsigned integer.
+    ///
+    /// Currently only applied on the baseline encode path; enabling
+    /// progressive output via [`Self::set_progressive`] suppresses
+    /// restart-marker emission.
     pub fn set_restart_interval(&mut self, mcus: u32) {
         self.restart_interval = mcus.min(u16::MAX as u32) as u16;
     }
@@ -96,6 +128,18 @@ impl MjpegEncoder {
     /// Current restart interval (MCUs between `RSTn` markers; 0 = off).
     pub fn restart_interval(&self) -> u16 {
         self.restart_interval
+    }
+
+    /// Enable or disable progressive (SOF2) JPEG emission. When enabled
+    /// the encoder produces one DC-first scan plus two per-component AC
+    /// band scans (Ss=1..5 then Ss=6..63). See module-level docs.
+    pub fn set_progressive(&mut self, on: bool) {
+        self.progressive = on;
+    }
+
+    /// True when progressive emission is enabled.
+    pub fn progressive(&self) -> bool {
+        self.progressive
     }
 }
 
@@ -122,7 +166,11 @@ impl Encoder for MjpegEncoder {
                         v.format, self.pix
                     )));
                 }
-                let data = encode_jpeg_with_opts(v, self.quality, self.restart_interval)?;
+                let data = if self.progressive {
+                    encode_jpeg_progressive(v, self.quality)?
+                } else {
+                    encode_jpeg_with_opts(v, self.quality, self.restart_interval)?
+                };
                 let mut pkt = Packet::new(0, self.time_base, data);
                 pkt.pts = v.pts;
                 pkt.dts = v.pts;
@@ -228,6 +276,334 @@ pub fn encode_jpeg_with_opts(
     out.push(0xFF);
     out.push(markers::EOI);
     Ok(out)
+}
+
+/// Encode a single `VideoFrame` (YUV 4:4:4 / 4:2:2 / 4:2:0) as a standalone
+/// **progressive** JPEG byte stream (SOF2). The scan decomposition is
+/// three scans: one interleaved DC-first scan followed by two
+/// non-interleaved AC band scans per component (`Ss=1..=5` then
+/// `Ss=6..=63`), all at `Ah=0, Al=0` — i.e. spectral selection without
+/// successive-approximation refinement. Uses the Annex K Huffman tables.
+/// Quality is the libjpeg-style factor 1..=100.
+pub fn encode_jpeg_progressive(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let (h_factor, v_factor) = match frame.format {
+        PixelFormat::Yuv444P => (1u8, 1u8),
+        PixelFormat::Yuv422P => (2, 1),
+        PixelFormat::Yuv420P => (2, 2),
+        _ => {
+            return Err(Error::unsupported(
+                "MJPEG progressive encoder: unsupported pixel format",
+            ))
+        }
+    };
+    if frame.planes.len() != 3 {
+        return Err(Error::invalid(
+            "MJPEG progressive encoder: expected 3 planes",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    // Compute DCT+quantise coefficients for every block in every component,
+    // keyed by block index (block_y * blocks_x + block_x).
+    let mcu_w_px = 8 * h_factor as usize;
+    let mcu_h_px = 8 * v_factor as usize;
+    let mcus_x = width.div_ceil(mcu_w_px);
+    let mcus_y = height.div_ceil(mcu_h_px);
+
+    // Luma: h_factor*mcus_x blocks wide × v_factor*mcus_y tall.
+    let luma_blocks_x = mcus_x * h_factor as usize;
+    let luma_blocks_y = mcus_y * v_factor as usize;
+    let mut y_coefs = vec![[0i32; 64]; luma_blocks_x * luma_blocks_y];
+    fill_coef_grid(
+        &mut y_coefs,
+        &frame.planes[0].data,
+        frame.planes[0].stride,
+        width,
+        height,
+        luma_blocks_x,
+        luma_blocks_y,
+        &luma_q,
+    );
+
+    // Chroma planes — always 1×1 block per MCU for 4:4:4/4:2:2/4:2:0.
+    let (c_w, c_h) = match frame.format {
+        PixelFormat::Yuv444P => (width, height),
+        PixelFormat::Yuv422P => (width.div_ceil(2), height),
+        PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
+        _ => unreachable!(),
+    };
+    let chroma_blocks_x = mcus_x;
+    let chroma_blocks_y = mcus_y;
+    let mut cb_coefs = vec![[0i32; 64]; chroma_blocks_x * chroma_blocks_y];
+    let mut cr_coefs = vec![[0i32; 64]; chroma_blocks_x * chroma_blocks_y];
+    fill_coef_grid(
+        &mut cb_coefs,
+        &frame.planes[1].data,
+        frame.planes[1].stride,
+        c_w,
+        c_h,
+        chroma_blocks_x,
+        chroma_blocks_y,
+        &chroma_q,
+    );
+    fill_coef_grid(
+        &mut cr_coefs,
+        &frame.planes[2].data,
+        frame.planes[2].stride,
+        c_w,
+        c_h,
+        chroma_blocks_x,
+        chroma_blocks_y,
+        &chroma_q,
+    );
+
+    // Header.
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof2(&mut out, width as u16, height as u16, h_factor, v_factor);
+    // All four default Huffman tables; scans pick per (class, id).
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
+    write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+
+    // Scan 1: interleaved DC-first (Ss=0, Se=0, Ah=0, Al=0). All 3 components.
+    write_sos_progressive_dc_interleaved(&mut out);
+    write_dc_scan_interleaved(
+        &mut out,
+        &y_coefs,
+        luma_blocks_x,
+        h_factor as usize,
+        v_factor as usize,
+        mcus_x,
+        mcus_y,
+        &cb_coefs,
+        &cr_coefs,
+        chroma_blocks_x,
+        &huff,
+    );
+
+    // AC bands, low then high.
+    for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
+        // Luma AC.
+        write_sos_progressive_ac(&mut out, 1, 0, ss, se);
+        write_ac_scan(
+            &mut out,
+            &y_coefs,
+            luma_blocks_x * luma_blocks_y,
+            &huff.luma_ac,
+            ss as usize,
+            se as usize,
+        );
+        // Cb AC.
+        write_sos_progressive_ac(&mut out, 2, 1, ss, se);
+        write_ac_scan(
+            &mut out,
+            &cb_coefs,
+            chroma_blocks_x * chroma_blocks_y,
+            &huff.chroma_ac,
+            ss as usize,
+            se as usize,
+        );
+        // Cr AC.
+        write_sos_progressive_ac(&mut out, 3, 1, ss, se);
+        write_ac_scan(
+            &mut out,
+            &cr_coefs,
+            chroma_blocks_x * chroma_blocks_y,
+            &huff.chroma_ac,
+            ss as usize,
+            se as usize,
+        );
+    }
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// Perform forward DCT + quantisation on every 8×8 block of a plane,
+/// storing the quantised coefficients in natural (row-major) order.
+/// Edge blocks are filled by replicating the last valid pixel.
+#[allow(clippy::too_many_arguments)]
+fn fill_coef_grid(
+    coefs: &mut [[i32; 64]],
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+    quant: &[u16; 64],
+) {
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let mut block = [0.0f32; 64];
+            fill_block(&mut block, plane, stride, w, h, bx * 8, by * 8);
+            fdct8x8(&mut block);
+            let mut q = [0i32; 64];
+            for k in 0..64 {
+                let v = block[k] / quant[k] as f32;
+                q[k] = if v >= 0.0 {
+                    (v + 0.5) as i32
+                } else {
+                    -((-v + 0.5) as i32)
+                };
+            }
+            coefs[by * blocks_x + bx] = q;
+        }
+    }
+}
+
+fn write_sof2(out: &mut Vec<u8>, width: u16, height: u16, h: u8, v: u8) {
+    // Same shape as SOF0 — spec only changes the marker byte for a
+    // progressive frame.
+    let mut payload = Vec::with_capacity(8 + 9);
+    payload.push(8); // precision
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // components
+    payload.push(1);
+    payload.push((h << 4) | v);
+    payload.push(0);
+    payload.push(2);
+    payload.push(0x11);
+    payload.push(1);
+    payload.push(3);
+    payload.push(0x11);
+    payload.push(1);
+    write_length_prefix(out, markers::SOF2, &payload);
+}
+
+fn write_sos_progressive_dc_interleaved(out: &mut Vec<u8>) {
+    // 3 components, Ss=0, Se=0, Ah|Al=0. Y uses DC=0, Cb/Cr use DC=1.
+    let payload: [u8; 10] = [3, 1, 0x00, 2, 0x10, 3, 0x10, 0, 0, 0x00];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+fn write_sos_progressive_ac(out: &mut Vec<u8>, comp_id: u8, ac_table: u8, ss: u8, se: u8) {
+    // Single-component AC scan. Td (DC table selector, high nibble) is
+    // unused here but the field is always present; zero it. Ta (AC
+    // selector) goes in the low nibble.
+    let payload: [u8; 6] = [
+        1,               // Ns
+        comp_id,         // Cs
+        ac_table & 0x0F, // Td | Ta
+        ss,              // Ss
+        se,              // Se
+        0x00,            // Ah | Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Emit the interleaved DC-first progressive scan. Walks the MCU grid
+/// identically to the baseline interleaved encoder, but only codes each
+/// block's DC coefficient with the DC Huffman table.
+#[allow(clippy::too_many_arguments)]
+fn write_dc_scan_interleaved(
+    out: &mut Vec<u8>,
+    y_coefs: &[[i32; 64]],
+    luma_blocks_x: usize,
+    h_factor: usize,
+    v_factor: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    cb_coefs: &[[i32; 64]],
+    cr_coefs: &[[i32; 64]],
+    chroma_blocks_x: usize,
+    huff: &DefaultHuffman,
+) {
+    let mut bw = BitWriter::new(out);
+    let mut prev_dc_y: i32 = 0;
+    let mut prev_dc_cb: i32 = 0;
+    let mut prev_dc_cr: i32 = 0;
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            // Luma blocks in MCU.
+            for by in 0..v_factor {
+                for bx in 0..h_factor {
+                    let bi_x = mx * h_factor + bx;
+                    let bi_y = my * v_factor + by;
+                    let bi = bi_y * luma_blocks_x + bi_x;
+                    encode_dc(&mut bw, y_coefs[bi][0], &mut prev_dc_y, &huff.luma_dc);
+                }
+            }
+            // Cb.
+            let cbi = my * chroma_blocks_x + mx;
+            encode_dc(&mut bw, cb_coefs[cbi][0], &mut prev_dc_cb, &huff.chroma_dc);
+            // Cr.
+            encode_dc(&mut bw, cr_coefs[cbi][0], &mut prev_dc_cr, &huff.chroma_dc);
+        }
+    }
+    bw.finish();
+}
+
+fn encode_dc(bw: &mut BitWriter<'_>, dc: i32, prev_dc: &mut i32, dc_huff: &HuffTable) {
+    let dc_diff = dc - *prev_dc;
+    *prev_dc = dc;
+    let (size, bits) = category(dc_diff);
+    let hc = dc_huff.encode[size as usize];
+    bw.write_bits(hc.code as u32, hc.len as u32);
+    if size > 0 {
+        bw.write_bits(bits, size as u32);
+    }
+}
+
+/// Emit a non-interleaved AC-band scan over one component's blocks. Walks
+/// `block_count` blocks in natural order and codes only zigzag coefficients
+/// in `[ss..=se]` using the supplied AC Huffman table. Ah=0 (initial scan).
+///
+/// No EOB-run (EOBn) is emitted: every fully-zero band gets a plain EOB
+/// (RS=0x00). This is valid and trades a handful of extra bits for much
+/// simpler encoder logic.
+fn write_ac_scan(
+    out: &mut Vec<u8>,
+    coefs: &[[i32; 64]],
+    block_count: usize,
+    ac_huff: &HuffTable,
+    ss: usize,
+    se: usize,
+) {
+    let mut bw = BitWriter::new(out);
+    for bi in 0..block_count {
+        let block = &coefs[bi];
+        let mut run: u32 = 0;
+        for k in ss..=se {
+            let v = block[ZIGZAG[k]];
+            if v == 0 {
+                run += 1;
+            } else {
+                while run >= 16 {
+                    let zc = ac_huff.encode[0xF0];
+                    bw.write_bits(zc.code as u32, zc.len as u32);
+                    run -= 16;
+                }
+                let (sz, bv) = category(v);
+                let rs = ((run as u8) << 4) | sz;
+                let ac = ac_huff.encode[rs as usize];
+                bw.write_bits(ac.code as u32, ac.len as u32);
+                if sz > 0 {
+                    bw.write_bits(bv, sz as u32);
+                }
+                run = 0;
+            }
+        }
+        if run > 0 {
+            // Trailing zeros in the band → plain EOB.
+            let eob = ac_huff.encode[0x00];
+            bw.write_bits(eob.code as u32, eob.len as u32);
+        }
+    }
+    bw.finish();
 }
 
 fn write_length_prefix(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {

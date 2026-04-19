@@ -345,6 +345,134 @@ fn restart_interval_no_trailing_marker_on_last_mcu() {
     };
 }
 
+/// Encode a 64×64 gradient as a progressive JPEG. Verify the bitstream
+/// carries SOF2 + multiple SOS markers, then round-trip it through our
+/// own progressive decoder and check that luma MSE stays within a
+/// lossy-encoder epsilon (baseline and progressive share Huffman tables
+/// and quant steps so quality should match).
+#[test]
+fn progressive_encode_roundtrip_yuv420p_64x64() {
+    use oxideav_mjpeg::encoder::{encode_jpeg, encode_jpeg_progressive};
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    let prog = encode_jpeg_progressive(&frame, 75).expect("progressive encode");
+    let base = encode_jpeg(&frame, 75).expect("baseline encode");
+
+    // --- Bitstream shape checks --------------------------------------
+    // Starts with SOI + ... + SOF2 (FF C2) before the first SOS.
+    assert_eq!(&prog[0..2], &[0xFF, 0xD8], "SOI");
+    let sof2_pos = prog
+        .windows(2)
+        .position(|w| w == [0xFF, 0xC2])
+        .expect("SOF2 present");
+    // No SOF0 in a progressive bitstream.
+    assert!(
+        !prog.windows(2).any(|w| w == [0xFF, 0xC0]),
+        "progressive stream must not carry SOF0"
+    );
+    // At least two SOS markers (DC + AC bands × 3 components = 7 total for our decomposition).
+    let sos_count = prog.windows(2).filter(|w| *w == [0xFF, 0xDA]).count();
+    assert!(
+        sos_count >= 2,
+        "progressive must carry multiple SOS, got {sos_count}"
+    );
+    assert!(
+        sof2_pos < prog.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap(),
+        "SOF2 must precede the first SOS"
+    );
+    assert_eq!(&prog[prog.len() - 2..], &[0xFF, 0xD9], "EOI");
+
+    // --- Decode & compare with source --------------------------------
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), prog.clone()))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode progressive") else {
+        panic!("expected video frame")
+    };
+    assert_eq!(v.width, w);
+    assert_eq!(v.height, h);
+    assert_eq!(v.format, pix);
+
+    // Y-plane MSE vs source — a progressive SOF2 spectral-selection
+    // encode uses the same quant step and DCT as baseline, so the
+    // reconstructed luma should match a baseline encode to within a
+    // small epsilon. Baseline gradient PSNR here is typically >35 dB.
+    let sw = w as usize;
+    let sh = h as usize;
+    let mut orig = Vec::with_capacity(sw * sh);
+    let mut out = Vec::with_capacity(sw * sh);
+    for j in 0..sh {
+        for i in 0..sw {
+            orig.push(frame.planes[0].data[j * frame.planes[0].stride + i]);
+            out.push(v.planes[0].data[j * v.planes[0].stride + i]);
+        }
+    }
+    let mut sse: f64 = 0.0;
+    for i in 0..orig.len() {
+        let d = orig[i] as f64 - out[i] as f64;
+        sse += d * d;
+    }
+    let mse = sse / orig.len() as f64;
+    eprintln!(
+        "progressive 64x64 yuv420p: luma MSE = {mse:.3}  prog bytes={}  base bytes={}",
+        prog.len(),
+        base.len()
+    );
+    assert!(mse < 10.0, "progressive luma MSE too high: {mse}");
+
+    // --- Progressive vs baseline pixel match -------------------------
+    // Same quant tables + same coefficients end up at the IDCT, so
+    // decoded pixels should be bit-identical across the two bitstreams
+    // (modulo any sign-of-zero differences — none here since we don't
+    // emit EOB-run).
+    let mut dec_b = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec_b
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), base))
+        .unwrap();
+    let Frame::Video(vb) = dec_b.receive_frame().unwrap() else {
+        panic!()
+    };
+    for p in 0..3 {
+        assert_eq!(
+            v.planes[p].data, vb.planes[p].data,
+            "plane {p} mismatch progressive vs baseline decode"
+        );
+    }
+}
+
+/// Exercise the `MjpegEncoder::set_progressive` API: flipping the flag
+/// on a concrete encoder must swap SOF0 for SOF2 on the next
+/// `send_frame`.
+#[test]
+fn progressive_encoder_trait_api() {
+    use oxideav_codec::Encoder;
+    use oxideav_mjpeg::encoder::MjpegEncoder;
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(pix);
+    let mut enc: Box<MjpegEncoder> =
+        MjpegEncoder::from_params(&enc_params).expect("concrete encoder");
+    enc.set_progressive(true);
+    assert!(enc.progressive());
+
+    enc.send_frame(&Frame::Video(frame)).expect("send frame");
+    let pkt = enc.receive_packet().expect("packet");
+    assert!(pkt.data.windows(2).any(|w| w == [0xFF, 0xC2]));
+    assert!(!pkt.data.windows(2).any(|w| w == [0xFF, 0xC0]));
+}
+
 /// The decoder should treat an extended-sequential (SOF1) 8-bit JPEG the
 /// same as baseline (SOF0), since both share the Huffman sequential scan
 /// structure. We produce a baseline JPEG with our encoder and rewrite the

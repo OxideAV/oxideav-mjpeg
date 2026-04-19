@@ -997,6 +997,96 @@ fn write_sos_grayscale(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+/// Test-only: emit a single-component, 8-bit precision **lossless** JPEG
+/// (SOF3). Uses predictor 1 (Ra / left) and point-transform Pt=0. The
+/// Annex K 8-bit DC luma Huffman table is reused for the category codes
+/// (residuals stay in categories 0..=8 at 8-bit precision, well within
+/// the 0..=11 symbols that table provides).
+#[cfg(test)]
+pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "lossless helper: samples shorter than stride*h",
+        ));
+    }
+    let huff = DefaultHuffman::build()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_sof3_grayscale_8bit(&mut out, w as u16, h as u16);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_sos_lossless(&mut out, 1 /* predictor = Ra */);
+
+    // Predict + encode per-pixel in row-major order. Predictor matches
+    // the decoder's forced behaviour at y=0 (Ra) and x=0 (Rb); inside
+    // the image we use predictor 1 (Ra) to match the SOS selector.
+    let origin: i32 = 1 << 7; // 2^(P-Pt-1) with P=8 Pt=0.
+    let mut bw = BitWriter::new(&mut out);
+    let mut buf = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            buf[y * w + x] = samples[y * stride + x];
+            let actual = samples[y * stride + x] as i32;
+            let pred: i32 = if x == 0 && y == 0 {
+                origin
+            } else if y == 0 {
+                buf[y * w + x - 1] as i32
+            } else if x == 0 {
+                buf[(y - 1) * w + x] as i32
+            } else {
+                // Predictor 1 = Ra (left).
+                buf[y * w + x - 1] as i32
+            };
+            let diff = actual - pred; // any value in -255..=255 at 8-bit
+            let (s, bits) = category(diff);
+            let hc = huff.luma_dc.encode[s as usize];
+            bw.write_bits(hc.code as u32, hc.len as u32);
+            if s > 0 {
+                bw.write_bits(bits, s as u32);
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn write_sof3_grayscale_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(8); // precision
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf
+    payload.push(1); // component id
+    payload.push(0x11); // H=1 V=1
+    payload.push(0); // qt = 0 (unused for lossless, but the field is still present)
+                     // SOF3 = 0xC3
+    write_length_prefix(out, 0xC3, &payload);
+}
+
+#[cfg(test)]
+fn write_sos_lossless(out: &mut Vec<u8>, predictor: u8) {
+    let payload: [u8; 6] = [
+        1, // Ns
+        1, 0x00, // comp 1 → DC=0 AC=0 (AC unused)
+        predictor, 0, // Ss = predictor, Se = 0
+        0, // Ah | Al=0 (Pt=0)
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

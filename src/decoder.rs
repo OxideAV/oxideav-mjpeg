@@ -76,6 +76,10 @@ struct JpegState {
     /// all subsequent scans also accumulate and we render at EOI (same path
     /// as progressive, just with single-pass coefficients).
     seq_accum: bool,
+    /// True when SOF3 (lossless) was parsed. Mutually exclusive with
+    /// `progressive` / `seq_accum` — lossless JPEGs use predictor-based
+    /// coding rather than DCT and take their own scan decoder.
+    lossless: bool,
     /// Adobe APP14 transform flag. `None` if no Adobe marker was seen;
     /// `Some(0)` for direct (CMYK / RGB, samples stored as-is but
     /// Adobe-inverted for CMYK); `Some(1)` for YCbCr (3-component);
@@ -93,6 +97,7 @@ impl JpegState {
             sof: None,
             progressive: false,
             seq_accum: false,
+            lossless: false,
             adobe_transform: None,
         }
     }
@@ -164,16 +169,36 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                 state.sof = Some(sof);
                 state.progressive = true;
             }
-            SOF3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+            SOF3 => {
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                if !(2..=16).contains(&sof.precision) {
+                    return Err(Error::unsupported(format!(
+                        "lossless JPEG: precision {} out of range 2..=16",
+                        sof.precision
+                    )));
+                }
+                if sof.components.len() != 1 {
+                    return Err(Error::unsupported(
+                        "lossless JPEG: only single-component (grayscale) scans are supported",
+                    ));
+                }
+                state.sof = Some(sof);
+                state.lossless = true;
+            }
+            0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "JPEG: only baseline/extended-sequential/progressive SOFs are supported (no hierarchical, lossless, or arithmetic-coded variants)",
+                    "JPEG: hierarchical and arithmetic-coded variants are not supported",
                 ));
             }
             SOS => {
                 let p = walker.read_segment_payload()?;
                 let sos = parse_sos(p)?;
                 let scan = walker.read_scan_data()?;
+                if state.lossless {
+                    return decode_lossless_scan(&state, &sos, scan, pts, time_base);
+                }
                 if state.progressive {
                     decode_progressive_scan(&state, &sos, scan, &mut coef_buf)?;
                     // Continue — more scans or EOI follow.
@@ -1655,6 +1680,180 @@ fn render_from_coefs_12bit(
     })
 }
 
+// ---- Lossless JPEG (SOF3) ------------------------------------------------
+//
+// Lossless JPEG replaces the DCT + quant pipeline with predictive coding
+// (Annex H). Each sample `Px` is predicted from its already-decoded
+// neighbours Ra (left), Rb (above), and Rc (above-left) via one of seven
+// predictors (1..=7), and the residual `Di = Px - Pred(Ra,Rb,Rc)` is
+// Huffman-coded with the same category / magnitude scheme as a DCT DC
+// coefficient. Precision ranges 2..=16 bits; the point-transform `Al`
+// shifts samples by `Pt` bits on the wire.
+//
+// This implementation handles single-component grayscale scans at any
+// precision in `2..=16`. Multi-component lossless (rare — used by some
+// RGB-lossless DNG/DICOM variants) is rejected. Point transform (Pt)
+// is honoured. Restart markers re-initialise the predictor to the
+// image-origin value as required by T.81.
+fn decode_lossless_scan(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    pts: Option<i64>,
+    time_base: TimeBase,
+) -> Result<VideoFrame> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    if sos.components.len() != 1 {
+        return Err(Error::unsupported(
+            "lossless: multi-component scans are not supported",
+        ));
+    }
+    let predictor = sos.ss;
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid("lossless: predictor Ss must be in 1..=7"));
+    }
+    let pt = sos.al as u32; // point transform
+    let precision = sof.precision as u32;
+    if pt >= precision {
+        return Err(Error::invalid("lossless: Pt >= precision"));
+    }
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+
+    let dc_t = state.dc_huff[sos.components[0].dc_table as usize]
+        .as_ref()
+        .ok_or_else(|| Error::invalid("lossless: DC Huffman table missing"))?;
+
+    // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
+    let sample_bits = precision - pt;
+    let sample_max: u32 = 1u32 << sample_bits;
+    let sample_mask: u32 = sample_max - 1;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    // Buffer holds samples in the pre-shift space; we apply `<< pt` at
+    // the final pack stage.
+    let mut samples = vec![0u32; width * height];
+    let mut br = BitReader::new(scan);
+    let mut mcus_since_restart: u32 = 0;
+    let mut expected_rst: u8 = RST0;
+    let mut reset_pred = true; // true at image start and after each RSTn.
+
+    for y in 0..height {
+        for x in 0..width {
+            if state.restart_interval != 0
+                && mcus_since_restart != 0
+                && mcus_since_restart % state.restart_interval as u32 == 0
+            {
+                br.bits = 0;
+                br.nbits = 0;
+                while br.saw_rst.is_none() {
+                    let prev = br.pos;
+                    match br.next_byte_with_stuff()? {
+                        Some(_) => {}
+                        None => {
+                            if prev == br.pos {
+                                break;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if br.saw_rst.is_some() {
+                    expected_rst = if expected_rst == RST7 {
+                        RST0
+                    } else {
+                        expected_rst + 1
+                    };
+                    br.reset_at_restart();
+                    reset_pred = true;
+                }
+            }
+
+            // Compute predicted value.
+            let pred: u32 = if reset_pred {
+                reset_pred = false;
+                origin
+            } else if y == 0 {
+                // First row: forced predictor 1 (Ra).
+                samples[y * width + x - 1]
+            } else if x == 0 {
+                // First column: forced predictor 2 (Rb).
+                samples[(y - 1) * width + x]
+            } else {
+                let ra = samples[y * width + x - 1];
+                let rb = samples[(y - 1) * width + x];
+                let rc = samples[(y - 1) * width + x - 1];
+                match predictor {
+                    1 => ra,
+                    2 => rb,
+                    3 => rc,
+                    4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                    5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                    6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                    7 => (ra.wrapping_add(rb)) >> 1,
+                    _ => unreachable!(),
+                }
+            };
+
+            // Decode residual. SSSS is the category; for lossless it can
+            // reach 16 as a special case meaning Di = 32768.
+            let s = decode_huff(&mut br, dc_t)? as u32;
+            let residual: i32 = if s == 0 {
+                0
+            } else if s == 16 {
+                32_768
+            } else {
+                let bits = br.get_bits(s)? as i32;
+                extend(bits, s)
+            };
+
+            let sv = ((pred as i32).wrapping_add(residual) as u32) & sample_mask;
+            samples[y * width + x] = sv;
+            mcus_since_restart += 1;
+        }
+    }
+
+    // Select an output PixelFormat by effective output precision
+    // (precision − Pt shifted samples fill `precision` bits). Gray16Le
+    // covers every bit depth that is not exactly 8 / 10 / 12.
+    let out_format = match precision {
+        8 => PixelFormat::Gray8,
+        10 => PixelFormat::Gray10Le,
+        12 => PixelFormat::Gray12Le,
+        _ => PixelFormat::Gray16Le,
+    };
+
+    let plane = if out_format == PixelFormat::Gray8 {
+        let stride = width;
+        let mut data = vec![0u8; stride * height];
+        for i in 0..width * height {
+            data[i] = (samples[i] << pt) as u8;
+        }
+        VideoPlane { stride, data }
+    } else {
+        let stride = width * 2;
+        let mut data = vec![0u8; stride * height];
+        for i in 0..width * height {
+            let v = (samples[i] << pt) as u16;
+            data[i * 2] = (v & 0xFF) as u8;
+            data[i * 2 + 1] = (v >> 8) as u8;
+        }
+        VideoPlane { stride, data }
+    };
+
+    Ok(VideoFrame {
+        format: out_format,
+        width: width as u32,
+        height: height as u32,
+        pts,
+        time_base,
+        planes: vec![plane],
+    })
+}
+
 #[cfg(test)]
 mod prog_tests {
     use super::*;
@@ -2217,5 +2416,83 @@ mod precision_12_tests {
             let diff = (*orig as i32 - *dec as i32).abs();
             assert!(diff < 16, "12-bit roundtrip diff too large: {diff}");
         }
+    }
+}
+
+#[cfg(test)]
+mod lossless_tests {
+    use super::*;
+    use crate::encoder::encode_lossless_grayscale_jpeg_8bit;
+    use oxideav_core::PixelFormat;
+
+    /// Lossless JPEG is, by definition, bit-exact. The decoder should
+    /// recover every sample of the input.
+    #[test]
+    fn lossless_8bit_gray_exact_roundtrip() {
+        let w = 24u32;
+        let h = 16u32;
+        let mut samples = vec![0u8; (w * h) as usize];
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                // Mix of smooth gradient + a bit of texture to exercise
+                // non-zero residuals through multiple Huffman categories.
+                samples[j * w as usize + i] =
+                    ((i as i32 * 3 + j as i32 * 5 + ((i ^ j) as i32 & 7)) & 0xFF) as u8;
+            }
+        }
+        let data = encode_lossless_grayscale_jpeg_8bit(w, h, &samples, w as usize)
+            .expect("encode lossless");
+        // SOF3 marker must appear in the output bitstream.
+        assert!(
+            data.windows(2).any(|x| x == [0xFF, 0xC3]),
+            "SOF3 marker missing from lossless output"
+        );
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v.format, PixelFormat::Gray8);
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w as usize);
+
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let got = v.planes[0].data[j * v.planes[0].stride + i];
+                let want = samples[j * w as usize + i];
+                assert_eq!(got, want, "mismatch at ({i},{j})");
+            }
+        }
+    }
+
+    /// Non-lossless SOF codes (hierarchical, arithmetic) must still be
+    /// rejected with Unsupported — make sure we didn't widen the SOF
+    /// accept matcher too far while adding SOF3.
+    #[test]
+    fn hierarchical_arithmetic_still_rejected() {
+        // Hand-construct a minimal stream with SOF5 (hierarchical). The
+        // walker stops at that marker with an Unsupported error; nothing
+        // further in the stream matters.
+        let bytes = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC5, 0x00, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, // SOF5 stub
+            0xFF, 0xD9, // EOI
+        ];
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(8);
+        dec_params.height = Some(8);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), bytes))
+            .unwrap();
+        let err = dec.receive_frame().expect_err("expected decode error");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 }

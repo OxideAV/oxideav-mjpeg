@@ -106,6 +106,10 @@ Decoder:
 - **12-bit precision** sequential JPEGs (SOF0/SOF1, `P=12`) → 16-bit-LE
   `Gray12Le` for grayscale and `Yuv420P12Le` for 4:2:0 YUV. Level shift
   is 2048 as per the spec.
+- **Lossless JPEG (SOF3)** — single-component grayscale at any
+  precision `P ∈ 2..=16`. Annex H predictor reconstruction (bit-exact).
+  Output: `Gray8` at P=8, `Gray10Le` / `Gray12Le` at P=10/12, else
+  `Gray16Le`. Point transform (`Pt = Al`) honoured.
 - **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
   Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
@@ -127,10 +131,10 @@ Encoder:
 
 Not supported (decoder returns `Error::Unsupported`):
 
-- Lossless JPEG (SOF3), hierarchical (SOF5+), arithmetic coding
-  (SOF9..SOF15).
+- Hierarchical (SOF5+), arithmetic-coded (SOF9..SOF15).
 - 12-bit progressive (SOF2 with `P=12`), 12-bit 4:2:2 / 4:4:4 YUV.
 - Progressive 4-component JPEGs.
+- Multi-component lossless JPEGs.
 
 ## License
 

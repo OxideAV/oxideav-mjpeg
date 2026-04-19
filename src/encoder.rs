@@ -747,6 +747,155 @@ fn write_component_scan(
     bw.finish();
 }
 
+/// Test-only: emit a 4-component JPEG (1:1:1:1 sampling, all components at
+/// full resolution). The caller supplies four raw sample planes and an
+/// optional Adobe APP14 transform flag:
+/// * `None` → no APP14 written (treated as plain/"regular" CMYK by this
+///   crate's decoder).
+/// * `Some(0)` → APP14 transform=0, i.e. Adobe CMYK where the stored
+///   samples are inverted (the test encoder inverts its inputs to match
+///   that convention before writing).
+/// * `Some(2)` → APP14 transform=2, YCCK. The caller supplies the four
+///   components in Adobe's stored order (Y, Cb, Cr, K); K is inverted
+///   on the way out because Adobe stores it that way.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_jpeg_cmyk_1111(
+    width: u32,
+    height: u32,
+    planes: &[&[u8]; 4],
+    plane_strides: &[usize; 4],
+    quality: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    for (i, p) in planes.iter().enumerate() {
+        if p.len() < plane_strides[i] * h {
+            return Err(Error::invalid(
+                "cmyk helper: plane shorter than height*stride",
+            ));
+        }
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    // For Adobe conventions we invert the stored samples (so the decoder
+    // can un-invert them and match the original inputs). For transform=2
+    // we also invert K only.
+    let needs_invert_all = matches!(adobe_transform, Some(0));
+    let needs_invert_k_only = matches!(adobe_transform, Some(2));
+    let maybe_invert = |plane_idx: usize, samples: &[u8]| -> Vec<u8> {
+        let must = needs_invert_all || (needs_invert_k_only && plane_idx == 3);
+        if !must {
+            return samples.to_vec();
+        }
+        samples.iter().map(|&b| 255 - b).collect()
+    };
+    let owned: [Vec<u8>; 4] = [
+        maybe_invert(0, planes[0]),
+        maybe_invert(1, planes[1]),
+        maybe_invert(2, planes[2]),
+        maybe_invert(3, planes[3]),
+    ];
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    if let Some(tx) = adobe_transform {
+        write_adobe_app14(&mut out, tx);
+    }
+    // Two quant tables suffice (one "luma-ish", one "chroma-ish"):
+    //   component 0 (Y or C)  → qt 0
+    //   components 1,2,3      → qt 1
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof0_4comp(&mut out, w as u16, h as u16);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
+    write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+    write_sos_4comp(&mut out);
+
+    // One interleaved scan, one block per component per MCU (1:1:1:1).
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let mut bw = BitWriter::new(&mut out);
+    let mut prev_dc = [0i32; 4];
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for ci in 0..4 {
+                let mut blk = [0.0f32; 64];
+                fill_block(
+                    &mut blk,
+                    &owned[ci],
+                    plane_strides[ci],
+                    w,
+                    h,
+                    mx * 8,
+                    my * 8,
+                );
+                let (qt, dc_t, ac_t) = if ci == 0 {
+                    (&luma_q, &huff.luma_dc, &huff.luma_ac)
+                } else {
+                    (&chroma_q, &huff.chroma_dc, &huff.chroma_ac)
+                };
+                encode_block(&mut bw, &mut blk, qt, &mut prev_dc[ci], dc_t, ac_t);
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn write_adobe_app14(out: &mut Vec<u8>, transform: u8) {
+    // "Adobe" + version 100 + flags0/flags1 (0) + transform.
+    let payload = [
+        b'A', b'd', b'o', b'b', b'e', //
+        0, 100, // DCTEncodeVersion = 100
+        0, 0, // APP14Flags0
+        0, 0, // APP14Flags1
+        transform,
+    ];
+    write_length_prefix(out, 0xEE, &payload);
+}
+
+#[cfg(test)]
+fn write_sof0_4comp(out: &mut Vec<u8>, width: u16, height: u16) {
+    // 1:1:1:1 sampling, qt 0 for component 1, qt 1 for the rest.
+    let mut payload = Vec::with_capacity(8 + 12);
+    payload.push(8); // precision
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(4); // Nf
+    for (id, qt) in [(1, 0u8), (2, 1), (3, 1), (4, 1)] {
+        payload.push(id);
+        payload.push(0x11); // H=1 V=1
+        payload.push(qt);
+    }
+    write_length_prefix(out, markers::SOF0, &payload);
+}
+
+#[cfg(test)]
+fn write_sos_4comp(out: &mut Vec<u8>) {
+    let payload: [u8; 12] = [
+        4, // Ns
+        1, 0x00, // comp 1 → DC=0 AC=0
+        2, 0x11, // comp 2 → DC=1 AC=1
+        3, 0x11, // comp 3 → DC=1 AC=1
+        4, 0x11, // comp 4 → DC=1 AC=1
+        0, 63, 0, // Ss, Se, Ah|Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

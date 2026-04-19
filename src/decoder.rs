@@ -76,6 +76,11 @@ struct JpegState {
     /// all subsequent scans also accumulate and we render at EOI (same path
     /// as progressive, just with single-pass coefficients).
     seq_accum: bool,
+    /// Adobe APP14 transform flag. `None` if no Adobe marker was seen;
+    /// `Some(0)` for direct (CMYK / RGB, samples stored as-is but
+    /// Adobe-inverted for CMYK); `Some(1)` for YCbCr (3-component);
+    /// `Some(2)` for YCCK (4-component Adobe colour transform).
+    adobe_transform: Option<u8>,
 }
 
 impl JpegState {
@@ -88,6 +93,7 @@ impl JpegState {
             sof: None,
             progressive: false,
             seq_accum: false,
+            adobe_transform: None,
         }
     }
 }
@@ -143,6 +149,11 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
             SOF2 => {
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
+                if sof.components.len() > 3 {
+                    return Err(Error::unsupported(
+                        "progressive JPEG: 4+ component scans not supported",
+                    ));
+                }
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
                 state.progressive = true;
@@ -166,9 +177,13 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                         .as_ref()
                         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
                     let fully_interleaved = sos.components.len() == sof.components.len();
-                    if fully_interleaved && !state.seq_accum {
-                        // Fast path: single-SOS interleaved baseline scan —
-                        // dequantise + IDCT straight into the output frame.
+                    // decode_scan only knows 1-3 components (Gray8 / YuvXXXP).
+                    // Any 4-component scan (CMYK/YCCK) must take the
+                    // accumulator path, which understands the packed CMYK
+                    // output format.
+                    let fast_path_ok =
+                        fully_interleaved && !state.seq_accum && sof.components.len() <= 3;
+                    if fast_path_ok {
                         return decode_scan(&state, &sos, scan, pts, time_base);
                     }
                     if !state.seq_accum {
@@ -180,6 +195,16 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
             }
             COM => {
                 let _ = walker.read_segment_payload()?;
+            }
+            // APP14 "Adobe" marker: `"Adobe"` magic + 5 bytes of metadata
+            // whose last byte is the colour-transform flag (0, 1, or 2).
+            // Needed to disambiguate 3-component RGB from YCbCr and
+            // 4-component CMYK from YCCK.
+            markers::APP14 => {
+                let p = walker.read_segment_payload()?;
+                if p.len() >= 12 && &p[0..5] == b"Adobe" {
+                    state.adobe_transform = Some(p[11]);
+                }
             }
             m if markers::is_app(m) => {
                 let _ = walker.read_segment_payload()?;
@@ -203,8 +228,8 @@ fn init_coef_buffers(sof: &SofInfo) -> Result<Vec<Vec<[i32; 64]>>> {
     if sof.components.is_empty() {
         return Err(Error::invalid("SOF: no components"));
     }
-    if sof.components.len() > 3 {
-        return Err(Error::unsupported("coef accumulator: 4+ components"));
+    if sof.components.len() > 4 {
+        return Err(Error::unsupported("coef accumulator: >4 components"));
     }
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
     let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
@@ -1270,6 +1295,14 @@ fn render_from_coefs(
                 )))
             }
         }
+    } else if n_comp == 4 {
+        // 4-component scans: plain CMYK (no APP14, or APP14 transform=0) or
+        // Adobe YCCK (APP14 transform=2). Either way the output is packed
+        // `Cmyk` — YCCK / Adobe-inverted pixel transforms are applied
+        // during the final pack. Any component sampling layout is allowed;
+        // planes at less-than-full resolution are upsampled by nearest-
+        // neighbour pixel replication.
+        PixelFormat::Cmyk
     } else {
         return Err(Error::unsupported("2-component JPEG"));
     };
@@ -1369,6 +1402,77 @@ fn render_from_coefs(
                 }
                 planes.push(VideoPlane { stride, data });
             }
+        }
+        PixelFormat::Cmyk => {
+            // Pack the 4 per-component planes into a single row-major
+            // `C M Y K` output, upsampling each plane to (width, height) by
+            // nearest-neighbour replication where sampling factors differ.
+            // Then apply the JPEG 4-component colour transform implied by
+            // the Adobe APP14 marker (if any) to produce "regular" CMYK
+            // where 0 = no ink.
+            let stride = width * 4;
+            let mut data = vec![0u8; stride * height];
+            let fh: [usize; 4] = [
+                sof.components[0].h_factor as usize,
+                sof.components[1].h_factor as usize,
+                sof.components[2].h_factor as usize,
+                sof.components[3].h_factor as usize,
+            ];
+            let fv: [usize; 4] = [
+                sof.components[0].v_factor as usize,
+                sof.components[1].v_factor as usize,
+                sof.components[2].v_factor as usize,
+                sof.components[3].v_factor as usize,
+            ];
+            let transform = state.adobe_transform;
+            for y in 0..height {
+                for x in 0..width {
+                    // Component sample index: scale output pixel by h/v_max
+                    // ratio to land on the correct spot in the full-MCU
+                    // sample buffer (nearest-neighbour).
+                    let mut s = [0u8; 4];
+                    for ci in 0..4 {
+                        let sx = x * fh[ci] / h_max;
+                        let sy = y * fv[ci] / v_max;
+                        s[ci] = comp_buf[ci][sy * comp_stride[ci] + sx];
+                    }
+                    let (c, m, yy, k) = match transform {
+                        Some(2) => {
+                            // YCCK (Adobe). Decode YCbCr→RGB via BT.601
+                            // full-range, then C/M/Y = 255 − RGB. Adobe
+                            // stores the K component inverted alongside
+                            // YCbCr, so flip it too.
+                            let y_s = s[0] as i32;
+                            let cb = s[1] as i32 - 128;
+                            let cr = s[2] as i32 - 128;
+                            let r = (y_s + ((cr * 91881 + 32768) >> 16)).clamp(0, 255);
+                            let g = (y_s - ((cb * 22554 + cr * 46802 + 32768) >> 16)).clamp(0, 255);
+                            let b = (y_s + ((cb * 116130 + 32768) >> 16)).clamp(0, 255);
+                            (
+                                (255 - r) as u8,
+                                (255 - g) as u8,
+                                (255 - b) as u8,
+                                255 - s[3],
+                            )
+                        }
+                        Some(0) => {
+                            // Adobe CMYK — samples stored inverted.
+                            (255 - s[0], 255 - s[1], 255 - s[2], 255 - s[3])
+                        }
+                        _ => {
+                            // No APP14 (or unexpected transform): assume
+                            // plain/regular CMYK, pass components through.
+                            (s[0], s[1], s[2], s[3])
+                        }
+                    };
+                    let o = y * stride + x * 4;
+                    data[o] = c;
+                    data[o + 1] = m;
+                    data[o + 2] = yy;
+                    data[o + 3] = k;
+                }
+            }
+            planes.push(VideoPlane { stride, data });
         }
         _ => unreachable!(),
     }
@@ -1719,5 +1823,176 @@ mod non_interleaved_tests {
     #[test]
     fn non_interleaved_yuv444p_matches_interleaved() {
         assert_matches_interleaved(16, 16, PixelFormat::Yuv444P);
+    }
+}
+
+#[cfg(test)]
+mod cmyk_tests {
+    use super::*;
+    use crate::encoder::encode_jpeg_cmyk_1111;
+    use oxideav_core::PixelFormat;
+
+    /// PSNR across all bytes of two buffers, treating them as 8-bit samples.
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut sse: f64 = 0.0;
+        for i in 0..a.len() {
+            let d = a[i] as f64 - b[i] as f64;
+            sse += d * d;
+        }
+        if sse == 0.0 {
+            return 99.0;
+        }
+        20.0 * (255.0 / (sse / a.len() as f64).sqrt()).log10()
+    }
+
+    fn make_cmyk_planes(w: usize, h: usize) -> [Vec<u8>; 4] {
+        // Deterministic gradients — one per component — so the roundtrip
+        // has enough variation across the plane to catch alignment /
+        // upsampling errors, while staying smooth enough to survive
+        // Q=85 DCT losses.
+        let mut c = vec![0u8; w * h];
+        let mut m = vec![0u8; w * h];
+        let mut y = vec![0u8; w * h];
+        let mut k = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                c[j * w + i] = ((i * 255 / w.max(1)) as u32).min(255) as u8;
+                m[j * w + i] = ((j * 255 / h.max(1)) as u32).min(255) as u8;
+                y[j * w + i] = (((i + j) * 255 / (w + h).max(1)) as u32).min(255) as u8;
+                k[j * w + i] = ((((i ^ j) * 7) & 0xFF) as u8) / 2;
+            }
+        }
+        [c, m, y, k]
+    }
+
+    /// Decoder should output a `Cmyk` frame for a 4-component JPEG and,
+    /// with no APP14 marker, pass samples through unchanged (up to DCT
+    /// quantisation noise).
+    #[test]
+    fn cmyk_plain_roundtrip() {
+        let w = 32u32;
+        let h = 16u32;
+        let planes = make_cmyk_planes(w as usize, h as usize);
+        let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+        let strides = [w as usize; 4];
+        let data =
+            encode_jpeg_cmyk_1111(w, h, &refs, &strides, 90, None).expect("encode plain CMYK");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v.format, PixelFormat::Cmyk);
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, (w * 4) as usize);
+
+        // Unpack each component out of the packed plane and compare to
+        // the source. PSNR threshold is set to a realistic roundtrip
+        // target for Q=90.
+        for (ci, src) in planes.iter().enumerate() {
+            let mut got = Vec::with_capacity(src.len());
+            for j in 0..h as usize {
+                for i in 0..w as usize {
+                    got.push(v.planes[0].data[j * v.planes[0].stride + i * 4 + ci]);
+                }
+            }
+            let p = psnr(src, &got);
+            assert!(p >= 30.0, "component {ci} PSNR too low: {p:.2}");
+        }
+    }
+
+    /// Adobe CMYK (APP14 transform=0) — the encoder inverts samples on the
+    /// way out; the decoder must invert them back so downstream bytes
+    /// match the original "regular"-convention inputs.
+    #[test]
+    fn cmyk_adobe_inverted_roundtrip() {
+        let w = 16u32;
+        let h = 16u32;
+        let planes = make_cmyk_planes(w as usize, h as usize);
+        let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+        let strides = [w as usize; 4];
+        let data =
+            encode_jpeg_cmyk_1111(w, h, &refs, &strides, 90, Some(0)).expect("encode Adobe CMYK");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v.format, PixelFormat::Cmyk);
+
+        for (ci, src) in planes.iter().enumerate() {
+            let mut got = Vec::with_capacity(src.len());
+            for j in 0..h as usize {
+                for i in 0..w as usize {
+                    got.push(v.planes[0].data[j * v.planes[0].stride + i * 4 + ci]);
+                }
+            }
+            let p = psnr(src, &got);
+            assert!(p >= 30.0, "Adobe CMYK component {ci} PSNR too low: {p:.2}");
+        }
+    }
+
+    /// Adobe YCCK (APP14 transform=2): the encoder stores YCbCr normally
+    /// and K inverted. The decoder should undo both the YCbCr→RGB→CMY
+    /// transform and the K inversion to recover the original C/M/Y/K
+    /// samples (modulo colour-space roundtrip loss for C/M/Y and DCT
+    /// loss for K).
+    #[test]
+    fn ycck_roundtrip_k_plane_matches() {
+        let w = 16u32;
+        let h = 16u32;
+        // For YCCK we interpret the four input planes as (Y, Cb, Cr, K)
+        // — the encoder will inject APP14 transform=2 and invert K.
+        // We only verify K recovery here: CMY values go through a
+        // YCbCr→RGB lossy transform, while K is straightforward.
+        let mut yp = vec![0u8; (w * h) as usize];
+        let mut cb = vec![128u8; (w * h) as usize];
+        let mut cr = vec![128u8; (w * h) as usize];
+        let mut k = vec![0u8; (w * h) as usize];
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let idx = j * w as usize + i;
+                yp[idx] = 128;
+                cb[idx] = 128;
+                cr[idx] = 128;
+                k[idx] = ((i * 255 / (w as usize - 1).max(1)) as u32).min(255) as u8;
+            }
+        }
+        let refs: [&[u8]; 4] = [&yp, &cb, &cr, &k];
+        let strides = [w as usize; 4];
+        let data = encode_jpeg_cmyk_1111(w, h, &refs, &strides, 90, Some(2)).expect("encode YCCK");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v.format, PixelFormat::Cmyk);
+
+        // YCbCr=(128,128,128) → RGB≈(128,128,128) → CMY≈(127,127,127).
+        // That plus the K gradient should produce a recoverable K plane.
+        let mut got_k = Vec::with_capacity((w * h) as usize);
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                got_k.push(v.planes[0].data[j * v.planes[0].stride + i * 4 + 3]);
+            }
+        }
+        let p = psnr(&k, &got_k);
+        assert!(p >= 30.0, "YCCK K plane PSNR too low: {p:.2}");
     }
 }

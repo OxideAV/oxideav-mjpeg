@@ -20,11 +20,16 @@
 //! baseline JPEG using the Annex K "typical" Huffman tables, so its
 //! output is interoperable with any compliant JPEG decoder.
 //!
+//! 4-component (CMYK / Adobe YCCK) JPEGs decode to packed `Cmyk` — the
+//! decoder inspects the APP14 Adobe transform flag to choose among plain
+//! CMYK, Adobe-inverted CMYK, and Adobe YCCK (which is colour-converted
+//! back to CMYK via BT.601 full-range YCbCr→RGB→CMY plus K inversion).
+//!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Lossless JPEG (SOF3), hierarchical (SOF5+), arithmetic coding
 //!   (SOF9..SOF15)
 //! - 12-bit precision
-//! - CMYK / 4-component scans
+//! - Progressive 4-component JPEGs
 
 pub mod container;
 pub mod decoder;

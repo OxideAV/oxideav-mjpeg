@@ -103,6 +103,11 @@ Decoder:
 - **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
   component) — transparently routed through the shared coefficient
   accumulator.
+- **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
+  Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
+  inverted) un-inverts on decode; transform=2 (YCCK) converts back to
+  CMYK via BT.601 YCbCr→RGB→CMY and K inversion; no APP14 → plain
+  ("regular", C=0 = no ink) pass-through.
 - Chroma subsampling: 4:4:4, 4:2:2, 4:2:0.
 - Grayscale (single-component → `Gray8`).
 - Restart markers (`RSTn`) + DRI.
@@ -122,7 +127,7 @@ Not supported (decoder returns `Error::Unsupported`):
 - Lossless JPEG (SOF3), hierarchical (SOF5+), arithmetic coding
   (SOF9..SOF15).
 - 12-bit precision.
-- CMYK / 4-component scans.
+- Progressive 4-component JPEGs.
 
 ## License
 

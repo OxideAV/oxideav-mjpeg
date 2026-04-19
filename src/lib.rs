@@ -31,29 +31,30 @@ pub mod decoder;
 pub mod encoder;
 pub mod jpeg;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_container::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "mjpeg";
 
 pub fn register(reg: &mut CodecRegistry) {
-    let cid = CodecId::new(CODEC_ID_STR);
     let caps = CodecCapabilities::video("mjpeg_sw")
         .with_lossy(true)
         .with_intra_only(true)
         .with_max_size(16384, 16384);
-    reg.register_both(
-        cid.clone(),
-        caps,
-        decoder::make_decoder,
-        encoder::make_encoder,
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
+            .tags([
+                // AVI FourCC claims — all unambiguous MJPEG variants.
+                CodecTag::fourcc(b"MJPG"),
+                CodecTag::fourcc(b"AVRN"),
+                CodecTag::fourcc(b"LJPG"),
+                CodecTag::fourcc(b"JPGL"),
+            ]),
     );
-
-    // AVI FourCC claims — all unambiguous MJPEG variants.
-    for fcc in &[b"MJPG", b"AVRN", b"LJPG", b"JPGL"] {
-        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
-    }
 }
 
 /// Register the still-image JPEG container (`.jpg` / `.jpeg`). Must be

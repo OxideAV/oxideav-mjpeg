@@ -100,6 +100,9 @@ Decoder:
 - **SOF2** (progressive, Huffman, 8-bit) — multi-scan spectral
   selection and successive approximation (DC first + refinement, AC
   first + refinement with EOB-run).
+- **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
+  component) — transparently routed through the shared coefficient
+  accumulator.
 - Chroma subsampling: 4:4:4, 4:2:2, 4:2:0.
 - Grayscale (single-component → `Gray8`).
 - Restart markers (`RSTn`) + DRI.
@@ -120,8 +123,6 @@ Not supported (decoder returns `Error::Unsupported`):
   (SOF9..SOF15).
 - 12-bit precision.
 - CMYK / 4-component scans.
-- Non-interleaved baseline (SOF0) scans — progressive does permit
-  non-interleaved AC scans as required by the spec.
 
 ## License
 

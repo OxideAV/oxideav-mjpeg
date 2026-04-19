@@ -71,6 +71,11 @@ struct JpegState {
     sof: Option<SofInfo>,
     /// True when SOF2 (progressive) was parsed.
     progressive: bool,
+    /// True when a baseline/extended-sequential scan has been accumulated
+    /// into the coefficient buffer because it was non-interleaved. Once set,
+    /// all subsequent scans also accumulate and we render at EOI (same path
+    /// as progressive, just with single-pass coefficients).
+    seq_accum: bool,
 }
 
 impl JpegState {
@@ -82,6 +87,7 @@ impl JpegState {
             restart_interval: 0,
             sof: None,
             progressive: false,
+            seq_accum: false,
         }
     }
 }
@@ -95,9 +101,10 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
     let mut walker = MarkerWalker::new(&data[2..]);
     let mut state = JpegState::new();
 
-    // Progressive coefficient accumulator, only populated once SOF2 is seen.
-    // One [i32;64] per MCU-block per component, in natural order.
-    let mut prog_coefs: Vec<Vec<[i32; 64]>> = Vec::new();
+    // Coefficient accumulator, populated on progressive (SOF2) or when a
+    // baseline scan turns out to be non-interleaved. One [i32;64] per block
+    // per component, in natural order.
+    let mut coef_buf: Vec<Vec<[i32; 64]>> = Vec::new();
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -105,8 +112,8 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
         };
         match marker {
             EOI => {
-                if state.progressive {
-                    return render_progressive(&state, &prog_coefs, pts, time_base);
+                if state.progressive || state.seq_accum {
+                    return render_from_coefs(&state, &coef_buf, pts, time_base);
                 }
                 return Err(Error::invalid("JPEG: EOI before SOS"));
             }
@@ -136,7 +143,7 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
             SOF2 => {
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                prog_coefs = init_progressive_coefs(&sof)?;
+                coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
                 state.progressive = true;
             }
@@ -151,10 +158,24 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                 let sos = parse_sos(p)?;
                 let scan = walker.read_scan_data()?;
                 if state.progressive {
-                    decode_progressive_scan(&state, &sos, scan, &mut prog_coefs)?;
+                    decode_progressive_scan(&state, &sos, scan, &mut coef_buf)?;
                     // Continue — more scans or EOI follow.
                 } else {
-                    return decode_scan(&state, &sos, scan, pts, time_base);
+                    let sof = state
+                        .sof
+                        .as_ref()
+                        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+                    let fully_interleaved = sos.components.len() == sof.components.len();
+                    if fully_interleaved && !state.seq_accum {
+                        // Fast path: single-SOS interleaved baseline scan —
+                        // dequantise + IDCT straight into the output frame.
+                        return decode_scan(&state, &sos, scan, pts, time_base);
+                    }
+                    if !state.seq_accum {
+                        coef_buf = init_coef_buffers(sof)?;
+                        state.seq_accum = true;
+                    }
+                    decode_sequential_scan_accum(&state, &sos, scan, &mut coef_buf)?;
                 }
             }
             COM => {
@@ -173,15 +194,17 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
 
 /// Allocate a coefficient-accumulator plane for each component in the SOF.
 /// Dimensions match the MCU grid so that blocks line up with decoded scans.
-fn init_progressive_coefs(sof: &SofInfo) -> Result<Vec<Vec<[i32; 64]>>> {
+/// Shared by progressive (SOF2, multi-scan successive-approximation) and
+/// non-interleaved baseline (SOF0/SOF1 with ns < nf) code paths.
+fn init_coef_buffers(sof: &SofInfo) -> Result<Vec<Vec<[i32; 64]>>> {
     if sof.precision != 8 {
-        return Err(Error::unsupported("progressive: precision != 8"));
+        return Err(Error::unsupported("coef accumulator: precision != 8"));
     }
     if sof.components.is_empty() {
         return Err(Error::invalid("SOF: no components"));
     }
     if sof.components.len() > 3 {
-        return Err(Error::unsupported("progressive: 4+ components"));
+        return Err(Error::unsupported("coef accumulator: 4+ components"));
     }
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
     let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
@@ -657,6 +680,158 @@ fn decode_block(
     Ok(())
 }
 
+// ---- Non-interleaved baseline / extended-sequential ---------------------
+//
+// Sequential JPEGs may split their components across multiple SOS segments
+// — one per component, each a full `[0..=63]` Ah=Al=0 scan. Decode each
+// segment's blocks into the per-component coefficient accumulator, same
+// shape as the progressive path. DC prediction runs independently within
+// each scan (reset at the start of every SOS and at each RSTn). Once EOI
+// arrives the shared `render_from_coefs` path emits the frame.
+fn decode_sequential_scan_accum(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+) -> Result<()> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    if sof.precision != 8 {
+        return Err(Error::unsupported("precision != 8"));
+    }
+
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    if h_max == 0 || v_max == 0 {
+        return Err(Error::invalid("SOF: sampling factor = 0"));
+    }
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let mcus_x = width.div_ceil(8 * h_max);
+    let mcus_y = height.div_ceil(8 * v_max);
+
+    let sos_map: Vec<usize> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            sof.components
+                .iter()
+                .position(|fc| fc.id == sc.id)
+                .ok_or_else(|| Error::invalid("SOS: component id not in SOF"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let dc_tables: Vec<&HuffTable> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            state.dc_huff[sc.dc_table as usize]
+                .as_ref()
+                .ok_or_else(|| Error::invalid("SOS: DC Huffman table missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ac_tables: Vec<&HuffTable> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            state.ac_huff[sc.ac_table as usize]
+                .as_ref()
+                .ok_or_else(|| Error::invalid("SOS: AC Huffman table missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let interleaved = sos.components.len() == sof.components.len();
+
+    // For an interleaved scan iterate the MCU grid; a non-interleaved scan
+    // iterates the single component's full block grid — per T.81 E.1.4 the
+    // scan's MCU is then a single data unit.
+    let (scan_mcus_x, scan_mcus_y) = if interleaved {
+        (mcus_x, mcus_y)
+    } else {
+        let sof_idx = sos_map[0];
+        let c = sof.components[sof_idx];
+        (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+    };
+
+    let mut br = BitReader::new(scan);
+    let mut prev_dc = vec![0i32; sos.components.len()];
+    let mut mcus_since_restart: u32 = 0;
+    let mut expected_rst: u8 = RST0;
+
+    for my in 0..scan_mcus_y {
+        for mx in 0..scan_mcus_x {
+            if state.restart_interval != 0
+                && mcus_since_restart != 0
+                && mcus_since_restart % state.restart_interval as u32 == 0
+            {
+                br.bits = 0;
+                br.nbits = 0;
+                while br.saw_rst.is_none() {
+                    let prev = br.pos;
+                    match br.next_byte_with_stuff()? {
+                        Some(_) => {}
+                        None => {
+                            if prev == br.pos {
+                                break;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if br.saw_rst.is_some() {
+                    expected_rst = if expected_rst == RST7 {
+                        RST0
+                    } else {
+                        expected_rst + 1
+                    };
+                    for p in prev_dc.iter_mut() {
+                        *p = 0;
+                    }
+                    br.reset_at_restart();
+                }
+            }
+
+            if interleaved {
+                for (sidx, &sof_idx) in sos_map.iter().enumerate() {
+                    let c = sof.components[sof_idx];
+                    let blocks_x = mcus_x * c.h_factor as usize;
+                    for by in 0..c.v_factor as usize {
+                        for bx in 0..c.h_factor as usize {
+                            let bidx_x = mx * c.h_factor as usize + bx;
+                            let bidx_y = my * c.v_factor as usize + by;
+                            let bi = bidx_y * blocks_x + bidx_x;
+                            decode_block(
+                                &mut br,
+                                dc_tables[sidx],
+                                ac_tables[sidx],
+                                &mut prev_dc[sidx],
+                                &mut coefs[sof_idx][bi],
+                            )?;
+                        }
+                    }
+                }
+            } else {
+                // Non-interleaved: one block per "MCU" in this component's grid.
+                let sof_idx = sos_map[0];
+                let c = sof.components[sof_idx];
+                let blocks_x = mcus_x * c.h_factor as usize;
+                let bi = my * blocks_x + mx;
+                decode_block(
+                    &mut br,
+                    dc_tables[0],
+                    ac_tables[0],
+                    &mut prev_dc[0],
+                    &mut coefs[sof_idx][bi],
+                )?;
+            }
+            mcus_since_restart += 1;
+        }
+    }
+    Ok(())
+}
+
 // ---- Progressive JPEG (SOF2) --------------------------------------------
 //
 // A progressive JPEG ships its DCT coefficients in multiple scans. Each
@@ -1048,9 +1223,9 @@ fn prog_decode_ac_refine(
     Ok(())
 }
 
-/// After all progressive scans land, dequantise + IDCT each component block
-/// and emit a VideoFrame.
-fn render_progressive(
+/// After all scans land, dequantise + IDCT each component block and emit a
+/// VideoFrame. Shared by progressive and non-interleaved baseline paths.
+fn render_from_coefs(
     state: &JpegState,
     coefs: &[Vec<[i32; 64]>],
     pts: Option<i64>,
@@ -1059,7 +1234,7 @@ fn render_progressive(
     let sof = state
         .sof
         .as_ref()
-        .ok_or_else(|| Error::invalid("progressive: EOI before SOF"))?;
+        .ok_or_else(|| Error::invalid("render: EOI before SOF"))?;
     let n_comp = sof.components.len();
     let grayscale = n_comp == 1;
     let width = sof.width as usize;
@@ -1233,7 +1408,7 @@ mod prog_tests {
         s
     }
 
-    /// `init_progressive_coefs` should size the accumulator to the MCU grid.
+    /// `init_coef_buffers` should size the accumulator to the MCU grid.
     #[test]
     fn accumulator_sizes() {
         let sof = SofInfo {
@@ -1261,7 +1436,7 @@ mod prog_tests {
                 },
             ],
         };
-        let coefs = init_progressive_coefs(&sof).unwrap();
+        let coefs = init_coef_buffers(&sof).unwrap();
         // 16x16 image, h_max=v_max=2 → 1 MCU. Y is 2x2 blocks, chroma is 1.
         assert_eq!(coefs[0].len(), 4);
         assert_eq!(coefs[1].len(), 1);
@@ -1435,5 +1610,114 @@ mod prog_tests {
         prog_decode_ac_refine(&mut br, &ac, &mut block, 1, 63, 1, &mut eob).unwrap();
         // 4 (binary 0b100) + 0b10 (1 << Al=1) = 0b110 = 6.
         assert_eq!(block[ZIGZAG[1]], 6);
+    }
+}
+
+#[cfg(test)]
+mod non_interleaved_tests {
+    use super::*;
+    use crate::encoder::{encode_jpeg, encode_jpeg_non_interleaved};
+    use oxideav_core::frame::VideoPlane;
+    use oxideav_core::PixelFormat;
+
+    fn make_frame(w: u32, h: u32, pix: PixelFormat) -> VideoFrame {
+        let (cw, ch) = match pix {
+            PixelFormat::Yuv444P => (w, h),
+            PixelFormat::Yuv422P => (w.div_ceil(2), h),
+            PixelFormat::Yuv420P => (w.div_ceil(2), h.div_ceil(2)),
+            _ => panic!("unsupported"),
+        };
+        let mut y = vec![0u8; (w * h) as usize];
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                y[j * w as usize + i] = (((i + j * 3) * 7) % 255) as u8;
+            }
+        }
+        let mut cb = vec![0u8; (cw * ch) as usize];
+        let mut cr = vec![0u8; (cw * ch) as usize];
+        for j in 0..ch as usize {
+            for i in 0..cw as usize {
+                cb[j * cw as usize + i] = ((128 + i as i32 / 2) as u8).clamp(0, 255);
+                cr[j * cw as usize + i] = ((128 + j as i32 / 2) as u8).clamp(0, 255);
+            }
+        }
+        VideoFrame {
+            format: pix,
+            width: w,
+            height: h,
+            pts: Some(0),
+            time_base: TimeBase::new(1, 30),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: cw as usize,
+                    data: cb,
+                },
+                VideoPlane {
+                    stride: cw as usize,
+                    data: cr,
+                },
+            ],
+        }
+    }
+
+    /// A non-interleaved-scan encoding of the same frame must yield the
+    /// same decoded pixels as the interleaved encoding, since the scan
+    /// ordering only affects how blocks are transported — not the coded
+    /// coefficient values.
+    fn assert_matches_interleaved(w: u32, h: u32, pix: PixelFormat) {
+        let frame = make_frame(w, h, pix);
+        let base = encode_jpeg(&frame, 75).expect("interleaved encode");
+        let non = encode_jpeg_non_interleaved(&frame, 75).expect("non-interleaved encode");
+
+        // The non-interleaved stream must contain 3 SOS segments.
+        let sos_count = non.windows(2).filter(|w| w == &[0xFF, 0xDA]).count();
+        assert_eq!(sos_count, 3, "expected 3 SOS segments");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec_a = make_decoder(&dec_params).unwrap();
+        let mut dec_b = make_decoder(&dec_params).unwrap();
+        dec_a
+            .send_packet(&Packet::new(0, TimeBase::new(1, 30), base))
+            .unwrap();
+        dec_b
+            .send_packet(&Packet::new(0, TimeBase::new(1, 30), non))
+            .unwrap();
+        let Frame::Video(va) = dec_a.receive_frame().unwrap() else {
+            panic!()
+        };
+        let Frame::Video(vb) = dec_b.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(va.format, vb.format);
+        assert_eq!(va.width, vb.width);
+        assert_eq!(va.height, vb.height);
+        assert_eq!(va.planes.len(), vb.planes.len());
+        for (pi, (pa, pb)) in va.planes.iter().zip(vb.planes.iter()).enumerate() {
+            assert_eq!(
+                pa.data, pb.data,
+                "plane {pi} mismatch between interleaved and non-interleaved decodes"
+            );
+        }
+    }
+
+    #[test]
+    fn non_interleaved_yuv420p_matches_interleaved() {
+        assert_matches_interleaved(32, 16, PixelFormat::Yuv420P);
+    }
+
+    #[test]
+    fn non_interleaved_yuv422p_matches_interleaved() {
+        assert_matches_interleaved(24, 24, PixelFormat::Yuv422P);
+    }
+
+    #[test]
+    fn non_interleaved_yuv444p_matches_interleaved() {
+        assert_matches_interleaved(16, 16, PixelFormat::Yuv444P);
     }
 }

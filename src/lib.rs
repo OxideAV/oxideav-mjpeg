@@ -9,7 +9,9 @@
 //! outputs `VideoFrame`s in the corresponding `Yuv*P` pixel format (or
 //! `Gray8` for 1-component streams). SOF0 and SOF1 share the same Huffman
 //! sequential scan structure at 8-bit precision; both are handled by the
-//! same scan decoder. Progressive scans accumulate DCT coefficients across
+//! same scan decoder, and non-interleaved sequential scans (one SOS per
+//! component) fall back to the same coefficient-accumulator path used by
+//! the progressive decoder. Progressive scans accumulate DCT coefficients across
 //! multiple SOS segments using both spectral selection and successive
 //! approximation; the inverse DCT runs once after EOI. Restart markers
 //! (`RSTn`) and DRI segments are honoured on both paths. APP0..APP15
@@ -23,8 +25,6 @@
 //!   (SOF9..SOF15)
 //! - 12-bit precision
 //! - CMYK / 4-component scans
-//! - Non-interleaved baseline scans (progressive permits them, as
-//!   required by the spec)
 
 pub mod container;
 pub mod decoder;

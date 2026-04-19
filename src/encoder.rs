@@ -599,6 +599,154 @@ impl<'a> BitWriter<'a> {
     }
 }
 
+/// Test-only: emit a YUV 4:4:4 / 4:2:2 / 4:2:0 JPEG using **non-interleaved**
+/// scans — one SOS per component. Exercises the decoder's non-interleaved
+/// code path. Output is a conformant baseline JPEG (same headers as
+/// [`encode_jpeg`]) with 3 SOS segments instead of 1.
+#[cfg(test)]
+pub(crate) fn encode_jpeg_non_interleaved(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let (h_factor, v_factor) = match frame.format {
+        PixelFormat::Yuv444P => (1u8, 1u8),
+        PixelFormat::Yuv422P => (2, 1),
+        PixelFormat::Yuv420P => (2, 2),
+        _ => {
+            return Err(Error::unsupported(
+                "non-interleaved helper: unsupported format",
+            ))
+        }
+    };
+    if frame.planes.len() != 3 {
+        return Err(Error::invalid("non-interleaved helper: expected 3 planes"));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof0(&mut out, width as u16, height as u16, h_factor, v_factor);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
+    write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+
+    // Per-component block counts cover the full MCU grid (padded).
+    let mcu_w_px = 8 * h_factor as usize;
+    let mcu_h_px = 8 * v_factor as usize;
+    let mcus_x = width.div_ceil(mcu_w_px);
+    let mcus_y = height.div_ceil(mcu_h_px);
+
+    let (c_w, c_h) = match frame.format {
+        PixelFormat::Yuv444P => (width, height),
+        PixelFormat::Yuv422P => (width.div_ceil(2), height),
+        PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
+        _ => unreachable!(),
+    };
+
+    // Y scan: blocks per row = mcus_x * h_factor, rows = mcus_y * v_factor.
+    write_non_interleaved_sos(&mut out, 1, 0, 0);
+    write_component_scan(
+        &mut out,
+        &frame.planes[0].data,
+        frame.planes[0].stride,
+        width,
+        height,
+        mcus_x * h_factor as usize,
+        mcus_y * v_factor as usize,
+        &luma_q,
+        &huff.luma_dc,
+        &huff.luma_ac,
+    );
+
+    // Cb scan.
+    write_non_interleaved_sos(&mut out, 2, 1, 1);
+    write_component_scan(
+        &mut out,
+        &frame.planes[1].data,
+        frame.planes[1].stride,
+        c_w,
+        c_h,
+        mcus_x,
+        mcus_y,
+        &chroma_q,
+        &huff.chroma_dc,
+        &huff.chroma_ac,
+    );
+
+    // Cr scan.
+    write_non_interleaved_sos(&mut out, 3, 1, 1);
+    write_component_scan(
+        &mut out,
+        &frame.planes[2].data,
+        frame.planes[2].stride,
+        c_w,
+        c_h,
+        mcus_x,
+        mcus_y,
+        &chroma_q,
+        &huff.chroma_dc,
+        &huff.chroma_ac,
+    );
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn write_non_interleaved_sos(out: &mut Vec<u8>, comp_id: u8, dc_table: u8, ac_table: u8) {
+    let payload = [
+        1, // Ns
+        comp_id,
+        ((dc_table & 0x0F) << 4) | (ac_table & 0x0F),
+        0,
+        63,
+        0, // Ss, Se, Ah|Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn write_component_scan(
+    out: &mut Vec<u8>,
+    plane: &[u8],
+    plane_stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+    quant: &[u16; 64],
+    dc_huff: &HuffTable,
+    ac_huff: &HuffTable,
+) {
+    let mut bw = BitWriter::new(out);
+    let mut prev_dc: i32 = 0;
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let mut blk = [0.0f32; 64];
+            fill_block(
+                &mut blk,
+                plane,
+                plane_stride,
+                plane_w,
+                plane_h,
+                bx * 8,
+                by * 8,
+            );
+            encode_block(&mut bw, &mut blk, quant, &mut prev_dc, dc_huff, ac_huff);
+        }
+    }
+    bw.finish();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

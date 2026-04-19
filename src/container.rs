@@ -30,7 +30,8 @@ use std::io::{Read, SeekFrom, Write};
 
 use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, PixelFormat, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Result,
+    StreamInfo, TimeBase,
 };
 
 use crate::jpeg::markers::{self, EOI, SOI};
@@ -58,7 +59,10 @@ pub fn probe(p: &ProbeData) -> u8 {
 
 // --- Demuxer ---------------------------------------------------------------
 
-fn open_demuxer(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open_demuxer(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
     input.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     input.read_to_end(&mut buf)?;

@@ -153,7 +153,11 @@ fn mux_then_demux_roundtrip() {
     // --- Demux + decode ----------------------------------------------------
     let input_buf: Cursor<Vec<u8>> = Cursor::new(stored);
     let mut demuxer = containers
-        .open_demuxer("jpeg", Box::new(input_buf))
+        .open_demuxer(
+            "jpeg",
+            Box::new(input_buf),
+            &oxideav_core::NullCodecResolver,
+        )
         .expect("demuxer");
     let streams = demuxer.streams();
     assert_eq!(streams.len(), 1);

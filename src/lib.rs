@@ -43,7 +43,12 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(true)
         .with_max_size(16384, 16384);
-    reg.register_both(cid.clone(), caps, decoder::make_decoder, encoder::make_encoder);
+    reg.register_both(
+        cid.clone(),
+        caps,
+        decoder::make_decoder,
+        encoder::make_encoder,
+    );
 
     // AVI FourCC claims — all unambiguous MJPEG variants.
     for fcc in &[b"MJPG", b"AVRN", b"LJPG", b"JPGL"] {

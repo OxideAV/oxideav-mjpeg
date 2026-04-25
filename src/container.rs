@@ -28,11 +28,11 @@
 
 use std::io::{Read, SeekFrom, Write};
 
-use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Result,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 
 use crate::jpeg::markers::{self, EOI, SOI};
 use crate::jpeg::parser::{parse_sof, SofInfo};

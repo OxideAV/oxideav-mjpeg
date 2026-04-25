@@ -451,7 +451,7 @@ fn progressive_encode_roundtrip_yuv420p_64x64() {
 /// `send_frame`.
 #[test]
 fn progressive_encoder_trait_api() {
-    use oxideav_codec::Encoder;
+    use oxideav_core::Encoder;
     use oxideav_mjpeg::encoder::MjpegEncoder;
     let w = 64u32;
     let h = 64u32;

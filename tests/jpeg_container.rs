@@ -9,9 +9,9 @@
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-use oxideav_container::{ContainerRegistry, ProbeData};
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame};
+use oxideav_core::{ContainerRegistry, ProbeData};
 
 fn make_gradient_frame(w: u32, h: u32) -> VideoFrame {
     let cw = w.div_ceil(2);

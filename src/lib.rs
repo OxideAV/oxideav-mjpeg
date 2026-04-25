@@ -50,9 +50,9 @@ pub mod decoder;
 pub mod encoder;
 pub mod jpeg;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 pub const CODEC_ID_STR: &str = "mjpeg";
 

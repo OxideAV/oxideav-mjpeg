@@ -1,7 +1,7 @@
 //! JPEG packet decoder — baseline (SOF0) and progressive (SOF2).
 
-use oxideav_codec::Decoder;
 use oxideav_core::frame::VideoPlane;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
 };

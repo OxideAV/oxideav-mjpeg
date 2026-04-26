@@ -51,9 +51,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 /// or progressive SOF2) per video frame.
 pub struct MjpegEncoder {
     output_params: CodecParameters,
-    width: u32,
-    height: u32,
-    pix: PixelFormat,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pix: PixelFormat,
     quality: u8,
     /// MCU-per-restart-interval count. 0 disables DRI / `RSTn` emission.
     /// Restart intervals are only honoured on the baseline (SOF0) path
@@ -155,21 +155,17 @@ impl Encoder for MjpegEncoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         match frame {
             Frame::Video(v) => {
-                if v.width != self.width || v.height != self.height {
-                    return Err(Error::invalid(
-                        "MJPEG encoder: frame dimensions do not match encoder config",
-                    ));
-                }
-                if v.format != self.pix {
-                    return Err(Error::invalid(format!(
-                        "MJPEG encoder: frame format {:?} does not match encoder format {:?}",
-                        v.format, self.pix
-                    )));
-                }
                 let data = if self.progressive {
-                    encode_jpeg_progressive(v, self.quality)?
+                    encode_jpeg_progressive(v, self.width, self.height, self.pix, self.quality)?
                 } else {
-                    encode_jpeg_with_opts(v, self.quality, self.restart_interval)?
+                    encode_jpeg_with_opts(
+                        v,
+                        self.width,
+                        self.height,
+                        self.pix,
+                        self.quality,
+                        self.restart_interval,
+                    )?
                 };
                 let mut pkt = Packet::new(0, self.time_base, data);
                 pkt.pts = v.pts;
@@ -203,8 +199,14 @@ impl Encoder for MjpegEncoder {
 ///
 /// Does not emit restart markers. For a restart-marker-aware variant see
 /// [`encode_jpeg_with_opts`].
-pub fn encode_jpeg(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
-    encode_jpeg_with_opts(frame, quality, 0)
+pub fn encode_jpeg(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    encode_jpeg_with_opts(frame, width, height, pix, quality, 0)
 }
 
 /// Like [`encode_jpeg`] but also emits a DRI segment and cycles
@@ -213,12 +215,15 @@ pub fn encode_jpeg(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
 /// [`encode_jpeg`]).
 pub fn encode_jpeg_with_opts(
     frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
     quality: u8,
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    let (h_factor, v_factor) = match frame.format {
+    let width = width as usize;
+    let height = height as usize;
+    let (h_factor, v_factor) = match pix {
         PixelFormat::Yuv444P => (1u8, 1u8),
         PixelFormat::Yuv422P => (2, 1),
         PixelFormat::Yuv420P => (2, 2),
@@ -263,6 +268,7 @@ pub fn encode_jpeg_with_opts(
     write_scan(
         &mut out,
         frame,
+        pix,
         width,
         height,
         h_factor,
@@ -285,10 +291,16 @@ pub fn encode_jpeg_with_opts(
 /// `Ss=6..=63`), all at `Ah=0, Al=0` — i.e. spectral selection without
 /// successive-approximation refinement. Uses the Annex K Huffman tables.
 /// Quality is the libjpeg-style factor 1..=100.
-pub fn encode_jpeg_progressive(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    let (h_factor, v_factor) = match frame.format {
+pub fn encode_jpeg_progressive(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    let (h_factor, v_factor) = match pix {
         PixelFormat::Yuv444P => (1u8, 1u8),
         PixelFormat::Yuv422P => (2, 1),
         PixelFormat::Yuv420P => (2, 2),
@@ -331,7 +343,7 @@ pub fn encode_jpeg_progressive(frame: &VideoFrame, quality: u8) -> Result<Vec<u8
     );
 
     // Chroma planes — always 1×1 block per MCU for 4:4:4/4:2:2/4:2:0.
-    let (c_w, c_h) = match frame.format {
+    let (c_w, c_h) = match pix {
         PixelFormat::Yuv444P => (width, height),
         PixelFormat::Yuv422P => (width.div_ceil(2), height),
         PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
@@ -689,6 +701,7 @@ fn write_sos(out: &mut Vec<u8>) {
 fn write_scan(
     out: &mut Vec<u8>,
     frame: &VideoFrame,
+    pix: PixelFormat,
     width: usize,
     height: usize,
     h_factor: u8,
@@ -708,7 +721,7 @@ fn write_scan(
     let cb_plane = &frame.planes[1];
     let cr_plane = &frame.planes[2];
 
-    let (c_w, c_h) = match frame.format {
+    let (c_w, c_h) = match pix {
         PixelFormat::Yuv444P => (width, height),
         PixelFormat::Yuv422P => (width.div_ceil(2), height),
         PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
@@ -980,10 +993,16 @@ impl<'a> BitWriter<'a> {
 /// code path. Output is a conformant baseline JPEG (same headers as
 /// [`encode_jpeg`]) with 3 SOS segments instead of 1.
 #[cfg(test)]
-pub(crate) fn encode_jpeg_non_interleaved(frame: &VideoFrame, quality: u8) -> Result<Vec<u8>> {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    let (h_factor, v_factor) = match frame.format {
+pub(crate) fn encode_jpeg_non_interleaved(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    let (h_factor, v_factor) = match pix {
         PixelFormat::Yuv444P => (1u8, 1u8),
         PixelFormat::Yuv422P => (2, 1),
         PixelFormat::Yuv420P => (2, 2),
@@ -1019,7 +1038,7 @@ pub(crate) fn encode_jpeg_non_interleaved(frame: &VideoFrame, quality: u8) -> Re
     let mcus_x = width.div_ceil(mcu_w_px);
     let mcus_y = height.div_ceil(mcu_h_px);
 
-    let (c_w, c_h) = match frame.format {
+    let (c_w, c_h) = match pix {
         PixelFormat::Yuv444P => (width, height),
         PixelFormat::Yuv422P => (width.div_ceil(2), height),
         PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),

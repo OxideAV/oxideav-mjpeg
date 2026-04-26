@@ -416,7 +416,7 @@ fn decode_scan(
     sos: &SosInfo,
     scan: &[u8],
     pts: Option<i64>,
-    time_base: TimeBase,
+    _time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -688,14 +688,7 @@ fn decode_scan(
         _ => unreachable!(),
     }
 
-    Ok(VideoFrame {
-        format: out_format,
-        width: width as u32,
-        height: height as u32,
-        pts,
-        time_base,
-        planes,
-    })
+    Ok(VideoFrame { pts, planes })
 }
 
 fn decode_block(
@@ -1305,6 +1298,7 @@ fn render_from_coefs(
     if sof.precision == 12 {
         return render_from_coefs_12bit(state, coefs, pts, time_base);
     }
+    let _ = time_base;
     let n_comp = sof.components.len();
     let grayscale = n_comp == 1;
     let width = sof.width as usize;
@@ -1522,14 +1516,7 @@ fn render_from_coefs(
         _ => unreachable!(),
     }
 
-    Ok(VideoFrame {
-        format: out_format,
-        width: width as u32,
-        height: height as u32,
-        pts,
-        time_base,
-        planes,
-    })
+    Ok(VideoFrame { pts, planes })
 }
 
 /// 12-bit precision render path. Mirrors `render_from_coefs` but keeps
@@ -1541,7 +1528,7 @@ fn render_from_coefs_12bit(
     state: &JpegState,
     coefs: &[Vec<[i32; 64]>],
     pts: Option<i64>,
-    time_base: TimeBase,
+    _time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -1670,14 +1657,7 @@ fn render_from_coefs_12bit(
         _ => unreachable!(),
     }
 
-    Ok(VideoFrame {
-        format: out_format,
-        width: width as u32,
-        height: height as u32,
-        pts,
-        time_base,
-        planes,
-    })
+    Ok(VideoFrame { pts, planes })
 }
 
 // ---- Lossless JPEG (SOF3) ------------------------------------------------
@@ -1700,7 +1680,7 @@ fn decode_lossless_scan(
     sos: &SosInfo,
     scan: &[u8],
     pts: Option<i64>,
-    time_base: TimeBase,
+    _time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -1845,11 +1825,7 @@ fn decode_lossless_scan(
     };
 
     Ok(VideoFrame {
-        format: out_format,
-        width: width as u32,
-        height: height as u32,
         pts,
-        time_base,
         planes: vec![plane],
     })
 }
@@ -2113,11 +2089,7 @@ mod non_interleaved_tests {
             }
         }
         VideoFrame {
-            format: pix,
-            width: w,
-            height: h,
             pts: Some(0),
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -2141,8 +2113,9 @@ mod non_interleaved_tests {
     /// coefficient values.
     fn assert_matches_interleaved(w: u32, h: u32, pix: PixelFormat) {
         let frame = make_frame(w, h, pix);
-        let base = encode_jpeg(&frame, 75).expect("interleaved encode");
-        let non = encode_jpeg_non_interleaved(&frame, 75).expect("non-interleaved encode");
+        let base = encode_jpeg(&frame, w, h, pix, 75).expect("interleaved encode");
+        let non =
+            encode_jpeg_non_interleaved(&frame, w, h, pix, 75).expect("non-interleaved encode");
 
         // The non-interleaved stream must contain 3 SOS segments.
         let sos_count = non.windows(2).filter(|w| w == &[0xFF, 0xDA]).count();
@@ -2165,9 +2138,6 @@ mod non_interleaved_tests {
         let Frame::Video(vb) = dec_b.receive_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(va.format, vb.format);
-        assert_eq!(va.width, vb.width);
-        assert_eq!(va.height, vb.height);
         assert_eq!(va.planes.len(), vb.planes.len());
         for (pi, (pa, pb)) in va.planes.iter().zip(vb.planes.iter()).enumerate() {
             assert_eq!(
@@ -2255,7 +2225,6 @@ mod cmyk_tests {
         let Frame::Video(v) = dec.receive_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(v.format, PixelFormat::Cmyk);
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, (w * 4) as usize);
 
@@ -2296,7 +2265,6 @@ mod cmyk_tests {
         let Frame::Video(v) = dec.receive_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(v.format, PixelFormat::Cmyk);
 
         for (ci, src) in planes.iter().enumerate() {
             let mut got = Vec::with_capacity(src.len());
@@ -2349,7 +2317,6 @@ mod cmyk_tests {
         let Frame::Video(v) = dec.receive_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(v.format, PixelFormat::Cmyk);
 
         // YCbCr=(128,128,128) → RGB≈(128,128,128) → CMY≈(127,127,127).
         // That plus the K gradient should produce a recoverable K plane.
@@ -2398,7 +2365,6 @@ mod precision_12_tests {
         let Frame::Video(v) = dec.receive_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(v.format, PixelFormat::Gray12Le);
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, (w * 2) as usize);
 
@@ -2457,7 +2423,6 @@ mod lossless_tests {
         let Frame::Video(v) = dec.receive_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(v.format, PixelFormat::Gray8);
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w as usize);
 

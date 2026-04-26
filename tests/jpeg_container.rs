@@ -34,11 +34,7 @@ fn make_gradient_frame(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: y_stride,
@@ -182,9 +178,7 @@ fn mux_then_demux_roundtrip() {
         panic!("expected video frame")
     };
 
-    assert_eq!(v.width, w);
-    assert_eq!(v.height, h);
-    assert_eq!(v.format, PixelFormat::Yuv420P);
+    // Stream-level dims/format moved off the frame; verified via stream params above.
 
     // PSNR on the Y plane (visible area).
     let sw = w as usize;

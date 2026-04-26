@@ -29,12 +29,9 @@ fn make_gradient_frame(w: u32, h: u32, pix: PixelFormat) -> VideoFrame {
             cr[j * cr_stride + i] = ((128 + (j as i32 - ch as i32 / 2)) as u8).clamp(0, 255);
         }
     }
+    let _ = pix;
     VideoFrame {
-        format: pix,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: y_stride,
@@ -97,9 +94,6 @@ fn run_roundtrip(w: u32, h: u32, pix: PixelFormat) -> f64 {
         panic!("expected video");
     };
 
-    assert_eq!(v.width, w);
-    assert_eq!(v.height, h);
-    assert_eq!(v.format, pix);
 
     // Compute PSNR across Y plane (visible area) — it's the most perceptually
     // important and has the highest resolution.
@@ -163,11 +157,7 @@ fn byte_stuffing_roundtrip() {
     let cb = vec![128u8; (cw * ch) as usize];
     let cr = vec![128u8; (cw * ch) as usize];
     let frame = VideoFrame {
-        format: pix,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -217,8 +207,6 @@ fn byte_stuffing_roundtrip() {
     let Frame::Video(v) = out else {
         panic!();
     };
-    assert_eq!(v.width, w);
-    assert_eq!(v.height, h);
 }
 
 /// When restart markers are enabled, the bitstream must carry a DRI
@@ -234,8 +222,8 @@ fn roundtrip_restart_interval_yuv420p() {
     let pix = PixelFormat::Yuv420P;
     let frame = make_gradient_frame(w, h, pix);
 
-    let base = encode_jpeg(&frame, 75).expect("base encode");
-    let with_rst = encode_jpeg_with_opts(&frame, 75, 4).expect("rst encode");
+    let base = encode_jpeg(&frame, w, h, pix, 75).expect("base encode");
+    let with_rst = encode_jpeg_with_opts(&frame, w, h, pix, 75, 4).expect("rst encode");
 
     // DRI: FFDD 0004 0004 appears before SOS (FFDA).
     let dri_pos = with_rst
@@ -315,7 +303,7 @@ fn restart_interval_no_trailing_marker_on_last_mcu() {
     let h = 48u32;
     let pix = PixelFormat::Yuv420P;
     let frame = make_gradient_frame(w, h, pix);
-    let stream = encode_jpeg_with_opts(&frame, 75, 6).expect("encode");
+    let stream = encode_jpeg_with_opts(&frame, w, h, pix, 75, 6).expect("encode");
     let sos_pos = stream
         .windows(2)
         .position(|w| w == [0xFF, 0xDA])
@@ -358,8 +346,8 @@ fn progressive_encode_roundtrip_yuv420p_64x64() {
     let pix = PixelFormat::Yuv420P;
     let frame = make_gradient_frame(w, h, pix);
 
-    let prog = encode_jpeg_progressive(&frame, 75).expect("progressive encode");
-    let base = encode_jpeg(&frame, 75).expect("baseline encode");
+    let prog = encode_jpeg_progressive(&frame, w, h, pix, 75).expect("progressive encode");
+    let base = encode_jpeg(&frame, w, h, pix, 75).expect("baseline encode");
 
     // --- Bitstream shape checks --------------------------------------
     // Starts with SOI + ... + SOF2 (FF C2) before the first SOS.
@@ -395,9 +383,6 @@ fn progressive_encode_roundtrip_yuv420p_64x64() {
     let Frame::Video(v) = dec.receive_frame().expect("decode progressive") else {
         panic!("expected video frame")
     };
-    assert_eq!(v.width, w);
-    assert_eq!(v.height, h);
-    assert_eq!(v.format, pix);
 
     // Y-plane MSE vs source — a progressive SOF2 spectral-selection
     // encode uses the same quant step and DCT as baseline, so the
@@ -508,7 +493,4 @@ fn decode_sof1_extended_sequential() {
     dec.send_packet(&in_pkt).unwrap();
     let out = dec.receive_frame().expect("decode SOF1");
     let Frame::Video(v) = out else { panic!() };
-    assert_eq!(v.width, w);
-    assert_eq!(v.height, h);
-    assert_eq!(v.format, pix);
 }

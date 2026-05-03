@@ -15,3 +15,12 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# libloading powers the `dlopen`-based libturbojpeg interop in
+# `tests/external_roundtrip.rs`. No `*-sys` crate, no libjpeg /
+# libjpeg-turbo source pulled into the dep tree — the test loads
+# the system shared library at runtime and skips silently when it
+# isn't installed. Mirrors the fuzz harness setup in
+# `fuzz/Cargo.toml`.
+libloading = "0.8"

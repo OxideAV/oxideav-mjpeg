@@ -35,9 +35,7 @@
 #![allow(unsafe_code)]
 
 use oxideav_core::frame::VideoPlane;
-use oxideav_core::{
-    CodecId, CodecParameters, Decoder as _, Frame, Packet, PixelFormat, TimeBase, VideoFrame,
-};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame};
 use oxideav_mjpeg::encoder::encode_jpeg_with_opts;
 
 /// Test image dimensions. 640×480 is the constraint from the task
@@ -205,6 +203,7 @@ fn synth_smooth_rgb(width: u32, height: u32) -> Vec<u8> {
     let mut out = vec![0u8; w * h * 3];
 
     // Five soft circles. (cx, cy, radius, (r, g, b)).
+    #[allow(clippy::type_complexity)]
     let circles: &[(f32, f32, f32, (u8, u8, u8))] = &[
         (160.0, 120.0, 80.0, (220, 60, 60)),
         (480.0, 120.0, 90.0, (60, 220, 90)),
@@ -306,10 +305,10 @@ fn yuv_planar_to_rgb(frame: &VideoFrame, width: u32, height: u32) -> Vec<u8> {
     let vs = frame.planes[2].stride.max(1);
     let cb_height = frame.planes[1].data.len() / us;
     let cr_height = frame.planes[2].data.len() / vs;
-    let h_factor_u = (h + cb_height.max(1) - 1) / cb_height.max(1);
-    let h_factor_v = (h + cr_height.max(1) - 1) / cr_height.max(1);
-    let w_factor_u = (w + us - 1) / us;
-    let w_factor_v = (w + vs - 1) / vs;
+    let h_factor_u = h.div_ceil(cb_height.max(1));
+    let h_factor_v = h.div_ceil(cr_height.max(1));
+    let w_factor_u = w.div_ceil(us);
+    let w_factor_v = w.div_ceil(vs);
 
     let mut out = vec![0u8; w * h * 3];
     for j in 0..h {
@@ -460,7 +459,7 @@ mod libjpeg {
     }
 
     /// Decode a JPEG byte string to packed RGB via `tjDecompressHeader2`
-    /// + `tjDecompress2`. Returns `None` on libturbojpeg unavailable,
+    /// and `tjDecompress2`. Returns `None` on libturbojpeg unavailable,
     /// header parse failure, allocation overflow, or decode failure.
     pub fn decode_to_rgb(data: &[u8]) -> Option<DecodedRgb> {
         type InitFn = unsafe extern "C" fn() -> TjHandle;

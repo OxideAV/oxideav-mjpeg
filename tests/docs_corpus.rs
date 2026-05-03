@@ -196,10 +196,18 @@ fn h2v2_fancy_upsample(
     let mut out = vec![0u8; out_w * out_h];
     for oy in 0..out_h {
         let cy_main = oy as i32 / 2;
-        let cy_neighbour = if oy % 2 == 0 { cy_main - 1 } else { cy_main + 1 };
+        let cy_neighbour = if oy % 2 == 0 {
+            cy_main - 1
+        } else {
+            cy_main + 1
+        };
         for ox in 0..out_w {
             let cx_main = ox as i32 / 2;
-            let cx_neighbour = if ox % 2 == 0 { cx_main - 1 } else { cx_main + 1 };
+            let cx_neighbour = if ox % 2 == 0 {
+                cx_main - 1
+            } else {
+                cx_main + 1
+            };
             // 9:3:3:1 blend with rounding +8, /16.
             let v = 9 * sample(cx_main, cy_main)
                 + 3 * sample(cx_neighbour, cy_main)
@@ -241,13 +249,7 @@ fn h2v1_fancy_upsample(
 /// Nearest-neighbour upsample for layouts where libjpeg-turbo doesn't
 /// apply a fancy filter (e.g. the legacy 4:1:1 path falls back to
 /// nearest-neighbour box upsampling).
-fn nearest_upsample(
-    chroma: &[u8],
-    c_w: usize,
-    c_h: usize,
-    out_w: usize,
-    out_h: usize,
-) -> Vec<u8> {
+fn nearest_upsample(chroma: &[u8], c_w: usize, c_h: usize, out_w: usize, out_h: usize) -> Vec<u8> {
     let mut out = vec![0u8; out_w * out_h];
     for oy in 0..out_h {
         for ox in 0..out_w {

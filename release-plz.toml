@@ -13,3 +13,8 @@ git_release_name = "v{{ version }}"
 # 0.x → 0.y churn cascades through every dependent's version pin.
 custom_major_increment_regex = "^___never_match___"
 custom_minor_increment_regex = "^___never_match___"
+
+# Also disable the semver-check minor-bump trigger: cargo-semver-checks
+# will detect any API change in this still-unstable crate as a "break"
+# and try to bump 0.1.x → 0.2.0 anyway, ignoring the regex overrides.
+semver_check = false

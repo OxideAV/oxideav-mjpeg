@@ -766,10 +766,9 @@ mod tests {
         let mut decoded = vec![0u8; 32];
         for byte_i in 0..32 {
             let mut byte = 0u8;
-            for bit_i in 0..8 {
+            for _ in 0..8 {
                 let b = d.decode(&mut ctx);
                 byte = (byte << 1) | b;
-                let _ = bit_i;
             }
             decoded[byte_i] = byte;
         }

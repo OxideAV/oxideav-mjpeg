@@ -129,7 +129,7 @@ pub struct DacEntry {
 /// Parse a DAC segment payload. Returns the list of entries; up to four DC
 /// destinations and four AC destinations may be specified per segment.
 pub fn parse_dac(payload: &[u8]) -> Result<Vec<DacEntry>> {
-    if !payload.len().is_multiple_of(2) {
+    if payload.len() % 2 != 0 {
         return Err(Error::invalid("DAC: payload length must be even"));
     }
     let n = payload.len() / 2;

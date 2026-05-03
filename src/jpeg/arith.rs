@@ -309,7 +309,7 @@ impl<'a> ArithDecoder<'a> {
                 self.ct = 8;
             }
             self.a = (self.a << 1) & 0xFFFF;
-            self.c = (self.c << 1) & 0xFFFF_FFFF;
+            self.c <<= 1;
             self.ct -= 1;
             if self.a >= 0x8000 {
                 break;

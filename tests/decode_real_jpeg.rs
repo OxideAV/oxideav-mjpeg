@@ -46,7 +46,6 @@ fn decode_ffmpeg_red_jpeg() {
         panic!("expected video frame");
     };
 
-
     let y_mean: u64 =
         v.planes[0].data.iter().map(|&b| b as u64).sum::<u64>() / v.planes[0].data.len() as u64;
     let cb_mean: u64 =
@@ -106,7 +105,6 @@ fn decode_progressive_red_jpeg() {
     let Frame::Video(v) = frame else {
         panic!("expected video frame");
     };
-
 
     let y_mean: u64 =
         v.planes[0].data.iter().map(|&b| b as u64).sum::<u64>() / v.planes[0].data.len() as u64;

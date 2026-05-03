@@ -94,7 +94,6 @@ fn run_roundtrip(w: u32, h: u32, pix: PixelFormat) -> f64 {
         panic!("expected video");
     };
 
-
     // Compute PSNR across Y plane (visible area) — it's the most perceptually
     // important and has the highest resolution.
     let sw = w as usize;

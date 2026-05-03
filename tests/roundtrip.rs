@@ -203,7 +203,7 @@ fn byte_stuffing_roundtrip() {
     let in_pkt = Packet::new(0, TimeBase::new(1, 30), pkt.data);
     dec.send_packet(&in_pkt).unwrap();
     let out = dec.receive_frame().unwrap();
-    let Frame::Video(v) = out else {
+    let Frame::Video(_v) = out else {
         panic!();
     };
 }
@@ -491,5 +491,5 @@ fn decode_sof1_extended_sequential() {
     let in_pkt = Packet::new(0, TimeBase::new(1, 30), sof1_bytes);
     dec.send_packet(&in_pkt).unwrap();
     let out = dec.receive_frame().expect("decode SOF1");
-    let Frame::Video(v) = out else { panic!() };
+    let Frame::Video(_v) = out else { panic!() };
 }

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn generate_red_jpeg(path: &Path) -> bool {
     let status = Command::new("/usr/bin/ffmpeg")

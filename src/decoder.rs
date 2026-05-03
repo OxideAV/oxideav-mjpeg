@@ -2065,7 +2065,6 @@ mod non_interleaved_tests {
     use super::*;
     use crate::encoder::{encode_jpeg, encode_jpeg_non_interleaved};
     use oxideav_core::frame::VideoPlane;
-    use oxideav_core::PixelFormat;
 
     fn make_frame(w: u32, h: u32, pix: PixelFormat) -> VideoFrame {
         let (cw, ch) = match pix {
@@ -2167,7 +2166,6 @@ mod non_interleaved_tests {
 mod cmyk_tests {
     use super::*;
     use crate::encoder::encode_jpeg_cmyk_1111;
-    use oxideav_core::PixelFormat;
 
     /// PSNR across all bytes of two buffers, treating them as 8-bit samples.
     fn psnr(a: &[u8], b: &[u8]) -> f64 {
@@ -2335,7 +2333,6 @@ mod cmyk_tests {
 mod precision_12_tests {
     use super::*;
     use crate::encoder::encode_grayscale_jpeg_12bit;
-    use oxideav_core::PixelFormat;
 
     /// Decoder should accept a 12-bit precision grayscale JPEG and output
     /// `Gray12Le` with 16-bit LE samples. We feed a smooth gradient
@@ -2389,7 +2386,6 @@ mod precision_12_tests {
 mod lossless_tests {
     use super::*;
     use crate::encoder::encode_lossless_grayscale_jpeg_8bit;
-    use oxideav_core::PixelFormat;
 
     /// Lossless JPEG is, by definition, bit-exact. The decoder should
     /// recover every sample of the input.

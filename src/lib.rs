@@ -38,8 +38,16 @@
 //! `Gray8` at P=8 and `Gray16Le` / `Gray10Le` / `Gray12Le` at wider
 //! depths.
 //!
+//! Extended-sequential arithmetic (SOF9) is decoded via the Q-coder /
+//! arithmetic entropy decoder from T.81 Annex D + F.2.4. The DAC marker
+//! (Define Arithmetic Conditioning) is parsed when present; if absent the
+//! decoder uses the spec defaults `(L=0, U=1)` for DC and `Kx=5` for AC.
+//!
 //! **Not supported** (will return `Error::Unsupported`):
-//! - Hierarchical (SOF5+) and arithmetic-coded (SOF9..SOF15) JPEGs
+//! - Hierarchical (SOF5..SOF7, SOF13..SOF15) JPEGs
+//! - SOF10..SOF12 / SOF14..SOF15 arithmetic variants (progressive
+//!   arithmetic, lossless arithmetic, and the 12-bit arithmetic
+//!   precisions)
 //! - 12-bit progressive (SOF2 with `P=12`)
 //! - 12-bit 4:2:2 / 4:4:4 YUV (no matching output `PixelFormat`)
 //! - Progressive 4-component JPEGs

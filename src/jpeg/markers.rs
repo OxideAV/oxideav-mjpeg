@@ -14,6 +14,9 @@ pub const SOS: u8 = 0xDA;
 pub const DQT: u8 = 0xDB;
 /// Define Huffman Table(s).
 pub const DHT: u8 = 0xC4;
+/// Define Arithmetic Coding conditioning table(s) — used by SOF9..SOF15
+/// arithmetic JPEGs to override the default `(L=0, U=1, Kx=5)` parameters.
+pub const DAC: u8 = 0xCC;
 /// Define Restart Interval.
 pub const DRI: u8 = 0xDD;
 /// COMment segment.
@@ -27,6 +30,8 @@ pub const SOF1: u8 = 0xC1;
 pub const SOF2: u8 = 0xC2;
 /// Lossless sequential (not implemented — uses predictor+Huffman, not DCT).
 pub const SOF3: u8 = 0xC3;
+/// Extended sequential DCT, arithmetic-coded (T.81 §F.1.4).
+pub const SOF9: u8 = 0xC9;
 
 /// Application-specific markers APP0..APP15 (0xE0..0xEF).
 pub const APP0: u8 = 0xE0;

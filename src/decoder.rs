@@ -6,10 +6,16 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
 };
 
+use crate::jpeg::arith::{
+    decode_ac as arith_decode_ac, decode_dc_diff as arith_decode_dc_diff, AcStats, ArithDecoder,
+    DcStats,
+};
 use crate::jpeg::dct::idct8x8;
 use crate::jpeg::huffman::{parse_dht, HuffTable};
 use crate::jpeg::markers::{self, *};
-use crate::jpeg::parser::{parse_dri, parse_sof, parse_sos, MarkerWalker, SofInfo, SosInfo};
+use crate::jpeg::parser::{
+    parse_dac, parse_dri, parse_sof, parse_sos, MarkerWalker, SofInfo, SosInfo,
+};
 use crate::jpeg::quant::{parse_dqt, QuantTable};
 use crate::jpeg::zigzag::ZIGZAG;
 
@@ -85,6 +91,29 @@ struct JpegState {
     /// Adobe-inverted for CMYK); `Some(1)` for YCbCr (3-component);
     /// `Some(2)` for YCCK (4-component Adobe colour transform).
     adobe_transform: Option<u8>,
+    /// True when SOF9 (extended sequential, arithmetic-coded) was parsed.
+    /// Mutually exclusive with `progressive` / `lossless`. The scan
+    /// dispatcher takes the arithmetic Q-coder path instead of Huffman.
+    arithmetic: bool,
+    /// Per-destination DC arithmetic conditioning (L/U bounds + per-scan
+    /// statistics). Indexed by Tb (0..3). Defaults are L=0, U=1.
+    arith_dc: [Option<ArithDcConditioning>; 4],
+    /// Per-destination AC arithmetic conditioning (Kx threshold + stats).
+    /// Indexed by Tb (0..3). Default Kx=5.
+    arith_ac: [Option<ArithAcConditioning>; 4],
+}
+
+/// Container holding both the conditioning parameters (L, U) and the live
+/// statistics-bin storage that persists across blocks within a scan.
+#[derive(Clone, Debug)]
+struct ArithDcConditioning {
+    pub l: u8,
+    pub u: u8,
+}
+
+#[derive(Clone, Debug)]
+struct ArithAcConditioning {
+    pub kx: u8,
 }
 
 impl JpegState {
@@ -99,6 +128,9 @@ impl JpegState {
             seq_accum: false,
             lossless: false,
             adobe_transform: None,
+            arithmetic: false,
+            arith_dc: Default::default(),
+            arith_ac: Default::default(),
         }
     }
 }
@@ -123,7 +155,7 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
         };
         match marker {
             EOI => {
-                if state.progressive || state.seq_accum {
+                if state.progressive || state.seq_accum || state.arithmetic {
                     return render_from_coefs(&state, &coef_buf, pts, time_base);
                 }
                 return Err(Error::invalid("JPEG: EOI before SOS"));
@@ -137,6 +169,24 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
             DHT => {
                 let p = walker.read_segment_payload()?;
                 parse_dht(p, &mut state.dc_huff, &mut state.ac_huff)?;
+            }
+            DAC => {
+                let p = walker.read_segment_payload()?;
+                let entries = parse_dac(p)?;
+                for e in entries {
+                    if e.tc == 0 {
+                        // DC conditioning: cs packs L (low nibble) and U (high nibble).
+                        let l = e.cs & 0x0F;
+                        let u = e.cs >> 4;
+                        if l > u || u > 15 {
+                            return Err(Error::invalid("DAC: invalid L/U bounds"));
+                        }
+                        state.arith_dc[e.tb as usize] = Some(ArithDcConditioning { l, u });
+                    } else {
+                        // AC conditioning: cs is Kx in 1..=63.
+                        state.arith_ac[e.tb as usize] = Some(ArithAcConditioning { kx: e.cs });
+                    }
+                }
             }
             DRI => {
                 let p = walker.read_segment_payload()?;
@@ -186,10 +236,34 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                 state.sof = Some(sof);
                 state.lossless = true;
             }
-            0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+            // SOF9 — extended sequential, arithmetic-coded (T.81 §F.1.4).
+            // Same DCT machinery as SOF1, but the entropy coder is the
+            // Q-coder from Annex D instead of Huffman. Coefficients are
+            // accumulated into the same per-block buffer as the
+            // progressive / non-interleaved baseline path so that
+            // `render_from_coefs` can do the dequant + IDCT pass at EOI.
+            SOF9 => {
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                if sof.precision != 8 {
+                    return Err(Error::unsupported(format!(
+                        "arithmetic JPEG: precision {} (only 8 is supported)",
+                        sof.precision
+                    )));
+                }
+                if sof.components.len() > 3 {
+                    return Err(Error::unsupported(
+                        "arithmetic JPEG: 4+ component scans not supported",
+                    ));
+                }
+                coef_buf = init_coef_buffers(&sof)?;
+                state.sof = Some(sof);
+                state.arithmetic = true;
+            }
+            0xC5..=0xC7 | 0xCA..=0xCB | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "JPEG: hierarchical and arithmetic-coded variants are not supported",
+                    "JPEG: hierarchical and SOF10..15 arithmetic variants are not supported",
                 ));
             }
             SOS => {
@@ -199,7 +273,10 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                 if state.lossless {
                     return decode_lossless_scan(&state, &sos, scan, pts, time_base);
                 }
-                if state.progressive {
+                if state.arithmetic {
+                    decode_arith_scan(&state, &sos, scan, &mut coef_buf)?;
+                    // Continue — more scans or EOI follow.
+                } else if state.progressive {
                     decode_progressive_scan(&state, &sos, scan, &mut coef_buf)?;
                     // Continue — more scans or EOI follow.
                 } else {
@@ -893,6 +970,230 @@ fn decode_sequential_scan_accum(
         }
     }
     Ok(())
+}
+
+// ---- SOF9 (extended sequential, arithmetic-coded) -----------------------
+//
+// Same MCU/component layout as Huffman SOF1, but the entropy coder is the
+// Q-coder from T.81 Annex D and the per-coefficient binary-decision trees
+// from §F.1.4.3 / decode procedures from §F.2.4. We accumulate the decoded
+// DCT coefficients into the shared `coef_buf` (one [i32;64] per block) so
+// that `render_from_coefs` handles dequant + IDCT at EOI.
+//
+// Restart intervals: at each RSTn boundary the spec mandates re-initialising
+// both the arithmetic decoder (Initdec) and the per-component statistics
+// areas, plus zeroing the DC predictor. We honour that by re-creating the
+// `ArithDecoder` with a fresh slice positioned past the marker.
+fn decode_arith_scan(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+) -> Result<()> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    if sof.precision != 8 {
+        return Err(Error::unsupported(format!(
+            "arithmetic scan: precision {} (only 8 supported)",
+            sof.precision
+        )));
+    }
+
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    if h_max == 0 || v_max == 0 {
+        return Err(Error::invalid("SOF: sampling factor = 0"));
+    }
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let mcus_x = width.div_ceil(8 * h_max);
+    let mcus_y = height.div_ceil(8 * v_max);
+
+    let sos_map: Vec<usize> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            sof.components
+                .iter()
+                .position(|fc| fc.id == sc.id)
+                .ok_or_else(|| Error::invalid("SOS: component id not in SOF"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let interleaved = sos.components.len() == sof.components.len();
+
+    // Per-component DC + AC statistics areas. These are SHARED across all
+    // blocks of a component within this scan and reset only at RSTn (per
+    // §F.2.4 / F.1.4.4 initial-conditions text).
+    let n_comp = sof.components.len();
+    let mut dc_stats: Vec<DcStats> = (0..n_comp)
+        .map(|i| {
+            let mut s = DcStats::new();
+            // Resolve DAC conditioning override for this component's DC
+            // table destination (sos.components[?].dc_table). For an
+            // interleaved scan the same DC destination may be shared across
+            // SOS components; we simply look up the SOS component matching
+            // this SOF index. If no SOS entry is present (i.e. component
+            // not part of this scan), defaults stay.
+            if let Some(sc) = sos.components.iter().find(|sc| {
+                sof.components
+                    .iter()
+                    .position(|fc| fc.id == sc.id)
+                    .map(|j| j == i)
+                    .unwrap_or(false)
+            }) {
+                if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
+                    s.l = cond.l;
+                    s.u = cond.u;
+                }
+            }
+            s
+        })
+        .collect();
+    let mut ac_stats: Vec<AcStats> = (0..n_comp)
+        .map(|i| {
+            let mut s = AcStats::new();
+            if let Some(sc) = sos.components.iter().find(|sc| {
+                sof.components
+                    .iter()
+                    .position(|fc| fc.id == sc.id)
+                    .map(|j| j == i)
+                    .unwrap_or(false)
+            }) {
+                if let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref() {
+                    s.kx = cond.kx;
+                }
+            }
+            s
+        })
+        .collect();
+
+    // The arithmetic decoder owns its byte source (with 0xFF 0x00 unstuff
+    // and marker trapping baked in). When we hit a restart boundary, we
+    // need to advance the source past the RSTn marker and re-Initdec.
+    // We track the byte offset within `scan` ourselves and rebuild the
+    // decoder as needed.
+    let mut scan_pos = 0usize;
+    let mut decoder = ArithDecoder::new(&scan[scan_pos..]);
+
+    let mut mcus_since_restart: u32 = 0;
+
+    let (scan_mcus_x, scan_mcus_y) = if interleaved {
+        (mcus_x, mcus_y)
+    } else {
+        let sof_idx = sos_map[0];
+        let c = sof.components[sof_idx];
+        (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+    };
+
+    for my in 0..scan_mcus_y {
+        for mx in 0..scan_mcus_x {
+            // Restart-interval boundary?
+            if state.restart_interval != 0
+                && mcus_since_restart != 0
+                && mcus_since_restart % state.restart_interval as u32 == 0
+            {
+                // The decoder may already have consumed the RSTn during a
+                // Byte_in (decoder.marker() is set), or we may need to
+                // scan ahead from the current cursor to find it. Either
+                // way the next byte after the marker pair is the start
+                // of fresh entropy data — so advance `scan_pos` and
+                // re-Initdec there. Statistics + DC predictor are reset
+                // per F.1.4.4.1.5 / F.2.4.4.
+                scan_pos = locate_next_marker_after(scan, scan_pos);
+                if scan_pos >= scan.len() {
+                    return Err(Error::invalid(
+                        "arithmetic scan: missing restart marker mid-scan",
+                    ));
+                }
+                for s in dc_stats.iter_mut() {
+                    s.restart_reset();
+                }
+                for s in ac_stats.iter_mut() {
+                    s.restart_reset();
+                }
+                decoder = ArithDecoder::new(&scan[scan_pos..]);
+            }
+
+            if interleaved {
+                for &sof_idx in sos_map.iter() {
+                    let c = sof.components[sof_idx];
+                    let blocks_x = mcus_x * c.h_factor as usize;
+                    for by in 0..c.v_factor as usize {
+                        for bx in 0..c.h_factor as usize {
+                            let bidx_x = mx * c.h_factor as usize + bx;
+                            let bidx_y = my * c.v_factor as usize + by;
+                            let bi = bidx_y * blocks_x + bidx_x;
+                            decode_arith_block(
+                                &mut decoder,
+                                &mut dc_stats[sof_idx],
+                                &mut ac_stats[sof_idx],
+                                &mut coefs[sof_idx][bi],
+                            )?;
+                        }
+                    }
+                }
+            } else {
+                let sof_idx = sos_map[0];
+                let c = sof.components[sof_idx];
+                let blocks_x = mcus_x * c.h_factor as usize;
+                let bi = my * blocks_x + mx;
+                decode_arith_block(
+                    &mut decoder,
+                    &mut dc_stats[sof_idx],
+                    &mut ac_stats[sof_idx],
+                    &mut coefs[sof_idx][bi],
+                )?;
+            }
+            mcus_since_restart += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Decode one DCT block (DC diff + AC zigzag) using the arithmetic Q-coder
+/// and the per-component DC/AC statistics areas. Writes natural-order
+/// dequant-input coefficients into `block`.
+fn decode_arith_block(
+    d: &mut ArithDecoder<'_>,
+    dc: &mut DcStats,
+    ac: &mut AcStats,
+    block: &mut [i32; 64],
+) -> Result<()> {
+    // Zero-fill — the AC band may exit early via EOB.
+    for v in block.iter_mut() {
+        *v = 0;
+    }
+    let diff = arith_decode_dc_diff(d, dc)?;
+    dc.pred = dc.pred.wrapping_add(diff);
+    block[0] = dc.pred;
+    arith_decode_ac(d, ac, block, 1, 63)?;
+    Ok(())
+}
+
+/// Locate the next non-stuff JPEG marker in `scan` starting at `from`.
+/// Returns the byte offset just AFTER the marker pair (i.e. past 0xFF Mn).
+/// Used by the arithmetic-scan restart handler to position the decoder for
+/// a fresh Initdec.
+fn locate_next_marker_after(scan: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i + 1 < scan.len() {
+        if scan[i] == 0xFF && scan[i + 1] != 0x00 {
+            // Skip 0xFF runs.
+            let mut j = i + 1;
+            while j < scan.len() && scan[j] == 0xFF {
+                j += 1;
+            }
+            if j < scan.len() {
+                return j + 1; // byte AFTER the marker code
+            }
+            return scan.len();
+        }
+        i += 1;
+    }
+    scan.len()
 }
 
 // ---- Progressive JPEG (SOF2) --------------------------------------------
@@ -2450,9 +2751,10 @@ mod lossless_tests {
         }
     }
 
-    /// Non-lossless SOF codes (hierarchical, arithmetic) must still be
-    /// rejected with Unsupported — make sure we didn't widen the SOF
-    /// accept matcher too far while adding SOF3.
+    /// Hierarchical (SOF5/6/7) and SOF10..15 arithmetic variants must
+    /// still be rejected with Unsupported — make sure we didn't widen
+    /// the SOF accept matcher too far while adding SOF3 or SOF9.
+    /// SOF9 (extended sequential arithmetic) is now handled separately.
     #[test]
     fn hierarchical_arithmetic_still_rejected() {
         // Hand-construct a minimal stream with SOF5 (hierarchical). The

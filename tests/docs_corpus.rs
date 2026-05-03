@@ -822,15 +822,15 @@ fn corpus_without_jfif_marker() {
 
 #[test]
 fn corpus_arithmetic_coded() {
-    // SOF9 — extended sequential arithmetic. Decoder returns
-    // `Error::Unsupported` per the lib.rs feature-gap notes. Ground
-    // truth is grayscale PGM (component_id list is single Y only).
-    // Tracked for follow-up: requires the Q-coder / arithmetic
-    // entropy decoder to be implemented.
+    // SOF9 — extended sequential arithmetic. Now handled via the Q-coder
+    // entropy decoder (T.81 Annex D + F.2.4). Promoted to ReportOnly so
+    // PSNR / per-channel stats are visible; bit-exact matching of the
+    // libjpeg-turbo `cjpeg -arithmetic` reference output is a stretch
+    // goal pending further trace-driven hardening.
     evaluate(&CorpusCase {
         name: "arithmetic-coded",
         is_rgb_jpeg: false,
-        tier: Tier::Ignored,
+        tier: Tier::ReportOnly,
     });
 }
 

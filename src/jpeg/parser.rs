@@ -114,6 +114,45 @@ pub fn parse_sos(payload: &[u8]) -> Result<SosInfo> {
     })
 }
 
+/// One arithmetic-conditioning entry decoded from a DAC marker (B.2.4.3).
+///
+/// `tc=0` is a DC (or lossless) table; `cs` packs the lower-bound `L` in the
+/// low nibble and the upper-bound `U` in the high nibble (so `L = cs & 0x0F`,
+/// `U = cs >> 4`). `tc=1` is an AC table; `cs` is `Kx` in the range 1..=63.
+#[derive(Clone, Copy, Debug)]
+pub struct DacEntry {
+    pub tc: u8,
+    pub tb: u8,
+    pub cs: u8,
+}
+
+/// Parse a DAC segment payload. Returns the list of entries; up to four DC
+/// destinations and four AC destinations may be specified per segment.
+pub fn parse_dac(payload: &[u8]) -> Result<Vec<DacEntry>> {
+    if !payload.len().is_multiple_of(2) {
+        return Err(Error::invalid("DAC: payload length must be even"));
+    }
+    let n = payload.len() / 2;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let tc_tb = payload[i * 2];
+        let cs = payload[i * 2 + 1];
+        let tc = tc_tb >> 4;
+        let tb = tc_tb & 0x0F;
+        if tc > 1 {
+            return Err(Error::invalid("DAC: Tc must be 0 or 1"));
+        }
+        if tb > 3 {
+            return Err(Error::invalid("DAC: Tb must be 0..=3"));
+        }
+        if tc == 1 && !(1..=63).contains(&cs) {
+            return Err(Error::invalid("DAC: AC Kx must be 1..=63"));
+        }
+        out.push(DacEntry { tc, tb, cs });
+    }
+    Ok(out)
+}
+
 /// DRI payload is a 16-bit big-endian restart interval count (in MCUs).
 pub fn parse_dri(payload: &[u8]) -> Result<u16> {
     if payload.len() < 2 {

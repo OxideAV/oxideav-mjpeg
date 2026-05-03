@@ -1,5 +1,6 @@
 //! Baseline JPEG bitstream primitives.
 
+pub mod arith;
 pub mod color;
 pub mod dct;
 pub mod huffman;

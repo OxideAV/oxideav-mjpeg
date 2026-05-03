@@ -505,6 +505,8 @@ fn compare_per_channel(got: &Decoded, want: &Pnm) -> Vec<ChannelStats> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Ignored exists for forward-flexibility; some
+                    // corpus runs may not currently use it.
 enum Tier {
     /// Decode is permitted to diverge (lossy JPEG); we log per-channel
     /// stats but do not gate CI on them.

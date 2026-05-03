@@ -526,9 +526,7 @@ fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelForm
             } else if cw == full_w.div_ceil(2) && ch == full_h.div_ceil(2) {
                 PixelFormat::Yuv420P
             } else {
-                panic!(
-                    "infer_pix_fmt: unrecognised chroma geometry cw={cw} ch={ch} for {w}x{h}"
-                );
+                panic!("infer_pix_fmt: unrecognised chroma geometry cw={cw} ch={ch} for {w}x{h}");
             }
         }
         n => panic!("infer_pix_fmt: unexpected plane count {n}"),

@@ -466,6 +466,7 @@ fn decode_scan(
             (1, 1) => PixelFormat::Yuv444P,
             (2, 1) => PixelFormat::Yuv422P,
             (2, 2) => PixelFormat::Yuv420P,
+            (4, 1) => PixelFormat::Yuv411P,
             _ => {
                 return Err(Error::unsupported(format!(
                     "luma sampling {}x{}",
@@ -654,11 +655,15 @@ fn decode_scan(
             }
             planes.push(VideoPlane { stride, data });
         }
-        PixelFormat::Yuv444P | PixelFormat::Yuv422P | PixelFormat::Yuv420P => {
+        PixelFormat::Yuv444P
+        | PixelFormat::Yuv422P
+        | PixelFormat::Yuv420P
+        | PixelFormat::Yuv411P => {
             let (c_w, c_h) = match out_format {
                 PixelFormat::Yuv444P => (width, height),
                 PixelFormat::Yuv422P => (width.div_ceil(2), height),
                 PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
+                PixelFormat::Yuv411P => (width.div_ceil(4), height),
                 _ => unreachable!(),
             };
             // Y plane.
@@ -1327,6 +1332,7 @@ fn render_from_coefs(
             (1, 1) => PixelFormat::Yuv444P,
             (2, 1) => PixelFormat::Yuv422P,
             (2, 2) => PixelFormat::Yuv420P,
+            (4, 1) => PixelFormat::Yuv411P,
             _ => {
                 return Err(Error::unsupported(format!(
                     "luma sampling {}x{}",
@@ -1413,11 +1419,15 @@ fn render_from_coefs(
             }
             planes.push(VideoPlane { stride, data });
         }
-        PixelFormat::Yuv444P | PixelFormat::Yuv422P | PixelFormat::Yuv420P => {
+        PixelFormat::Yuv444P
+        | PixelFormat::Yuv422P
+        | PixelFormat::Yuv420P
+        | PixelFormat::Yuv411P => {
             let (c_w, c_h) = match out_format {
                 PixelFormat::Yuv444P => (width, height),
                 PixelFormat::Yuv422P => (width.div_ceil(2), height),
                 PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
+                PixelFormat::Yuv411P => (width.div_ceil(4), height),
                 _ => unreachable!(),
             };
             let y_stride = width;

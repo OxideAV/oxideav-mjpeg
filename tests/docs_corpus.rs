@@ -17,9 +17,7 @@
 //!   visible for the human implementer to spot regressions, but
 //!   individual divergences are picked off in follow-up rounds.
 //! * `Tier::Ignored` — variants the decoder explicitly does not support
-//!   (arithmetic-coded SOF9 returns `Error::Unsupported`; YUV 4:1:1
-//!   sampling is rejected because `PixelFormat::Yuv411P` does not exist
-//!   in the shared enum yet).
+//!   (arithmetic-coded SOF9 returns `Error::Unsupported`).
 //!
 //! Color-space convention:
 //! * 1-component JPEGs decode to `Gray8` / `Gray12Le` and are compared
@@ -221,12 +219,16 @@ fn flatten_frame(
                 data,
             }
         }
-        PixelFormat::Yuv444P | PixelFormat::Yuv422P | PixelFormat::Yuv420P => {
+        PixelFormat::Yuv444P
+        | PixelFormat::Yuv422P
+        | PixelFormat::Yuv420P
+        | PixelFormat::Yuv411P => {
             assert_eq!(vf.planes.len(), 3, "YUV frame should have 3 planes");
             let (cw, ch) = match fmt {
                 PixelFormat::Yuv444P => (w, h),
                 PixelFormat::Yuv422P => (w.div_ceil(2), h),
                 PixelFormat::Yuv420P => (w.div_ceil(2), h.div_ceil(2)),
+                PixelFormat::Yuv411P => (w.div_ceil(4), h),
                 _ => unreachable!(),
             };
             let y_stride = vf.planes[0].stride;
@@ -525,6 +527,8 @@ fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelForm
                 PixelFormat::Yuv422P
             } else if cw == full_w.div_ceil(2) && ch == full_h.div_ceil(2) {
                 PixelFormat::Yuv420P
+            } else if cw == full_w.div_ceil(4) && ch == full_h {
+                PixelFormat::Yuv411P
             } else {
                 panic!("infer_pix_fmt: unrecognised chroma geometry cw={cw} ch={ch} for {w}x{h}");
             }
@@ -699,14 +703,13 @@ fn corpus_arithmetic_coded() {
 
 #[test]
 fn corpus_baseline_yuv411_32x32() {
-    // 4:1:1 chroma subsampling: luma h_factor=4, v_factor=1. The
-    // decoder rejects this with `Error::Unsupported` because the
-    // shared `PixelFormat` enum has no `Yuv411P` variant. Tracked
-    // for follow-up: needs either a `Yuv411P` addition to
-    // `oxideav-core`, or an internal upsample-to-4:2:2 path.
+    // 4:1:1 chroma subsampling: luma h_factor=4, v_factor=1. Decoder
+    // emits the chroma planes at 1/4 horizontal resolution as
+    // `PixelFormat::Yuv411P` (added to oxideav-core alongside this
+    // fixture's promotion to ReportOnly).
     evaluate(&CorpusCase {
         name: "baseline-yuv411-32x32",
         is_rgb_jpeg: false,
-        tier: Tier::Ignored,
+        tier: Tier::ReportOnly,
     });
 }

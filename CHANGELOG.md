@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.2...v0.1.3) - 2026-05-03
+
+### Other
+
+- allow dead Tier::Ignored variant
+- drop no-op u32 mask + replace MSRV-1.87 is_multiple_of
+- cargo-fuzz harness with libjpeg-turbo cross-decode oracle
+- drop unused loop binding in K.4 test
+- align QE_TABLE comments to column 28 to satisfy rustfmt
+- fmt QE_TABLE column alignment to single-space
+- add SOF9 arithmetic-coded JPEG entropy decoder
+- cargo fmt rustfmt 1.95 if-expression wrap
+- fancy chroma upsampling + green-channel rounding fix
+- emit Yuv411P for JPEG 4:1:1 sampling (luma 4x1)
+- cargo fmt: collapse single-line panic! in tests/docs_corpus.rs
+- wire docs/image/jpeg/ fixture corpus into integration suite
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.1...v0.1.2) - 2026-05-03
 
 ### Other

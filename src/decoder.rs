@@ -1490,12 +1490,21 @@ fn render_from_coefs(
                             // YCCK (Adobe). Decode YCbCr→RGB via BT.601
                             // full-range, then C/M/Y = 255 − RGB. Adobe
                             // stores the K component inverted alongside
-                            // YCbCr, so flip it too.
+                            // YCbCr, so flip it too. Coefficients are
+                            // libjpeg-turbo's 16-bit fixed-point set
+                            // (91881=FIX(1.40200), 22554=FIX(0.34414),
+                            // 46802=FIX(0.71414), 116130=FIX(1.77200));
+                            // the green expression mirrors libjpeg-turbo's
+                            // `Cb_g_tab + Cr_g_tab >> SCALEBITS` form
+                            // exactly — moving the negation outside the
+                            // shift would round the wrong way at the
+                            // 32768 boundary and emit g 1 LSB low.
                             let y_s = s[0] as i32;
                             let cb = s[1] as i32 - 128;
                             let cr = s[2] as i32 - 128;
                             let r = (y_s + ((cr * 91881 + 32768) >> 16)).clamp(0, 255);
-                            let g = (y_s - ((cb * 22554 + cr * 46802 + 32768) >> 16)).clamp(0, 255);
+                            let g =
+                                (y_s + ((-22554 * cb - 46802 * cr + 32768) >> 16)).clamp(0, 255);
                             let b = (y_s + ((cb * 116130 + 32768) >> 16)).clamp(0, 255);
                             (
                                 (255 - r) as u8,

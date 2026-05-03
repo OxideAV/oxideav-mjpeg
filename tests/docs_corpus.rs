@@ -145,21 +145,118 @@ struct Decoded {
 }
 
 /// JPEG/JFIF full-range BT.601 YCbCr → RGB. Returns clamped 0..=255.
+///
+/// Coefficients are the standard 16-bit fixed-point constants
+/// (`FIX(x) = round(x * 65536)`) per ITU-T T.871 §7:
+///   * 1.40200 → 91881
+///   * 0.34414 → 22554
+///   * 0.71414 → 46802
+///   * 1.77200 → 116130 (libjpeg-turbo uses 116130 even though the
+///     strict round of 1.772 * 65536 = 116131.84)
+///
+/// The green expression must mirror libjpeg-turbo's `Cb_g_tab[cb] +
+/// Cr_g_tab[cr] >> SCALEBITS` exactly:
+///   * `Cb_g_tab[cb] = -22554*(cb-128) + 32768`  (ONE_HALF on Cb side)
+///   * `Cr_g_tab[cr] = -46802*(cr-128)`           (no half-bias on Cr)
+///   * `g = y + ((Cb_g_tab + Cr_g_tab) >> 16)`
+///
+/// Writing it as `y - ((22554*db + 46802*dr + 32768) >> 16)` is *not*
+/// equivalent — at the boundary where the inner sum lands exactly on
+/// the rounding step (e.g. db,dr push the sum to 32768), arithmetic
+/// shift on the negated form rounds toward positive infinity while
+/// the libjpeg form rounds toward negative infinity, leaving green
+/// off by 1 LSB. Reproducing libjpeg-turbo's expression keeps every
+/// pixel byte-exact with its `expected.ppm`.
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
-    // Same coefficients used elsewhere in the decoder for YCCK; the
-    // standard JFIF formula is:
-    //   R = Y + 1.402   * (Cr - 128)
-    //   G = Y - 0.34414 * (Cb - 128) - 0.71414 * (Cr - 128)
-    //   B = Y + 1.772   * (Cb - 128)
-    // Use rounded fixed-point mirrors of the decoder's own constants
-    // for parity with internal colour math.
     let y_s = y as i32;
     let cbi = cb as i32 - 128;
     let cri = cr as i32 - 128;
     let r = (y_s + ((cri * 91881 + 32768) >> 16)).clamp(0, 255) as u8;
-    let g = (y_s - ((cbi * 22554 + cri * 46802 + 32768) >> 16)).clamp(0, 255) as u8;
+    let g = (y_s + ((-22554 * cbi - 46802 * cri + 32768) >> 16)).clamp(0, 255) as u8;
     let b = (y_s + ((cbi * 116130 + 32768) >> 16)).clamp(0, 255) as u8;
     (r, g, b)
+}
+
+/// libjpeg-turbo `h2v2_fancy_upsample` — chroma upsampling for 4:2:0.
+/// Each output pixel is a 9:3:3:1 weighted blend of the four enclosing
+/// chroma samples (T.871 §9 Note 1: "a commonly used filter").
+/// Edge samples extend by replication.
+fn h2v2_fancy_upsample(
+    chroma: &[u8],
+    c_w: usize,
+    c_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<u8> {
+    let sample = |cx: i32, cy: i32| -> i32 {
+        let x = cx.clamp(0, c_w as i32 - 1) as usize;
+        let y = cy.clamp(0, c_h as i32 - 1) as usize;
+        chroma[y * c_w + x] as i32
+    };
+    let mut out = vec![0u8; out_w * out_h];
+    for oy in 0..out_h {
+        let cy_main = oy as i32 / 2;
+        let cy_neighbour = if oy % 2 == 0 { cy_main - 1 } else { cy_main + 1 };
+        for ox in 0..out_w {
+            let cx_main = ox as i32 / 2;
+            let cx_neighbour = if ox % 2 == 0 { cx_main - 1 } else { cx_main + 1 };
+            // 9:3:3:1 blend with rounding +8, /16.
+            let v = 9 * sample(cx_main, cy_main)
+                + 3 * sample(cx_neighbour, cy_main)
+                + 3 * sample(cx_main, cy_neighbour)
+                + sample(cx_neighbour, cy_neighbour);
+            out[oy * out_w + ox] = ((v + 8) / 16).clamp(0, 255) as u8;
+        }
+    }
+    out
+}
+
+/// libjpeg-turbo `h2v1_fancy_upsample` — horizontal-only fancy
+/// upsampling for 4:2:2. Triangle filter (3:1 weights) per output
+/// position; edge replication.
+fn h2v1_fancy_upsample(
+    chroma: &[u8],
+    c_w: usize,
+    c_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<u8> {
+    let sample = |cx: i32, cy: usize| -> i32 {
+        let x = cx.clamp(0, c_w as i32 - 1) as usize;
+        chroma[cy * c_w + x] as i32
+    };
+    let mut out = vec![0u8; out_w * out_h];
+    for oy in 0..out_h {
+        let cy = oy.min(c_h - 1);
+        for ox in 0..out_w {
+            let cx = ox as i32 / 2;
+            let neighbour = if ox % 2 == 0 { cx - 1 } else { cx + 1 };
+            let v = 3 * sample(cx, cy) + sample(neighbour, cy);
+            out[oy * out_w + ox] = ((v + 2) / 4).clamp(0, 255) as u8;
+        }
+    }
+    out
+}
+
+/// Nearest-neighbour upsample for layouts where libjpeg-turbo doesn't
+/// apply a fancy filter (e.g. the legacy 4:1:1 path falls back to
+/// nearest-neighbour box upsampling).
+fn nearest_upsample(
+    chroma: &[u8],
+    c_w: usize,
+    c_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; out_w * out_h];
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let cy = (oy * c_h / out_h).min(c_h - 1);
+            let cx = (ox * c_w / out_w).min(c_w - 1);
+            out[oy * out_w + ox] = chroma[cy * c_w + cx];
+        }
+    }
+    out
 }
 
 /// Flatten a decoded VideoFrame into the format that matches the PNM
@@ -232,17 +329,51 @@ fn flatten_frame(
                 _ => unreachable!(),
             };
             let y_stride = vf.planes[0].stride;
-            let cb_stride = vf.planes[1].stride;
-            let cr_stride = vf.planes[2].stride;
+
+            // Repack the chroma planes into tight `c_w * c_h` buffers
+            // (drop any plane stride padding) before handing them to
+            // the upsamplers.
+            let pack_plane = |idx: usize| -> Vec<u8> {
+                let stride = vf.planes[idx].stride;
+                let mut out = Vec::with_capacity(cw * ch);
+                for cy in 0..ch {
+                    out.extend_from_slice(&vf.planes[idx].data[cy * stride..cy * stride + cw]);
+                }
+                out
+            };
+            let cb_plane = pack_plane(1);
+            let cr_plane = pack_plane(2);
+
+            // For RGB JPEGs the "chroma" planes are actually G/B at full
+            // resolution (Adobe APP14 transform=0 path); just copy them
+            // through with no upsampling, no colour conversion.
+            let (cb_full, cr_full) = if is_rgb_jpeg {
+                (cb_plane, cr_plane)
+            } else {
+                match fmt {
+                    PixelFormat::Yuv444P => (cb_plane, cr_plane),
+                    PixelFormat::Yuv422P => (
+                        h2v1_fancy_upsample(&cb_plane, cw, ch, w, h),
+                        h2v1_fancy_upsample(&cr_plane, cw, ch, w, h),
+                    ),
+                    PixelFormat::Yuv420P => (
+                        h2v2_fancy_upsample(&cb_plane, cw, ch, w, h),
+                        h2v2_fancy_upsample(&cr_plane, cw, ch, w, h),
+                    ),
+                    PixelFormat::Yuv411P => (
+                        nearest_upsample(&cb_plane, cw, ch, w, h),
+                        nearest_upsample(&cr_plane, cw, ch, w, h),
+                    ),
+                    _ => unreachable!(),
+                }
+            };
+
             let mut data = Vec::with_capacity(w * h * 3);
             for y in 0..h {
                 for x in 0..w {
                     let yv = vf.planes[0].data[y * y_stride + x];
-                    // Nearest-neighbour upsample for chroma.
-                    let cy = (y * ch / h).min(ch - 1);
-                    let cx = (x * cw / w).min(cw - 1);
-                    let cb = vf.planes[1].data[cy * cb_stride + cx];
-                    let cr = vf.planes[2].data[cy * cr_stride + cx];
+                    let cb = cb_full[y * w + x];
+                    let cr = cr_full[y * w + x];
                     let (r, g, b) = if is_rgb_jpeg {
                         // Plane[0]/[1]/[2] already carry R/G/B.
                         (yv, cb, cr)

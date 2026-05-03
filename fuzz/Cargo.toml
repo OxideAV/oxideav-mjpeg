@@ -1,0 +1,55 @@
+[package]
+name = "oxideav-mjpeg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libjpeg-turbo interop: each cross-decode harness
+# `dlopen`s the system-installed libturbojpeg at startup. No `*-sys` crate,
+# no libjpeg / libjpeg-turbo source pulled into the dep tree. Harnesses
+# skip silently when libturbojpeg isn't installed (see fuzz/src/lib.rs).
+libloading = "0.8"
+
+[dependencies.oxideav-mjpeg]
+path = ".."
+
+[lib]
+name = "oxideav_mjpeg_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "jpeg_self_roundtrip"
+path = "fuzz_targets/jpeg_self_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "libjpeg_encode_oxideav_decode"
+path = "fuzz_targets/libjpeg_encode_oxideav_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oxideav_encode_libjpeg_decode"
+path = "fuzz_targets/oxideav_encode_libjpeg_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jpeg_progressive_self_roundtrip"
+path = "fuzz_targets/jpeg_progressive_self_roundtrip.rs"
+test = false
+doc = false

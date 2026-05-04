@@ -14,7 +14,25 @@ keywords = ["multimedia", "mjpeg", "jpeg", "video", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
-oxideav-core = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-mjpeg` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes a free-standing
+# `decoder::decode_jpeg` / `encoder::encode_jpeg_*` API plus local
+# `MjpegFrame` / `MjpegPlane` / `MjpegPixelFormat` / `MjpegError`
+# types and never references `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+
+# Wires up the `Decoder` / `Encoder` trait implementations, the JPEG
+# still-image container demuxer + muxer + probe, and the
+# `register_codecs` / `register_containers` entry points against
+# `oxideav-core` so the crate can plug into the `oxideav` framework
+# registry. Default-on; turn off for image-library use-cases that
+# just want the standalone `decode_jpeg` / `encode_jpeg_*` API.
+registry = ["dep:oxideav-core"]
 
 [dev-dependencies]
 # libloading powers the `dlopen`-based libturbojpeg interop in

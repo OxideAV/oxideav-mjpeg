@@ -1,12 +1,19 @@
 // Parallel-array index loops are idiomatic in codec code; skip the lint.
 #![allow(clippy::needless_range_loop)]
+// When built without the `registry` feature, large swathes of the
+// decoder/encoder (the JPEG entry-point + render helpers) have no
+// callers — they're only reachable via the `Decoder` / `Encoder`
+// trait implementations that live behind the `registry` feature.
+// Suppress the resulting dead-code warnings rather than gating every
+// helper.
+#![cfg_attr(not(feature = "registry"), allow(dead_code))]
 
 //! JPEG / Motion-JPEG codec, pure Rust.
 //!
 //! Each video packet is a standalone JPEG (one full SOI..EOI). The decoder
 //! recognises baseline (SOF0), extended-sequential (SOF1), progressive
 //! (SOF2), and lossless (SOF3) JPEGs with 4:2:0 / 4:2:2 / 4:4:4 chroma
-//! subsampling (DCT variants) and outputs `VideoFrame`s in the matching
+//! subsampling (DCT variants) and outputs `MjpegFrame`s in the matching
 //! `Yuv*P` pixel format or `Gray8` for 1-component streams. SOF0 and
 //! SOF1 share the same Huffman sequential scan structure at 8-bit
 //! precision; both are handled by the same scan decoder, and
@@ -52,41 +59,39 @@
 //! - 12-bit 4:2:2 / 4:4:4 YUV (no matching output `PixelFormat`)
 //! - Progressive 4-component JPEGs
 //! - Multi-component lossless JPEGs (only grayscale is supported)
+//!
+//! ## Standalone vs registry-integrated
+//!
+//! The crate's default `registry` Cargo feature pulls in `oxideav-core`
+//! and exposes the `Decoder` / `Encoder` trait surface, the JPEG-still
+//! container, and the [`registry::register`] / [`registry::register_containers`]
+//! entry points. Disable the feature (`default-features = false`) for
+//! an oxideav-core-free build that still exposes the standalone
+//! [`decoder::decode_jpeg`] API plus crate-local [`MjpegFrame`] /
+//! [`MjpegPlane`] / [`MjpegPixelFormat`] / [`MjpegError`] types built
+//! only on `std`.
 
-pub mod container;
 pub mod decoder;
 pub mod encoder;
+pub mod error;
+pub mod image;
 pub mod jpeg;
 
-use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
-use oxideav_core::{CodecInfo, CodecRegistry};
+#[cfg(feature = "registry")]
+pub mod container;
+
+#[cfg(feature = "registry")]
+pub mod registry;
 
 pub const CODEC_ID_STR: &str = "mjpeg";
 
-pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("mjpeg_sw")
-        .with_lossy(true)
-        .with_intra_only(true)
-        .with_max_size(16384, 16384);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(decoder::make_decoder)
-            .encoder(encoder::make_encoder)
-            .tags([
-                // AVI FourCC claims — all unambiguous MJPEG variants.
-                CodecTag::fourcc(b"MJPG"),
-                CodecTag::fourcc(b"AVRN"),
-                CodecTag::fourcc(b"LJPG"),
-                CodecTag::fourcc(b"JPGL"),
-            ]),
-    );
-}
+// Standalone, framework-free API. Available regardless of the
+// `registry` feature.
+pub use error::{MjpegError, Result};
+pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 
-/// Register the still-image JPEG container (`.jpg` / `.jpeg`). Must be
-/// called alongside [`register`] when wiring up a pipeline that expects
-/// to read or write raw JPEG files.
-pub fn register_containers(reg: &mut ContainerRegistry) {
-    container::register(reg);
-}
+// Framework-integrated API (`oxideav-core`-dependent). Gated behind
+// `registry` so image-library callers can build the crate without
+// dragging in `oxideav-core`.
+#[cfg(feature = "registry")]
+pub use registry::{register, register_containers};

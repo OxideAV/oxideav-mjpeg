@@ -11,7 +11,7 @@
 //! Code assignment follows Annex C.2: canonical, length-major, numeric-order
 //! per length.
 
-use oxideav_core::{Error, Result};
+use crate::error::{MjpegError as Error, Result};
 
 /// Per-symbol Huffman code, used for encoding.
 #[derive(Clone, Copy, Debug, Default)]

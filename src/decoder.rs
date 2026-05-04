@@ -1,10 +1,33 @@
 //! JPEG packet decoder — baseline (SOF0) and progressive (SOF2).
 
+use crate::error::{MjpegError as Error, Result};
+
+// When the `registry` feature is on, the public `decode_jpeg` returns
+// `oxideav_core::VideoFrame` directly so the trait-side `Decoder`
+// impl can hand it to `Frame::Video(...)` without an extra
+// conversion. The inner decoder logic only touches plane
+// `(stride, data)` tuples and YUV / Gray / Cmyk pixel-format
+// discriminants — both type families share that shape, so the same
+// helpers compile against either alias unchanged.
+//
+// With `--no-default-features` the same names resolve to the
+// crate-local [`MjpegFrame`] / [`MjpegPixelFormat`] / [`MjpegPlane`]
+// types so the standalone build never references `oxideav-core`.
+#[cfg(feature = "registry")]
 use oxideav_core::frame::VideoPlane;
-use oxideav_core::Decoder;
-use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+#[cfg(feature = "registry")]
+use oxideav_core::{PixelFormat, VideoFrame};
+
+#[cfg(not(feature = "registry"))]
+use crate::image::{
+    MjpegFrame as VideoFrame, MjpegPixelFormat as PixelFormat, MjpegPlane as VideoPlane,
 };
+
+// Re-export the framework-side `Decoder` factory at its historical
+// path so consumers (and integration tests) that import
+// `oxideav_mjpeg::decoder::make_decoder` keep compiling.
+#[cfg(feature = "registry")]
+pub use crate::registry::make_decoder;
 
 use crate::jpeg::arith::{
     decode_ac as arith_decode_ac, decode_dc_diff as arith_decode_dc_diff, AcStats, ArithDecoder,
@@ -18,54 +41,6 @@ use crate::jpeg::parser::{
 };
 use crate::jpeg::quant::{parse_dqt, QuantTable};
 use crate::jpeg::zigzag::ZIGZAG;
-
-pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let codec_id = params.codec_id.clone();
-    Ok(Box::new(MjpegDecoder {
-        codec_id,
-        pending: None,
-        eof: false,
-    }))
-}
-
-struct MjpegDecoder {
-    codec_id: CodecId,
-    pending: Option<Packet>,
-    eof: bool,
-}
-
-impl Decoder for MjpegDecoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
-            return Err(Error::other(
-                "MJPEG decoder: receive_frame must be called before sending another packet",
-            ));
-        }
-        self.pending = Some(packet.clone());
-        Ok(())
-    }
-
-    fn receive_frame(&mut self) -> Result<Frame> {
-        let Some(pkt) = self.pending.take() else {
-            return if self.eof {
-                Err(Error::Eof)
-            } else {
-                Err(Error::NeedMore)
-            };
-        };
-        let vf = decode_jpeg(&pkt.data, pkt.pts, pkt.time_base)?;
-        Ok(Frame::Video(vf))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.eof = true;
-        Ok(())
-    }
-}
 
 // ---- Decoding state ------------------------------------------------------
 
@@ -135,7 +110,7 @@ impl JpegState {
     }
 }
 
-fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<VideoFrame> {
+pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
@@ -156,7 +131,7 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
         match marker {
             EOI => {
                 if state.progressive || state.seq_accum || state.arithmetic {
-                    return render_from_coefs(&state, &coef_buf, pts, time_base);
+                    return render_from_coefs(&state, &coef_buf, pts);
                 }
                 return Err(Error::invalid("JPEG: EOI before SOS"));
             }
@@ -271,7 +246,7 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                 let sos = parse_sos(p)?;
                 let scan = walker.read_scan_data()?;
                 if state.lossless {
-                    return decode_lossless_scan(&state, &sos, scan, pts, time_base);
+                    return decode_lossless_scan(&state, &sos, scan, pts);
                 }
                 if state.arithmetic {
                     decode_arith_scan(&state, &sos, scan, &mut coef_buf)?;
@@ -295,7 +270,7 @@ fn decode_jpeg(data: &[u8], pts: Option<i64>, time_base: TimeBase) -> Result<Vid
                         && sof.components.len() <= 3
                         && sof.precision == 8;
                     if fast_path_ok {
-                        return decode_scan(&state, &sos, scan, pts, time_base);
+                        return decode_scan(&state, &sos, scan, pts);
                     }
                     if !state.seq_accum {
                         coef_buf = init_coef_buffers(sof)?;
@@ -493,7 +468,6 @@ fn decode_scan(
     sos: &SosInfo,
     scan: &[u8],
     pts: Option<i64>,
-    _time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -1593,7 +1567,6 @@ fn render_from_coefs(
     state: &JpegState,
     coefs: &[Vec<[i32; 64]>],
     pts: Option<i64>,
-    time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -1602,9 +1575,8 @@ fn render_from_coefs(
     // 12-bit precision JPEGs take their own render path — different level
     // shift, different clamp range, 16-bit-LE output planes.
     if sof.precision == 12 {
-        return render_from_coefs_12bit(state, coefs, pts, time_base);
+        return render_from_coefs_12bit(state, coefs, pts);
     }
-    let _ = time_base;
     let n_comp = sof.components.len();
     let grayscale = n_comp == 1;
     let width = sof.width as usize;
@@ -1848,7 +1820,6 @@ fn render_from_coefs_12bit(
     state: &JpegState,
     coefs: &[Vec<[i32; 64]>],
     pts: Option<i64>,
-    _time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -2000,7 +1971,6 @@ fn decode_lossless_scan(
     sos: &SosInfo,
     scan: &[u8],
     pts: Option<i64>,
-    _time_base: TimeBase,
 ) -> Result<VideoFrame> {
     let sof = state
         .sof
@@ -2150,7 +2120,7 @@ fn decode_lossless_scan(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod prog_tests {
     use super::*;
     use crate::jpeg::huffman::{HuffTable, STD_DC_LUMA_BITS, STD_DC_LUMA_VALS};
@@ -2380,11 +2350,12 @@ mod prog_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod non_interleaved_tests {
     use super::*;
     use crate::encoder::{encode_jpeg, encode_jpeg_non_interleaved};
-    use oxideav_core::frame::VideoPlane;
+    use crate::registry::make_decoder;
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     fn make_frame(w: u32, h: u32, pix: PixelFormat) -> VideoFrame {
         let (cw, ch) = match pix {
@@ -2482,10 +2453,11 @@ mod non_interleaved_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod cmyk_tests {
-    use super::*;
     use crate::encoder::encode_jpeg_cmyk_1111;
+    use crate::registry::make_decoder;
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     /// PSNR across all bytes of two buffers, treating them as 8-bit samples.
     fn psnr(a: &[u8], b: &[u8]) -> f64 {
@@ -2649,10 +2621,11 @@ mod cmyk_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod precision_12_tests {
-    use super::*;
     use crate::encoder::encode_grayscale_jpeg_12bit;
+    use crate::registry::make_decoder;
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     /// Decoder should accept a 12-bit precision grayscale JPEG and output
     /// `Gray12Le` with 16-bit LE samples. We feed a smooth gradient
@@ -2702,10 +2675,11 @@ mod precision_12_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod lossless_tests {
-    use super::*;
     use crate::encoder::encode_lossless_grayscale_jpeg_8bit;
+    use crate::registry::make_decoder;
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     /// Lossless JPEG is, by definition, bit-exact. The decoder should
     /// recover every sample of the input.
@@ -2773,7 +2747,7 @@ mod lossless_tests {
             .unwrap();
         let err = dec.receive_frame().expect_err("expected decode error");
         assert!(
-            matches!(err, Error::Unsupported(_)),
+            matches!(err, oxideav_core::Error::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
     }

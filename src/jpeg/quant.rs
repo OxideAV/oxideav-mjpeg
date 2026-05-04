@@ -4,7 +4,7 @@
 //! DQT segments encode values in zigzag order — `parse_dqt` unshuffles them
 //! on the way in. The encoder shuffles them back on the way out.
 
-use oxideav_core::{Error, Result};
+use crate::error::{MjpegError as Error, Result};
 
 use super::zigzag::ZIGZAG;
 

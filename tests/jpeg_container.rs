@@ -1,3 +1,4 @@
+#![cfg(feature = "registry")]
 //! Round-trip test for the still-image JPEG container.
 //!
 //! Encodes a synthetic 64x64 YUV420P frame through the MJPEG encoder, writes

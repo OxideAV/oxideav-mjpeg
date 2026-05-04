@@ -3,7 +3,7 @@
 //! Advances through a JPEG byte stream, returning each marker segment plus
 //! the entropy-coded scan data between SOS and the next marker.
 
-use oxideav_core::{Error, Result};
+use crate::error::{MjpegError as Error, Result};
 
 use super::markers;
 

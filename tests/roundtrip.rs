@@ -1,3 +1,4 @@
+#![cfg(feature = "registry")]
 //! Synthetic encode→decode roundtrip tests.
 
 use oxideav_core::frame::VideoPlane;

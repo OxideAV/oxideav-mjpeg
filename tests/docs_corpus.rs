@@ -1,3 +1,4 @@
+#![cfg(feature = "registry")]
 //! Integration tests against the docs/image/jpeg/ fixture corpus.
 //!
 //! Each fixture under `../../docs/image/jpeg/fixtures/<name>/` carries an

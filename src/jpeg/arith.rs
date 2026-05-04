@@ -9,7 +9,7 @@
 //! the only references used here are the T.81 spec PDF (in
 //! `docs/image/jpeg/`) and its Annex K.4 worked example (Tables K.7 / K.8).
 
-use oxideav_core::{Error, Result};
+use crate::error::{MjpegError as Error, Result};
 
 // ---------------------------------------------------------------------------
 // Probability-estimation state machine (Table D.3).

@@ -1,3 +1,4 @@
+#![cfg(feature = "registry")]
 //! End-to-end cross-codec roundtrip test for `oxideav-mjpeg`.
 //!
 //! The pipeline is the round-trip pattern from the task tracker:

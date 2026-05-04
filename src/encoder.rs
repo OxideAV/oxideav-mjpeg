@@ -23,13 +23,31 @@
 //! and round-trips losslessly against a spectral-selection-only decoder
 //! (including our own).
 
-use std::collections::VecDeque;
+use crate::error::{MjpegError as Error, Result};
 
-use oxideav_core::Encoder;
-use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame,
-};
+// When the `registry` feature is on, the public `encode_jpeg_*`
+// functions accept the framework's `oxideav_core::VideoFrame` /
+// `PixelFormat` types directly so callers that already operate on
+// trait-API plumbing don't have to translate. The inner code only
+// touches plane `(stride, data)` tuples and 4:4:4/4:2:2/4:2:0 YUV
+// pixel-format discriminants — both type families share that shape,
+// so the same encode helpers compile against either alias unchanged.
+//
+// With `--no-default-features` the same names resolve to the
+// crate-local [`MjpegFrame`] / [`MjpegPixelFormat`] / [`MjpegPlane`]
+// types so the standalone build never references `oxideav-core`.
+#[cfg(feature = "registry")]
+use oxideav_core::{PixelFormat, VideoFrame};
+
+#[cfg(not(feature = "registry"))]
+use crate::image::{MjpegFrame as VideoFrame, MjpegPixelFormat as PixelFormat};
+
+// Re-export the framework-side `Encoder` factory and concrete
+// `MjpegEncoder` at their historical paths so consumers (and
+// integration tests) that import `oxideav_mjpeg::encoder::make_encoder`
+// or `oxideav_mjpeg::encoder::MjpegEncoder` keep compiling.
+#[cfg(feature = "registry")]
+pub use crate::registry::{make_encoder, MjpegEncoder};
 
 use crate::jpeg::dct::fdct8x8;
 use crate::jpeg::huffman::{
@@ -42,151 +60,6 @@ use crate::jpeg::zigzag::ZIGZAG;
 
 /// Quality factor 1..=100 (libjpeg style). 75 is a sensible default.
 pub const DEFAULT_QUALITY: u8 = 75;
-
-pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Ok(MjpegEncoder::from_params(params)?)
-}
-
-/// JPEG encoder. Emits one self-contained JPEG bitstream (baseline SOF0
-/// or progressive SOF2) per video frame.
-pub struct MjpegEncoder {
-    output_params: CodecParameters,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) pix: PixelFormat,
-    quality: u8,
-    /// MCU-per-restart-interval count. 0 disables DRI / `RSTn` emission.
-    /// Restart intervals are only honoured on the baseline (SOF0) path
-    /// for now; progressive emission ignores this field.
-    restart_interval: u16,
-    /// When true, emit SOF2 + multi-scan (spectral selection only).
-    progressive: bool,
-    time_base: TimeBase,
-    pending: VecDeque<Packet>,
-    eof: bool,
-}
-
-impl MjpegEncoder {
-    /// Build a concrete `MjpegEncoder` from video codec parameters.
-    /// Preferred over `make_encoder` when the caller wants to tweak
-    /// encoder-specific knobs (e.g. progressive mode, restart interval)
-    /// before feeding frames.
-    pub fn from_params(params: &CodecParameters) -> Result<Box<Self>> {
-        let width = params
-            .width
-            .ok_or_else(|| Error::invalid("MJPEG encoder: missing width"))?;
-        let height = params
-            .height
-            .ok_or_else(|| Error::invalid("MJPEG encoder: missing height"))?;
-        let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        match pix {
-            PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P => {}
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "MJPEG encoder: pixel format {:?} not supported",
-                    pix
-                )))
-            }
-        }
-
-        let mut output_params = params.clone();
-        output_params.media_type = MediaType::Video;
-        output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
-        output_params.width = Some(width);
-        output_params.height = Some(height);
-        output_params.pixel_format = Some(pix);
-
-        Ok(Box::new(Self {
-            output_params,
-            width,
-            height,
-            pix,
-            quality: DEFAULT_QUALITY,
-            restart_interval: 0,
-            progressive: false,
-            time_base: params
-                .frame_rate
-                .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
-            pending: VecDeque::new(),
-            eof: false,
-        }))
-    }
-
-    /// Set the restart interval in MCUs (JPEG DRI field). `0` disables
-    /// restart marker emission (matches the default).
-    ///
-    /// Values are clamped to `u16::MAX` since the JPEG DRI field is a
-    /// 16-bit big-endian unsigned integer.
-    ///
-    /// Currently only applied on the baseline encode path; enabling
-    /// progressive output via [`Self::set_progressive`] suppresses
-    /// restart-marker emission.
-    pub fn set_restart_interval(&mut self, mcus: u32) {
-        self.restart_interval = mcus.min(u16::MAX as u32) as u16;
-    }
-
-    /// Current restart interval (MCUs between `RSTn` markers; 0 = off).
-    pub fn restart_interval(&self) -> u16 {
-        self.restart_interval
-    }
-
-    /// Enable or disable progressive (SOF2) JPEG emission. When enabled
-    /// the encoder produces one DC-first scan plus two per-component AC
-    /// band scans (Ss=1..5 then Ss=6..63). See module-level docs.
-    pub fn set_progressive(&mut self, on: bool) {
-        self.progressive = on;
-    }
-
-    /// True when progressive emission is enabled.
-    pub fn progressive(&self) -> bool {
-        self.progressive
-    }
-}
-
-impl Encoder for MjpegEncoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.output_params.codec_id
-    }
-
-    fn output_params(&self) -> &CodecParameters {
-        &self.output_params
-    }
-
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        match frame {
-            Frame::Video(v) => {
-                let data = if self.progressive {
-                    encode_jpeg_progressive(v, self.width, self.height, self.pix, self.quality)?
-                } else {
-                    encode_jpeg_with_opts(
-                        v,
-                        self.width,
-                        self.height,
-                        self.pix,
-                        self.quality,
-                        self.restart_interval,
-                    )?
-                };
-                let mut pkt = Packet::new(0, self.time_base, data);
-                pkt.pts = v.pts;
-                pkt.dts = v.pts;
-                pkt.flags.keyframe = true;
-                self.pending.push_back(pkt);
-                Ok(())
-            }
-            _ => Err(Error::invalid("MJPEG encoder: video frames only")),
-        }
-    }
-
-    fn receive_packet(&mut self) -> Result<Packet> {
-        self.pending.pop_front().ok_or(Error::NeedMore)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.eof = true;
-        Ok(())
-    }
-}
 
 // ---- Encoding ------------------------------------------------------------
 

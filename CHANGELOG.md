@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Default-on `registry` Cargo feature gates the `oxideav-core`
+  dependency, the `Decoder` / `Encoder` trait implementations, the
+  still-image JPEG container demuxer / muxer / probe, and the
+  `register_codecs` / `register` / `register_containers` entry points.
+  Image-library consumers can now depend on `oxideav-mjpeg` with
+  `default-features = false` and skip the `oxideav-core` dep tree
+  entirely; the standalone path exposes `decoder::decode_jpeg` and the
+  `encoder::encode_jpeg_*` family plus crate-local `MjpegFrame` /
+  `MjpegPlane` / `MjpegPixelFormat` / `MjpegError` types built only on
+  `std`.
+- Inline `ci-standalone` CI job verifies `cargo build --lib
+  --no-default-features` and `cargo test --no-default-features` stay
+  green on every change.
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.2...v0.1.3) - 2026-05-03
 
 ### Other

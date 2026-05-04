@@ -171,7 +171,7 @@ fn scan_for_sof(data: &[u8]) -> Result<SofInfo> {
         };
         if markers::is_sof(marker) {
             let payload = walker.read_segment_payload()?;
-            return parse_sof(payload);
+            return Ok(parse_sof(payload)?);
         }
         // SOI / EOI / RST have no length field. Everything else does.
         if marker == SOI || marker == EOI || markers::is_rst(marker) {

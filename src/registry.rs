@@ -29,9 +29,7 @@ use oxideav_core::{
 
 use crate::container;
 use crate::decoder::decode_jpeg;
-use crate::encoder::{
-    encode_jpeg_progressive, encode_jpeg_with_opts, DEFAULT_QUALITY,
-};
+use crate::encoder::{encode_jpeg_progressive, encode_jpeg_with_opts, DEFAULT_QUALITY};
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 use crate::CODEC_ID_STR;
@@ -253,9 +251,7 @@ impl MjpegEncoder {
             ))
         })?;
         match pix {
-            MjpegPixelFormat::Yuv420P
-            | MjpegPixelFormat::Yuv422P
-            | MjpegPixelFormat::Yuv444P => {}
+            MjpegPixelFormat::Yuv420P | MjpegPixelFormat::Yuv422P | MjpegPixelFormat::Yuv444P => {}
             _ => {
                 return Err(Error::unsupported(format!(
                     "MJPEG encoder: pixel format {pix_core:?} not supported"

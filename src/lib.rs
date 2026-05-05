@@ -64,8 +64,8 @@
 //!
 //! The crate's default `registry` Cargo feature pulls in `oxideav-core`
 //! and exposes the `Decoder` / `Encoder` trait surface, the JPEG-still
-//! container, and the [`registry::register`] / [`registry::register_containers`]
-//! entry points. Disable the feature (`default-features = false`) for
+//! container, and the [`registry::register`] / [`registry::register_codecs`]
+//! / [`registry::register_containers`] entry points. Disable the feature (`default-features = false`) for
 //! an oxideav-core-free build that still exposes the standalone
 //! [`decoder::decode_jpeg`] API plus crate-local [`MjpegFrame`] /
 //! [`MjpegPlane`] / [`MjpegPixelFormat`] / [`MjpegError`] types built
@@ -94,4 +94,23 @@ pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 // `registry` so image-library callers can build the crate without
 // dragging in `oxideav-core`.
 #[cfg(feature = "registry")]
-pub use registry::{register, register_containers};
+pub use registry::{register, register_codecs, register_containers};
+
+#[cfg(all(test, feature = "registry"))]
+mod register_tests {
+    use oxideav_core::RuntimeContext;
+
+    #[test]
+    fn register_via_runtime_context_installs_factories() {
+        let mut ctx = RuntimeContext::new();
+        super::register(&mut ctx);
+        assert!(
+            ctx.codecs.decoder_ids().next().is_some(),
+            "register(ctx) should install codec decoder factories"
+        );
+        assert!(
+            ctx.containers.demuxer_names().next().is_some(),
+            "register(ctx) should install container demuxer factories"
+        );
+    }
+}

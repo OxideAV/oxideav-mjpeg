@@ -27,16 +27,14 @@ Motion-JPEG streams (inside AVI / MOV / AMV / etc.) reuse the same
 codec — each video packet is a full JPEG.
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
-use oxideav_core::Frame;
+use oxideav_core::{Frame, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_mjpeg::register(&mut codecs);
-oxideav_mjpeg::register_containers(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_mjpeg::register(&mut ctx);
+let codecs = &ctx.codecs;
+let containers = &ctx.containers;
 
-let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
+let input: Box<dyn oxideav_core::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("photo.jpg")?),
 );
 let mut dmx = containers.open("jpeg", input)?;

@@ -24,7 +24,7 @@ use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
     ContainerRegistry, Decoder, Encoder, Error, Frame, MediaType, Packet, PixelFormat, Result,
-    TimeBase, VideoFrame,
+    RuntimeContext, TimeBase, VideoFrame,
 };
 
 use crate::container;
@@ -138,19 +138,18 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Backward-compatible alias for [`register_codecs`]. The crate has
-/// shipped this name through 0.1.x and downstream callers (the
-/// umbrella `oxideav` crate, oxideav-cli, etc.) reference it
-/// unchanged.
-pub fn register(reg: &mut CodecRegistry) {
-    register_codecs(reg);
-}
-
 /// Register the still-image JPEG container (`.jpg` / `.jpeg`). Must be
-/// called alongside [`register`] when wiring up a pipeline that expects
-/// to read or write raw JPEG files.
+/// called alongside [`register_codecs`] when wiring up a pipeline that
+/// expects to read or write raw JPEG files.
 pub fn register_containers(reg: &mut ContainerRegistry) {
     container::register(reg);
+}
+
+/// Unified entry point: install every codec and container provided by
+/// `oxideav-mjpeg` into a [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 // ---- Decoder trait impl ------------------------------------------------

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.3...v0.1.4) - 2026-05-04
+
+### Fixed
+
+- *(clippy)* drop unused Decoder import + div_ceil + doc lints
+
+### Other
+
+- cargo fmt: collapse import + match-arm wrap in registry.rs
+- add default-on `registry` cargo feature for standalone-friendly builds
+- end-to-end cross-codec roundtrip via libturbojpeg
+
 ### Added
 
 - Default-on `registry` Cargo feature gates the `oxideav-core`

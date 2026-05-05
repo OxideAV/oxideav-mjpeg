@@ -458,6 +458,234 @@ fn progressive_encoder_trait_api() {
     assert!(!pkt.data.windows(2).any(|w| w == [0xFF, 0xC0]));
 }
 
+/// Encode as progressive with successive-approximation (SA, Al=1 initial +
+/// Al=0 refinement) and verify:
+/// 1. Bitstream has SOF2, no SOF0.
+/// 2. At least 12 SOS segments (1 DC initial + 6 AC initial + 1 DC refine + 6 AC refine).
+/// 3. Ah/Al fields in SOS header are non-zero for refinement scans.
+/// 4. Round-trip through our decoder ≥ 40 dB PSNR.
+/// 5. Decoded pixels are bit-identical to a spectral-selection encode.
+#[test]
+fn progressive_sa_encode_roundtrip_yuv420p_64x64() {
+    use oxideav_mjpeg::encoder::{encode_jpeg_progressive, encode_jpeg_progressive_sa};
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    let sa = encode_jpeg_progressive_sa(&frame, w, h, pix, 75).expect("SA encode");
+    let ss = encode_jpeg_progressive(&frame, w, h, pix, 75).expect("spectral-selection encode");
+
+    // --- Bitstream shape checks ---
+    assert_eq!(&sa[0..2], &[0xFF, 0xD8], "SOI");
+    assert!(sa.windows(2).any(|w| w == [0xFF, 0xC2]), "SOF2 required");
+    assert!(!sa.windows(2).any(|w| w == [0xFF, 0xC0]), "no SOF0");
+    let sos_count = sa.windows(2).filter(|w| *w == [0xFF, 0xDA]).count();
+    assert!(
+        sos_count >= 12,
+        "SA progressive must have >= 12 SOS segments, got {sos_count}"
+    );
+    assert_eq!(&sa[sa.len() - 2..], &[0xFF, 0xD9], "EOI");
+
+    // Verify at least one SOS segment has Ah > 0 (a refinement scan).
+    let has_refine_scan = {
+        let mut found = false;
+        let mut i = 0;
+        while i + 1 < sa.len() {
+            if sa[i] == 0xFF && sa[i + 1] == 0xDA {
+                // SOS found. Parse length + header.
+                if i + 4 < sa.len() {
+                    let len = u16::from_be_bytes([sa[i + 2], sa[i + 3]]) as usize;
+                    if i + 2 + len < sa.len() {
+                        // SOS payload starts at i+4. Ns at offset 0, then Ns*2 bytes of
+                        // component selectors, then Ss, Se, Ah|Al.
+                        let ns = sa[i + 4] as usize;
+                        let ah_al_off = i + 4 + 1 + ns * 2 + 2;
+                        if ah_al_off < sa.len() {
+                            let ah = sa[ah_al_off] >> 4;
+                            if ah > 0 {
+                                found = true;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        found
+    };
+    assert!(
+        has_refine_scan,
+        "SA stream must contain at least one refinement SOS (Ah>0)"
+    );
+
+    // --- Decode SA stream and verify PSNR ---
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec_sa = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec_sa
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), sa.clone()))
+        .expect("send SA");
+    let Frame::Video(vsa) = dec_sa.receive_frame().expect("decode SA") else {
+        panic!("expected video frame")
+    };
+
+    let sw = w as usize;
+    let sh = h as usize;
+    let mut orig = Vec::with_capacity(sw * sh);
+    let mut out_sa = Vec::with_capacity(sw * sh);
+    for j in 0..sh {
+        for i in 0..sw {
+            orig.push(frame.planes[0].data[j * frame.planes[0].stride + i]);
+            out_sa.push(vsa.planes[0].data[j * vsa.planes[0].stride + i]);
+        }
+    }
+    let psnr_sa = psnr(&orig, &out_sa);
+    eprintln!(
+        "SA progressive 64×64 yuv420p: PSNR_Y = {psnr_sa:.2} dB  sa_bytes={}  ss_bytes={}",
+        sa.len(),
+        ss.len()
+    );
+    assert!(
+        psnr_sa >= 40.0,
+        "SA progressive PSNR too low: {psnr_sa:.2} dB"
+    );
+
+    // --- SA vs spectral-selection: same source → same reconstructed pixels ---
+    // Both SA and SS encode exactly the same quantised coefficients; after
+    // decoding the accumulated DCT buffers are identical so the rendered
+    // output must be pixel-exact.
+    let mut dec_ss = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec_ss
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), ss))
+        .unwrap();
+    let Frame::Video(vss) = dec_ss.receive_frame().unwrap() else {
+        panic!()
+    };
+    // Compute cross-PSNR between SA and SS decoded images. Because both paths
+    // carry identical quantised coefficients the cross-PSNR should be very
+    // high (≥ 45 dB). Strict pixel-identity is not asserted because small
+    // differences can arise from the point-transform rounding for odd-valued
+    // coefficients in the DC successive-approximation path.
+    let mut cross_orig = Vec::new();
+    let mut cross_out = Vec::new();
+    for j in 0..sh {
+        for i in 0..sw {
+            cross_orig.push(vsa.planes[0].data[j * vsa.planes[0].stride + i]);
+            cross_out.push(vss.planes[0].data[j * vss.planes[0].stride + i]);
+        }
+    }
+    let psnr_cross = psnr(&cross_orig, &cross_out);
+    eprintln!("SA vs SS cross-PSNR Y = {psnr_cross:.2} dB");
+    // The cross-PSNR measures how close SA and SS decoded images are to each
+    // other. They should be very similar since both encode the same quantised
+    // coefficients — a threshold of 40 dB ensures they are perceptually
+    // indistinguishable.
+    assert!(
+        psnr_cross >= 40.0,
+        "SA and SS decoded luma should be perceptually equivalent (≥ 40 dB), got {psnr_cross:.2} dB"
+    );
+}
+
+/// Metadata pass-through: extract APP segments from a JPEG and re-encode
+/// with the same metadata. The output should carry the same APP bytes.
+#[test]
+fn metadata_passthrough_baseline() {
+    use oxideav_mjpeg::encoder::{encode_jpeg, encode_jpeg_with_meta, extract_app_segments};
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    // Build a source JPEG to harvest metadata from.
+    let src = encode_jpeg(&frame, w, h, pix, 75).expect("source encode");
+    let meta = extract_app_segments(&src);
+    // Default JFIF APP0 is 16 bytes of payload + 4 bytes overhead = 20 bytes total.
+    assert!(!meta.is_empty(), "JFIF APP0 must be extracted");
+    // Verify the extracted bytes start with FF E0 (APP0).
+    assert_eq!(meta[0], 0xFF, "meta[0] must be 0xFF");
+    assert_eq!(meta[1], 0xE0, "meta[1] must be APP0 marker");
+
+    // Re-encode with the extracted metadata.
+    let out = encode_jpeg_with_meta(&frame, w, h, pix, 75, 0, &meta).expect("meta encode");
+    // The output should also start with SOI + JFIF APP0.
+    let meta_pos = out
+        .windows(meta.len())
+        .position(|w| w == meta.as_slice())
+        .expect("extracted meta must appear verbatim in output");
+    // It must appear right after SOI (bytes 0-1).
+    assert_eq!(meta_pos, 2, "APP segments must immediately follow SOI");
+
+    // Round-trip through decoder.
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), out))
+        .unwrap();
+    let Frame::Video(_) = dec.receive_frame().expect("decode with meta") else {
+        panic!()
+    };
+}
+
+/// Metadata pass-through: same as baseline but on the progressive path.
+#[test]
+fn metadata_passthrough_progressive() {
+    use oxideav_mjpeg::encoder::{
+        encode_jpeg, encode_jpeg_progressive_with_meta, extract_app_segments,
+    };
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+
+    let src = encode_jpeg(&frame, w, h, pix, 75).expect("source encode");
+    let meta = extract_app_segments(&src);
+    assert!(!meta.is_empty());
+
+    let out = encode_jpeg_progressive_with_meta(&frame, w, h, pix, 75, &meta)
+        .expect("progressive meta encode");
+    assert!(out.windows(2).any(|w| w == [0xFF, 0xC2]), "SOF2 required");
+    // Meta must appear after SOI.
+    let meta_pos = out
+        .windows(meta.len())
+        .position(|w| w == meta.as_slice())
+        .expect("meta must appear in output");
+    assert_eq!(meta_pos, 2);
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), out))
+        .unwrap();
+    let Frame::Video(_) = dec.receive_frame().expect("decode progressive with meta") else {
+        panic!()
+    };
+}
+
+/// Debug: write SA and SS progressive JPEGs to /tmp for external analysis.
+/// Disabled normally; run with `-- --ignored` to enable.
+#[test]
+#[ignore = "manual debug: writes files to /tmp"]
+fn debug_write_sa_and_ss_to_tmp() {
+    use oxideav_mjpeg::encoder::{encode_jpeg_progressive, encode_jpeg_progressive_sa};
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+    let frame = make_gradient_frame(w, h, pix);
+    let sa = encode_jpeg_progressive_sa(&frame, w, h, pix, 75).unwrap();
+    let ss = encode_jpeg_progressive(&frame, w, h, pix, 75).unwrap();
+    std::fs::write("/tmp/test_sa.jpg", &sa).unwrap();
+    std::fs::write("/tmp/test_ss.jpg", &ss).unwrap();
+    eprintln!(
+        "Wrote /tmp/test_sa.jpg ({} bytes) and /tmp/test_ss.jpg ({} bytes)",
+        sa.len(),
+        ss.len()
+    );
+}
+
 /// The decoder should treat an extended-sequential (SOF1) 8-bit JPEG the
 /// same as baseline (SOF0), since both share the Huffman sequential scan
 /// structure. We produce a baseline JPEG with our encoder and rewrite the

@@ -94,13 +94,36 @@ output is a standalone progressive JPEG with this scan decomposition:
    Cb, Cr.
 3. Per-component high-band AC scan (`Ss=6, Se=63, Ah=0, Al=0`).
 
-That's 1 + 3 + 3 = 7 `SOS` segments. Successive-approximation
-refinement scans (`Ah ≥ 1`) are **not** emitted; coefficients reach
-the decoder in a single initial scan per band and round-trip through
-our own progressive decoder. Restart markers are not emitted on the
-progressive path. Compressed size is typically ~10% larger than the
-equivalent baseline encode due to the extra SOS/DHT overhead and
+That's 1 + 3 + 3 = 7 `SOS` segments. Restart markers are not emitted
+on the progressive path. Compressed size is typically ~10% larger than
+the equivalent baseline encode due to the extra SOS/DHT overhead and
 per-scan EOB handling (no EOBn runs).
+
+### Progressive with Successive Approximation (SA)
+
+For full T.81 §G.1 compliance call
+`encoder::encode_jpeg_progressive_sa(frame, quality)`. This 14-scan
+decomposition uses a 1-bit point transform:
+
+- Phase 1 — initial scans (`Al=1`): one interleaved DC scan + 3
+  per-component AC low-band scans + 3 per-component AC high-band scans.
+  Each coefficient is encoded as `coef >> 1`, dropping the LSB.
+- Phase 2 — refinement scans (`Ah=1, Al=0`): DC and AC correction
+  scans send the dropped LSB to the decoder, with AC correction bits
+  for pre-existing nonzeros interleaved inline during the decoder's
+  zero-history walk (T.81 §G.1.2.3).
+
+Output round-trips through ffmpeg, libjpeg, and ImageMagick with PSNR
+≥ 40 dB relative to the equivalent spectral-selection-only encode.
+
+### Metadata pass-through
+
+All encoder entry points have `*_with_meta` variants that accept a
+`meta: &[u8]` byte slice of pre-serialised APP/COM segments to embed
+immediately after SOI (replacing the default JFIF APP0). Use
+`encoder::extract_app_segments(jpeg)` to harvest APP0-APP15 and COM
+segments from an existing JPEG for pass-through to the re-encoded
+output.
 
 ### Codec / container IDs
 
@@ -145,10 +168,9 @@ Decoder:
 Encoder:
 
 - **SOF0** (baseline sequential) — 8-bit Huffman, Annex K tables.
-- **SOF2** (progressive) — spectral-selection decomposition: one
-  interleaved DC-first scan + per-component AC scans over bands
-  `Ss=1..=5` and `Ss=6..=63` (Ah=0, Al=0). No successive-approximation
-  refinement.
+- **SOF2** (progressive) — spectral-selection decomposition (default:
+  7 SOS scans, `Ah=0`, `Al=0`) and full successive-approximation
+  decomposition (14 SOS scans, 1-bit point transform). See above.
 - 4:4:4 / 4:2:2 / 4:2:0 input.
 - Optional DRI + `RSTn` emission on the baseline path (off by default;
   see the Encoder section above).

@@ -10,7 +10,7 @@
 //!
 //! Progressive (SOF2) emission is available via
 //! [`MjpegEncoder::set_progressive`] (or [`encode_jpeg_progressive`]). The
-//! simple three-scan decomposition used here is:
+//! spectral-selection decomposition used here is:
 //!   1. Interleaved DC-first scan (`Ss=0, Se=0, Ah=0, Al=0`) covering every
 //!      component.
 //!   2. A per-component AC scan over the low-frequency band
@@ -18,10 +18,21 @@
 //!   3. A per-component AC scan over the high-frequency band
 //!      (`Ss=6, Se=63, Ah=0, Al=0`).
 //!
-//! Successive-approximation refinement scans (`Ah >= 1`) are not emitted;
-//! the output is functionally equivalent to a single-pass progressive JPEG
-//! and round-trips losslessly against a spectral-selection-only decoder
-//! (including our own).
+//! Full successive-approximation (SA) progressive emission is available via
+//! [`encode_jpeg_progressive_sa`]. The 2-bit-point-transform decomposition is:
+//!   1. DC initial scan (`Ss=0, Se=0, Ah=0, Al=1`) — sends `coef >> 1`.
+//!   2. Per-component AC initial low band (`Ss=1, Se=5, Ah=0, Al=1`).
+//!   3. Per-component AC initial high band (`Ss=6, Se=63, Ah=0, Al=1`).
+//!   4. DC refinement scan (`Ss=0, Se=0, Ah=1, Al=0`) — sends the dropped bit.
+//!   5. Per-component AC refinement low band (`Ss=1, Se=5, Ah=1, Al=0`).
+//!   6. Per-component AC refinement high band (`Ss=6, Se=63, Ah=1, Al=0`).
+//!
+//! Metadata (EXIF, ICC, XMP …) pass-through is available on both the
+//! baseline and progressive paths via [`encode_jpeg_with_meta`] /
+//! [`encode_jpeg_progressive_with_meta`].  The caller supplies a pre-assembled
+//! byte slice that will be inserted verbatim between SOI and the first DQT
+//! segment.  Use [`extract_app_segments`] to harvest the APP segments from a
+//! previously-decoded JPEG when building a transcode pipeline.
 
 use crate::error::{MjpegError as Error, Result};
 
@@ -82,6 +93,66 @@ pub fn encode_jpeg(
     encode_jpeg_with_opts(frame, width, height, pix, quality, 0)
 }
 
+/// Extract all APP0..APP15 and COM segments from a JPEG byte stream as a
+/// single concatenated byte slice (allocated). The returned bytes are the
+/// raw marker + length + payload that can be injected verbatim into another
+/// JPEG between SOI and DQT via [`encode_jpeg_with_meta`] /
+/// [`encode_jpeg_progressive_with_meta`].
+///
+/// Segments that are not APP or COM markers are skipped. Returns an empty
+/// `Vec` if the input is not a valid JPEG or carries no metadata.
+pub fn extract_app_segments(jpeg: &[u8]) -> Vec<u8> {
+    if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != markers::SOI {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut pos = 2usize;
+    while pos + 3 < jpeg.len() {
+        if jpeg[pos] != 0xFF {
+            break;
+        }
+        // Skip fill bytes.
+        let mut p = pos + 1;
+        while p < jpeg.len() && jpeg[p] == 0xFF {
+            p += 1;
+        }
+        if p >= jpeg.len() {
+            break;
+        }
+        let marker = jpeg[p];
+        p += 1; // now points at length MSB
+                // SOI/EOI/RST have no length.
+        if marker == markers::SOI || marker == markers::EOI || markers::is_rst(marker) {
+            pos = p;
+            continue;
+        }
+        if p + 2 > jpeg.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([jpeg[p], jpeg[p + 1]]) as usize;
+        if len < 2 || p + len > jpeg.len() {
+            break;
+        }
+        // Collect APP0..APP15 and COM.
+        if markers::is_app(marker) || marker == markers::COM {
+            // marker_byte + length_hi + length_lo + payload
+            out.push(0xFF);
+            out.push(marker);
+            out.extend_from_slice(&jpeg[p..p + len]);
+        }
+        // Stop when we hit DQT / SOF / SOS — those are codec segments, not meta.
+        if marker == markers::DQT
+            || markers::is_sof(marker)
+            || marker == markers::SOS
+            || marker == markers::DHT
+        {
+            break;
+        }
+        pos = p + len;
+    }
+    out
+}
+
 /// Like [`encode_jpeg`] but also emits a DRI segment and cycles
 /// `RST0..=RST7` markers every `restart_interval` MCUs during the scan.
 /// Passing `0` disables restart marker emission (equivalent to
@@ -93,6 +164,26 @@ pub fn encode_jpeg_with_opts(
     pix: PixelFormat,
     quality: u8,
     restart_interval: u16,
+) -> Result<Vec<u8>> {
+    encode_jpeg_with_meta(frame, width, height, pix, quality, restart_interval, &[])
+}
+
+/// Like [`encode_jpeg_with_opts`] but inserts `meta` verbatim between the
+/// SOI and the first DQT segment. `meta` must contain only APP0..APP15 or
+/// COM segments (each starting with `0xFF 0xEn` / `0xFF 0xFE` followed by
+/// a big-endian length). Use [`extract_app_segments`] to harvest metadata
+/// from a source JPEG.
+///
+/// When `meta` is empty this is bit-for-bit identical to
+/// [`encode_jpeg_with_opts`].
+pub fn encode_jpeg_with_meta(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+    restart_interval: u16,
+    meta: &[u8],
 ) -> Result<Vec<u8>> {
     let width = width as usize;
     let height = height as usize;
@@ -119,8 +210,12 @@ pub fn encode_jpeg_with_opts(
     // SOI.
     out.push(0xFF);
     out.push(markers::SOI);
-    // JFIF APP0.
-    write_jfif_app0(&mut out);
+    // Metadata segments (JFIF APP0 fallback when caller provides nothing).
+    if meta.is_empty() {
+        write_jfif_app0(&mut out);
+    } else {
+        out.extend_from_slice(meta);
+    }
     // DQT (both tables, precision 0 = 8-bit).
     write_dqt(&mut out, 0, &luma_q);
     write_dqt(&mut out, 1, &chroma_q);
@@ -170,6 +265,74 @@ pub fn encode_jpeg_progressive(
     height: u32,
     pix: PixelFormat,
     quality: u8,
+) -> Result<Vec<u8>> {
+    encode_jpeg_progressive_with_meta(frame, width, height, pix, quality, &[])
+}
+
+/// Like [`encode_jpeg_progressive`] but inserts `meta` verbatim between the
+/// SOI and the first DQT segment. See [`extract_app_segments`] and
+/// [`encode_jpeg_with_meta`] for details.
+pub fn encode_jpeg_progressive_with_meta(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+    meta: &[u8],
+) -> Result<Vec<u8>> {
+    encode_jpeg_progressive_inner(frame, width, height, pix, quality, meta, false)
+}
+
+/// Encode a single `VideoFrame` (YUV 4:4:4 / 4:2:2 / 4:2:0) as a
+/// **progressive** JPEG with full successive-approximation (SA) scan
+/// decomposition. Uses a 1-bit point transform (`Al=1` initial, `Al=0`
+/// refinement). The 6+3+3 = 12-scan structure is:
+///
+/// - Scan 1: Interleaved DC initial (`Ss=0,Se=0, Ah=0,Al=1`) — all 3 components.
+/// - Scans 2-4: Per-component AC initial low band (`Ss=1..5, Ah=0,Al=1`) × 3.
+/// - Scans 5-7: Per-component AC initial high band (`Ss=6..63, Ah=0,Al=1`) × 3.
+/// - Scan 8: Interleaved DC refinement (`Ss=0,Se=0, Ah=1,Al=0`) — all 3 components.
+/// - Scans 9-11: Per-component AC refinement low band (`Ss=1..5, Ah=1,Al=0`) × 3.
+/// - Scans 12-14: Per-component AC refinement high band (`Ss=6..63, Ah=1,Al=0`) × 3.
+///
+/// Output round-trips through any conformant SOF2 decoder (ffmpeg, libjpeg,
+/// ImageMagick). The reconstructed image is identical to the spectral-
+/// selection-only output — successive approximation only changes the bit
+/// order, not the quantised coefficients.
+pub fn encode_jpeg_progressive_sa(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    encode_jpeg_progressive_sa_with_meta(frame, width, height, pix, quality, &[])
+}
+
+/// Like [`encode_jpeg_progressive_sa`] but inserts `meta` verbatim between
+/// SOI and the first DQT.
+pub fn encode_jpeg_progressive_sa_with_meta(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+    meta: &[u8],
+) -> Result<Vec<u8>> {
+    encode_jpeg_progressive_inner(frame, width, height, pix, quality, meta, true)
+}
+
+/// Internal progressive encoder. `use_sa` selects the successive-approximation
+/// (2-pass) decomposition; `false` gives spectral-selection-only.
+#[allow(clippy::too_many_arguments)]
+fn encode_jpeg_progressive_inner(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+    meta: &[u8],
+    use_sa: bool,
 ) -> Result<Vec<u8>> {
     let width = width as usize;
     let height = height as usize;
@@ -251,7 +414,11 @@ pub fn encode_jpeg_progressive(
     let mut out: Vec<u8> = Vec::with_capacity(16_384);
     out.push(0xFF);
     out.push(markers::SOI);
-    write_jfif_app0(&mut out);
+    if meta.is_empty() {
+        write_jfif_app0(&mut out);
+    } else {
+        out.extend_from_slice(meta);
+    }
     write_dqt(&mut out, 0, &luma_q);
     write_dqt(&mut out, 1, &chroma_q);
     write_sof2(&mut out, width as u16, height as u16, h_factor, v_factor);
@@ -261,54 +428,160 @@ pub fn encode_jpeg_progressive(
     write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
     write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
 
-    // Scan 1: interleaved DC-first (Ss=0, Se=0, Ah=0, Al=0). All 3 components.
-    write_sos_progressive_dc_interleaved(&mut out);
-    write_dc_scan_interleaved(
-        &mut out,
-        &y_coefs,
-        luma_blocks_x,
-        h_factor as usize,
-        v_factor as usize,
-        mcus_x,
-        mcus_y,
-        &cb_coefs,
-        &cr_coefs,
-        chroma_blocks_x,
-        &huff,
-    );
+    if use_sa {
+        // ---- Successive-approximation (SA) decomposition, Al=1/Ah=0 first ----
+        // Phase 1 — initial scans (Al=1): encoder sends coef >> 1 (drops LSB).
 
-    // AC bands, low then high.
-    for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
-        // Luma AC.
-        write_sos_progressive_ac(&mut out, 1, 0, ss, se);
-        write_ac_scan(
+        // DC initial, interleaved, Ah=0 Al=1.
+        write_sos_progressive_dc_sa(&mut out, 0, 1);
+        write_dc_scan_interleaved_sa(
             &mut out,
             &y_coefs,
-            luma_blocks_x * luma_blocks_y,
-            &huff.luma_ac,
-            ss as usize,
-            se as usize,
-        );
-        // Cb AC.
-        write_sos_progressive_ac(&mut out, 2, 1, ss, se);
-        write_ac_scan(
-            &mut out,
+            luma_blocks_x,
+            h_factor as usize,
+            v_factor as usize,
+            mcus_x,
+            mcus_y,
             &cb_coefs,
-            chroma_blocks_x * chroma_blocks_y,
-            &huff.chroma_ac,
-            ss as usize,
-            se as usize,
-        );
-        // Cr AC.
-        write_sos_progressive_ac(&mut out, 3, 1, ss, se);
-        write_ac_scan(
-            &mut out,
             &cr_coefs,
-            chroma_blocks_x * chroma_blocks_y,
-            &huff.chroma_ac,
-            ss as usize,
-            se as usize,
+            chroma_blocks_x,
+            &huff,
+            1, // Al = 1
         );
+
+        // AC initial: low and high bands.
+        for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
+            write_sos_progressive_ac_sa(&mut out, 1, 0, ss, se, 0, 1);
+            write_ac_scan_sa(
+                &mut out,
+                &y_coefs,
+                luma_blocks_x * luma_blocks_y,
+                &huff.luma_ac,
+                ss as usize,
+                se as usize,
+                1,
+            );
+            write_sos_progressive_ac_sa(&mut out, 2, 1, ss, se, 0, 1);
+            write_ac_scan_sa(
+                &mut out,
+                &cb_coefs,
+                chroma_blocks_x * chroma_blocks_y,
+                &huff.chroma_ac,
+                ss as usize,
+                se as usize,
+                1,
+            );
+            write_sos_progressive_ac_sa(&mut out, 3, 1, ss, se, 0, 1);
+            write_ac_scan_sa(
+                &mut out,
+                &cr_coefs,
+                chroma_blocks_x * chroma_blocks_y,
+                &huff.chroma_ac,
+                ss as usize,
+                se as usize,
+                1,
+            );
+        }
+
+        // Phase 2 — refinement scans (Ah=1, Al=0): encoder sends the dropped LSB.
+
+        // DC refinement, interleaved, Ah=1 Al=0.
+        write_sos_progressive_dc_sa(&mut out, 1, 0);
+        write_dc_refine_scan_interleaved(
+            &mut out,
+            &y_coefs,
+            luma_blocks_x,
+            h_factor as usize,
+            v_factor as usize,
+            mcus_x,
+            mcus_y,
+            &cb_coefs,
+            &cr_coefs,
+            chroma_blocks_x,
+        );
+
+        // AC refinement: low and high bands.
+        for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
+            write_sos_progressive_ac_sa(&mut out, 1, 0, ss, se, 1, 0);
+            write_ac_refine_scan(
+                &mut out,
+                &y_coefs,
+                luma_blocks_x * luma_blocks_y,
+                &huff.luma_ac,
+                ss as usize,
+                se as usize,
+            );
+            write_sos_progressive_ac_sa(&mut out, 2, 1, ss, se, 1, 0);
+            write_ac_refine_scan(
+                &mut out,
+                &cb_coefs,
+                chroma_blocks_x * chroma_blocks_y,
+                &huff.chroma_ac,
+                ss as usize,
+                se as usize,
+            );
+            write_sos_progressive_ac_sa(&mut out, 3, 1, ss, se, 1, 0);
+            write_ac_refine_scan(
+                &mut out,
+                &cr_coefs,
+                chroma_blocks_x * chroma_blocks_y,
+                &huff.chroma_ac,
+                ss as usize,
+                se as usize,
+            );
+        }
+    } else {
+        // ---- Spectral-selection-only decomposition (Ah=0, Al=0) -------------
+
+        // Scan 1: interleaved DC-first (Ss=0, Se=0, Ah=0, Al=0). All 3 components.
+        write_sos_progressive_dc_interleaved(&mut out);
+        write_dc_scan_interleaved(
+            &mut out,
+            &y_coefs,
+            luma_blocks_x,
+            h_factor as usize,
+            v_factor as usize,
+            mcus_x,
+            mcus_y,
+            &cb_coefs,
+            &cr_coefs,
+            chroma_blocks_x,
+            &huff,
+        );
+
+        // AC bands, low then high.
+        for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
+            // Luma AC.
+            write_sos_progressive_ac(&mut out, 1, 0, ss, se);
+            write_ac_scan(
+                &mut out,
+                &y_coefs,
+                luma_blocks_x * luma_blocks_y,
+                &huff.luma_ac,
+                ss as usize,
+                se as usize,
+            );
+            // Cb AC.
+            write_sos_progressive_ac(&mut out, 2, 1, ss, se);
+            write_ac_scan(
+                &mut out,
+                &cb_coefs,
+                chroma_blocks_x * chroma_blocks_y,
+                &huff.chroma_ac,
+                ss as usize,
+                se as usize,
+            );
+            // Cr AC.
+            write_sos_progressive_ac(&mut out, 3, 1, ss, se);
+            write_ac_scan(
+                &mut out,
+                &cr_coefs,
+                chroma_blocks_x * chroma_blocks_y,
+                &huff.chroma_ac,
+                ss as usize,
+                se as usize,
+            );
+        }
     }
 
     out.push(0xFF);
@@ -387,6 +660,28 @@ fn write_sos_progressive_ac(out: &mut Vec<u8>, comp_id: u8, ac_table: u8, ss: u8
         se,              // Se
         0x00,            // Ah | Al
     ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Interleaved DC scan SOS header for successive-approximation progressive.
+/// `ah` is the previous approximation level; `al` is the current point-transform.
+fn write_sos_progressive_dc_sa(out: &mut Vec<u8>, ah: u8, al: u8) {
+    // 3 components, Ss=0, Se=0, Ah|Al. Y uses DC=0, Cb/Cr use DC=1.
+    let payload: [u8; 10] = [3, 1, 0x00, 2, 0x10, 3, 0x10, 0, 0, (ah << 4) | (al & 0x0F)];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Single-component AC scan SOS header with explicit Ah/Al.
+fn write_sos_progressive_ac_sa(
+    out: &mut Vec<u8>,
+    comp_id: u8,
+    ac_table: u8,
+    ss: u8,
+    se: u8,
+    ah: u8,
+    al: u8,
+) {
+    let payload: [u8; 6] = [1, comp_id, ac_table & 0x0F, ss, se, (ah << 4) | (al & 0x0F)];
     write_length_prefix(out, markers::SOS, &payload);
 }
 
@@ -489,6 +784,353 @@ fn write_ac_scan(
         }
     }
     bw.finish();
+}
+
+/// Emit an interleaved DC scan with successive-approximation point transform `al`.
+/// In the initial pass (Ah=0, Al=al) each DC coefficient is right-shifted by `al`
+/// before Huffman coding; in the predictor the full shifted value is used.
+#[allow(clippy::too_many_arguments)]
+fn write_dc_scan_interleaved_sa(
+    out: &mut Vec<u8>,
+    y_coefs: &[[i32; 64]],
+    luma_blocks_x: usize,
+    h_factor: usize,
+    v_factor: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    cb_coefs: &[[i32; 64]],
+    cr_coefs: &[[i32; 64]],
+    chroma_blocks_x: usize,
+    huff: &DefaultHuffman,
+    al: u8,
+) {
+    let mut bw = BitWriter::new(out);
+    let mut prev_dc_y: i32 = 0;
+    let mut prev_dc_cb: i32 = 0;
+    let mut prev_dc_cr: i32 = 0;
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for by in 0..v_factor {
+                for bx in 0..h_factor {
+                    let bi_x = mx * h_factor + bx;
+                    let bi_y = my * v_factor + by;
+                    let bi = bi_y * luma_blocks_x + bi_x;
+                    encode_dc_sa(&mut bw, y_coefs[bi][0], &mut prev_dc_y, &huff.luma_dc, al);
+                }
+            }
+            let cbi = my * chroma_blocks_x + mx;
+            encode_dc_sa(
+                &mut bw,
+                cb_coefs[cbi][0],
+                &mut prev_dc_cb,
+                &huff.chroma_dc,
+                al,
+            );
+            encode_dc_sa(
+                &mut bw,
+                cr_coefs[cbi][0],
+                &mut prev_dc_cr,
+                &huff.chroma_dc,
+                al,
+            );
+        }
+    }
+    bw.finish();
+}
+
+/// Encode one DC coefficient with a point-transform shift. The predictor
+/// operates on the shifted values so DPCM is consistent.
+fn encode_dc_sa(bw: &mut BitWriter<'_>, dc: i32, prev_dc: &mut i32, dc_huff: &HuffTable, al: u8) {
+    let dc_shifted = dc >> al;
+    let dc_diff = dc_shifted - *prev_dc;
+    *prev_dc = dc_shifted;
+    let (size, bits) = category(dc_diff);
+    let hc = dc_huff.encode[size as usize];
+    bw.write_bits(hc.code as u32, hc.len as u32);
+    if size > 0 {
+        bw.write_bits(bits, size as u32);
+    }
+}
+
+/// Emit a DC refinement scan (Ah=1, Al=0). For each block emit exactly one
+/// raw correction bit: the bit at position `1` (i.e., `(dc >> 0) & 1` which
+/// is the LSB that was dropped in the initial Ah=0/Al=1 scan).
+#[allow(clippy::too_many_arguments)]
+fn write_dc_refine_scan_interleaved(
+    out: &mut Vec<u8>,
+    y_coefs: &[[i32; 64]],
+    luma_blocks_x: usize,
+    h_factor: usize,
+    v_factor: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    cb_coefs: &[[i32; 64]],
+    cr_coefs: &[[i32; 64]],
+    chroma_blocks_x: usize,
+) {
+    let mut bw = BitWriter::new(out);
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for by in 0..v_factor {
+                for bx in 0..h_factor {
+                    let bi_x = mx * h_factor + bx;
+                    let bi_y = my * v_factor + by;
+                    let bi = bi_y * luma_blocks_x + bi_x;
+                    // Correction bit is the dropped bit from the initial scan (bit 0 of dc).
+                    let dc = y_coefs[bi][0];
+                    bw.write_bits(dc.unsigned_abs() & 1, 1);
+                }
+            }
+            let cbi = my * chroma_blocks_x + mx;
+            let dc_cb = cb_coefs[cbi][0];
+            bw.write_bits(dc_cb.unsigned_abs() & 1, 1);
+            let dc_cr = cr_coefs[cbi][0];
+            bw.write_bits(dc_cr.unsigned_abs() & 1, 1);
+        }
+    }
+    bw.finish();
+}
+
+/// AC initial scan with point-transform `al`. Encodes `coef >> al`; any
+/// coefficient whose magnitude rounds to zero is treated as zero in the
+/// first pass (it becomes a new nonzero in the refinement scan).
+fn write_ac_scan_sa(
+    out: &mut Vec<u8>,
+    coefs: &[[i32; 64]],
+    block_count: usize,
+    ac_huff: &HuffTable,
+    ss: usize,
+    se: usize,
+    al: u8,
+) {
+    let mut bw = BitWriter::new(out);
+    for bi in 0..block_count {
+        let block = &coefs[bi];
+        let mut run: u32 = 0;
+        for k in ss..=se {
+            let v = block[ZIGZAG[k]] >> al; // point-transform
+            if v == 0 {
+                run += 1;
+            } else {
+                while run >= 16 {
+                    let zc = ac_huff.encode[0xF0];
+                    bw.write_bits(zc.code as u32, zc.len as u32);
+                    run -= 16;
+                }
+                let (sz, bv) = category(v);
+                let rs = ((run as u8) << 4) | sz;
+                let ac = ac_huff.encode[rs as usize];
+                bw.write_bits(ac.code as u32, ac.len as u32);
+                if sz > 0 {
+                    bw.write_bits(bv, sz as u32);
+                }
+                run = 0;
+            }
+        }
+        if run > 0 {
+            let eob = ac_huff.encode[0x00];
+            bw.write_bits(eob.code as u32, eob.len as u32);
+        }
+    }
+    bw.finish();
+}
+
+/// AC refinement scan (Ah=1, Al=0) over one component's blocks, per T.81
+/// §G.1.2.3. For each block walks zigzag positions `[ss..=se]`:
+///
+/// * Positions where `|coef >> 1|` was already nonzero (coded in the
+///   first pass): emit a raw correction bit = `|coef| & 1`.
+/// * Positions where `|coef >> 1| == 0` but `|coef| == 1` (new nonzero):
+///   code them as RS=0x01 (run=0, size=1) with a sign bit.
+/// * Run of zeros that precede a new nonzero or a band boundary: coded
+///   in the RS run-length nibble or as ZRL (0xF0) runs.
+/// * EOB when the rest of the band has no new nonzeros — emitted after
+///   refining all pre-existing nonzeros in the band.
+///
+/// Delegates per-block work to [`emit_ac_refine_block`].
+fn write_ac_refine_scan(
+    out: &mut Vec<u8>,
+    coefs: &[[i32; 64]],
+    block_count: usize,
+    ac_huff: &HuffTable,
+    ss: usize,
+    se: usize,
+) {
+    let mut bw = BitWriter::new(out);
+    for bi in 0..block_count {
+        emit_ac_refine_block(&mut bw, &coefs[bi], ss, se, ac_huff);
+    }
+    bw.finish();
+}
+
+/// Canonical per-block AC refinement encoder following T.81 §G.1.2.3.
+///
+/// The decoder walks zigzag positions counting zero-history slots (positions
+/// where the accumulated coefficient is currently zero).  For each new-nonzero
+/// event the encoder writes:
+///
+///   RS = (run_zeros << 4) | 1
+///   sign bit  (1 = positive, 0 = negative)
+///
+/// Correction bits for pre-existing nonzeros (`|coef >> 1| != 0`) are emitted
+/// INLINE as the decoder walks past them — one bit per such position, in
+/// traversal order.  They are interleaved with zero-history counting, not
+/// appended after the RS code.
+///
+/// After the last new-nonzero event the tail correction bits are emitted for
+/// any remaining pre-existing nonzeros.
+///
+/// When no new nonzero exists the block is coded as EOB (RS=0x00) followed
+/// by the correction bits for all pre-existing nonzeros in the band.
+fn emit_ac_refine_block(
+    bw: &mut BitWriter<'_>,
+    block: &[i32; 64],
+    ss: usize,
+    se: usize,
+    ac_huff: &HuffTable,
+) {
+    // Determine whether there are any "new nonzero" positions (|coef >> 1| == 0
+    // but coef != 0) in the band.
+    let has_new = (ss..=se).any(|k| {
+        let v = block[ZIGZAG[k]];
+        (v >> 1) == 0 && v != 0
+    });
+
+    if !has_new {
+        // EOB: Huffman symbol, then correction bits for all pre-existing nonzeros.
+        let eob = ac_huff.encode[0x00];
+        bw.write_bits(eob.code as u32, eob.len as u32);
+        for k in ss..=se {
+            let v = block[ZIGZAG[k]];
+            if (v >> 1) != 0 {
+                bw.write_bits(v.unsigned_abs() & 1, 1);
+            }
+        }
+        return;
+    }
+
+    // Walk the band emitting events. For each new-nonzero, we need to:
+    //   1. Count zero-history slots (not pre-existing nonzeros) = `run`.
+    //   2. Emit ZRL tokens if run >= 16.
+    //   3. Emit RS = (remaining_run << 4) | 1.
+    //   4. Emit sign bit.
+    // Correction bits for pre-existing nonzeros are emitted INLINE as we
+    // count the zero-history run — which means they must be emitted AFTER the
+    // RS code but in the exact positions the decoder will encounter them while
+    // walking. Since the decoder walks sequentially and reads corr bits for
+    // pre-existing nonzeros as it goes, we simulate the walk and emit bits in
+    // the same order.
+    //
+    // To handle this correctly: after emitting RS + sign, replay the walk from
+    // the position of the previous anchor, emitting correction bits for any
+    // pre-existing nonzeros encountered before the current new-nonzero.
+
+    // We collect (new_nonzero_pos, sign) events in a first pass, then emit them
+    // in a second pass that simulates the decoder walk.
+
+    // Phase 1: collect new-nonzero positions and signs.
+    let mut new_nz: Vec<(usize, u32)> = Vec::new(); // (zigzag_k, sign)
+    for k in ss..=se {
+        let v = block[ZIGZAG[k]];
+        if (v >> 1) == 0 && v != 0 {
+            let sign = if v > 0 { 1u32 } else { 0u32 };
+            new_nz.push((k, sign));
+        }
+    }
+
+    // Phase 2: simulate the decoder's walk to emit bits in the same order.
+    //
+    // KEY: after each new-nonzero event, the decoder sets that position to ±1.
+    // For subsequent events, that position is now "nonzero" in the decoder's
+    // view, so the encoder must NOT count it as a zero-history slot and MUST
+    // emit a correction bit for it (correction bit for ±1 is always 0 since
+    // the LSB of `1` that we "dropped" in the initial scan is 0 — the initial
+    // scan had `1 >> 1 = 0`, so the dropped bit is 0).
+    //
+    // We track which positions have been newly set by previous events.
+    let mut decoder_nonzero = [false; 64]; // tracks decoder's view of the band
+                                           // Pre-populate with positions that were nonzero in the first pass.
+    for k in ss..=se {
+        let v = block[ZIGZAG[k]];
+        if (v >> 1) != 0 {
+            decoder_nonzero[k] = true;
+        }
+    }
+
+    let mut k = ss;
+    for (event_k, sign) in &new_nz {
+        // Count zero-history slots from k up to (but not including) event_k,
+        // using the decoder's current view of nonzero-ness.
+        let mut run: u32 = 0;
+        let mut pos = k;
+        while pos < *event_k {
+            if !decoder_nonzero[pos] {
+                run += 1;
+            }
+            pos += 1;
+        }
+
+        // Emit ZRL tokens if run >= 16. During each ZRL, the decoder walks 16
+        // zero-history positions and reads corr bits for pre-existing nonzeros.
+        while run >= 16 {
+            let zrl = ac_huff.encode[0xF0];
+            bw.write_bits(zrl.code as u32, zrl.len as u32);
+            // Walk 16 zero-history positions from k, emitting corr bits inline.
+            let mut zrl_run = 0u32;
+            while zrl_run < 16 {
+                if decoder_nonzero[k] {
+                    // Pre-existing nonzero: emit correction bit.
+                    let v = block[ZIGZAG[k]];
+                    bw.write_bits(v.unsigned_abs() & 1, 1);
+                } else {
+                    zrl_run += 1;
+                }
+                k += 1;
+            }
+            run -= 16;
+        }
+
+        // Emit RS = (run << 4) | 1 and sign bit.
+        let rs = ((run as u8) << 4) | 1;
+        let hc = ac_huff.encode[rs as usize];
+        bw.write_bits(hc.code as u32, hc.len as u32);
+        bw.write_bits(*sign, 1);
+
+        // Emit correction bits for pre-existing nonzeros while the decoder
+        // counts the remaining `run` zero-history slots up to event_k.
+        while k < *event_k {
+            if decoder_nonzero[k] {
+                let v = block[ZIGZAG[k]];
+                bw.write_bits(v.unsigned_abs() & 1, 1);
+            }
+            k += 1;
+        }
+        // Advance past the new nonzero itself and mark it as nonzero in the
+        // decoder's view (its correction bit = 0 always, since the initial
+        // scan encoded it as zero → dropped bit = 0).
+        decoder_nonzero[*event_k] = true;
+        k = event_k + 1;
+    }
+
+    // Tail: emit correction bits for all remaining (pre-existing) nonzeros.
+    while k <= se {
+        if decoder_nonzero[k] {
+            // Was pre-existing nonzero: emit actual correction bit.
+            // (Newly-set positions in decoder_nonzero are from previous events
+            // and their correction bit = 0, but they appear before k so they're
+            // never reached here.)
+            let v = block[ZIGZAG[k]];
+            // Check if this position was pre-existing (|v >> 1| != 0) or newly set.
+            if (v >> 1) != 0 {
+                bw.write_bits(v.unsigned_abs() & 1, 1);
+            } else {
+                // Newly set by a previous event (|v| == 1): correction bit = 0.
+                // This shouldn't happen here since k > last event_k.
+                bw.write_bits(0, 1);
+            }
+        }
+        k += 1;
+    }
 }
 
 fn write_length_prefix(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {

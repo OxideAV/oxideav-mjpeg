@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `encode_jpeg_progressive_sa` / `encode_jpeg_progressive_sa_with_meta`: full
+  successive-approximation (SA) progressive JPEG encoder using a 1-bit point
+  transform (`Al=1` initial, `Ah=1,Al=0` refinement). Produces 14 SOS scans
+  (1 DC initial + 6 AC initial + 1 DC refine + 6 AC refine) that round-trip
+  through ffmpeg, libjpeg, and ImageMagick with PSNR ≥ 40 dB relative to the
+  source. Implements T.81 §G.1.2.3 AC refinement with correction bits
+  interleaved inline during the decoder's zero-history walk.
+- `encode_jpeg_with_meta` / `encode_jpeg_progressive_with_meta`: variants of
+  the baseline and spectral-selection progressive encoders that accept a `meta`
+  byte slice of pre-serialised APP0-APP15 and COM segments to embed verbatim,
+  replacing the default JFIF APP0 marker.
+- `extract_app_segments(jpeg: &[u8]) -> Vec<u8>`: walks a JPEG byte stream and
+  returns a contiguous buffer of all APP (0xFF 0xEn) and COM (0xFF 0xFE)
+  segment bytes, ready to pass as `meta` to the `*_with_meta` encoder family.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.4...v0.1.5) - 2026-05-05
 
 ### Other

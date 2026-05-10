@@ -152,9 +152,153 @@ pub mod libjpeg {
         pub rgb: Vec<u8>,
     }
 
+    /// A JPEG image as decoded by libturbojpeg into 4:2:0 YUV planes,
+    /// with each plane sized to the *visible* region (no MCU padding).
+    pub struct DecodedYuv420 {
+        pub width: u32,
+        pub height: u32,
+        /// Y plane, length `width * height`.
+        pub y: Vec<u8>,
+        /// Cb plane, length `ceil(width/2) * ceil(height/2)`.
+        pub cb: Vec<u8>,
+        /// Cr plane, length `ceil(width/2) * ceil(height/2)`.
+        pub cr: Vec<u8>,
+    }
+
+    /// Decode a JPEG byte string to 4:2:0 YUV planes via
+    /// `tjDecompressToYUVPlanes`. Each output plane is sized to the
+    /// visible image region (Y is `width × height`, Cb/Cr are
+    /// `ceil(width/2) × ceil(height/2)`) so it can be compared
+    /// directly against `oxideav-mjpeg`'s decoder output, which
+    /// trims padding the same way.
+    ///
+    /// Comparing in YUV space is what every cross-decode 4:2:0 fuzz
+    /// target *should* do: the chroma upsampling method (fancy vs
+    /// nearest) is a consumer choice and applying it on the harness
+    /// side introduces unbounded drift on tiny images with abrupt
+    /// chroma transitions (e.g. a 5×1 image where each chroma sample
+    /// covers a different colour). Our decoder is responsible for
+    /// the IDCT + dequantisation only; once that lands in YUV planes
+    /// it should match libjpeg byte-for-byte (within ≤1 LSB IDCT
+    /// precision slack).
+    pub fn decode_to_yuv420(data: &[u8]) -> Option<DecodedYuv420> {
+        type InitFn = unsafe extern "C" fn() -> TjHandle;
+        type DestroyFn = unsafe extern "C" fn(TjHandle) -> c_int;
+        type HeaderFn = unsafe extern "C" fn(
+            handle: TjHandle,
+            jpeg_buf: *const c_uchar,
+            jpeg_size: c_ulong,
+            width: *mut c_int,
+            height: *mut c_int,
+            jpeg_subsamp: *mut c_int,
+        ) -> c_int;
+        type DecYuvPlanesFn = unsafe extern "C" fn(
+            handle: TjHandle,
+            jpeg_buf: *const c_uchar,
+            jpeg_size: c_ulong,
+            dst_planes: *mut *mut c_uchar,
+            width: c_int,
+            strides: *mut c_int,
+            height: c_int,
+            flags: c_int,
+        ) -> c_int;
+        type PlaneWidthFn = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
+        type PlaneHeightFn = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
+
+        let l = lib()?;
+        unsafe {
+            let init: Symbol<InitFn> = l.get(b"tjInitDecompress").ok()?;
+            let destroy: Symbol<DestroyFn> = l.get(b"tjDestroy").ok()?;
+            let header: Symbol<HeaderFn> = l.get(b"tjDecompressHeader2").ok()?;
+            let dec: Symbol<DecYuvPlanesFn> = l.get(b"tjDecompressToYUVPlanes").ok()?;
+            let plane_w: Symbol<PlaneWidthFn> = l.get(b"tjPlaneWidth").ok()?;
+            let plane_h: Symbol<PlaneHeightFn> = l.get(b"tjPlaneHeight").ok()?;
+
+            let handle = init();
+            if handle.is_null() {
+                return None;
+            }
+            let mut w: c_int = 0;
+            let mut h: c_int = 0;
+            let mut subsamp: c_int = 0;
+            let header_rc = header(
+                handle,
+                data.as_ptr(),
+                data.len() as c_ulong,
+                &mut w,
+                &mut h,
+                &mut subsamp,
+            );
+            if header_rc != 0 || w <= 0 || h <= 0 || subsamp != TJSAMP_420 {
+                let _ = destroy(handle);
+                return None;
+            }
+            // libjpeg writes plane data in MCU-aligned rows (e.g. for
+            // a 5×1 image with 4:2:0, the Y plane gets two rows
+            // because the MCU row is 16 px tall — even though the
+            // visible image is one row). Allocate per
+            // tjPlaneWidth × tjPlaneHeight and use the same value as
+            // the row stride so libjpeg has a contiguous landing
+            // area, then trim down to the visible region for the
+            // caller-facing buffer.
+            let yw_full = plane_w(0, w, TJSAMP_420) as usize;
+            let yh_full = plane_h(0, h, TJSAMP_420) as usize;
+            let cw_full = plane_w(1, w, TJSAMP_420) as usize;
+            let ch_full = plane_h(1, h, TJSAMP_420) as usize;
+            let mut y_full = vec![0u8; yw_full * yh_full];
+            let mut cb_full = vec![0u8; cw_full * ch_full];
+            let mut cr_full = vec![0u8; cw_full * ch_full];
+            let mut planes: [*mut c_uchar; 3] = [
+                y_full.as_mut_ptr(),
+                cb_full.as_mut_ptr(),
+                cr_full.as_mut_ptr(),
+            ];
+            let mut strides: [c_int; 3] = [yw_full as c_int, cw_full as c_int, cw_full as c_int];
+            let dec_rc = dec(
+                handle,
+                data.as_ptr(),
+                data.len() as c_ulong,
+                planes.as_mut_ptr(),
+                w,
+                strides.as_mut_ptr(),
+                h,
+                TJFLAG_ACCURATEDCT,
+            );
+            let _ = destroy(handle);
+            if dec_rc != 0 {
+                return None;
+            }
+            // Trim each plane down to the visible region (tight
+            // packing, no MCU padding) so the caller can compare
+            // pixel-for-pixel against an oxideav-mjpeg decoder
+            // output that does the same trim.
+            let yw = w as usize;
+            let yh = h as usize;
+            let cw = yw.div_ceil(2);
+            let ch = yh.div_ceil(2);
+            let mut y = vec![0u8; yw * yh];
+            let mut cb = vec![0u8; cw * ch];
+            let mut cr = vec![0u8; cw * ch];
+            for j in 0..yh {
+                y[j * yw..j * yw + yw].copy_from_slice(&y_full[j * yw_full..j * yw_full + yw]);
+            }
+            for j in 0..ch {
+                cb[j * cw..j * cw + cw].copy_from_slice(&cb_full[j * cw_full..j * cw_full + cw]);
+                cr[j * cw..j * cw + cw].copy_from_slice(&cr_full[j * cw_full..j * cw_full + cw]);
+            }
+            Some(DecodedYuv420 {
+                width: w as u32,
+                height: h as u32,
+                y,
+                cb,
+                cr,
+            })
+        }
+    }
+
     /// Decode a JPEG byte string to packed RGB via `tjDecompressHeader2`
     /// + `tjDecompress2`. Returns `None` on libturbojpeg unavailable,
-    /// header parse failure, allocation overflow, or decode failure.
+    ///   header parse failure, allocation overflow, or decode failure.
     pub fn decode_to_rgb(data: &[u8]) -> Option<DecodedRgb> {
         type InitFn = unsafe extern "C" fn() -> TjHandle;
         type DestroyFn = unsafe extern "C" fn(TjHandle) -> c_int;
@@ -236,7 +380,7 @@ pub mod libjpeg {
 // ---------------------------------------------------------------------
 
 use oxideav_core::frame::VideoPlane;
-use oxideav_core::{PixelFormat, VideoFrame};
+use oxideav_core::VideoFrame;
 
 /// Maximum width allowed for synthesized fuzz inputs. Bounds the per-row
 /// MCU count so encoder/decoder allocations stay small in CI.
@@ -352,13 +496,34 @@ pub const SELF_TOLERANCE: i32 = 2;
 ///     (≤ 1 LSB on YUV per JPEG conformance).
 ///  2. Chroma upsampling method differences ("fancy" smoothing vs
 ///     nearest-neighbour) — ≤ ~2 LSB on chroma rows in 4:2:0 mode.
-///  3. YUV→RGB rounding done by libjpeg vs by our harness — ≤ ~1
+///  3. YUV→RGB rounding done by libjpeg vs by our harness → ≤ ~1
 ///     LSB per RGB component.
 ///
 /// ±5 LSB covers the worst-case sum without admitting real decoder
 /// bugs (which typically manifest as tens-of-LSB excursions or DC
 /// shifts across whole MCUs).
+///
+/// Note: this bound assumes natural-image chroma (slow-varying).
+/// For tiny synthetic inputs where a single chroma sample covers a
+/// hard colour edge, the chroma-upsampling-method delta alone can
+/// exceed 5 LSB after the YUV→RGB matrix. The
+/// `libjpeg_encode_oxideav_decode` target compares in YUV space
+/// (see [`YUV_TOLERANCE`]) instead, side-stepping this entirely.
 pub const CROSS_TOLERANCE: i32 = 5;
+
+/// Tolerance window for *YUV-plane* cross-decode assertions
+/// (libjpeg encode → oxideav decode, both observed in YUV before
+/// any chroma upsampling).
+///
+/// Comparing in YUV space drops two of the three slack sources
+/// `CROSS_TOLERANCE` budgets for: there is no chroma upsampling
+/// step on either side of the comparison, and no YUV→RGB matrix
+/// to introduce rounding drift. What remains is IDCT precision —
+/// JPEG conformance bounds this at ≤ 1 LSB per YUV component, but
+/// most implementations sit well inside that. ±2 LSB gives a one-
+/// LSB margin without admitting real decoder bugs (DC offsets,
+/// quantisation errors, etc.).
+pub const YUV_TOLERANCE: i32 = 2;
 
 /// Assert two equally-sized byte buffers agree to within `tolerance`
 /// LSBs at every position. Panics with the failing index, expected,
@@ -377,5 +542,61 @@ pub fn assert_within(expected: &[u8], actual: &[u8], tolerance: i32, context: &s
             d <= tolerance,
             "{context}: byte {i} differs by {d} > {tolerance} (expected {e}, actual {a})"
         );
+    }
+}
+
+/// Assert that the *visible* `width × height` region of a
+/// row-strided plane matches the corresponding region of a tight
+/// (`width × height`) reference, within `tolerance` LSBs at every
+/// pixel. The strided plane may carry MCU-padding past the visible
+/// columns; only the first `width` columns of each of the first
+/// `height` rows participate in the comparison.
+///
+/// Used to compare oxideav-mjpeg's per-plane decoder output (which
+/// may carry stride padding past the visible width on chroma planes
+/// at small image sizes) against libturbojpeg's tight YUV planes.
+#[allow(clippy::too_many_arguments)]
+pub fn assert_plane_within(
+    expected_tight: &[u8],
+    actual_strided: &[u8],
+    actual_stride: usize,
+    width: usize,
+    height: usize,
+    tolerance: i32,
+    context: &str,
+) {
+    let need_actual = if height == 0 {
+        0
+    } else {
+        actual_stride * (height - 1) + width
+    };
+    assert!(
+        actual_strided.len() >= need_actual,
+        "{context}: actual plane too small: have {} need {} (stride {}, {}x{})",
+        actual_strided.len(),
+        need_actual,
+        actual_stride,
+        width,
+        height
+    );
+    assert_eq!(
+        expected_tight.len(),
+        width * height,
+        "{context}: expected plane sized wrong: have {} need {} ({}x{} tight)",
+        expected_tight.len(),
+        width * height,
+        width,
+        height
+    );
+    for j in 0..height {
+        for i in 0..width {
+            let e = expected_tight[j * width + i] as i32;
+            let a = actual_strided[j * actual_stride + i] as i32;
+            let d = (e - a).abs();
+            assert!(
+                d <= tolerance,
+                "{context}: pixel ({i},{j}) differs by {d} > {tolerance} (expected {e}, actual {a})"
+            );
+        }
     }
 }

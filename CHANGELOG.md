@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Raw Motion-JPEG container demuxer (`mjpeg-raw`, owns the `.mjpeg` /
+  `.mjpg` extensions). One packet per JPEG frame in the stream, marker-
+  aware boundary scanner (T.81 §B.1.1.2 / §B.1.1.4) that honours
+  length-prefixed segment bodies — APP1 thumbnails, COM segments, etc.
+  cannot false-trigger an SOI / EOI match. Default time base is `1/25`
+  (frame `i` carries `pts = i`); callers that know the real rate can
+  post-process the emitted `StreamInfo::time_base`.
+- `Demuxer::seek_to(stream_index, pts)` on the raw MJPEG demuxer.
+  Lazy `(pts, byte_offset)` index pushed every 5 frames (anchor at
+  frame 0 seeded at open time); binary-search-then-linear-scan to the
+  exact target frame. Past-end targets clamp to the last frame and
+  surface `Error::Eof` from the following `next_packet`. Integration
+  tests in `tests/seek.rs` cover zero-reset, mid-stream seek, past-end
+  clamp, byte-stuffed `FF D8` false-positives, and byte-for-byte
+  parity with a baseline drain.
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.5...v0.1.6) - 2026-05-06
 
 ### Other

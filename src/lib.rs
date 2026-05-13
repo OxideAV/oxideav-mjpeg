@@ -81,6 +81,9 @@ pub mod jpeg;
 pub mod container;
 
 #[cfg(feature = "registry")]
+pub mod mjpeg_container;
+
+#[cfg(feature = "registry")]
 pub mod registry;
 
 pub const CODEC_ID_STR: &str = "mjpeg";

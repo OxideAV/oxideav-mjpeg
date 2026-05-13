@@ -132,6 +132,13 @@ output.
 - Container: `"jpeg"`, matches `.jpg` / `.jpeg` / `.jpe` / `.jfif` by
   extension and by `FF D8 FF` magic bytes. One frame per file; muxing
   is a pass-through of the codec packet.
+- Container: `"mjpeg-raw"`, matches `.mjpeg` / `.mjpg` by extension.
+  Raw concatenated SOI..EOI JPEG frames, one packet per frame.
+  Default time base is `1/25` so frame `i` carries `pts = i`; the
+  demuxer implements `seek_to(stream, pts)` with a marker-aware
+  scanner (no SOI false-positives from APP1 thumbnails / stuffed
+  entropy bytes) and a lazy `(pts, byte_offset)` waypoint index
+  (one entry every 5 frames).
 
 ## Format coverage
 

@@ -32,6 +32,7 @@ use crate::decoder::decode_jpeg;
 use crate::encoder::{encode_jpeg_progressive, encode_jpeg_with_opts, DEFAULT_QUALITY};
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
+use crate::mjpeg_container;
 use crate::CODEC_ID_STR;
 
 // ---- Error / pixel-format / frame conversions --------------------------
@@ -138,11 +139,18 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Register the still-image JPEG container (`.jpg` / `.jpeg`). Must be
-/// called alongside [`register_codecs`] when wiring up a pipeline that
-/// expects to read or write raw JPEG files.
+/// Register both JPEG-family containers:
+///
+/// - `jpeg` — still-image (`.jpg` / `.jpeg` / `.jpe` / `.jfif`), single
+///   packet per file.
+/// - `mjpeg-raw` — raw Motion-JPEG (`.mjpeg` / `.mjpg`), concatenated
+///   SOI..EOI frames, one packet per frame, with seek support.
+///
+/// Must be called alongside [`register_codecs`] when wiring up a
+/// pipeline that expects to read or write JPEG-family files.
 pub fn register_containers(reg: &mut ContainerRegistry) {
     container::register(reg);
+    mjpeg_container::register(reg);
 }
 
 /// Unified entry point: install every codec and container provided by

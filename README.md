@@ -1,10 +1,11 @@
 # oxideav-mjpeg
 
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
-decodes baseline (SOF0), extended-sequential (SOF1) and progressive
-(SOF2) 8-bit JPEGs, encodes baseline **and** progressive JPEG using the
-Annex K "typical" Huffman tables. YUV 4:4:4 / 4:2:2 / 4:2:0 and
-grayscale. Zero C dependencies.
+decodes baseline (SOF0), extended-sequential (SOF1), progressive (SOF2)
+and lossless (SOF3) 8-bit JPEGs, encodes baseline, progressive **and**
+lossless JPEG (the lossless path covers single-component grayscale at
+every precision `P ∈ 2..=16` and every Annex H Table H.1 predictor).
+YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -116,6 +117,39 @@ decomposition uses a 1-bit point transform:
 Output round-trips through ffmpeg, libjpeg, and ImageMagick with PSNR
 ≥ 40 dB relative to the equivalent spectral-selection-only encode.
 
+### Lossless (SOF3) encode
+
+For single-component grayscale input call
+`encoder::encode_lossless_jpeg_grayscale(width, height, samples,
+stride, precision, predictor)` directly:
+
+- `precision` must be in `2..=16`. Samples for `P ≤ 8` are one byte
+  each (`stride` = bytes per row); for `P > 8` they are 16-bit
+  little-endian (`stride` = `width * 2`).
+- `predictor` selects one of the Annex H Table H.1 spatial
+  predictors `1..=7` (1 = Ra / left is the safest default; 4..7 are
+  two-dimensional and can compress better on smooth images).
+- Output is bit-exact: the decoder side recovers every input sample
+  verbatim, including the special `Di = 32768` half-modulus case
+  (T.81 §H.1.2.2). Point transform is fixed at `Pt = 0` and no
+  restart markers are emitted.
+
+The same path is available through the trait-API encoder:
+
+```rust
+let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+params.width = Some(w);
+params.height = Some(h);
+params.pixel_format = Some(PixelFormat::Gray12Le);
+let mut enc = MjpegEncoder::from_params(&params)?;
+enc.set_lossless(true);
+enc.set_lossless_predictor(4);
+enc.send_frame(&frame)?;
+```
+
+Without `set_lossless(true)` the trait-API encoder rejects grayscale
+input rather than silently downgrading the bitstream.
+
 ### Metadata pass-through
 
 All encoder entry points have `*_with_meta` variants that accept a
@@ -178,7 +212,11 @@ Encoder:
 - **SOF2** (progressive) — spectral-selection decomposition (default:
   7 SOS scans, `Ah=0`, `Al=0`) and full successive-approximation
   decomposition (14 SOS scans, 1-bit point transform). See above.
-- 4:4:4 / 4:2:2 / 4:2:0 input.
+- **SOF3** (lossless) — single-component grayscale at any precision
+  `P ∈ 2..=16` and any Annex H Table H.1 predictor `1..=7`. Bit-exact
+  roundtrip including the SSSS=16 / Di=32768 half-modulus case.
+- 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths; `Gray8` /
+  `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless path.
 - Optional DRI + `RSTn` emission on the baseline path (off by default;
   see the Encoder section above).
 
@@ -187,7 +225,9 @@ Not supported (decoder returns `Error::Unsupported`):
 - Hierarchical (SOF5+), arithmetic-coded (SOF9..SOF15).
 - 12-bit progressive (SOF2 with `P=12`), 12-bit 4:2:2 / 4:4:4 YUV.
 - Progressive 4-component JPEGs.
-- Multi-component lossless JPEGs.
+- Multi-component lossless JPEGs (encoder + decoder; only grayscale).
+- Lossless encoder restart markers and non-zero point transform on
+  the encode side (the decoder already supports both).
 
 ## License
 

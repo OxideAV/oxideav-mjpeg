@@ -29,7 +29,9 @@ use oxideav_core::{
 
 use crate::container;
 use crate::decoder::decode_jpeg;
-use crate::encoder::{encode_jpeg_progressive, encode_jpeg_with_opts, DEFAULT_QUALITY};
+use crate::encoder::{
+    encode_jpeg_progressive, encode_jpeg_with_opts, encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
+};
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 use crate::mjpeg_container;
@@ -239,6 +241,12 @@ pub struct MjpegEncoder {
     restart_interval: u16,
     /// When true, emit SOF2 + multi-scan (spectral selection only).
     progressive: bool,
+    /// When true, take the lossless (SOF3) path for single-component
+    /// grayscale input. Ignored for any non-grayscale `pix`.
+    lossless: bool,
+    /// Lossless predictor selector (T.81 Table H.1, 1..=7). Only
+    /// consulted on the lossless path. Defaults to 1 (Ra / left).
+    lossless_predictor: u8,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -264,6 +272,15 @@ impl MjpegEncoder {
         })?;
         match pix {
             MjpegPixelFormat::Yuv420P | MjpegPixelFormat::Yuv422P | MjpegPixelFormat::Yuv444P => {}
+            // Grayscale takes the lossless (SOF3) path when requested via
+            // `set_lossless(true)`. Accepting it here lets callers wire a
+            // grayscale `CodecParameters` through the trait API directly
+            // rather than dropping to the standalone `encode_lossless_*`
+            // function.
+            MjpegPixelFormat::Gray8
+            | MjpegPixelFormat::Gray10Le
+            | MjpegPixelFormat::Gray12Le
+            | MjpegPixelFormat::Gray16Le => {}
             _ => {
                 return Err(Error::unsupported(format!(
                     "MJPEG encoder: pixel format {pix_core:?} not supported"
@@ -286,6 +303,11 @@ impl MjpegEncoder {
             quality: DEFAULT_QUALITY,
             restart_interval: 0,
             progressive: false,
+            // Lossless mode is opt-in even for grayscale: callers may
+            // legitimately want a (lossy) baseline encode of `Gray8`
+            // input in the future, so default to off.
+            lossless: false,
+            lossless_predictor: 1,
             time_base: params
                 .frame_rate
                 .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
@@ -323,6 +345,40 @@ impl MjpegEncoder {
     pub fn progressive(&self) -> bool {
         self.progressive
     }
+
+    /// Enable or disable lossless (SOF3) emission. Only honoured when
+    /// the input pixel format is `Gray8` / `Gray10Le` / `Gray12Le` /
+    /// `Gray16Le`; ignored for YUV inputs (which always take the
+    /// baseline / progressive DCT path).
+    ///
+    /// The lossless path is bit-exact and reuses the predictor selected
+    /// by [`Self::set_lossless_predictor`] (default 1 = Ra / left). It
+    /// ignores [`Self::set_progressive`] and [`Self::set_restart_interval`].
+    pub fn set_lossless(&mut self, on: bool) {
+        self.lossless = on;
+    }
+
+    /// True when lossless (SOF3) emission is enabled.
+    pub fn lossless(&self) -> bool {
+        self.lossless
+    }
+
+    /// Set the lossless predictor selector (T.81 Table H.1, 1..=7).
+    /// Values outside `1..=7` are silently clamped to 1 so the setter
+    /// can't fail; the value is consulted only when [`Self::set_lossless`]
+    /// has been enabled and the input is grayscale.
+    pub fn set_lossless_predictor(&mut self, predictor: u8) {
+        self.lossless_predictor = if (1..=7).contains(&predictor) {
+            predictor
+        } else {
+            1
+        };
+    }
+
+    /// Current lossless predictor selector.
+    pub fn lossless_predictor(&self) -> u8 {
+        self.lossless_predictor
+    }
 }
 
 impl Encoder for MjpegEncoder {
@@ -343,17 +399,66 @@ impl Encoder for MjpegEncoder {
                 // conditional alias in `encoder.rs`), so we can pass
                 // the frame through without local-type bounce.
                 let pix = self.pix.into();
-                let data = if self.progressive {
-                    encode_jpeg_progressive(v, self.width, self.height, pix, self.quality)?
-                } else {
-                    encode_jpeg_with_opts(
-                        v,
-                        self.width,
-                        self.height,
-                        pix,
-                        self.quality,
-                        self.restart_interval,
-                    )?
+                let data = match (self.pix, self.lossless) {
+                    // Grayscale + lossless → SOF3 path. Precision is
+                    // implied by the pixel format and we read row bytes
+                    // straight from plane 0.
+                    (MjpegPixelFormat::Gray8, true)
+                    | (MjpegPixelFormat::Gray10Le, true)
+                    | (MjpegPixelFormat::Gray12Le, true)
+                    | (MjpegPixelFormat::Gray16Le, true) => {
+                        if v.planes.is_empty() {
+                            return Err(Error::invalid(
+                                "MJPEG encoder: grayscale frame missing plane 0",
+                            ));
+                        }
+                        let plane = &v.planes[0];
+                        let precision: u8 = match self.pix {
+                            MjpegPixelFormat::Gray8 => 8,
+                            MjpegPixelFormat::Gray10Le => 10,
+                            MjpegPixelFormat::Gray12Le => 12,
+                            MjpegPixelFormat::Gray16Le => 16,
+                            _ => unreachable!(),
+                        };
+                        encode_lossless_jpeg_grayscale(
+                            self.width,
+                            self.height,
+                            &plane.data,
+                            plane.stride,
+                            precision,
+                            self.lossless_predictor,
+                        )?
+                    }
+                    // Grayscale without lossless enabled is currently
+                    // unsupported on the registry side (the baseline
+                    // DCT encoder still only handles YUV). Surface a
+                    // clear error rather than silently downgrading.
+                    (
+                        MjpegPixelFormat::Gray8
+                        | MjpegPixelFormat::Gray10Le
+                        | MjpegPixelFormat::Gray12Le
+                        | MjpegPixelFormat::Gray16Le,
+                        false,
+                    ) => {
+                        return Err(Error::unsupported(
+                            "MJPEG encoder: grayscale input requires set_lossless(true)",
+                        ));
+                    }
+                    // YUV inputs take the baseline / progressive DCT path.
+                    _ => {
+                        if self.progressive {
+                            encode_jpeg_progressive(v, self.width, self.height, pix, self.quality)?
+                        } else {
+                            encode_jpeg_with_opts(
+                                v,
+                                self.width,
+                                self.height,
+                                pix,
+                                self.quality,
+                                self.restart_interval,
+                            )?
+                        }
+                    }
                 };
                 let mut pkt = Packet::new(0, self.time_base, data);
                 pkt.pts = v.pts;

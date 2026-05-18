@@ -1907,60 +1907,200 @@ fn write_sos_grayscale(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
-/// Test-only: emit a single-component, 8-bit precision **lossless** JPEG
-/// (SOF3). Uses predictor 1 (Ra / left) and point-transform Pt=0. The
-/// Annex K 8-bit DC luma Huffman table is reused for the category codes
-/// (residuals stay in categories 0..=8 at 8-bit precision, well within
-/// the 0..=11 symbols that table provides).
-#[cfg(test)]
-pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
+// ---- Lossless JPEG encoder (SOF3, single-component grayscale) -----------
+
+/// Custom DC Huffman table for the lossless (SOF3) encoder.
+///
+/// Annex K's standard luma DC table (`STD_DC_LUMA_BITS` / `STD_DC_LUMA_VALS`)
+/// only covers SSSS symbols 0..=11, which is enough for 8-bit lossless but
+/// breaks at higher precisions where the residual magnitude category can
+/// reach 16 (T.81 Table H.2). We use a single canonical table that covers
+/// every SSSS value in 0..=16 and is therefore valid for any precision
+/// `P ∈ 2..=16`.
+///
+/// Layout (Kraft sum 1.0):
+///   * 15 symbols at code length 4 — SSSS 0..=14 (the common cases).
+///   * 2 symbols at code length 5 — SSSS 15 and 16 (large residuals).
+///
+/// `STD_DC_LOSSLESS_BITS[L-1]` is the count of codes of length `L`, and
+/// `STD_DC_LOSSLESS_VALS` is the canonical-order symbol list per
+/// T.81 Annex C.2.
+const STD_DC_LOSSLESS_BITS: [u8; 16] = [0, 0, 0, 15, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+const STD_DC_LOSSLESS_VALS: [u8; 17] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+/// Category for a lossless residual computed modulo 2^16 (T.81 §H.1.2.1).
+/// Returns `(ssss, bits, extra_bits_count)` where `extra_bits_count` is the
+/// number of magnitude bits to write after the Huffman code:
+///
+///   * `ssss == 0`       → no extra bits (residual is 0).
+///   * `1 <= ssss <= 15` → `ssss` extra bits per Annex F category code.
+///   * `ssss == 16`      → no extra bits; encodes the special diff value
+///     32768 (§H.1.2.2, Table H.2).
+///
+/// Caller passes the *unreduced* signed difference `diff = actual - pred`.
+/// The function handles the mod-2^16 reduction internally: any `diff`
+/// whose 16-bit-wrapped magnitude equals 0x8000 is mapped to `ssss == 16`
+/// regardless of original sign (since +32768 and -32768 alias under
+/// mod-2^16 arithmetic).
+fn category_lossless(diff: i32) -> (u8, u32) {
+    // Reduce to the canonical signed 16-bit representative: positive
+    // diffs > 32767 wrap below 0, and the lone half-modulus point
+    // (±32768) becomes the special SSSS=16 case.
+    let diff16 = (diff as i64) & 0xFFFF;
+    // Treat 0x8000 as the half-modulus point regardless of sign.
+    if diff16 == 0x8000 {
+        return (16, 0);
+    }
+    // Canonical signed: in -32767..=32767.
+    let signed: i32 = if diff16 >= 0x8000 {
+        (diff16 - 0x1_0000) as i32
+    } else {
+        diff16 as i32
+    };
+    category(signed)
+}
+
+/// Encode a single-component grayscale image as a standalone **lossless**
+/// JPEG (SOF3) byte stream.
+///
+/// * `samples` — row-major luminance samples; row `y` starts at byte
+///   `y * stride`. For 8-bit precision this carries one byte per sample;
+///   for `precision > 8` it must contain little-endian 16-bit samples
+///   (two bytes per sample) and `stride` is therefore in bytes.
+/// * `precision` — input bits per sample, in `2..=16`. Outside this
+///   range the function returns [`Error::Unsupported`].
+/// * `predictor` — selector value 1..=7 from T.81 Table H.1. Predictor
+///   1 (Ra) is the safest default; predictors 2 / 3 / 4..=7 may compress
+///   better on horizontally or vertically smooth images.
+///
+/// Output is bit-exact: the decoder side recovers every input sample
+/// verbatim. Point transform is fixed at `Pt = 0` and no restart markers
+/// are emitted. The encoder reuses the [`HuffTable`] machinery to build
+/// the wide-symbol DC table at construction time so the output stays
+/// universal for every precision in the valid range.
+pub fn encode_lossless_jpeg_grayscale(
     width: u32,
     height: u32,
     samples: &[u8],
     stride: usize,
+    precision: u8,
+    predictor: u8,
 ) -> Result<Vec<u8>> {
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "lossless encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
     let w = width as usize;
     let h = height as usize;
-    if samples.len() < stride * h {
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("lossless encoder: zero-size image"));
+    }
+    let bytes_per_sample = if precision <= 8 { 1 } else { 2 };
+    if stride < w * bytes_per_sample {
         return Err(Error::invalid(
-            "lossless helper: samples shorter than stride*h",
+            "lossless encoder: stride smaller than width*bytes_per_sample",
         ));
     }
-    let huff = DefaultHuffman::build()?;
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "lossless encoder: samples shorter than stride*h",
+        ));
+    }
 
-    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    // Build the wide-symbol DC Huffman table once per call. The
+    // STD_DC_LOSSLESS_* constants give a Kraft-complete (sum=1) layout
+    // valid for any precision in 2..=16, so no per-image table tuning
+    // is required for spec correctness.
+    let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 2 * w * h);
     out.push(0xFF);
     out.push(markers::SOI);
     write_jfif_app0(&mut out);
-    write_sof3_grayscale_8bit(&mut out, w as u16, h as u16);
-    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
-    write_sos_lossless(&mut out, 1 /* predictor = Ra */);
+    write_sof_lossless(&mut out, w as u16, h as u16, precision);
+    write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+    write_sos_lossless(&mut out, predictor);
 
-    // Predict + encode per-pixel in row-major order. Predictor matches
-    // the decoder's forced behaviour at y=0 (Ra) and x=0 (Rb); inside
-    // the image we use predictor 1 (Ra) to match the SOS selector.
-    let origin: i32 = 1 << 7; // 2^(P-Pt-1) with P=8 Pt=0.
+    // Decode samples into a flat u16 buffer once so the predictor loop
+    // doesn't have to branch on `precision` per pixel.
+    let mut src = vec![0u16; w * h];
+    if precision <= 8 {
+        for y in 0..h {
+            for x in 0..w {
+                src[y * w + x] = samples[y * stride + x] as u16;
+            }
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                let lo = samples[y * stride + x * 2] as u16;
+                let hi = samples[y * stride + x * 2 + 1] as u16;
+                src[y * w + x] = lo | (hi << 8);
+            }
+        }
+    }
+
+    // Validate that no input sample exceeds the declared precision.
+    let max_sample: u32 = (1u32 << precision) - 1;
+    for &v in &src {
+        if v as u32 > max_sample {
+            return Err(Error::invalid(format!(
+                "lossless encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+            )));
+        }
+    }
+
+    // Default prediction for the first sample of the scan and after each
+    // restart interval (T.81 §H.1.2.1). With Pt=0 this is 2^(P-1).
+    let origin: i32 = 1i32 << (precision - 1);
+
     let mut bw = BitWriter::new(&mut out);
-    let mut buf = vec![0u8; w * h];
     for y in 0..h {
         for x in 0..w {
-            buf[y * w + x] = samples[y * stride + x];
-            let actual = samples[y * stride + x] as i32;
+            let actual = src[y * w + x] as i32;
             let pred: i32 = if x == 0 && y == 0 {
                 origin
             } else if y == 0 {
-                buf[y * w + x - 1] as i32
+                // First line uses Ra regardless of selector (Table H.1
+                // applies after the first line / restart).
+                src[y * w + x - 1] as i32
             } else if x == 0 {
-                buf[(y - 1) * w + x] as i32
+                // Start of a non-first line uses Rb.
+                src[(y - 1) * w + x] as i32
             } else {
-                // Predictor 1 = Ra (left).
-                buf[y * w + x - 1] as i32
+                let ra = src[y * w + x - 1] as i32;
+                let rb = src[(y - 1) * w + x] as i32;
+                let rc = src[(y - 1) * w + x - 1] as i32;
+                match predictor {
+                    1 => ra,
+                    2 => rb,
+                    3 => rc,
+                    4 => ra + rb - rc,
+                    // Per H.1 footnote: divide-by-2 is an arithmetic shift.
+                    5 => ra + ((rb - rc) >> 1),
+                    6 => rb + ((ra - rc) >> 1),
+                    7 => (ra + rb) >> 1,
+                    _ => unreachable!(),
+                }
             };
-            let diff = actual - pred; // any value in -255..=255 at 8-bit
-            let (s, bits) = category(diff);
-            let hc = huff.luma_dc.encode[s as usize];
+            let diff = actual - pred;
+            let (s, bits) = category_lossless(diff);
+            let hc = dc_huff.encode[s as usize];
+            debug_assert!(
+                hc.len != 0,
+                "DC Huffman code for SSSS={s} must be present; \
+                 STD_DC_LOSSLESS_VALS covers 0..=16"
+            );
             bw.write_bits(hc.code as u32, hc.len as u32);
-            if s > 0 {
+            // SSSS == 0 emits no extra bits (zero residual); SSSS == 16
+            // also emits no extras (special-case Di = 32768 per H.1.2.2).
+            if s != 0 && s != 16 {
                 bw.write_bits(bits, s as u32);
             }
         }
@@ -1972,27 +2112,37 @@ pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
     Ok(out)
 }
 
+/// Back-compat wrapper kept for the existing 8-bit roundtrip test in
+/// `decoder::lossless_tests`. New callers should prefer
+/// [`encode_lossless_jpeg_grayscale`].
 #[cfg(test)]
-fn write_sof3_grayscale_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
-    let mut payload = Vec::with_capacity(8 + 3);
-    payload.push(8); // precision
-    payload.extend_from_slice(&height.to_be_bytes());
-    payload.extend_from_slice(&width.to_be_bytes());
-    payload.push(1); // Nf
-    payload.push(1); // component id
-    payload.push(0x11); // H=1 V=1
-    payload.push(0); // qt = 0 (unused for lossless, but the field is still present)
-                     // SOF3 = 0xC3
-    write_length_prefix(out, 0xC3, &payload);
+pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+) -> Result<Vec<u8>> {
+    encode_lossless_jpeg_grayscale(width, height, samples, stride, 8, 1)
 }
 
-#[cfg(test)]
+fn write_sof_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u8) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(precision);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf — single grayscale component
+    payload.push(1); // component id
+    payload.push(0x11); // H=1 V=1
+    payload.push(0); // Tq=0 (lossless ignores quant tables, but the byte is still present)
+    write_length_prefix(out, 0xC3 /* SOF3 */, &payload);
+}
+
 fn write_sos_lossless(out: &mut Vec<u8>, predictor: u8) {
     let payload: [u8; 6] = [
         1, // Ns
-        1, 0x00, // comp 1 → DC=0 AC=0 (AC unused)
-        predictor, 0, // Ss = predictor, Se = 0
-        0, // Ah | Al=0 (Pt=0)
+        1, 0x00, // comp 1 → DC=0 AC=0 (AC unused for lossless)
+        predictor, 0, // Ss = predictor selector, Se = 0
+        0, // Ah | Al — Pt=0 for now (the decoder still supports non-zero Pt)
     ];
     write_length_prefix(out, markers::SOS, &payload);
 }
@@ -2025,5 +2175,49 @@ mod tests {
         bw.write_bits(0xFF, 8);
         bw.finish();
         assert_eq!(buf, vec![0xFF, 0x00]);
+    }
+
+    #[test]
+    fn category_lossless_special_case_half_modulus() {
+        // The half-modulus point ±32768 collapses to SSSS=16 with zero
+        // extra bits per T.81 §H.1.2.2 (Table H.2).
+        assert_eq!(category_lossless(32768), (16, 0));
+        assert_eq!(category_lossless(-32768), (16, 0));
+        // Adjacent values fall back to the normal magnitude scheme:
+        // 32767 fits in 15 bits, encodes plain.
+        assert_eq!(category_lossless(32767).0, 15);
+        assert_eq!(category_lossless(-32767).0, 15);
+    }
+
+    #[test]
+    fn category_lossless_mod_2_to_16_aliases() {
+        // The encoder reduces diff modulo 2^16, so values like 65536+x
+        // (which the i32-domain calculation might produce when actual
+        // is near 2^16 and pred is small) must collapse to x.
+        for v in [-65535i32, -65000, -16384, 0, 16384, 65000, 65535] {
+            let (s1, b1) = category_lossless(v);
+            let (s2, b2) = category_lossless(v + 0x1_0000);
+            assert_eq!((s1, b1), (s2, b2), "mod-2^16 alias mismatch at v={v}");
+        }
+    }
+
+    #[test]
+    fn lossless_dc_huff_table_kraft_complete() {
+        // STD_DC_LOSSLESS_BITS must satisfy the Kraft equality so every
+        // SSSS in 0..=16 has a unique prefix-free code.
+        let mut kraft_num: u32 = 0; // numerator over 2^16
+        for (i, &n) in STD_DC_LOSSLESS_BITS.iter().enumerate() {
+            let len = (i + 1) as u32;
+            kraft_num += (n as u32) * (1u32 << (16 - len));
+        }
+        assert_eq!(kraft_num, 1 << 16, "Kraft inequality must equal exactly 1");
+        // Symbol coverage: all 17 SSSS values present.
+        assert_eq!(STD_DC_LOSSLESS_VALS.len(), 17);
+        let mut seen = [false; 17];
+        for &v in &STD_DC_LOSSLESS_VALS {
+            assert!((v as usize) < 17, "symbol {v} out of expected 0..=16 range");
+            seen[v as usize] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "every SSSS in 0..=16 must appear");
     }
 }

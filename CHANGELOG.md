@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encoder::encode_lossless_jpeg_grayscale(width, height, samples,
+  stride, precision, predictor)`: public single-component grayscale
+  lossless JPEG (SOF3) encoder. Supports every precision `P ∈ 2..=16`
+  and every Annex H Table H.1 predictor `1..=7`. Output is bit-exact —
+  the existing SOF3 grayscale decoder recovers every sample verbatim,
+  including the special SSSS=16 / Di=32768 half-modulus case (T.81
+  §H.1.2.2). Uses a single canonical wide-symbol DC Huffman table
+  (`STD_DC_LOSSLESS_*`) that is Kraft-complete over symbols 0..=16, so
+  the same table is valid at every supported precision without
+  per-image tuning.
+- `MjpegEncoder::set_lossless(bool)` /
+  `MjpegEncoder::set_lossless_predictor(u8)` on the registry-side
+  encoder. With `set_lossless(true)` the trait-API encoder accepts
+  `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` `VideoFrame` input
+  and dispatches to the lossless path; without the flag, grayscale
+  input is rejected with a clear error so the historical YUV-only
+  contract stays explicit.
 - Raw Motion-JPEG container demuxer (`mjpeg-raw`, owns the `.mjpeg` /
   `.mjpg` extensions). One packet per JPEG frame in the stream, marker-
   aware boundary scanner (T.81 §B.1.1.2 / §B.1.1.4) that honours

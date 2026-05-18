@@ -31,7 +31,12 @@
 //! `encoder::MjpegEncoder::set_progressive` or
 //! `encoder::encode_jpeg_progressive`; it emits a DC-first scan
 //! followed by two per-component AC band scans (spectral selection
-//! only, `Ah = Al = 0`).
+//! only, `Ah = Al = 0`). A lossless (SOF3) grayscale output mode is
+//! available via `encoder::encode_lossless_jpeg_grayscale` (or
+//! `MjpegEncoder::set_lossless(true)` on the trait-API encoder):
+//! every precision `P ∈ 2..=16` and every Annex H Table H.1 spatial
+//! predictor `1..=7` are supported, and the bitstream round-trips
+//! bit-exact through the matching SOF3 decoder.
 //!
 //! 4-component (CMYK / Adobe YCCK) JPEGs decode to packed `Cmyk` — the
 //! decoder inspects the APP14 Adobe transform flag to choose among plain

@@ -421,8 +421,8 @@ impl<'a> BitReader<'a> {
                     self.nbits += 8;
                 }
                 None => {
-                    // If we ran out of bits mid-decode, pad with zeros — this
-                    // matches libjpeg's behaviour at scan end. The caller is
+                    // If we ran out of bits mid-decode, pad with zeros —
+                    // a conventional tolerance at scan end. The caller is
                     // responsible for noticing `saw_rst` / EOI and stopping.
                     self.bits |= 0;
                     self.nbits = needed;
@@ -1779,15 +1779,14 @@ fn render_from_coefs(
                             // YCCK (Adobe). Decode YCbCr→RGB via BT.601
                             // full-range, then C/M/Y = 255 − RGB. Adobe
                             // stores the K component inverted alongside
-                            // YCbCr, so flip it too. Coefficients are
-                            // libjpeg-turbo's 16-bit fixed-point set
-                            // (91881=FIX(1.40200), 22554=FIX(0.34414),
-                            // 46802=FIX(0.71414), 116130=FIX(1.77200));
-                            // the green expression mirrors libjpeg-turbo's
-                            // `Cb_g_tab + Cr_g_tab >> SCALEBITS` form
-                            // exactly — moving the negation outside the
-                            // shift would round the wrong way at the
-                            // 32768 boundary and emit g 1 LSB low.
+                            // YCbCr, so flip it too. Coefficients are the
+                            // BT.601 conversion constants in 16-bit
+                            // fixed-point (1.40200 / 0.34414 / 0.71414 /
+                            // 1.77200 multiplied by 65536 and rounded).
+                            // The green expression keeps the negation
+                            // inside the shift so rounding lands on the
+                            // same 32768 boundary as R and B; moving the
+                            // negation outside would emit g 1 LSB low.
                             let y_s = s[0] as i32;
                             let cb = s[1] as i32 - 128;
                             let cr = s[2] as i32 - 128;

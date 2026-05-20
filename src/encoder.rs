@@ -2125,6 +2125,177 @@ pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
     encode_lossless_jpeg_grayscale(width, height, samples, stride, 8, 1)
 }
 
+/// Encode three planar 8-bit colour channels as a standalone **multi-component
+/// lossless** JPEG (SOF3, three-component interleaved scan) byte stream.
+///
+/// Annex H of T.81 specifies that "each component in the scan is modeled
+/// independently, using predictions derived from neighbouring samples of
+/// that component" (§H.1.2). This is the natural extension of the
+/// single-component grayscale encoder: three independent predictor planes
+/// share a single Huffman table and a single predictor-selector value, and
+/// their samples are interleaved one-per-MCU-position in the entropy
+/// stream (since each component is declared with sampling factors
+/// `H_i = V_i = 1`, a single MCU is exactly one sample per component).
+///
+/// * `planes` — three plane slices in `[ch0, ch1, ch2]` order. The
+///   encoder's input is colour-agnostic: the caller passes `[R, G, B]`,
+///   `[G, B, R]`, or any other three independent monochrome planes that
+///   share the same `width` × `height`. Component IDs in the bitstream
+///   are 1, 2, 3 in that order.
+/// * `strides` — bytes per row per plane. For 8-bit precision this is
+///   typically `width`; for `precision > 8` it is `width * 2` (the plane
+///   carries little-endian 16-bit samples).
+/// * `precision` — input bits per sample, in `2..=16`.
+/// * `predictor` — selector value `1..=7` from Table H.1, **shared by
+///   every component** (T.81 §B.2.3: the scan-header predictor selector
+///   `Ss` applies to the whole scan).
+///
+/// Output is bit-exact for every supported precision. Point transform is
+/// fixed at `Pt = 0` and no restart markers are emitted. The DC Huffman
+/// table built once at the top of the call is shared across all three
+/// components via DHT `Td = 0`.
+pub fn encode_lossless_jpeg_rgb(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    precision: u8,
+    predictor: u8,
+) -> Result<Vec<u8>> {
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "lossless RGB encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless RGB encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("lossless RGB encoder: zero-size image"));
+    }
+    let bytes_per_sample = if precision <= 8 { 1 } else { 2 };
+    for c in 0..3 {
+        if strides[c] < w * bytes_per_sample {
+            return Err(Error::invalid(
+                "lossless RGB encoder: stride smaller than width*bytes_per_sample",
+            ));
+        }
+        if planes[c].len() < strides[c] * h {
+            return Err(Error::invalid(
+                "lossless RGB encoder: plane shorter than stride*h",
+            ));
+        }
+    }
+
+    // Single shared DC Huffman table (Td = 0). The Kraft-complete layout
+    // in STD_DC_LOSSLESS_* covers SSSS 0..=16, valid for any precision.
+    let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 3 * 2 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_sof_lossless_multi(&mut out, w as u16, h as u16, precision, 3);
+    write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+    write_sos_lossless_multi(&mut out, predictor, 3);
+
+    // Decode each plane into a flat u16 buffer once so the predictor
+    // loop is precision-uniform.
+    let mut src: [Vec<u16>; 3] = [vec![0u16; w * h], vec![0u16; w * h], vec![0u16; w * h]];
+    if precision <= 8 {
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    src[c][y * w + x] = planes[c][y * strides[c] + x] as u16;
+                }
+            }
+        }
+    } else {
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let lo = planes[c][y * strides[c] + x * 2] as u16;
+                    let hi = planes[c][y * strides[c] + x * 2 + 1] as u16;
+                    src[c][y * w + x] = lo | (hi << 8);
+                }
+            }
+        }
+    }
+
+    // Validate sample range against declared precision.
+    let max_sample: u32 = (1u32 << precision) - 1;
+    for c in 0..3 {
+        for &v in &src[c] {
+            if v as u32 > max_sample {
+                return Err(Error::invalid(format!(
+                    "lossless RGB encoder: sample {v} in plane {c} exceeds precision-{precision} max {max_sample}"
+                )));
+            }
+        }
+    }
+
+    // Default prediction for the first sample of each component at scan
+    // start (T.81 §H.1.2.1, Pt=0): 2^(P-1).
+    let origin: i32 = 1i32 << (precision - 1);
+
+    let mut bw = BitWriter::new(&mut out);
+    for y in 0..h {
+        for x in 0..w {
+            // Annex H interleaved-MCU order with Hi=Vi=1 across all
+            // components: at each (y, x) position, emit one residual for
+            // component 0, then 1, then 2 (component IDs in scan-header
+            // order).
+            for c in 0..3 {
+                let plane = &src[c];
+                let actual = plane[y * w + x] as i32;
+                let pred: i32 = if x == 0 && y == 0 {
+                    origin
+                } else if y == 0 {
+                    // First line: forced predictor 1 (Ra) per H.1.2.1.
+                    plane[y * w + x - 1] as i32
+                } else if x == 0 {
+                    // First column: forced predictor 2 (Rb) per H.1.2.1.
+                    plane[(y - 1) * w + x] as i32
+                } else {
+                    let ra = plane[y * w + x - 1] as i32;
+                    let rb = plane[(y - 1) * w + x] as i32;
+                    let rc = plane[(y - 1) * w + x - 1] as i32;
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra + rb - rc,
+                        // H.1 footnote: divide-by-2 is an arithmetic shift.
+                        5 => ra + ((rb - rc) >> 1),
+                        6 => rb + ((ra - rc) >> 1),
+                        7 => (ra + rb) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
+                let diff = actual - pred;
+                let (s, bits) = category_lossless(diff);
+                let hc = dc_huff.encode[s as usize];
+                debug_assert!(hc.len != 0, "DC Huffman code for SSSS={s} must be present");
+                bw.write_bits(hc.code as u32, hc.len as u32);
+                // SSSS == 0 emits no residual bits; SSSS == 16 is the
+                // half-modulus special case (T.81 §H.1.2.2).
+                if s != 0 && s != 16 {
+                    bw.write_bits(bits, s as u32);
+                }
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 fn write_sof_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u8) {
     let mut payload = Vec::with_capacity(8 + 3);
     payload.push(precision);
@@ -2144,6 +2315,42 @@ fn write_sos_lossless(out: &mut Vec<u8>, predictor: u8) {
         predictor, 0, // Ss = predictor selector, Se = 0
         0, // Ah | Al — Pt=0 for now (the decoder still supports non-zero Pt)
     ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Write an SOF3 segment for an `nf`-component lossless frame with every
+/// component declared `H_i = V_i = 1` (the natural interleaved layout for
+/// multi-component lossless per T.81 §H.1.2). Component identifiers start
+/// at 1 and increment by 1.
+fn write_sof_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precision: u8, nf: u8) {
+    debug_assert!((1..=4).contains(&nf));
+    let mut payload = Vec::with_capacity(8 + 3 * nf as usize);
+    payload.push(precision);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(nf);
+    for ci in 1..=nf {
+        payload.push(ci); // component identifier
+        payload.push(0x11); // H=1 V=1
+        payload.push(0); // Tq (ignored for lossless)
+    }
+    write_length_prefix(out, markers::SOF3, &payload);
+}
+
+/// Write an interleaved SOS segment for an `ns`-component lossless scan.
+/// Every component selects DC table 0 (AC unused), `Ss` carries the
+/// shared predictor selector, `Se = 0`, `Ah | Al = 0` (`Pt = 0`).
+fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ns: u8) {
+    debug_assert!((1..=4).contains(&ns));
+    let mut payload = Vec::with_capacity(3 + 2 * ns as usize);
+    payload.push(ns);
+    for ci in 1..=ns {
+        payload.push(ci); // component identifier
+        payload.push(0x00); // DC=0 AC=0
+    }
+    payload.push(predictor); // Ss = predictor selector
+    payload.push(0); // Se
+    payload.push(0); // Ah | Al (Pt = 0)
     write_length_prefix(out, markers::SOS, &payload);
 }
 

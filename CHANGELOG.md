@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encoder::encode_lossless_jpeg_rgb(width, height, [r, g, b], strides,
+  precision, predictor)`: public three-component (RGB-class) lossless
+  JPEG (SOF3) encoder. Emits a standalone SOF3 stream with one
+  interleaved SOS scan, each component declared `H_i = V_i = 1` per
+  T.81 §H.1.2 (lossless data unit is one sample, so the natural MCU is
+  one residual per component at each pixel position). Each component
+  is modeled with its own independent predictor buffer (per H.1.2:
+  "each component in the scan is modeled independently, using
+  predictions derived from neighbouring samples of that component").
+  Supports every precision `P ∈ 2..=16` and every Annex H Table H.1
+  predictor `1..=7`. Bit-exact roundtrip at `P = 8` against the
+  packed `Rgb24` decoder output.
+- SOF3 lossless decoder: accept three-component interleaved scans at
+  `P = 8` and emit packed `PixelFormat::Rgb24`. Per-component sample
+  buffers track independent predictor history; restart markers reset
+  every component's predictor together. Four-component CMYK-class
+  lossless and non-unit sampling factors stay rejected with
+  `Unsupported`.
+- `MjpegPixelFormat::Rgb24` (8-bit packed R-G-B) added to the
+  standalone-build pixel-format enum, with `From` conversions in both
+  directions against `oxideav_core::PixelFormat::Rgb24`.
 - `encoder::encode_lossless_jpeg_grayscale(width, height, samples,
   stride, precision, predictor)`: public single-component grayscale
   lossless JPEG (SOF3) encoder. Supports every precision `P ∈ 2..=16`

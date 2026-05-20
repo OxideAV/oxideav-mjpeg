@@ -2,10 +2,13 @@
 
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
 decodes baseline (SOF0), extended-sequential (SOF1), progressive (SOF2)
-and lossless (SOF3) 8-bit JPEGs, encodes baseline, progressive **and**
-lossless JPEG (the lossless path covers single-component grayscale at
-every precision `P ∈ 2..=16` and every Annex H Table H.1 predictor).
-YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. Zero C dependencies.
+and lossless (SOF3) JPEGs (single-component grayscale at any precision
+`P ∈ 2..=16` plus three-component RGB-class at `P = 8`), encodes
+baseline, progressive **and** lossless JPEG (the lossless path covers
+single-component grayscale at every precision `P ∈ 2..=16` and
+three-component interleaved RGB at every precision `P ∈ 2..=16`, with
+every Annex H Table H.1 predictor). YUV 4:4:4 / 4:2:2 / 4:2:0 and
+grayscale. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -150,6 +153,27 @@ enc.send_frame(&frame)?;
 Without `set_lossless(true)` the trait-API encoder rejects grayscale
 input rather than silently downgrading the bitstream.
 
+### Lossless (SOF3) RGB / three-component encode
+
+For three-component (R, G, B / or any three independent monochrome
+planes) lossless output call `encoder::encode_lossless_jpeg_rgb(width,
+height, [r, g, b], strides, precision, predictor)` directly:
+
+- The three planes share one shared DC Huffman table (Td = 0) and one
+  predictor selector. Each component is modeled independently per
+  T.81 §H.1.2 — neighbours come from the same plane only.
+- Each component is declared `H_i = V_i = 1`, so the MCU at every
+  pixel position is exactly one residual per component in scan order
+  (component IDs 1, 2, 3). Output: a standalone SOF3 JPEG with one
+  interleaved SOS scan.
+- `precision` is the same `2..=16` range as the grayscale entry point.
+  Output decoding is supported at `P = 8` (packed `Rgb24`); higher
+  precisions are encoder-only today since the decoder lacks an 8-bit
+  planar GBR target format.
+- The encoder is colour-agnostic: callers pass planes in whatever
+  channel order they want (R-G-B, G-B-R, etc.) and the decoder reads
+  them back in the same order via `Rgb24`'s R-G-B byte layout.
+
 ### Metadata pass-through
 
 All encoder entry points have `*_with_meta` variants that accept a
@@ -194,6 +218,11 @@ Decoder:
   precision `P ∈ 2..=16`. Annex H predictor reconstruction (bit-exact).
   Output: `Gray8` at P=8, `Gray10Le` / `Gray12Le` at P=10/12, else
   `Gray16Le`. Point transform (`Pt = Al`) honoured.
+- **Lossless JPEG (SOF3) three-component** — `P = 8` only, interleaved
+  scan with each component declared `H_i = V_i = 1` (the natural
+  RGB-class layout). Independent per-component predictor buffers per
+  Annex H §H.1.2. Output: packed `PixelFormat::Rgb24` (3 bytes per
+  pixel, R-G-B byte order).
 - **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
   Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
@@ -213,8 +242,10 @@ Encoder:
   7 SOS scans, `Ah=0`, `Al=0`) and full successive-approximation
   decomposition (14 SOS scans, 1-bit point transform). See above.
 - **SOF3** (lossless) — single-component grayscale at any precision
-  `P ∈ 2..=16` and any Annex H Table H.1 predictor `1..=7`. Bit-exact
-  roundtrip including the SSSS=16 / Di=32768 half-modulus case.
+  `P ∈ 2..=16` and three-component interleaved (RGB-class) at any
+  precision `P ∈ 2..=16` with `H_i = V_i = 1` per component, every
+  Annex H Table H.1 predictor `1..=7`. Bit-exact roundtrip including
+  the SSSS=16 / Di=32768 half-modulus case.
 - 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths; `Gray8` /
   `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless path.
 - Optional DRI + `RSTn` emission on the baseline path (off by default;
@@ -225,7 +256,12 @@ Not supported (decoder returns `Error::Unsupported`):
 - Hierarchical (SOF5+), arithmetic-coded (SOF9..SOF15).
 - 12-bit progressive (SOF2 with `P=12`), 12-bit 4:2:2 / 4:4:4 YUV.
 - Progressive 4-component JPEGs.
-- Multi-component lossless JPEGs (encoder + decoder; only grayscale).
+- Multi-component lossless decode at `P > 8` (encoder side covers
+  every `P ∈ 2..=16`, decoder side is 8-bit packed-RGB only until a
+  planar GBR target pixel format lands in `oxideav-core`).
+- 4-component lossless (CMYK-class) and lossless with non-unit
+  sampling factors (the spec permits this but no real-world corpus
+  exercises it; rejected with `Unsupported`).
 - Lossless encoder restart markers and non-zero point transform on
   the encode side (the decoder already supports both).
 

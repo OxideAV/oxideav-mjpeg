@@ -58,6 +58,9 @@ pub enum MjpegPixelFormat {
     Gray16Le,
     /// 8-bit packed CMYK (4 bytes per pixel).
     Cmyk,
+    /// 8-bit packed RGB (3 bytes per pixel, R-G-B order). Produced by the
+    /// SOF3 lossless decoder for 8-bit three-component scans.
+    Rgb24,
     /// 8-bit planar 4:1:1 YUV (luma 4× chroma horizontally).
     Yuv411P,
     /// 8-bit planar 4:2:0 YUV.

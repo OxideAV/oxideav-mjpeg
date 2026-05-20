@@ -9,7 +9,7 @@
 //! so these tests exercise the two halves end-to-end.
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
-use oxideav_mjpeg::encoder::encode_lossless_jpeg_grayscale;
+use oxideav_mjpeg::encoder::{encode_lossless_jpeg_grayscale, encode_lossless_jpeg_rgb};
 use oxideav_mjpeg::registry::make_decoder;
 
 /// Build a deterministic, textured 8-bit grayscale source so the residuals
@@ -158,6 +158,137 @@ fn lossless_16bit_predictor_4_is_bit_exact() {
             assert_eq!(got, want, "16-bit mismatch at ({i},{j})");
         }
     }
+}
+
+/// Build three textured 8-bit planes (one each for R, G, B) so each
+/// component independently exercises the predictor + Huffman magnitude
+/// ladder. The planes are deliberately decorrelated so a bug in
+/// per-component buffer indexing (e.g. predicting R from G's neighbours)
+/// would produce a visible mismatch rather than a coincidentally-correct
+/// roundtrip on a single-colour source.
+fn mk_rgb_8bit(w: usize, h: usize) -> [Vec<u8>; 3] {
+    let mut r = vec![0u8; w * h];
+    let mut g = vec![0u8; w * h];
+    let mut b = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            r[j * w + i] = ((i as i32 * 5 + j as i32 * 3 + ((i ^ j) as i32 & 31)) & 0xFF) as u8;
+            g[j * w + i] =
+                ((i as i32 * 11 + j as i32 * 7 + ((i.wrapping_mul(j)) as i32 & 63)) & 0xFF) as u8;
+            b[j * w + i] = ((255 - (i as i32 * 2 + j as i32 * 9)) & 0xFF) as u8;
+        }
+    }
+    [r, g, b]
+}
+
+#[test]
+fn lossless_rgb_8bit_every_predictor_is_bit_exact() {
+    let w = 24u32;
+    let h = 16u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_jpeg_rgb(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2]],
+            strides,
+            8,
+            predictor,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        // SOF3 marker must be present.
+        assert!(
+            jpeg.windows(2).any(|x| x == [0xFF, 0xC3]),
+            "predictor={predictor}: SOF3 marker missing"
+        );
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(v.planes.len(), 1, "predictor={predictor}");
+        let stride = v.planes[0].stride;
+        assert_eq!(
+            stride,
+            (w as usize) * 3,
+            "predictor={predictor}: expected packed Rgb24 stride"
+        );
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let got_r = v.planes[0].data[j * stride + i * 3];
+                let got_g = v.planes[0].data[j * stride + i * 3 + 1];
+                let got_b = v.planes[0].data[j * stride + i * 3 + 2];
+                assert_eq!(
+                    got_r,
+                    planes[0][j * w as usize + i],
+                    "predictor={predictor} R mismatch at ({i},{j})"
+                );
+                assert_eq!(
+                    got_g,
+                    planes[1][j * w as usize + i],
+                    "predictor={predictor} G mismatch at ({i},{j})"
+                );
+                assert_eq!(
+                    got_b,
+                    planes[2][j * w as usize + i],
+                    "predictor={predictor} B mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_rgb_rejects_oversized_sample() {
+    // Precision = 4 (max value 15) but a sample is 200: encoder must
+    // reject up-front rather than producing a stream the decoder can't
+    // reconstruct.
+    let w = 4u32;
+    let h = 4u32;
+    let mut r = vec![0u8; (w * h) as usize];
+    let g = vec![0u8; (w * h) as usize];
+    let b = vec![0u8; (w * h) as usize];
+    r[0] = 200; // > 2^4 - 1
+    let err = encode_lossless_jpeg_rgb(
+        w,
+        h,
+        [&r, &g, &b],
+        [w as usize, w as usize, w as usize],
+        4,
+        1,
+    );
+    assert!(
+        err.is_err(),
+        "expected encoder to reject sample exceeding declared precision"
+    );
+}
+
+#[test]
+fn lossless_rgb_rejects_higher_precision_decode() {
+    // The decoder side only emits packed Rgb24 today; multi-component
+    // P > 8 is encoder-only for now. Verify the decoder surfaces a
+    // clean Unsupported when fed a P=12 3-component stream.
+    let w = 4u32;
+    let h = 4u32;
+    let precision = 12u8;
+    // Build a tiny solid plane so the validation doesn't trip first.
+    let bytes_per_sample = 2usize;
+    let plane = vec![0u8; (w as usize) * (h as usize) * bytes_per_sample];
+    let strides = [
+        (w as usize) * bytes_per_sample,
+        (w as usize) * bytes_per_sample,
+        (w as usize) * bytes_per_sample,
+    ];
+    let jpeg = encode_lossless_jpeg_rgb(w, h, [&plane, &plane, &plane], strides, precision, 1)
+        .expect("encode 12-bit 3-component");
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.width = Some(w);
+    params.height = Some(h);
+    let mut dec = make_decoder(&params).unwrap();
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), jpeg))
+        .unwrap();
+    let r = dec.receive_frame();
+    assert!(
+        r.is_err(),
+        "decoder should reject 3-component lossless at P>8"
+    );
 }
 
 #[test]

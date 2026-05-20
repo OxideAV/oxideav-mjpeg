@@ -203,10 +203,26 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                         sof.precision
                     )));
                 }
-                if sof.components.len() != 1 {
-                    return Err(Error::unsupported(
-                        "lossless JPEG: only single-component (grayscale) scans are supported",
-                    ));
+                // Single-component grayscale and three-component RGB-class
+                // interleaved scans (each component declared `H_i = V_i = 1`,
+                // per T.81 §H.1.2) are supported. Components with non-unit
+                // sampling factors are rejected — Annex H pairs lossless
+                // with `data unit = one sample` (E.1.1), so non-1:1 sampling
+                // would not be a well-defined MCU.
+                if !matches!(sof.components.len(), 1 | 3) {
+                    return Err(Error::unsupported(format!(
+                        "lossless JPEG: {} component(s) — only 1 (grayscale) and 3 (RGB-class) are supported",
+                        sof.components.len()
+                    )));
+                }
+                if sof.components.len() > 1 {
+                    for c in &sof.components {
+                        if c.h_factor != 1 || c.v_factor != 1 {
+                            return Err(Error::unsupported(
+                                "lossless JPEG: multi-component scans require H_i = V_i = 1",
+                            ));
+                        }
+                    }
                 }
                 state.sof = Some(sof);
                 state.lossless = true;
@@ -1961,11 +1977,16 @@ fn render_from_coefs_12bit(
 // coefficient. Precision ranges 2..=16 bits; the point-transform `Al`
 // shifts samples by `Pt` bits on the wire.
 //
-// This implementation handles single-component grayscale scans at any
-// precision in `2..=16`. Multi-component lossless (rare — used by some
-// RGB-lossless DNG/DICOM variants) is rejected. Point transform (Pt)
-// is honoured. Restart markers re-initialise the predictor to the
-// image-origin value as required by T.81.
+// This implementation handles single-component grayscale at any precision
+// in `2..=16`, and three-component (RGB-class) interleaved scans at
+// `precision = 8` (output: packed `Rgb24`). T.81 §H.1.2 specifies that
+// "each component in the scan is modeled independently, using predictions
+// derived from neighbouring samples of that component"; with each
+// component declared `H_i = V_i = 1` (E.1.1: lossless data unit is one
+// sample) the MCU at position (y, x) is exactly one residual per component
+// in scan-header order. Point transform (Pt) is honoured. Restart markers
+// re-initialise every component's predictor to the image-origin value as
+// required by T.81.
 fn decode_lossless_scan(
     state: &JpegState,
     sos: &SosInfo,
@@ -1976,9 +1997,15 @@ fn decode_lossless_scan(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
-    if sos.components.len() != 1 {
+    if !matches!(sos.components.len(), 1 | 3) {
+        return Err(Error::unsupported(format!(
+            "lossless: {} component(s) — only 1 and 3 are supported",
+            sos.components.len()
+        )));
+    }
+    if sos.components.len() != sof.components.len() {
         return Err(Error::unsupported(
-            "lossless: multi-component scans are not supported",
+            "lossless: non-interleaved multi-component scans are not supported",
         ));
     }
     let predictor = sos.ss;
@@ -1992,10 +2019,24 @@ fn decode_lossless_scan(
     }
     let width = sof.width as usize;
     let height = sof.height as usize;
+    let nc = sos.components.len();
 
-    let dc_t = state.dc_huff[sos.components[0].dc_table as usize]
-        .as_ref()
-        .ok_or_else(|| Error::invalid("lossless: DC Huffman table missing"))?;
+    // Multi-component output is currently packed Rgb24 only (P=8).
+    if nc > 1 && precision != 8 {
+        return Err(Error::unsupported(format!(
+            "lossless: 3-component decode requires precision = 8 (got {precision})",
+        )));
+    }
+
+    // Resolve one DC Huffman table per scan component (selectors are
+    // independent per Annex H; the encoder may share the same table).
+    let mut dc_tables: Vec<&HuffTable> = Vec::with_capacity(nc);
+    for sc in &sos.components {
+        let t = state.dc_huff[sc.dc_table as usize]
+            .as_ref()
+            .ok_or_else(|| Error::invalid("lossless: DC Huffman table missing"))?;
+        dc_tables.push(t);
+    }
 
     // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
     let sample_bits = precision - pt;
@@ -2003,9 +2044,9 @@ fn decode_lossless_scan(
     let sample_mask: u32 = sample_max - 1;
     let origin: u32 = 1u32 << (sample_bits - 1);
 
-    // Buffer holds samples in the pre-shift space; we apply `<< pt` at
-    // the final pack stage.
-    let mut samples = vec![0u32; width * height];
+    // One sample buffer per component; each component is modeled
+    // independently per H.1.2.
+    let mut samples: Vec<Vec<u32>> = (0..nc).map(|_| vec![0u32; width * height]).collect();
     let mut br = BitReader::new(scan);
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = RST0;
@@ -2042,53 +2083,67 @@ fn decode_lossless_scan(
                 }
             }
 
-            // Compute predicted value.
-            let pred: u32 = if reset_pred {
-                reset_pred = false;
-                origin
-            } else if y == 0 {
-                // First row: forced predictor 1 (Ra).
-                samples[y * width + x - 1]
-            } else if x == 0 {
-                // First column: forced predictor 2 (Rb).
-                samples[(y - 1) * width + x]
-            } else {
-                let ra = samples[y * width + x - 1];
-                let rb = samples[(y - 1) * width + x];
-                let rc = samples[(y - 1) * width + x - 1];
-                match predictor {
-                    1 => ra,
-                    2 => rb,
-                    3 => rc,
-                    4 => ra.wrapping_add(rb).wrapping_sub(rc),
-                    5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
-                    6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
-                    7 => (ra.wrapping_add(rb)) >> 1,
-                    _ => unreachable!(),
-                }
-            };
+            for ci in 0..nc {
+                let plane = &samples[ci];
+                let pred: u32 = if reset_pred {
+                    origin
+                } else if y == 0 {
+                    plane[y * width + x - 1]
+                } else if x == 0 {
+                    plane[(y - 1) * width + x]
+                } else {
+                    let ra = plane[y * width + x - 1];
+                    let rb = plane[(y - 1) * width + x];
+                    let rc = plane[(y - 1) * width + x - 1];
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                        7 => (ra.wrapping_add(rb)) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
 
-            // Decode residual. SSSS is the category; for lossless it can
-            // reach 16 as a special case meaning Di = 32768.
-            let s = decode_huff(&mut br, dc_t)? as u32;
-            let residual: i32 = if s == 0 {
-                0
-            } else if s == 16 {
-                32_768
-            } else {
-                let bits = br.get_bits(s)? as i32;
-                extend(bits, s)
-            };
+                let s = decode_huff(&mut br, dc_tables[ci])? as u32;
+                let residual: i32 = if s == 0 {
+                    0
+                } else if s == 16 {
+                    32_768
+                } else {
+                    let bits = br.get_bits(s)? as i32;
+                    extend(bits, s)
+                };
 
-            let sv = ((pred as i32).wrapping_add(residual) as u32) & sample_mask;
-            samples[y * width + x] = sv;
+                let sv = ((pred as i32).wrapping_add(residual) as u32) & sample_mask;
+                samples[ci][y * width + x] = sv;
+            }
+            reset_pred = false;
             mcus_since_restart += 1;
         }
     }
 
-    // Select an output PixelFormat by effective output precision
-    // (precision − Pt shifted samples fill `precision` bits). Gray16Le
-    // covers every bit depth that is not exactly 8 / 10 / 12.
+    // Three-component decode emits packed Rgb24.
+    if nc == 3 {
+        let stride = width * 3;
+        let mut data = vec![0u8; stride * height];
+        for i in 0..width * height {
+            data[i * 3] = (samples[0][i] << pt) as u8;
+            data[i * 3 + 1] = (samples[1][i] << pt) as u8;
+            data[i * 3 + 2] = (samples[2][i] << pt) as u8;
+        }
+        return Ok(VideoFrame {
+            pts,
+            planes: vec![VideoPlane { stride, data }],
+        });
+    }
+
+    // Single-component grayscale: select an output PixelFormat by
+    // effective output precision (precision − Pt shifted samples fill
+    // `precision` bits). Gray16Le covers every bit depth that is not
+    // exactly 8 / 10 / 12.
     let out_format = match precision {
         8 => PixelFormat::Gray8,
         10 => PixelFormat::Gray10Le,
@@ -2100,14 +2155,14 @@ fn decode_lossless_scan(
         let stride = width;
         let mut data = vec![0u8; stride * height];
         for i in 0..width * height {
-            data[i] = (samples[i] << pt) as u8;
+            data[i] = (samples[0][i] << pt) as u8;
         }
         VideoPlane { stride, data }
     } else {
         let stride = width * 2;
         let mut data = vec![0u8; stride * height];
         for i in 0..width * height {
-            let v = (samples[i] << pt) as u16;
+            let v = (samples[0][i] << pt) as u16;
             data[i * 2] = (v & 0xFF) as u8;
             data[i * 2 + 1] = (v >> 8) as u8;
         }

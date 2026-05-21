@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encoder::encode_lossless_jpeg_grayscale_with_opts(width, height,
+  samples, stride, precision, predictor, restart_interval,
+  point_transform)` and `encoder::encode_lossless_jpeg_rgb_with_opts(...)`:
+  public lossless (SOF3) encoder variants that emit DRI + `RST0..=RST7`
+  every `restart_interval` MCUs (cycling modulo 8 per T.81 §F.1.1.5.2)
+  and honour a non-zero `point_transform` (`Pt`, the SOS `Al` nibble).
+  On every restart boundary the encoder byte-aligns the stream and
+  re-seeds every component's predictor history to the per-component
+  origin `2^(P − Pt − 1)` per T.81 §H.1.2.1; with `Pt > 0` every input
+  sample is right-shifted by `Pt` before prediction, and the decoder
+  side reconstructs `(sample >> Pt) << Pt`. Bit-exact roundtrips at
+  every supported predictor / restart interval / Pt combination across
+  the grayscale 2..=16-bit precisions and the 8-bit three-component
+  path. The default-options entry points
+  `encode_lossless_jpeg_grayscale` / `encode_lossless_jpeg_rgb` are
+  unchanged (now thin wrappers passing `restart_interval = 0`,
+  `point_transform = 0`).
 - `encoder::encode_lossless_jpeg_rgb(width, height, [r, g, b], strides,
   precision, predictor)`: public three-component (RGB-class) lossless
   JPEG (SOF3) encoder. Emits a standalone SOF3 stream with one

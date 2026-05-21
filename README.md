@@ -135,7 +135,16 @@ stride, precision, predictor)` directly:
 - Output is bit-exact: the decoder side recovers every input sample
   verbatim, including the special `Di = 32768` half-modulus case
   (T.81 §H.1.2.2). Point transform is fixed at `Pt = 0` and no
-  restart markers are emitted.
+  restart markers are emitted by the default entry point; for non-zero
+  `Pt` or DRI + `RSTn` emission call
+  `encode_lossless_jpeg_grayscale_with_opts(width, height, samples,
+  stride, precision, predictor, restart_interval, point_transform)`.
+  On each restart boundary the encoder byte-aligns the stream, writes
+  `RST0..=RST7` cycling modulo 8 per T.81 §F.1.1.5.2, and re-seeds the
+  predictor history to the per-component origin `2^(P − Pt − 1)`
+  (§H.1.2.1). With `Pt > 0` every input sample is right-shifted by `Pt`
+  before prediction; the decoder side then left-shifts the
+  reconstructed sample by the same `Pt` on output.
 
 The same path is available through the trait-API encoder:
 
@@ -173,6 +182,12 @@ height, [r, g, b], strides, precision, predictor)` directly:
 - The encoder is colour-agnostic: callers pass planes in whatever
   channel order they want (R-G-B, G-B-R, etc.) and the decoder reads
   them back in the same order via `Rgb24`'s R-G-B byte layout.
+- For DRI + `RSTn` emission or a non-zero point transform call
+  `encode_lossless_jpeg_rgb_with_opts(width, height, [r, g, b],
+  strides, precision, predictor, restart_interval, point_transform)`.
+  Both options behave identically to the grayscale variant; restarts
+  reset every component's predictor in lockstep, and `Pt` shifts every
+  sample of every plane uniformly.
 
 ### Metadata pass-through
 
@@ -245,7 +260,11 @@ Encoder:
   `P ∈ 2..=16` and three-component interleaved (RGB-class) at any
   precision `P ∈ 2..=16` with `H_i = V_i = 1` per component, every
   Annex H Table H.1 predictor `1..=7`. Bit-exact roundtrip including
-  the SSSS=16 / Di=32768 half-modulus case.
+  the SSSS=16 / Di=32768 half-modulus case. Optional DRI + `RSTn`
+  emission and non-zero point transform `Pt ∈ 0..=15` (with `Pt < P`)
+  via `encode_lossless_jpeg_grayscale_with_opts` /
+  `encode_lossless_jpeg_rgb_with_opts`. Restart boundaries re-seed
+  every component's predictor to `2^(P − Pt − 1)` per T.81 §H.1.2.1.
 - 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths; `Gray8` /
   `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless path.
 - Optional DRI + `RSTn` emission on the baseline path (off by default;
@@ -262,8 +281,6 @@ Not supported (decoder returns `Error::Unsupported`):
 - 4-component lossless (CMYK-class) and lossless with non-unit
   sampling factors (the spec permits this but no real-world corpus
   exercises it; rejected with `Unsupported`).
-- Lossless encoder restart markers and non-zero point transform on
-  the encode side (the decoder already supports both).
 
 ## License
 

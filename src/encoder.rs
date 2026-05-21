@@ -1975,9 +1975,11 @@ fn category_lossless(diff: i32) -> (u8, u32) {
 ///
 /// Output is bit-exact: the decoder side recovers every input sample
 /// verbatim. Point transform is fixed at `Pt = 0` and no restart markers
-/// are emitted. The encoder reuses the [`HuffTable`] machinery to build
-/// the wide-symbol DC table at construction time so the output stays
-/// universal for every precision in the valid range.
+/// are emitted. For non-zero point transform or restart-marker emission
+/// see [`encode_lossless_jpeg_grayscale_with_opts`]. The encoder reuses
+/// the [`HuffTable`] machinery to build the wide-symbol DC table at
+/// construction time so the output stays universal for every precision
+/// in the valid range.
 pub fn encode_lossless_jpeg_grayscale(
     width: u32,
     height: u32,
@@ -1985,6 +1987,46 @@ pub fn encode_lossless_jpeg_grayscale(
     stride: usize,
     precision: u8,
     predictor: u8,
+) -> Result<Vec<u8>> {
+    encode_lossless_jpeg_grayscale_with_opts(
+        width, height, samples, stride, precision, predictor, 0, 0,
+    )
+}
+
+/// Like [`encode_lossless_jpeg_grayscale`] but also accepts a non-zero
+/// point transform `point_transform` (`Pt` in T.81 — the SOS `Al` field)
+/// and a `restart_interval` measured in MCUs (= samples, since a lossless
+/// MCU is one residual). Both default-to-zero options match the
+/// historical zero-restart, zero-Pt output.
+///
+/// * `point_transform` — `0..=15`, but must be strictly less than
+///   `precision` (T.81 §H.1.2: a non-zero `Pt` divides every input
+///   sample by `2^Pt`, so `Pt = precision` would discard every bit).
+///   With `Pt > 0` the encoder right-shifts every input sample by `Pt`
+///   before predictive coding; the decoder side then left-shifts the
+///   reconstructed sample back by `Pt` on output (the low `Pt` bits of
+///   the original sample are lost).
+/// * `restart_interval` — number of samples between successive `RSTn`
+///   markers (`0` disables restart emission, matching
+///   [`encode_lossless_jpeg_grayscale`]). On each boundary the encoder
+///   byte-aligns the bitstream, writes a fresh `RST0..=RST7` marker
+///   (cycling modulo 8 per T.81 §F.1.1.5.2), and re-seeds the
+///   single-sample predictor history to the image-origin value
+///   `2^(precision − Pt − 1)` (T.81 §H.1.2.1 — every restart interval
+///   starts with the same scan-origin defaults as the image start).
+///
+/// Bit-exact roundtrip vs. the SOF3 decoder for every supported
+/// precision, predictor, restart interval, and `Pt`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_jpeg_grayscale_with_opts(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    precision: u8,
+    predictor: u8,
+    restart_interval: u16,
+    point_transform: u8,
 ) -> Result<Vec<u8>> {
     if !(2..=16).contains(&precision) {
         return Err(Error::unsupported(format!(
@@ -1994,6 +2036,16 @@ pub fn encode_lossless_jpeg_grayscale(
     if !(1..=7).contains(&predictor) {
         return Err(Error::invalid(format!(
             "lossless encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= precision {
+        return Err(Error::invalid(format!(
+            "lossless encoder: point_transform {point_transform} must be < precision {precision}"
+        )));
+    }
+    if point_transform > 15 {
+        return Err(Error::invalid(format!(
+            "lossless encoder: point_transform {point_transform} > 15 (SOS Al is 4 bits)"
         )));
     }
     let w = width as usize;
@@ -2025,15 +2077,22 @@ pub fn encode_lossless_jpeg_grayscale(
     write_jfif_app0(&mut out);
     write_sof_lossless(&mut out, w as u16, h as u16, precision);
     write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
-    write_sos_lossless(&mut out, predictor);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless(&mut out, predictor, point_transform);
 
     // Decode samples into a flat u16 buffer once so the predictor loop
-    // doesn't have to branch on `precision` per pixel.
+    // doesn't have to branch on `precision` per pixel. With Pt > 0 the
+    // wire samples are `actual >> Pt` (T.81 §H.1.2). We apply the
+    // shift here so every subsequent value already lives in the
+    // `precision - Pt` range, matching the decoder's `sample_bits`.
+    let pt = point_transform as u32;
     let mut src = vec![0u16; w * h];
     if precision <= 8 {
         for y in 0..h {
             for x in 0..w {
-                src[y * w + x] = samples[y * stride + x] as u16;
+                src[y * w + x] = (samples[y * stride + x] as u16) >> pt;
             }
         }
     } else {
@@ -2041,30 +2100,67 @@ pub fn encode_lossless_jpeg_grayscale(
             for x in 0..w {
                 let lo = samples[y * stride + x * 2] as u16;
                 let hi = samples[y * stride + x * 2 + 1] as u16;
-                src[y * w + x] = lo | (hi << 8);
+                src[y * w + x] = (lo | (hi << 8)) >> pt;
             }
         }
     }
 
-    // Validate that no input sample exceeds the declared precision.
+    // Validate that no pre-shift input sample exceeds the declared
+    // precision (the shifted value automatically fits in `precision - Pt`
+    // bits, but a stray out-of-range input is still a caller bug).
     let max_sample: u32 = (1u32 << precision) - 1;
-    for &v in &src {
-        if v as u32 > max_sample {
-            return Err(Error::invalid(format!(
-                "lossless encoder: sample {v} exceeds precision-{precision} max {max_sample}"
-            )));
+    if precision <= 8 {
+        for y in 0..h {
+            for x in 0..w {
+                let v = samples[y * stride + x] as u32;
+                if v > max_sample {
+                    return Err(Error::invalid(format!(
+                        "lossless encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+                    )));
+                }
+            }
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                let lo = samples[y * stride + x * 2] as u32;
+                let hi = samples[y * stride + x * 2 + 1] as u32;
+                let v = lo | (hi << 8);
+                if v > max_sample {
+                    return Err(Error::invalid(format!(
+                        "lossless encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+                    )));
+                }
+            }
         }
     }
 
     // Default prediction for the first sample of the scan and after each
-    // restart interval (T.81 §H.1.2.1). With Pt=0 this is 2^(P-1).
-    let origin: i32 = 1i32 << (precision - 1);
+    // restart interval (T.81 §H.1.2.1). With Pt the working precision is
+    // `precision − Pt`, so the origin is `2^(precision − Pt − 1)`.
+    let sample_bits = precision as u32 - pt;
+    let origin: i32 = 1i32 << (sample_bits - 1);
+
+    // Restart bookkeeping. A lossless MCU is exactly one sample (per
+    // §H.1.2 with H_i=V_i=1), so the restart interval counts samples.
+    // `samples_since_restart` is reset on every `RSTn` emission; the
+    // encoder cycles RST0..=RST7 modulo 8 per §F.1.1.5.2.
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut samples_since_restart: u32 = 0;
+    let total_samples: u64 = w as u64 * h as u64;
+    let mut sample_index: u64 = 0;
+    // `reset_pred` is true at scan start and immediately after each
+    // RSTn so the next sample uses `origin` (not Ra/Rb/Rc from the
+    // previous interval — those neighbours are still present in `src`
+    // but the spec mandates we forget them at the restart boundary).
+    let mut reset_pred = true;
 
     let mut bw = BitWriter::new(&mut out);
     for y in 0..h {
         for x in 0..w {
             let actual = src[y * w + x] as i32;
-            let pred: i32 = if x == 0 && y == 0 {
+            let pred: i32 = if reset_pred {
                 origin
             } else if y == 0 {
                 // First line uses Ra regardless of selector (Table H.1
@@ -2102,6 +2198,21 @@ pub fn encode_lossless_jpeg_grayscale(
             // also emits no extras (special-case Di = 32768 per H.1.2.2).
             if s != 0 && s != 16 {
                 bw.write_bits(bits, s as u32);
+            }
+
+            reset_pred = false;
+            sample_index += 1;
+            samples_since_restart += 1;
+
+            // Emit an RSTn marker after every `ri` samples, but never
+            // after the very last sample (the decoder expects EOI next,
+            // and the spec disallows a trailing RST per §F.1.1.5.2).
+            if ri != 0 && samples_since_restart == ri && sample_index < total_samples {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                samples_since_restart = 0;
+                reset_pred = true;
             }
         }
     }
@@ -2151,9 +2262,11 @@ pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
 ///   `Ss` applies to the whole scan).
 ///
 /// Output is bit-exact for every supported precision. Point transform is
-/// fixed at `Pt = 0` and no restart markers are emitted. The DC Huffman
-/// table built once at the top of the call is shared across all three
-/// components via DHT `Td = 0`.
+/// fixed at `Pt = 0` and no restart markers are emitted. For non-zero
+/// point transform or restart-marker emission see
+/// [`encode_lossless_jpeg_rgb_with_opts`]. The DC Huffman table built
+/// once at the top of the call is shared across all three components via
+/// DHT `Td = 0`.
 pub fn encode_lossless_jpeg_rgb(
     width: u32,
     height: u32,
@@ -2161,6 +2274,44 @@ pub fn encode_lossless_jpeg_rgb(
     strides: [usize; 3],
     precision: u8,
     predictor: u8,
+) -> Result<Vec<u8>> {
+    encode_lossless_jpeg_rgb_with_opts(width, height, planes, strides, precision, predictor, 0, 0)
+}
+
+/// Like [`encode_lossless_jpeg_rgb`] but also accepts `restart_interval`
+/// (in MCUs — and a 3-component lossless MCU is exactly one sample per
+/// component, i.e. one pixel position — per T.81 §H.1.2 with
+/// `H_i = V_i = 1`) and a `point_transform` (`Pt` in T.81, the low
+/// nibble of the SOS `Ah|Al` field). Both default-to-zero options match
+/// the historical zero-restart, zero-Pt output.
+///
+/// * `point_transform` — `0..=15` and strictly less than `precision`.
+///   With `Pt > 0` every input sample is right-shifted by `Pt` before
+///   prediction; the decoder side later left-shifts the reconstructed
+///   sample by the same `Pt` when materialising the output plane.
+/// * `restart_interval` — number of MCUs (= pixel positions) between
+///   successive `RSTn` markers. On every boundary the encoder
+///   byte-aligns the bitstream, emits the next `RST0..=RST7` marker
+///   (cycling modulo 8 per T.81 §F.1.1.5.2), and re-seeds **every**
+///   component's predictor history to the per-component origin
+///   `2^(precision − Pt − 1)` (T.81 §H.1.2.1: each restart interval
+///   starts with the same scan-origin defaults as the image start,
+///   independently per component).
+///
+/// Bit-exact roundtrip vs. the SOF3 three-component decoder for every
+/// supported predictor / restart interval / Pt combination at
+/// `precision = 8` (the only precision the decoder currently supports
+/// for multi-component lossless).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_jpeg_rgb_with_opts(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    precision: u8,
+    predictor: u8,
+    restart_interval: u16,
+    point_transform: u8,
 ) -> Result<Vec<u8>> {
     if !(2..=16).contains(&precision) {
         return Err(Error::unsupported(format!(
@@ -2170,6 +2321,16 @@ pub fn encode_lossless_jpeg_rgb(
     if !(1..=7).contains(&predictor) {
         return Err(Error::invalid(format!(
             "lossless RGB encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= precision {
+        return Err(Error::invalid(format!(
+            "lossless RGB encoder: point_transform {point_transform} must be < precision {precision}"
+        )));
+    }
+    if point_transform > 15 {
+        return Err(Error::invalid(format!(
+            "lossless RGB encoder: point_transform {point_transform} > 15 (SOS Al is 4 bits)"
         )));
     }
     let w = width as usize;
@@ -2201,16 +2362,22 @@ pub fn encode_lossless_jpeg_rgb(
     write_jfif_app0(&mut out);
     write_sof_lossless_multi(&mut out, w as u16, h as u16, precision, 3);
     write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
-    write_sos_lossless_multi(&mut out, predictor, 3);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+
+    let pt = point_transform as u32;
 
     // Decode each plane into a flat u16 buffer once so the predictor
-    // loop is precision-uniform.
+    // loop is precision-uniform, and apply the point-transform shift
+    // up-front so all downstream arithmetic lives in `precision - Pt`.
     let mut src: [Vec<u16>; 3] = [vec![0u16; w * h], vec![0u16; w * h], vec![0u16; w * h]];
     if precision <= 8 {
         for c in 0..3 {
             for y in 0..h {
                 for x in 0..w {
-                    src[c][y * w + x] = planes[c][y * strides[c] + x] as u16;
+                    src[c][y * w + x] = (planes[c][y * strides[c] + x] as u16) >> pt;
                 }
             }
         }
@@ -2220,27 +2387,58 @@ pub fn encode_lossless_jpeg_rgb(
                 for x in 0..w {
                     let lo = planes[c][y * strides[c] + x * 2] as u16;
                     let hi = planes[c][y * strides[c] + x * 2 + 1] as u16;
-                    src[c][y * w + x] = lo | (hi << 8);
+                    src[c][y * w + x] = (lo | (hi << 8)) >> pt;
                 }
             }
         }
     }
 
-    // Validate sample range against declared precision.
+    // Validate pre-shift sample range against declared precision.
     let max_sample: u32 = (1u32 << precision) - 1;
-    for c in 0..3 {
-        for &v in &src[c] {
-            if v as u32 > max_sample {
-                return Err(Error::invalid(format!(
-                    "lossless RGB encoder: sample {v} in plane {c} exceeds precision-{precision} max {max_sample}"
-                )));
+    if precision <= 8 {
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let v = planes[c][y * strides[c] + x] as u32;
+                    if v > max_sample {
+                        return Err(Error::invalid(format!(
+                            "lossless RGB encoder: sample {v} in plane {c} exceeds precision-{precision} max {max_sample}"
+                        )));
+                    }
+                }
+            }
+        }
+    } else {
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let lo = planes[c][y * strides[c] + x * 2] as u32;
+                    let hi = planes[c][y * strides[c] + x * 2 + 1] as u32;
+                    let v = lo | (hi << 8);
+                    if v > max_sample {
+                        return Err(Error::invalid(format!(
+                            "lossless RGB encoder: sample {v} in plane {c} exceeds precision-{precision} max {max_sample}"
+                        )));
+                    }
+                }
             }
         }
     }
 
     // Default prediction for the first sample of each component at scan
-    // start (T.81 §H.1.2.1, Pt=0): 2^(P-1).
-    let origin: i32 = 1i32 << (precision - 1);
+    // start and after every RSTn (T.81 §H.1.2.1): `2^(P − Pt − 1)`.
+    let sample_bits = precision as u32 - pt;
+    let origin: i32 = 1i32 << (sample_bits - 1);
+
+    // Restart bookkeeping. The lossless 3-component MCU is one pixel
+    // (each component's `H_i = V_i = 1`, so all three samples land in a
+    // single MCU). `mcus_since_restart` counts pixels.
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: u32 = 0;
+    let total_mcus: u64 = w as u64 * h as u64;
+    let mut mcu_index: u64 = 0;
+    let mut reset_pred = true;
 
     let mut bw = BitWriter::new(&mut out);
     for y in 0..h {
@@ -2252,7 +2450,7 @@ pub fn encode_lossless_jpeg_rgb(
             for c in 0..3 {
                 let plane = &src[c];
                 let actual = plane[y * w + x] as i32;
-                let pred: i32 = if x == 0 && y == 0 {
+                let pred: i32 = if reset_pred {
                     origin
                 } else if y == 0 {
                     // First line: forced predictor 1 (Ra) per H.1.2.1.
@@ -2287,6 +2485,20 @@ pub fn encode_lossless_jpeg_rgb(
                     bw.write_bits(bits, s as u32);
                 }
             }
+
+            reset_pred = false;
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            // Emit an RSTn marker after every `ri` MCUs, but never after
+            // the very last MCU (the decoder expects EOI next).
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                mcus_since_restart = 0;
+                reset_pred = true;
+            }
         }
     }
     bw.finish();
@@ -2308,12 +2520,15 @@ fn write_sof_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u8)
     write_length_prefix(out, 0xC3 /* SOF3 */, &payload);
 }
 
-fn write_sos_lossless(out: &mut Vec<u8>, predictor: u8) {
+fn write_sos_lossless(out: &mut Vec<u8>, predictor: u8, point_transform: u8) {
+    debug_assert!(point_transform <= 0x0F, "Pt must fit in 4 bits");
     let payload: [u8; 6] = [
         1, // Ns
-        1, 0x00, // comp 1 → DC=0 AC=0 (AC unused for lossless)
-        predictor, 0, // Ss = predictor selector, Se = 0
-        0, // Ah | Al — Pt=0 for now (the decoder still supports non-zero Pt)
+        1,
+        0x00, // comp 1 → DC=0 AC=0 (AC unused for lossless)
+        predictor,
+        0,                      // Ss = predictor selector, Se = 0
+        point_transform & 0x0F, // Ah | Al — Ah=0 (lossless), Al=Pt (low nibble)
     ];
     write_length_prefix(out, markers::SOS, &payload);
 }
@@ -2339,9 +2554,12 @@ fn write_sof_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precisio
 
 /// Write an interleaved SOS segment for an `ns`-component lossless scan.
 /// Every component selects DC table 0 (AC unused), `Ss` carries the
-/// shared predictor selector, `Se = 0`, `Ah | Al = 0` (`Pt = 0`).
-fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ns: u8) {
+/// shared predictor selector, `Se = 0`, `Ah | Al` packs `Ah = 0` (no
+/// successive approximation in lossless) and the supplied
+/// `point_transform` in the low nibble (`Al = Pt`).
+fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ns: u8, point_transform: u8) {
     debug_assert!((1..=4).contains(&ns));
+    debug_assert!(point_transform <= 0x0F, "Pt must fit in 4 bits");
     let mut payload = Vec::with_capacity(3 + 2 * ns as usize);
     payload.push(ns);
     for ci in 1..=ns {
@@ -2350,7 +2568,7 @@ fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ns: u8) {
     }
     payload.push(predictor); // Ss = predictor selector
     payload.push(0); // Se
-    payload.push(0); // Ah | Al (Pt = 0)
+    payload.push(point_transform & 0x0F); // Ah | Al: Ah=0, Al=Pt
     write_length_prefix(out, markers::SOS, &payload);
 }
 

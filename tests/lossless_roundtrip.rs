@@ -9,7 +9,10 @@
 //! so these tests exercise the two halves end-to-end.
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
-use oxideav_mjpeg::encoder::{encode_lossless_jpeg_grayscale, encode_lossless_jpeg_rgb};
+use oxideav_mjpeg::encoder::{
+    encode_lossless_jpeg_grayscale, encode_lossless_jpeg_grayscale_with_opts,
+    encode_lossless_jpeg_rgb, encode_lossless_jpeg_rgb_with_opts,
+};
 use oxideav_mjpeg::registry::make_decoder;
 
 /// Build a deterministic, textured 8-bit grayscale source so the residuals
@@ -433,4 +436,295 @@ fn registry_encoder_gray8_without_lossless_flag_errors() {
         format!("{err:?}").to_lowercase().contains("lossless"),
         "expected lossless-hint error, got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lossless encoder restart-marker + point-transform coverage (round 89).
+//
+// The decoder side has supported `RSTn` resets and non-zero `Pt` for the
+// lossless path since round 0.1.0; these tests exercise the matching
+// encoder options shipped in `*_with_opts` variants.
+// ---------------------------------------------------------------------------
+
+/// Confirm DRI + at least one `RSTn` marker land in the bitstream when
+/// `restart_interval > 0`. Pure header-level: independent from the decode
+/// roundtrip below.
+#[test]
+fn lossless_grayscale_with_restart_emits_dri_and_rst() {
+    let w = 16u32;
+    let h = 8u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    let ri: u16 = 32; // 32 samples per restart on a 128-sample image → 3 RSTn.
+    let jpeg = encode_lossless_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 1, ri, 0)
+        .expect("encode with restart");
+    // DRI = 0xFF 0xDD.
+    assert!(
+        jpeg.windows(2).any(|x| x == [0xFF, 0xDD]),
+        "DRI marker missing"
+    );
+    // At least one RSTn marker (0xD0..=0xD7) — not stuff-prefixed, so the
+    // first 0xFF in the pair must be a real marker introducer.
+    let rst_count = jpeg
+        .windows(2)
+        .filter(|x| x[0] == 0xFF && (0xD0..=0xD7).contains(&x[1]))
+        .count();
+    assert!(rst_count >= 3, "expected ≥3 RSTn markers, got {rst_count}");
+}
+
+/// 8-bit grayscale lossless with a non-trivial restart interval must
+/// still round-trip exactly through the SOF3 decoder, for every
+/// predictor 1..=7. The restart interval is set so that several
+/// boundaries fall inside the image (not just at the end).
+#[test]
+fn lossless_grayscale_with_restart_roundtrips_every_predictor() {
+    let w = 24u32;
+    let h = 16u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    let ri: u16 = 17; // forces ≥22 RSTn on a 384-sample image
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_jpeg_grayscale_with_opts(
+            w, h, &samples, w as usize, 8, predictor, ri, 0,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        let v = decode_to_frame(jpeg, w, h);
+        let stride = v.planes[0].stride;
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                assert_eq!(
+                    v.planes[0].data[j * stride + i],
+                    samples[j * w as usize + i],
+                    "predictor={predictor} mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// 12-bit grayscale lossless with restart and predictor 4. Confirms the
+/// wider-precision path threads the restart bookkeeping correctly.
+#[test]
+fn lossless_grayscale_12bit_with_restart_roundtrips() {
+    let w = 16u32;
+    let h = 12u32;
+    let precision = 12u8;
+    let bytes = mk_samples_wide(w as usize, h as usize, precision);
+    let ri: u16 = 23; // 192-sample image → ≥8 RSTn boundaries.
+    let jpeg = encode_lossless_jpeg_grayscale_with_opts(
+        w,
+        h,
+        &bytes,
+        (w as usize) * 2,
+        precision,
+        4,
+        ri,
+        0,
+    )
+    .expect("encode 12-bit with restart");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let lo_in = bytes[(j * w as usize + i) * 2] as u16;
+            let hi_in = bytes[(j * w as usize + i) * 2 + 1] as u16;
+            let want = lo_in | (hi_in << 8);
+            let lo = v.planes[0].data[j * stride + i * 2] as u16;
+            let hi = v.planes[0].data[j * stride + i * 2 + 1] as u16;
+            let got = lo | (hi << 8);
+            assert_eq!(got, want, "12-bit restart mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// Non-zero `Pt` (point transform) shifts the wire samples right by Pt
+/// at encode time; the decoder shifts left by Pt on the way out. The
+/// round-trip therefore preserves the high `precision − Pt` bits exactly
+/// and zeroes the low `Pt` bits.
+#[test]
+fn lossless_grayscale_with_point_transform_drops_low_bits() {
+    let w = 16u32;
+    let h = 8u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    let pt: u8 = 2;
+    let jpeg = encode_lossless_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 1, 0, pt)
+        .expect("encode with Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let got = v.planes[0].data[j * stride + i];
+            // Pt rounds toward zero: encoder right-shifts (samples[i] >> Pt),
+            // decoder left-shifts back (got = (samples[i] >> Pt) << Pt).
+            let want = (samples[j * w as usize + i] >> pt) << pt;
+            assert_eq!(got, want, "Pt={pt} mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// Combining Pt + restart on the grayscale path: round-trip must still
+/// drop exactly the low Pt bits and reset cleanly at every RSTn.
+#[test]
+fn lossless_grayscale_with_restart_and_pt_roundtrips() {
+    let w = 20u32;
+    let h = 12u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    let pt: u8 = 1;
+    let ri: u16 = 13;
+    let jpeg = encode_lossless_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 5, ri, pt)
+        .expect("encode with restart+Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let got = v.planes[0].data[j * stride + i];
+            let want = (samples[j * w as usize + i] >> pt) << pt;
+            assert_eq!(got, want, "Pt+restart mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// 3-component RGB lossless with restart markers — every predictor must
+/// still byte-exact-roundtrip through the SOF3 decoder. The decoder side
+/// already exercises per-component predictor reset at RSTn (`reset_pred`
+/// applies uniformly across all components in `decode_lossless_scan`).
+#[test]
+fn lossless_rgb_with_restart_roundtrips_every_predictor() {
+    let w = 16u32;
+    let h = 12u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    let ri: u16 = 11; // 192-pixel image → ≥17 RSTn boundaries.
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_jpeg_rgb_with_opts(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2]],
+            strides,
+            8,
+            predictor,
+            ri,
+            0,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        let v = decode_to_frame(jpeg, w, h);
+        let stride = v.planes[0].stride;
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let got_r = v.planes[0].data[j * stride + i * 3];
+                let got_g = v.planes[0].data[j * stride + i * 3 + 1];
+                let got_b = v.planes[0].data[j * stride + i * 3 + 2];
+                assert_eq!(
+                    got_r,
+                    planes[0][j * w as usize + i],
+                    "pred={predictor} R mismatch at ({i},{j})"
+                );
+                assert_eq!(
+                    got_g,
+                    planes[1][j * w as usize + i],
+                    "pred={predictor} G mismatch at ({i},{j})"
+                );
+                assert_eq!(
+                    got_b,
+                    planes[2][j * w as usize + i],
+                    "pred={predictor} B mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// 3-component RGB lossless with non-zero Pt: every plane must decode
+/// back to `(sample >> Pt) << Pt`.
+#[test]
+fn lossless_rgb_with_point_transform_drops_low_bits() {
+    let w = 16u32;
+    let h = 12u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    let pt: u8 = 3;
+    let jpeg = encode_lossless_jpeg_rgb_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        8,
+        1,
+        0,
+        pt,
+    )
+    .expect("encode RGB with Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for (ch, plane) in planes.iter().enumerate() {
+                let got = v.planes[0].data[j * stride + i * 3 + ch];
+                let want = (plane[j * w as usize + i] >> pt) << pt;
+                assert_eq!(got, want, "ch={ch} Pt={pt} mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// 3-component RGB lossless with restart + Pt combined.
+#[test]
+fn lossless_rgb_with_restart_and_pt_roundtrips() {
+    let w = 24u32;
+    let h = 16u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    let pt: u8 = 2;
+    let ri: u16 = 19;
+    let jpeg = encode_lossless_jpeg_rgb_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        8,
+        7,
+        ri,
+        pt,
+    )
+    .expect("encode RGB restart+Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for (ch, plane) in planes.iter().enumerate() {
+                let got = v.planes[0].data[j * stride + i * 3 + ch];
+                let want = (plane[j * w as usize + i] >> pt) << pt;
+                assert_eq!(got, want, "ch={ch} Pt+restart mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// Reject Pt ≥ precision on both encoders (would shift away every bit).
+#[test]
+fn lossless_encoders_reject_pt_ge_precision() {
+    let w = 4u32;
+    let h = 4u32;
+    let samples = vec![0u8; (w * h) as usize];
+    let err = encode_lossless_jpeg_grayscale_with_opts(
+        w, h, &samples, w as usize, 8, 1, 0, 8, // Pt == precision
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}")
+        .to_lowercase()
+        .contains("point_transform"));
+
+    let plane = vec![0u8; (w * h) as usize];
+    let err = encode_lossless_jpeg_rgb_with_opts(
+        w,
+        h,
+        [&plane, &plane, &plane],
+        [w as usize, w as usize, w as usize],
+        8,
+        1,
+        0,
+        9, // Pt > precision
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}")
+        .to_lowercase()
+        .contains("point_transform"));
 }

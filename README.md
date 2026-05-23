@@ -239,9 +239,49 @@ Coverage:
   intra-frame delivery is tolerated as long as the marker-bit fragment
   arrives.
 
+### RTP/JPEG packetization (RFC 2435)
+
+`rtp::packetize(jpeg, max_payload, qmode)` is the encode-side inverse:
+it parses a complete baseline JPEG, strips the frame/scan headers, and
+emits a `Vec<rtp::JpegPacket>` of RTP/JPEG payloads ready to drop after
+the RTP fixed header.
+
+```rust
+use oxideav_mjpeg::rtp::{packetize, QMode};
+
+# let jpeg: &[u8] = &[];
+// `jpeg` = a complete baseline SOF0/SOF1 4:2:2 or 4:2:0 YUV stream.
+let packets = packetize(jpeg, 1400, QMode::InBand(255))?;
+for pkt in &packets {
+    // Prepend a 12-byte RTP header: same 90 kHz timestamp across the
+    // frame, ascending sequence numbers, and the marker bit set when
+    // `pkt.marker` is true.
+    send_rtp(&pkt.payload, pkt.marker);
+}
+# fn send_rtp(_p: &[u8], _m: bool) {}
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+Coverage:
+
+- Luma sampling `2x1` → type 0 (4:2:2), `2x2` → type 1 (4:2:0); chroma must
+  be `1x1` (the well-known §4.1 layout).
+- A source DRI promotes the type to 64/65 and writes the §3.1.7 Restart
+  Marker header (whole-frame reassembly: F=L=1, Restart Count 0x3FFF).
+- `QMode::Quality(1..=99)` carries an IJG-quality Q value (receiver
+  regenerates the Annex K tables); `QMode::InBand(128..=255)` carries the
+  JPEG's own two DQT tables in a §3.1.8 Quantization Table header on the
+  first fragment.
+- The scan is fragmented at `max_payload` (header bytes counted); the first
+  fragment has offset 0, the last has `JpegPacket::marker == true`.
+
 Lacks: RTP transport framing itself (the 12-byte RTP fixed header,
-sequence ordering, packetization on the encode side stay the caller's
-job), out-of-band table negotiation (`Q ≥ 128` with no in-band tables →
+sequence numbering, 90 kHz timestamping stay the caller's job),
+restart-interval-aligned chunk splitting across packets (the scan is
+fragmented on arbitrary byte boundaries, with whole-frame reassembly
+signalled), packetization of progressive / lossless / grayscale / CMYK
+JPEGs (no well-known RTP/JPEG type — `Unsupported`), out-of-band table
+negotiation on depacketize (`Q ≥ 128` with no in-band tables →
 `Unsupported`), and the dynamic non-well-known types 128..=255.
 
 ### Codec / container IDs
@@ -295,8 +335,9 @@ Decoder:
 - **RTP/JPEG (RFC 2435)** depacketization via `rtp::JpegDepacketizer` —
   reassembles fragmented RTP/JPEG payloads and reconstructs the absent
   frame/scan headers (from the Q field or an in-band quantization-table
-  header) into a complete JPEG the decoder consumes. See the RTP/JPEG
-  section below.
+  header) into a complete JPEG the decoder consumes. The encode-side
+  inverse `rtp::packetize` fragments a baseline JPEG into RTP/JPEG
+  payloads. See the RTP/JPEG sections below.
 - APP0..APP15 segments skipped cleanly (EXIF/XMP/ICC preserved at the
   container level, not parsed).
 - Trailing garbage past EOI is stripped by the demuxer.

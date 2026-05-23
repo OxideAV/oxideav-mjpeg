@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rtp` module: RFC 2435 RTP/JPEG **packetization** (the encode-side inverse
+  of the depacketizer). `rtp::packetize(jpeg, max_payload, qmode)` parses a
+  complete baseline (SOF0/SOF1) three-component YUV JPEG, strips the frame and
+  scan headers, and fragments the entropy-coded scan into `rtp::JpegPacket`
+  RTP/JPEG payloads. Luma sampling `2x1` maps to the well-known type 0 (4:2:2)
+  and `2x2` to type 1 (4:2:0); a DRI segment promotes the type to 64/65 and
+  emits the §3.1.7 Restart Marker header (whole-frame reassembly, F=L=1,
+  count=0x3FFF). `rtp::QMode` selects table carriage: `Quality(1..=99)` puts an
+  IJG-quality Q value in the Q field (receiver regenerates Annex K tables), or
+  `InBand(128..=255)` carries the JPEG's own two DQT tables in a §3.1.8
+  Quantization Table header on the first fragment (offset 0). Fragments are
+  byte-contiguous; the first has fragment offset 0, the last has
+  `JpegPacket::marker == true` (caller sets the RTP marker bit). The caller
+  still owns RTP transport (12-byte fixed header, sequence numbers, 90 kHz
+  timestamp). Progressive/lossless/grayscale/CMYK, non-2:x luma sampling, and
+  16-bit DQT return `Unsupported` — RTP/JPEG has no well-known type for them.
+  Tests cover header layout, type 0/1 selection, restart-bit promotion, scan
+  fragmentation, the unsupported-input rejections, a structural
+  packetize→depacketize scan round trip, and end-to-end
+  encode→packetize→depacketize→decode for both the in-band and Q-field paths.
 - `rtp` module: RFC 2435 RTP/JPEG depacketization. `rtp::JpegDepacketizer`
   reassembles fragmented RTP/JPEG payloads (keyed on the §3.1.2 Fragment
   Offset, so misordered intra-frame delivery is tolerated) and

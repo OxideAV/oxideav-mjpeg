@@ -538,6 +538,385 @@ fn parse_qtable_header(bytes: &[u8], q: u8) -> Result<(Option<QuantPair>, usize)
     Ok((Some(QuantPair { luma, chroma }), QTBL_HDR_LEN + length))
 }
 
+// ============================================================================
+// Packetization (encode side) — the inverse of the depacketizer above.
+// ============================================================================
+
+/// One RTP/JPEG payload produced by the packetizer.
+///
+/// This is the RTP *payload* only — the bytes the caller places immediately
+/// after the 12-byte RTP fixed header (and any CSRC / extension words). The
+/// caller owns the RTP transport: it assigns the sequence number, the 90 kHz
+/// timestamp (identical across all fragments of one frame, §3), and sets the
+/// RTP marker bit when [`JpegPacket::marker`] is true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JpegPacket {
+    /// The RTP/JPEG payload bytes: main JPEG header + optional Restart Marker
+    /// header + optional Quantization Table header (first fragment only) +
+    /// a slice of the entropy-coded scan.
+    pub payload: Vec<u8>,
+    /// True on the last fragment of the frame — the caller MUST set the RTP
+    /// marker bit on the packet carrying this payload (§3).
+    pub marker: bool,
+}
+
+/// How the packetizer carries the frame's quantization tables on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QMode {
+    /// Carry a Q value 1..=99 in the Q field; the receiver regenerates the
+    /// tables with the §4.2 IJG scale formula. Use this only when the JPEG's
+    /// DQT tables actually equal the IJG-scaled Annex K tables for this Q —
+    /// otherwise the receiver's tables will not match the scan and the image
+    /// will be wrong. Suitable for streams this crate's encoder produced at
+    /// the same quality factor.
+    Quality(u8),
+    /// Carry the JPEG's own two DQT tables in-band via a §3.1.8 Quantization
+    /// Table header on the first fragment, with the Q field set to `q`
+    /// (128..=255). `q = 255` means "tables may change every frame"; 128..=254
+    /// means "static mapping". This is the safe default for an arbitrary JPEG
+    /// whose tables are not a known IJG quality.
+    InBand(u8),
+}
+
+/// Parsed pieces of a complete baseline JPEG that the packetizer needs to
+/// build the RTP/JPEG main header and (optionally) the in-band tables.
+struct JpegParts {
+    width: u16,
+    height: u16,
+    /// Base type 0 (4:2:2, luma `H=2 V=1`) or 1 (4:2:0, luma `H=2 V=2`).
+    base_type: u8,
+    /// Luma quantization table (id 0) in zigzag order, as carried in DQT.
+    qt_luma: [u8; 64],
+    /// Chroma quantization table (id 1) in zigzag order.
+    qt_chroma: [u8; 64],
+    /// DRI value (0 = no restart markers).
+    dri: u16,
+    /// Byte span `[start, end)` of the entropy-coded scan: everything after
+    /// the SOS segment up to (and excluding) the final EOI marker.
+    scan_start: usize,
+    scan_end: usize,
+}
+
+/// Read a big-endian u16 segment length at `pos` (the two bytes following a
+/// marker), returning the length value.
+fn seg_len(jpeg: &[u8], pos: usize) -> Result<usize> {
+    if pos + 2 > jpeg.len() {
+        return Err(Error::invalid(
+            "RTP/JPEG packetize: truncated segment length",
+        ));
+    }
+    Ok(u16::from_be_bytes([jpeg[pos], jpeg[pos + 1]]) as usize)
+}
+
+/// Parse the subset of a complete JPEG interchange stream that RTP/JPEG can
+/// carry: a baseline (SOF0/SOF1) three-component YUV image with luma `H=2`
+/// and unit-sampled chroma, exactly the well-known §4.1 type-0/1 layout.
+///
+/// Anything outside that envelope (progressive, lossless, grayscale, CMYK,
+/// non-2:x luma sampling, 16-bit DQT) returns `Unsupported` — RTP/JPEG has no
+/// way to signal it with the well-known types.
+fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
+    if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != markers::SOI {
+        return Err(Error::invalid("RTP/JPEG packetize: missing SOI"));
+    }
+    let mut pos = 2usize;
+    let mut width = 0u16;
+    let mut height = 0u16;
+    let mut base_type: Option<u8> = None;
+    let mut dqt: [Option<[u8; 64]>; 4] = [None, None, None, None];
+    let mut dri = 0u16;
+
+    loop {
+        // Markers may be preceded by fill 0xFF bytes (§B.1.1.2).
+        while pos < jpeg.len() && jpeg[pos] == 0xFF && pos + 1 < jpeg.len() && jpeg[pos + 1] == 0xFF
+        {
+            pos += 1;
+        }
+        if pos + 1 >= jpeg.len() {
+            return Err(Error::invalid("RTP/JPEG packetize: ran off end before SOS"));
+        }
+        if jpeg[pos] != 0xFF {
+            return Err(Error::invalid("RTP/JPEG packetize: expected marker"));
+        }
+        let marker = jpeg[pos + 1];
+        pos += 2;
+
+        match marker {
+            markers::SOF0 | markers::SOF1 => {
+                let len = seg_len(jpeg, pos)?;
+                let body = pos + 2;
+                if body + len - 2 > jpeg.len() || len < 8 {
+                    return Err(Error::invalid("RTP/JPEG packetize: truncated SOF"));
+                }
+                let precision = jpeg[body];
+                if precision != 8 {
+                    return Err(Error::unsupported(
+                        "RTP/JPEG packetize: only 8-bit precision is carryable",
+                    ));
+                }
+                height = u16::from_be_bytes([jpeg[body + 1], jpeg[body + 2]]);
+                width = u16::from_be_bytes([jpeg[body + 3], jpeg[body + 4]]);
+                let nc = jpeg[body + 5];
+                if nc != 3 {
+                    return Err(Error::unsupported(
+                        "RTP/JPEG packetize: only three-component YUV is carryable",
+                    ));
+                }
+                // Component records: id(1) H|V(1) Tq(1), three of them.
+                let c0 = body + 6;
+                let y_samp = jpeg[c0 + 1];
+                let cb_samp = jpeg[c0 + 3 + 1];
+                let cr_samp = jpeg[c0 + 6 + 1];
+                let (yh, yv) = (y_samp >> 4, y_samp & 0x0F);
+                // Chroma must be unit-sampled per the well-known mappings.
+                if cb_samp != 0x11 || cr_samp != 0x11 {
+                    return Err(Error::unsupported(
+                        "RTP/JPEG packetize: chroma must be 1x1 sampled (type 0/1)",
+                    ));
+                }
+                base_type = Some(match (yh, yv) {
+                    (2, 1) => 0,
+                    (2, 2) => 1,
+                    _ => return Err(Error::unsupported(
+                        "RTP/JPEG packetize: luma sampling must be 2x1 (type 0) or 2x2 (type 1)",
+                    )),
+                });
+                pos = body + len - 2;
+            }
+            markers::DQT => {
+                let len = seg_len(jpeg, pos)?;
+                let body = pos + 2;
+                let end = body + len - 2;
+                if end > jpeg.len() {
+                    return Err(Error::invalid("RTP/JPEG packetize: truncated DQT"));
+                }
+                let mut i = body;
+                while i < end {
+                    let pq_tq = jpeg[i];
+                    let pq = pq_tq >> 4;
+                    let tq = (pq_tq & 0x0F) as usize;
+                    i += 1;
+                    if pq != 0 {
+                        return Err(Error::unsupported(
+                            "RTP/JPEG packetize: 16-bit DQT not carryable in 8-bit type 0/1",
+                        ));
+                    }
+                    if tq >= 4 || i + 64 > end {
+                        return Err(Error::invalid("RTP/JPEG packetize: bad DQT entry"));
+                    }
+                    let mut t = [0u8; 64];
+                    t.copy_from_slice(&jpeg[i..i + 64]);
+                    dqt[tq] = Some(t);
+                    i += 64;
+                }
+                pos = end;
+            }
+            markers::DRI => {
+                let len = seg_len(jpeg, pos)?;
+                if len != 4 || pos + 4 > jpeg.len() {
+                    return Err(Error::invalid("RTP/JPEG packetize: bad DRI"));
+                }
+                dri = u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]);
+                pos += len;
+            }
+            markers::SOS => {
+                let len = seg_len(jpeg, pos)?;
+                let scan_start = pos + len;
+                // Find the EOI that terminates the entropy-coded scan. Skip
+                // 0x00 stuffing and RSTn markers inside the scan.
+                let mut s = scan_start;
+                let scan_end = loop {
+                    if s + 1 >= jpeg.len() {
+                        return Err(Error::invalid("RTP/JPEG packetize: scan has no EOI"));
+                    }
+                    if jpeg[s] == 0xFF {
+                        let m = jpeg[s + 1];
+                        if m == markers::EOI {
+                            break s;
+                        }
+                        // A second 0xFF is a fill byte (§B.1.1.2): advance one
+                        // and re-examine, so 0xFF 0xFF … D9 still finds EOI.
+                        if m == 0xFF {
+                            s += 1;
+                            continue;
+                        }
+                        // 0xFF00 stuffing and RSTn stay part of the scan.
+                        if m == 0x00 || markers::is_rst(m) {
+                            s += 2;
+                            continue;
+                        }
+                        // Any other marker terminates the scan (shouldn't
+                        // happen for the single-scan baseline images we carry).
+                        break s;
+                    }
+                    s += 1;
+                };
+                let base_type = base_type
+                    .ok_or_else(|| Error::invalid("RTP/JPEG packetize: SOS before SOF"))?;
+                let qt_luma = dqt[0]
+                    .ok_or_else(|| Error::invalid("RTP/JPEG packetize: missing luma DQT (id 0)"))?;
+                let qt_chroma = dqt[1].ok_or_else(|| {
+                    Error::invalid("RTP/JPEG packetize: missing chroma DQT (id 1)")
+                })?;
+                return Ok(JpegParts {
+                    width,
+                    height,
+                    base_type,
+                    qt_luma,
+                    qt_chroma,
+                    dri,
+                    scan_start,
+                    scan_end,
+                });
+            }
+            markers::SOF2 | markers::SOF3 | markers::SOF9 => {
+                return Err(Error::unsupported(
+                    "RTP/JPEG packetize: only baseline SOF0/SOF1 is carryable",
+                ));
+            }
+            markers::EOI => {
+                return Err(Error::invalid("RTP/JPEG packetize: EOI before SOS"));
+            }
+            // Skip every other length-prefixed segment (APPn, COM, DHT, …):
+            // RTP/JPEG infers the Huffman tables from the type, and the
+            // JFIF/APP/COM metadata is not carried on the wire.
+            _ if markers::is_rst(marker) => { /* stray RSTn outside scan — skip */ }
+            _ => {
+                let len = seg_len(jpeg, pos)?;
+                pos += len;
+            }
+        }
+    }
+}
+
+/// Validate that `width`/`height` fit the §3.1.5–3.1.6 8-pixel-unit fields
+/// (max 2040) and return them divided by 8.
+fn dim_units(width: u16, height: u16) -> Result<(u8, u8)> {
+    if width == 0 || height == 0 || width > 2040 || height > 2040 {
+        return Err(Error::unsupported(
+            "RTP/JPEG packetize: dimensions must be 8..=2040 px (8-pixel-unit wire field)",
+        ));
+    }
+    // The wire field counts 8-pixel units; round up so a non-multiple-of-8
+    // image still spans its full MCU grid (the receiver clips to width/height
+    // from the reconstructed SOF0, which carries the exact pixel size).
+    Ok((width.div_ceil(8) as u8, height.div_ceil(8) as u8))
+}
+
+/// Packetize a complete baseline JPEG interchange stream into RFC 2435
+/// RTP/JPEG payloads — the inverse of [`JpegDepacketizer`].
+///
+/// `jpeg` is one SOI..EOI baseline (SOF0/SOF1) three-component YUV image with
+/// luma sampling `2x1` (→ type 0, 4:2:2) or `2x2` (→ type 1, 4:2:0) and
+/// unit-sampled chroma. `max_payload` is the largest RTP/JPEG payload the
+/// caller's MTU allows (header bytes included; e.g. 1400 for a typical
+/// Ethernet path). `qmode` selects how the quantization tables travel.
+///
+/// The returned `Vec` holds the fragments in order: the first has fragment
+/// offset 0 (and carries the in-band Quantization Table header when
+/// `qmode` is [`QMode::InBand`]); the last has `marker == true`. The scan is
+/// fragmented on arbitrary byte boundaries unless the image uses restart
+/// markers, in which case fragments are kept whole (single packet) because
+/// this entry point does not split a restart-aligned scan across packets.
+///
+/// Feeding the produced payloads (with their `marker` flags) back into a
+/// [`JpegDepacketizer`] reconstructs a JPEG that decodes to the same image.
+pub fn packetize(jpeg: &[u8], max_payload: usize, qmode: QMode) -> Result<Vec<JpegPacket>> {
+    let parts = parse_jpeg(jpeg)?;
+    let (w_units, h_units) = dim_units(parts.width, parts.height)?;
+
+    // Resolve the Q field and any in-band Quantization Table header bytes.
+    let (q_field, qtable_hdr): (u8, Vec<u8>) = match qmode {
+        QMode::Quality(q) => {
+            if !(1..=99).contains(&q) {
+                return Err(Error::invalid(
+                    "RTP/JPEG packetize: QMode::Quality must be 1..=99",
+                ));
+            }
+            (q, Vec::new())
+        }
+        QMode::InBand(q) => {
+            if q < 128 {
+                return Err(Error::invalid(
+                    "RTP/JPEG packetize: QMode::InBand Q must be 128..=255",
+                ));
+            }
+            // §3.1.8 Quantization Table header: MBZ(1) Precision(1) Length(2)
+            // then two 8-bit tables (luma id 0, chroma id 1) in zigzag order.
+            let mut h = Vec::with_capacity(QTBL_HDR_LEN + 128);
+            h.push(0); // MBZ
+            h.push(0); // Precision: both tables 8-bit
+            h.extend_from_slice(&128u16.to_be_bytes()); // Length = two 64-byte tables
+            h.extend_from_slice(&parts.qt_luma);
+            h.extend_from_slice(&parts.qt_chroma);
+            (q, h)
+        }
+    };
+
+    let typ = if parts.dri != 0 {
+        parts.base_type | TYPE_RESTART_BIT
+    } else {
+        parts.base_type
+    };
+
+    // Per-fragment header size: main(8) + restart(4 if any) + qtable header
+    // (first fragment only). Reserve room so at least one scan byte fits.
+    let rst_len = if parts.dri != 0 { RST_HDR_LEN } else { 0 };
+    let first_hdr = MAIN_HDR_LEN + rst_len + qtable_hdr.len();
+    let cont_hdr = MAIN_HDR_LEN + rst_len;
+    if max_payload <= first_hdr || max_payload <= cont_hdr {
+        return Err(Error::invalid(
+            "RTP/JPEG packetize: max_payload too small for the headers",
+        ));
+    }
+
+    let scan = &jpeg[parts.scan_start..parts.scan_end];
+    let mut packets = Vec::new();
+    let mut offset = 0usize;
+    let mut first = true;
+
+    loop {
+        let hdr_room = if first { first_hdr } else { cont_hdr };
+        let chunk = (max_payload - hdr_room).min(scan.len() - offset);
+        let is_last = offset + chunk >= scan.len();
+
+        let mut payload = Vec::with_capacity(hdr_room + chunk);
+        // Main JPEG header (§3.1).
+        payload.push(0); // Type-specific (progressive frame).
+        payload.push((offset >> 16) as u8);
+        payload.push((offset >> 8) as u8);
+        payload.push(offset as u8);
+        payload.push(typ);
+        payload.push(q_field);
+        payload.push(w_units);
+        payload.push(h_units);
+        // Restart Marker header (§3.1.7) when restart markers are present.
+        if parts.dri != 0 {
+            payload.extend_from_slice(&parts.dri.to_be_bytes());
+            // Whole frame reassembled before decode: F=L=1, count=0x3FFF.
+            payload.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        }
+        // Quantization Table header on the first fragment only (§3.1.4).
+        if first {
+            payload.extend_from_slice(&qtable_hdr);
+        }
+        payload.extend_from_slice(&scan[offset..offset + chunk]);
+
+        packets.push(JpegPacket {
+            payload,
+            marker: is_last,
+        });
+
+        offset += chunk;
+        first = false;
+        if is_last {
+            break;
+        }
+    }
+
+    Ok(packets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,6 +1338,234 @@ mod tests {
             _ => panic!(),
         };
         let decoded = decode_jpeg(&rebuilt, None).expect("decode Q-field RTP/JPEG");
+        assert_eq!(decoded.planes.len(), 3);
+        assert_eq!(decoded.planes[0].data.len(), w * h);
+    }
+
+    // ---- Packetizer (encode side) ----
+
+    /// Build a complete baseline JPEG by hand: SOI, two DQT (ids 0/1), SOF0
+    /// (3-component, given luma sampling, chroma 1x1), optional DRI, SOS, a
+    /// short stuffed scan, EOI. This avoids depending on the real encoder for
+    /// the non-registry tests.
+    fn handmade_jpeg(width: u16, height: u16, luma_samp: u8, dri: u16, scan: &[u8]) -> Vec<u8> {
+        let mut j = vec![0xFF, markers::SOI];
+        // DQT id 0 (luma): 1..=64.
+        j.extend_from_slice(&[0xFF, markers::DQT, 0x00, 67, 0x00]);
+        j.extend((0..64).map(|i| (i as u8) + 1));
+        // DQT id 1 (chroma): 64..=1.
+        j.extend_from_slice(&[0xFF, markers::DQT, 0x00, 67, 0x01]);
+        j.extend((0..64).map(|i| 64 - i as u8));
+        // SOF0.
+        j.extend_from_slice(&[0xFF, markers::SOF0, 0x00, 17, 8]);
+        j.extend_from_slice(&height.to_be_bytes());
+        j.extend_from_slice(&width.to_be_bytes());
+        j.push(3);
+        j.extend_from_slice(&[1, luma_samp, 0]); // Y
+        j.extend_from_slice(&[2, 0x11, 1]); // Cb
+        j.extend_from_slice(&[3, 0x11, 1]); // Cr
+        if dri != 0 {
+            j.extend_from_slice(&[0xFF, markers::DRI, 0x00, 0x04]);
+            j.extend_from_slice(&dri.to_be_bytes());
+        }
+        // SOS: 3 components, Ss=0 Se=63 Ah|Al=0.
+        j.extend_from_slice(&[
+            0xFF,
+            markers::SOS,
+            0x00,
+            12,
+            3,
+            1,
+            0x00,
+            2,
+            0x11,
+            3,
+            0x11,
+            0,
+            63,
+            0,
+        ]);
+        j.extend_from_slice(scan);
+        j.extend_from_slice(&[0xFF, markers::EOI]);
+        j
+    }
+
+    #[test]
+    fn packetize_single_fragment_inband() {
+        let scan = vec![0x11, 0x22, 0x33, 0x44];
+        let jpeg = handmade_jpeg(64, 64, 0x22, 0, &scan); // 4:2:0 → type 1
+        let pkts = packetize(&jpeg, 1400, QMode::InBand(255)).unwrap();
+        assert_eq!(pkts.len(), 1);
+        assert!(pkts[0].marker);
+        let p = &pkts[0].payload;
+        let h = parse_main_header(p).unwrap();
+        assert_eq!(h.fragment_offset, 0);
+        assert_eq!(h.typ, 1);
+        assert_eq!(h.q, 255);
+        assert_eq!(h.width, 64);
+        assert_eq!(h.height, 64);
+        assert!(!h.has_restart());
+        // Quantization Table header (MBZ, Precision=0, Length=128) + two tables.
+        let qh = &p[MAIN_HDR_LEN..];
+        assert_eq!(u16::from_be_bytes([qh[2], qh[3]]), 128);
+        assert_eq!(&qh[QTBL_HDR_LEN..QTBL_HDR_LEN + 64][..4], &[1, 2, 3, 4]);
+        // Scan trails after the table header.
+        assert_eq!(&p[p.len() - 4..], &scan[..]);
+    }
+
+    #[test]
+    fn packetize_type0_from_422_sampling() {
+        let jpeg = handmade_jpeg(64, 64, 0x21, 0, &[0xAB; 8]); // 4:2:2 → type 0
+        let pkts = packetize(&jpeg, 1400, QMode::Quality(50)).unwrap();
+        assert_eq!(pkts.len(), 1);
+        let h = parse_main_header(&pkts[0].payload).unwrap();
+        assert_eq!(h.typ, 0);
+        assert_eq!(h.q, 50);
+        // Q-field mode emits no in-band table header; scan starts at byte 8.
+        assert_eq!(&pkts[0].payload[MAIN_HDR_LEN..], &[0xAB; 8]);
+    }
+
+    #[test]
+    fn packetize_restart_sets_type_bit_and_header() {
+        let jpeg = handmade_jpeg(64, 64, 0x22, 7, &[0x5A; 6]);
+        let pkts = packetize(&jpeg, 1400, QMode::Quality(60)).unwrap();
+        let p = &pkts[0].payload;
+        let h = parse_main_header(p).unwrap();
+        assert_eq!(h.typ, 1 | TYPE_RESTART_BIT); // type 65
+        assert!(h.has_restart());
+        let rh = parse_restart_header(&p[MAIN_HDR_LEN..]).unwrap();
+        assert_eq!(rh.restart_interval, 7);
+        assert!(rh.first && rh.last);
+        assert_eq!(rh.count, 0x3FFF);
+    }
+
+    #[test]
+    fn packetize_fragments_long_scan() {
+        // 100-byte scan, max_payload 8(hdr)+10(scan)=18 → 10 scan bytes/frag.
+        let scan: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        let jpeg = handmade_jpeg(64, 64, 0x22, 0, &scan);
+        let pkts = packetize(&jpeg, MAIN_HDR_LEN + 10, QMode::Quality(50)).unwrap();
+        assert_eq!(pkts.len(), 10);
+        // Offsets are contiguous and only the last carries the marker.
+        let mut expect_off = 0u32;
+        for (i, pk) in pkts.iter().enumerate() {
+            let h = parse_main_header(&pk.payload).unwrap();
+            assert_eq!(h.fragment_offset, expect_off);
+            expect_off += (pk.payload.len() - MAIN_HDR_LEN) as u32;
+            assert_eq!(pk.marker, i == pkts.len() - 1);
+        }
+        assert_eq!(expect_off, 100);
+    }
+
+    #[test]
+    fn packetize_rejects_progressive() {
+        // SOF2 in place of SOF0.
+        let mut jpeg = handmade_jpeg(64, 64, 0x22, 0, &[0u8; 4]);
+        let sof = jpeg
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == markers::SOF0)
+            .unwrap();
+        jpeg[sof + 1] = markers::SOF2;
+        assert!(packetize(&jpeg, 1400, QMode::Quality(50)).is_err());
+    }
+
+    #[test]
+    fn packetize_rejects_unsupported_qmode_ranges() {
+        let jpeg = handmade_jpeg(64, 64, 0x22, 0, &[0u8; 4]);
+        assert!(packetize(&jpeg, 1400, QMode::Quality(0)).is_err());
+        assert!(packetize(&jpeg, 1400, QMode::Quality(100)).is_err());
+        assert!(packetize(&jpeg, 1400, QMode::InBand(127)).is_err());
+    }
+
+    #[test]
+    fn packetize_rejects_oversize_dimensions() {
+        let jpeg = handmade_jpeg(2048, 64, 0x22, 0, &[0u8; 4]);
+        assert!(packetize(&jpeg, 1400, QMode::Quality(50)).is_err());
+    }
+
+    #[test]
+    fn packetize_then_depacketize_roundtrips_scan() {
+        // Structural round trip without the codec: the scan bytes that go in
+        // come back out, and the reconstructed type/dims match.
+        // A real entropy-coded scan never carries a bare 0xFF (the encoder
+        // byte-stuffs them), so keep the synthetic scan below 0xFF.
+        let scan: Vec<u8> = (0..200).map(|i| (i % 0xF0) as u8).collect();
+        let jpeg = handmade_jpeg(128, 96, 0x22, 0, &scan);
+        // Quant header is 132 B; size the MTU to fit it plus a small scan
+        // chunk so the 200-byte scan still spans more than one fragment.
+        let pkts = packetize(&jpeg, MAIN_HDR_LEN + 132 + 40, QMode::InBand(200)).unwrap();
+        assert!(pkts.len() > 1);
+        let mut dp = JpegDepacketizer::new();
+        let mut rebuilt = None;
+        for pk in &pkts {
+            match dp.push(&pk.payload, pk.marker).unwrap() {
+                Progress::NeedMore => {}
+                Progress::Frame(j) => rebuilt = Some(j),
+            }
+        }
+        let rebuilt = rebuilt.expect("frame reassembled");
+        // SOI..EOI bookends and the scan survives intact.
+        assert_eq!(&rebuilt[0..2], &[0xFF, markers::SOI]);
+        assert_eq!(&rebuilt[rebuilt.len() - 2..], &[0xFF, markers::EOI]);
+        let scan_start = rebuilt.len() - 2 - scan.len();
+        assert_eq!(&rebuilt[scan_start..rebuilt.len() - 2], &scan[..]);
+        // 4:2:0 sampling preserved through the round trip.
+        let sof = rebuilt
+            .windows(2)
+            .position(|w| w[0] == 0xFF && w[1] == markers::SOF0)
+            .unwrap();
+        assert_eq!(rebuilt[sof + 2 + 2 + 1 + 2 + 2 + 1 + 1], 0x22);
+    }
+
+    // ---- End-to-end: encode → packetize → depacketize → decode. Proves a
+    // packetized stream really decodes back to the source image. ----
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn end_to_end_packetize_inband_decodes() {
+        let (w, h) = (96usize, 64usize);
+        let frame = make_420_frame(w, h);
+        let jpeg =
+            encode_jpeg(&frame, w as u32, h as u32, PixelFormat::Yuv420P, 75).expect("encode");
+
+        // Fragment small enough to force several packets out of the scan.
+        let pkts = packetize(&jpeg, MAIN_HDR_LEN + 200, QMode::InBand(255)).expect("packetize");
+        assert!(pkts.len() > 1, "scan should span multiple fragments");
+        assert!(pkts.last().unwrap().marker);
+
+        let mut dp = JpegDepacketizer::new();
+        let mut rebuilt = None;
+        for pk in &pkts {
+            if let Progress::Frame(j) = dp.push(&pk.payload, pk.marker).unwrap() {
+                rebuilt = Some(j);
+            }
+        }
+        let rebuilt = rebuilt.expect("frame reassembled");
+        let decoded = decode_jpeg(&rebuilt, None).expect("decode packetized RTP/JPEG");
+        assert_eq!(decoded.planes.len(), 3);
+        assert_eq!(decoded.planes[0].data.len(), w * h);
+        assert_eq!(decoded.planes[1].data.len(), w.div_ceil(2) * h.div_ceil(2));
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn end_to_end_packetize_q_field_decodes() {
+        // Encode at quality 50 so the depacketizer's IJG-regenerated tables
+        // match the scan's quantization exactly.
+        let (w, h) = (64usize, 64usize);
+        let frame = make_420_frame(w, h);
+        let jpeg =
+            encode_jpeg(&frame, w as u32, h as u32, PixelFormat::Yuv420P, 50).expect("encode");
+        let pkts = packetize(&jpeg, 1400, QMode::Quality(50)).expect("packetize");
+
+        let mut dp = JpegDepacketizer::new();
+        let mut rebuilt = None;
+        for pk in &pkts {
+            if let Progress::Frame(j) = dp.push(&pk.payload, pk.marker).unwrap() {
+                rebuilt = Some(j);
+            }
+        }
+        let decoded = decode_jpeg(&rebuilt.unwrap(), None).expect("decode");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
     }

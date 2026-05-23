@@ -65,6 +65,13 @@
 //! - Progressive 4-component JPEGs
 //! - Multi-component lossless JPEGs (only grayscale is supported)
 //!
+//! Motion-JPEG carried over RTP (RFC 2435) is supported on the decode
+//! path via [`rtp::JpegDepacketizer`], which reassembles fragmented
+//! RTP/JPEG payloads and reconstructs the absent SOI / DQT / SOF0 / DHT /
+//! SOS / EOI marker segments (from the §3.1 main header's Q field or an
+//! in-band §3.1.8 quantization-table header) so the result is a complete
+//! JPEG interchange stream the [`decoder`] consumes directly.
+//!
 //! ## Standalone vs registry-integrated
 //!
 //! The crate's default `registry` Cargo feature pulls in `oxideav-core`
@@ -81,6 +88,7 @@ pub mod encoder;
 pub mod error;
 pub mod image;
 pub mod jpeg;
+pub mod rtp;
 
 #[cfg(feature = "registry")]
 pub mod container;

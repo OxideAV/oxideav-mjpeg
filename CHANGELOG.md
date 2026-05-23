@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rtp` module: RFC 2435 RTP/JPEG depacketization. `rtp::JpegDepacketizer`
+  reassembles fragmented RTP/JPEG payloads (keyed on the §3.1.2 Fragment
+  Offset, so misordered intra-frame delivery is tolerated) and
+  reconstructs the absent SOI / DQT / SOF0 / DHT / [DRI] / SOS / EOI
+  marker segments into a complete JPEG interchange stream the existing
+  decoder consumes directly. Covers the well-known fixed type mappings
+  0/64 (4:2:2, `H=2 V=1` luma) and 1/65 (4:2:0, `H=2 V=2` luma) with the
+  three-component YUV interleaved scan (§4.1). Quantization tables are
+  recovered from the Q field via the Independent JPEG Group scale formula
+  over Annex K.1 / K.2 for `Q ∈ 1..=99` (§4.2), or read in-band from the
+  §3.1.8 Quantization Table header for `Q ∈ 128..=255` (8- and 16-bit
+  precision, the latter saturated to the emitted 8-bit DQT). Types
+  64..=127 consume the §3.1.7 Restart Marker header and emit a DRI
+  segment with the carried interval. Annex K typical Huffman tables are
+  written for the abbreviated-format scan. The standalone helpers
+  `rtp::parse_main_header` / `rtp::parse_restart_header` expose the wire
+  header layout (`MainHeader` / `RestartHeader`). End-to-end tests encode
+  a frame, strip it to an RTP/JPEG payload (both Q-field and in-band-table
+  paths), depacketize, and decode the result back to a valid frame.
+  Out-of-band table negotiation (Q ≥ 128 with no in-band tables) and the
+  non-well-known dynamic types 128..=255 return `Unsupported`. RTP
+  transport framing (the 12-byte RTP fixed header, sequence ordering)
+  stays the caller's responsibility.
 - `encoder::encode_lossless_jpeg_grayscale_with_opts(width, height,
   samples, stride, precision, predictor, restart_interval,
   point_transform)` and `encoder::encode_lossless_jpeg_rgb_with_opts(...)`:

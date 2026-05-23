@@ -198,6 +198,52 @@ immediately after SOI (replacing the default JFIF APP0). Use
 segments from an existing JPEG for pass-through to the re-encoded
 output.
 
+### RTP/JPEG depacketization (RFC 2435)
+
+Motion-JPEG carried over RTP omits the JPEG frame and scan headers from
+the wire (abbreviated table-specification format) and fragments the
+entropy-coded scan across packets. `rtp::JpegDepacketizer` reassembles
+those fragments and reconstructs the absent SOI / DQT / SOF0 / DHT /
+[DRI] / SOS / EOI marker segments into a complete JPEG interchange
+stream the decoder consumes directly.
+
+```rust
+use oxideav_mjpeg::rtp::{JpegDepacketizer, Progress};
+
+let mut dp = JpegDepacketizer::new();
+// `payload` = one RTP packet body with the 12-byte RTP fixed header
+// already stripped; `marker` = the RTP marker bit (set on the last
+// fragment of a frame).
+# let payload: &[u8] = &[];
+# let marker = false;
+match dp.push(payload, marker)? {
+    Progress::NeedMore => { /* await further fragments */ }
+    Progress::Frame(jpeg) => { /* `jpeg` is a complete SOI..EOI stream */ }
+}
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+Coverage:
+
+- Well-known fixed type mappings 0/64 (4:2:2-class, `H=2 V=1` luma) and
+  1/65 (4:2:0-class, `H=2 V=2` luma), three-component YUV interleaved
+  scan (§4.1).
+- Quantization tables recovered from the Q field via the Independent
+  JPEG Group scale formula over Annex K.1 / K.2 for `Q ∈ 1..=99` (§4.2),
+  or read in-band from the §3.1.8 Quantization Table header for
+  `Q ∈ 128..=255` (8-bit, plus 16-bit saturated to the emitted 8-bit
+  DQT).
+- Types 64..=127 consume the §3.1.7 Restart Marker header and emit a DRI
+  segment with the carried interval.
+- Fragment reassembly keyed on the §3.1.2 Fragment Offset, so misordered
+  intra-frame delivery is tolerated as long as the marker-bit fragment
+  arrives.
+
+Lacks: RTP transport framing itself (the 12-byte RTP fixed header,
+sequence ordering, packetization on the encode side stay the caller's
+job), out-of-band table negotiation (`Q ≥ 128` with no in-band tables →
+`Unsupported`), and the dynamic non-well-known types 128..=255.
+
 ### Codec / container IDs
 
 - Codec: `"mjpeg"`. Decoder output / encoder input pixel formats:
@@ -246,6 +292,11 @@ Decoder:
 - Chroma subsampling: 4:4:4, 4:2:2, 4:2:0.
 - Grayscale (single-component → `Gray8`).
 - Restart markers (`RSTn`) + DRI.
+- **RTP/JPEG (RFC 2435)** depacketization via `rtp::JpegDepacketizer` —
+  reassembles fragmented RTP/JPEG payloads and reconstructs the absent
+  frame/scan headers (from the Q field or an in-band quantization-table
+  header) into a complete JPEG the decoder consumes. See the RTP/JPEG
+  section below.
 - APP0..APP15 segments skipped cleanly (EXIF/XMP/ICC preserved at the
   container level, not parsed).
 - Trailing garbage past EOI is stripped by the demuxer.

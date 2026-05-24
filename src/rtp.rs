@@ -19,7 +19,10 @@
 //! value. Q values 1..=99 select tables computed with the Independent
 //! JPEG Group scale formula over Annex K.1 / K.2 (§4.2); Q values
 //! 128..=255 carry the quantization tables in-band via a Quantization
-//! Table header (§3.1.8).
+//! Table header (§3.1.8). A *static* Q value (128..=254) may carry its
+//! tables only once and then omit them (`Length = 0`) on later frames; the
+//! depacketizer caches the tables per Q value across [`JpegDepacketizer`]
+//! frames and reuses them when a later frame's header is empty (§4.2).
 //!
 //! What is *not* the depacketizer's job: RTP transport itself. Callers
 //! strip the 12-byte RTP fixed header (and any CSRC / extension words),
@@ -156,6 +159,7 @@ pub fn parse_restart_header(bytes: &[u8]) -> Result<RestartHeader> {
 
 /// Two reconstructed 8-bit quantization tables (luma id 0, chroma id 1),
 /// in zigzag order exactly as a DQT segment would carry them.
+#[derive(Clone, Copy)]
 struct QuantPair {
     luma: [u8; 64],
     chroma: [u8; 64],
@@ -339,16 +343,31 @@ struct FrameState {
 #[derive(Default)]
 pub struct JpegDepacketizer {
     state: Option<FrameState>,
+    /// Most-recent in-band quantization tables for a *static* Q value
+    /// (128..=254), with the Q value they belong to. §4.2: in-band tables
+    /// for a static Q "need not be sent with every frame"; later frames
+    /// carry a Quantization Table header with `Length = 0` and the receiver
+    /// reuses the tables it cached the first time it saw that Q. Q = 255 is
+    /// dynamic and never populates this cache (the spec forbids depending on
+    /// a previous frame's tables for Q = 255).
+    cached_tables: Option<(u8, QuantPair)>,
 }
 
 impl JpegDepacketizer {
     /// Create an empty depacketizer.
     pub fn new() -> Self {
-        Self { state: None }
+        Self {
+            state: None,
+            cached_tables: None,
+        }
     }
 
     /// Discard any partially-reassembled frame (e.g. after a detected
     /// packet loss the caller cannot recover from).
+    ///
+    /// This drops only the in-progress reassembly buffer; the cached static
+    /// quantization tables (§4.2) are retained so frames that follow can
+    /// still decode. Use [`JpegDepacketizer::new`] for a fully fresh state.
     pub fn reset(&mut self) {
         self.state = None;
     }
@@ -376,6 +395,15 @@ impl JpegDepacketizer {
         let inband_quant = if main.q >= 128 && main.fragment_offset == 0 {
             let (qp, consumed) = parse_qtable_header(&payload[cursor..], main.q)?;
             cursor += consumed;
+            // §4.2: a static Q (128..=254) carrying tables in-band caches
+            // them so later frames may omit them (Length = 0). A new static
+            // Q replaces any previously cached pair; Q = 255 (dynamic) never
+            // touches the cache.
+            if let Some(qp) = qp {
+                if (128..=254).contains(&main.q) {
+                    self.cached_tables = Some((main.q, qp));
+                }
+            }
             qp
         } else {
             None
@@ -443,17 +471,28 @@ impl JpegDepacketizer {
             Some(q) => q,
             None => {
                 if st.main.q >= 128 {
-                    // Q >= 128 with no in-band tables means out-of-band
-                    // table negotiation, which this depacketizer does not
-                    // support — there is no JPEG to build without tables.
-                    return Err(Error::unsupported(
-                        "RTP/JPEG: Q >= 128 without an in-band quantization table",
-                    ));
-                }
-                if st.main.q == 0 {
+                    // No in-band tables this frame. For a static Q
+                    // (128..=254) the tables may have arrived on an earlier
+                    // frame (§4.2 "need not be sent with every frame"); reuse
+                    // the cached pair if it belongs to this exact Q value.
+                    // Q = 255 is dynamic and the cache is never consulted —
+                    // a Q = 255 / Length = 0 packet is already rejected during
+                    // header parsing, and a genuinely table-less Q = 255 frame
+                    // is undecodable.
+                    match self.cached_tables {
+                        Some((cached_q, qp)) if cached_q == st.main.q => qp,
+                        _ => {
+                            return Err(Error::unsupported(
+                                "RTP/JPEG: Q >= 128 without in-band tables and none cached \
+                                 for this Q (out-of-band negotiation unsupported)",
+                            ));
+                        }
+                    }
+                } else if st.main.q == 0 {
                     return Err(Error::invalid("RTP/JPEG: Q = 0 is reserved"));
+                } else {
+                    tables_from_q(st.main.q)
                 }
-                tables_from_q(st.main.q)
             }
         };
 
@@ -1159,6 +1198,155 @@ mod tests {
         p.extend_from_slice(&0u16.to_be_bytes()); // length 0 — illegal for Q=255
         let mut dp = JpegDepacketizer::new();
         assert!(dp.push(&p, true).is_err());
+    }
+
+    /// Build a type-1 RTP/JPEG single-packet payload for a Q >= 128 value.
+    /// When `tables` is `Some((luma, chroma))` an in-band Quantization Table
+    /// header carrying both 8-bit tables is emitted; when `None` a header
+    /// with `Length = 0` (no tables this frame) is emitted instead.
+    fn payload_q_inband(q: u8, tables: Option<(&[u8; 64], &[u8; 64])>, scan: &[u8]) -> Vec<u8> {
+        let mut p = vec![0, 0, 0, 0, 1, q, 8, 8]; // tspec+off0, type 1, Q, 64x64
+        p.push(0); // MBZ
+        p.push(0); // Precision: both 8-bit
+        match tables {
+            Some((luma, chroma)) => {
+                p.extend_from_slice(&128u16.to_be_bytes()); // Length = 2*64
+                p.extend_from_slice(luma);
+                p.extend_from_slice(chroma);
+            }
+            None => p.extend_from_slice(&0u16.to_be_bytes()), // Length = 0
+        }
+        p.extend_from_slice(scan);
+        p
+    }
+
+    /// Read the n-th DQT segment's 64-byte (8-bit) table out of a JPEG built
+    /// by the depacketizer.
+    fn dqt_of(jpeg: &[u8], which: usize) -> [u8; 64] {
+        let mut found = 0;
+        let mut pos = 2usize;
+        while pos + 4 < jpeg.len() {
+            if jpeg[pos] == 0xFF && jpeg[pos + 1] == markers::DQT {
+                if found == which {
+                    let mut t = [0u8; 64];
+                    t.copy_from_slice(&jpeg[pos + 5..pos + 5 + 64]);
+                    return t;
+                }
+                found += 1;
+                let len = u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]) as usize;
+                pos += 2 + len;
+            } else {
+                pos += 1;
+            }
+        }
+        panic!("DQT #{which} not found");
+    }
+
+    #[test]
+    fn static_q_tables_cached_then_reused_when_omitted() {
+        // §4.2: in-band tables for a static Q (128..=254) "need not be sent
+        // with every frame". Frame 1 carries them; frame 2 sends Length = 0
+        // and must reuse the cached pair.
+        let luma: [u8; 64] = std::array::from_fn(|i| (i as u8) + 1);
+        let chroma: [u8; 64] = std::array::from_fn(|i| 200 - i as u8);
+
+        let mut dp = JpegDepacketizer::new();
+        // Frame 1: tables present.
+        let p1 = payload_q_inband(200, Some((&luma, &chroma)), &[0x01, 0x02]);
+        let j1 = match dp.push(&p1, true).unwrap() {
+            Progress::Frame(j) => j,
+            _ => panic!("frame 1"),
+        };
+        assert_eq!(dqt_of(&j1, 0), luma);
+        assert_eq!(dqt_of(&j1, 1), chroma);
+
+        // Frame 2: same static Q, Length = 0 — the cached tables reappear.
+        let p2 = payload_q_inband(200, None, &[0x03, 0x04]);
+        let j2 = match dp.push(&p2, true).unwrap() {
+            Progress::Frame(j) => j,
+            _ => panic!("frame 2"),
+        };
+        assert_eq!(dqt_of(&j2, 0), luma, "frame 2 reuses cached luma table");
+        assert_eq!(dqt_of(&j2, 1), chroma, "frame 2 reuses cached chroma table");
+        // Frame 2's scan is its own, not frame 1's.
+        assert_eq!(&j2[j2.len() - 4..j2.len() - 2], &[0x03, 0x04]);
+    }
+
+    #[test]
+    fn static_q_length_zero_without_prior_tables_errors() {
+        // A receiver that joins after the table-bearing frame has no cache;
+        // §4.2 acknowledges it "will be unable to properly decode frames
+        // from the time they start up until they receive the tables".
+        let mut dp = JpegDepacketizer::new();
+        let p = payload_q_inband(200, None, &[0xAA, 0xBB]);
+        assert!(dp.push(&p, true).is_err());
+    }
+
+    #[test]
+    fn cache_is_keyed_on_the_exact_q_value() {
+        // Tables cached for Q = 200 must not satisfy a Length = 0 frame that
+        // advertises a different static Q (each static Q maps to its own
+        // table set, §3.1.8 / §4.2).
+        let luma: [u8; 64] = std::array::from_fn(|i| (i as u8) + 1);
+        let chroma: [u8; 64] = std::array::from_fn(|i| 200 - i as u8);
+        let mut dp = JpegDepacketizer::new();
+        dp.push(
+            &payload_q_inband(200, Some((&luma, &chroma)), &[0x01]),
+            true,
+        )
+        .unwrap();
+        // Different static Q, no tables, no cache for *this* Q → error.
+        let other = payload_q_inband(201, None, &[0x02]);
+        assert!(dp.push(&other, true).is_err());
+    }
+
+    #[test]
+    fn q255_does_not_populate_the_static_cache() {
+        // Q = 255 is dynamic: its tables MUST NOT be cached for reuse. After
+        // a Q = 255 frame, a static-Q Length = 0 frame still has no cache.
+        let luma: [u8; 64] = std::array::from_fn(|i| (i as u8) + 1);
+        let chroma: [u8; 64] = std::array::from_fn(|i| 200 - i as u8);
+        let mut dp = JpegDepacketizer::new();
+        // A Q = 255 frame with tables decodes, but caches nothing.
+        dp.push(
+            &payload_q_inband(255, Some((&luma, &chroma)), &[0x01]),
+            true,
+        )
+        .unwrap();
+        // A later static Q = 200 with Length = 0 finds an empty cache.
+        let p = payload_q_inband(200, None, &[0x02]);
+        assert!(dp.push(&p, true).is_err());
+    }
+
+    #[test]
+    fn reset_keeps_the_table_cache() {
+        // reset() drops only the in-progress reassembly buffer; the static
+        // table cache survives so subsequent frames still decode.
+        let luma: [u8; 64] = std::array::from_fn(|i| (i as u8) + 1);
+        let chroma: [u8; 64] = std::array::from_fn(|i| 200 - i as u8);
+        let mut dp = JpegDepacketizer::new();
+        // Cache tables via a complete frame.
+        dp.push(
+            &payload_q_inband(200, Some((&luma, &chroma)), &[0x01]),
+            true,
+        )
+        .unwrap();
+        // Begin a second frame, then abandon its partial reassembly.
+        assert_eq!(
+            dp.push(&payload_q_inband(200, None, &[0x02]), false)
+                .unwrap(),
+            Progress::NeedMore
+        );
+        dp.reset();
+        // A fresh Length = 0 frame still reuses the surviving cache.
+        let j = match dp
+            .push(&payload_q_inband(200, None, &[0x03]), true)
+            .unwrap()
+        {
+            Progress::Frame(j) => j,
+            _ => panic!(),
+        };
+        assert_eq!(dqt_of(&j, 0), luma);
     }
 
     #[test]

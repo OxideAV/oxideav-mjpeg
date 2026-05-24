@@ -233,6 +233,12 @@ Coverage:
   or read in-band from the §3.1.8 Quantization Table header for
   `Q ∈ 128..=255` (8-bit, plus 16-bit saturated to the emitted 8-bit
   DQT).
+- Cross-frame in-band table caching (§4.2): a static `Q ∈ 128..=254` may
+  carry its tables once and omit them (`Length = 0`) on later frames; the
+  depacketizer caches them per Q value and reuses the cached pair, so a
+  multi-frame static-Q stream keeps decoding. `Q = 255` is dynamic and
+  never cached (tables reload every frame). `reset()` keeps the cache;
+  `new()` starts fresh.
 - Types 64..=127 consume the §3.1.7 Restart Marker header and emit a DRI
   segment with the carried interval.
 - Fragment reassembly keyed on the §3.1.2 Fragment Offset, so misordered
@@ -281,8 +287,10 @@ restart-interval-aligned chunk splitting across packets (the scan is
 fragmented on arbitrary byte boundaries, with whole-frame reassembly
 signalled), packetization of progressive / lossless / grayscale / CMYK
 JPEGs (no well-known RTP/JPEG type — `Unsupported`), out-of-band table
-negotiation on depacketize (`Q ≥ 128` with no in-band tables →
-`Unsupported`), and the dynamic non-well-known types 128..=255.
+negotiation via a session-setup protocol on depacketize (a static
+`Q ≥ 128` frame whose tables were never sent in-band, nor cached from an
+earlier frame, → `Unsupported`), and the dynamic non-well-known types
+128..=255.
 
 ### Codec / container IDs
 

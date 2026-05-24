@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rtp::JpegDepacketizer`: cross-frame in-band quantization-table caching
+  (RFC 2435 §4.2). For a *static* Q value (128..=254) the sender may carry the
+  Quantization Table header once and then omit the tables (`Length = 0`) on
+  subsequent frames; the depacketizer now caches the tables per Q value and
+  reuses them when a later frame's header is empty, so a multi-frame static-Q
+  stream decodes past the first frame. A `Length = 0` frame with no cached
+  tables for that Q (e.g. a receiver that joined mid-stream) still returns
+  `Unsupported`, matching the §4.2 startup caveat. Q = 255 is dynamic and never
+  populates the cache (the spec forbids depending on a previous frame's tables
+  for Q = 255). `reset()` clears the in-progress reassembly buffer but retains
+  the table cache; `new()` starts fully fresh. Five tests cover cache reuse,
+  the no-prior-cache error, per-Q keying, the Q = 255 non-caching rule, and
+  cache survival across `reset()`.
+
 - `rtp` module: RFC 2435 RTP/JPEG **packetization** (the encode-side inverse
   of the depacketizer). `rtp::packetize(jpeg, max_payload, qmode)` parses a
   complete baseline (SOF0/SOF1) three-component YUV JPEG, strips the frame and

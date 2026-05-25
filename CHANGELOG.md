@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Decoder dequantise i32 overflow** (`render_from_coefs` ×3 sites): when a
+  DQT carries `Pq = 1` (16-bit precision, T.81 §B.2.4.1) the quant value can
+  be up to 65535, and a coefficient at the high end of the DCT range
+  (progressive `Al`-shifted, or accumulated DPCM DC) can multiply past
+  `i32::MAX`. The 8-bit, 12-bit, and progressive render paths now perform the
+  dequantise multiplication in `f32` directly — the IDCT input is `f32`
+  either way, and `f32` carries the product well past 24 bits of mantissa
+  without overflow. Fuzz-found regression (`crash-ee0cdd45`); replaying the
+  artifact through the patched `decode` target now completes in 0 ms.
+
 - Decoder panic surfaces uncovered during fuzz harness bring-up:
   - **SOS `Tdj` / `Taj` selectors** outside `0..=3` no longer panic
     indexing the 4-wide `dc_huff` / `ac_huff` / `arith_dc` / `arith_ac`

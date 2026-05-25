@@ -788,7 +788,10 @@ fn decode_scan(
                         let mut fblock = [0.0f32; 64];
                         for k in 0..64 {
                             // `block` is natural-order; `qt.values` is natural-order.
-                            fblock[k] = (block[k] * qt.values[k] as i32) as f32;
+                            // Multiply in f32 to avoid i32 overflow when Pq=1 (16-bit
+                            // quantiser, values up to 65535) meets a coefficient at the
+                            // top of its range — the IDCT input is f32 either way.
+                            fblock[k] = block[k] as f32 * qt.values[k] as f32;
                         }
                         idct8x8(&mut fblock);
                         // Write 8×8 to component buffer at position (mx * H + bx, my * V + by).
@@ -1781,7 +1784,10 @@ fn render_from_coefs(
                 let block = &coefs[ci][by * blocks_x + bx];
                 let mut fblock = [0.0f32; 64];
                 for k in 0..64 {
-                    fblock[k] = (block[k] * qt.values[k] as i32) as f32;
+                    // Multiply in f32 to avoid i32 overflow when Pq=1 (16-bit
+                    // quantiser, values up to 65535) meets a coefficient at the
+                    // top of its range — the IDCT input is f32 either way.
+                    fblock[k] = block[k] as f32 * qt.values[k] as f32;
                 }
                 idct8x8(&mut fblock);
                 let dst_x0 = bx * 8;
@@ -2022,7 +2028,10 @@ fn render_from_coefs_12bit(
                 let block = &coefs[ci][by * blocks_x + bx];
                 let mut fblock = [0.0f32; 64];
                 for k in 0..64 {
-                    fblock[k] = (block[k] * qt.values[k] as i32) as f32;
+                    // Multiply in f32 to avoid i32 overflow when Pq=1 (16-bit
+                    // quantiser, values up to 65535) meets a coefficient at the
+                    // top of its range — the IDCT input is f32 either way.
+                    fblock[k] = block[k] as f32 * qt.values[k] as f32;
                 }
                 idct8x8(&mut fblock);
                 let dst_x0 = bx * 8;

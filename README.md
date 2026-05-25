@@ -394,8 +394,10 @@ reusable fuzz workflow:
   Contract: never panic. Covers the SOF / SOS validators (`Tdj`/`Taj`
   / `Tq` selectors, `Nf` / `Ns` bounds, `Hi`/`Vi` factors), the
   multi-SOF rejection, the `Wt × Ht × Nf ≤ 64 Mpx` pixel-budget cap,
-  and the `BitReader::get_bits(n)` guards (`n == 0` short-circuit,
-  `n > 24` rejection).
+  the `BitReader::get_bits(n)` guards (`n == 0` short-circuit, `n > 24`
+  rejection), and the `Pq = 1` (16-bit quantiser) × coefficient dequantise
+  multiplication (now in `f32` to skip i32 overflow). Last local 60 s
+  baseline: 25 694 runs, 0 crashes (cov 2023 / ft 7670).
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
   oxideav-mjpeg encode → oxideav-mjpeg decode round-trip with ±2 LSB
   YUV tolerance.

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.6...v0.1.7) - 2026-05-25
+
+### Other
+
+- add decode robustness target + fix four panic surfaces
+- cache static-Q in-band quantization tables across frames (RFC 2435 §4.2)
+- add RFC 2435 RTP/JPEG packetizer (encode side)
+- add RFC 2435 RTP/JPEG depacketizer
+- lossless encoder: restart markers + non-zero point transform
+- rewrite library-citation comments to remove external-library references
+- lossless (SOF3) three-component encoder + decoder
+- lossless (SOF3) grayscale encoder: P=2..=16 + all 7 predictors
+- add multi-frame demuxer with seek_to + marker-aware scanner
+- compare libjpeg cross-decode in YUV space, not RGB
+
 ### Added
 
 - `fuzz/fuzz_targets/decode.rs`: cargo-fuzz robustness target that

@@ -382,6 +382,26 @@ Not supported (decoder returns `Error::Unsupported`):
   sampling factors (the spec permits this but no real-world corpus
   exercises it; rejected with `Unsupported`).
 
+## Fuzzing
+
+The `fuzz/` sub-crate runs five cargo-fuzz harnesses against the
+public encoder + decoder surface, executed daily by the org-wide
+reusable fuzz workflow:
+
+- `decode` — feeds arbitrary bytes (≤ 64 KiB) through the public
+  `Decoder` trait (`make_decoder` → `send_packet` → `receive_frame`).
+  Contract: never panic. Covers the SOF / SOS validators (`Tdj`/`Taj`
+  / `Tq` selectors, `Nf` / `Ns` bounds, `Hi`/`Vi` factors), the
+  multi-SOF rejection, the `Wt × Ht × Nf ≤ 64 Mpx` pixel-budget cap,
+  and the `BitReader::get_bits(n)` guards (`n == 0` short-circuit,
+  `n > 24` rejection).
+- `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
+  oxideav-mjpeg encode → oxideav-mjpeg decode round-trip with ±2 LSB
+  YUV tolerance.
+- `libjpeg_encode_oxideav_decode` / `oxideav_encode_libjpeg_decode` —
+  cross-decode against system `libturbojpeg` (loaded via `libloading`
+  at runtime; no `*-sys` crate in the dep tree).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

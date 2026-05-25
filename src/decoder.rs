@@ -110,6 +110,76 @@ impl JpegState {
     }
 }
 
+/// Bound the total number of luma samples a single frame may declare
+/// in its SOF. T.81 nominally permits 65535 × 65535 × Nf, which a
+/// naive implementation would happily attempt to allocate as
+/// `width × height × Nf × per-sample-size` bytes — easily tens of
+/// gigabytes from a 16-byte SOF segment. The cap here is generous
+/// enough to cover any realistic JPEG (8K = 33 Mpx) while keeping the
+/// largest possible decoder allocation in the low hundreds of MiB.
+const MAX_PIXEL_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Centralised SOF validator. Run on every freshly-parsed SOF before
+/// it's stored as `state.sof`. Catches the panic surfaces a SOF can
+/// open downstream:
+///   * `Nf = 0` → empty component list → divisions by zero / empty
+///     vec indexing.
+///   * `Hi / Vi` outside `1..=4` (T.81 §B.2.2) → MCU geometry
+///     arithmetic overflows + zero-MCU loops.
+///   * `Tq > 3` → out-of-bounds index into the 4-wide quant table.
+///   * `Wt × Ht × Nf > MAX_PIXEL_BUDGET` → unbounded
+///     `vec![0u8; W × H]` allocation.
+fn validate_sof(sof: &SofInfo) -> Result<()> {
+    if sof.components.is_empty() {
+        return Err(Error::invalid("SOF: Nf = 0"));
+    }
+    if sof.components.len() > 4 {
+        return Err(Error::unsupported("SOF: Nf > 4"));
+    }
+    for c in &sof.components {
+        if !(1..=4).contains(&c.h_factor) || !(1..=4).contains(&c.v_factor) {
+            return Err(Error::invalid("SOF: Hi/Vi outside 1..=4"));
+        }
+        if c.qt_id >= 4 {
+            return Err(Error::invalid("SOF: Tq > 3"));
+        }
+    }
+    let w = sof.width as u64;
+    let h = sof.height as u64;
+    let nf = sof.components.len() as u64;
+    if w.saturating_mul(h).saturating_mul(nf) > MAX_PIXEL_BUDGET {
+        return Err(Error::unsupported("SOF: pixel budget exceeded"));
+    }
+    Ok(())
+}
+
+/// Centralised SOS validator. Run on every freshly-parsed SOS before
+/// dispatch to the scan decoder. Catches the panic surfaces a SOS
+/// can open:
+///   * `Ns = 0` → empty scan-component list → empty `prev_dc` /
+///     `dc_tables` and out-of-bounds Tdj/Taj indexing later.
+///   * `Ns > 4` → larger than the spec's 4-component cap; the per-MCU
+///     accumulator loops assume at most 4 components.
+///   * `Tdj / Taj > 3` → out-of-bounds index into the 4-wide DC / AC
+///     Huffman table arrays.
+fn validate_sos(sos: &SosInfo) -> Result<()> {
+    if sos.components.is_empty() {
+        return Err(Error::invalid("SOS: Ns = 0"));
+    }
+    if sos.components.len() > 4 {
+        return Err(Error::invalid("SOS: Ns > 4"));
+    }
+    for sc in &sos.components {
+        if sc.dc_table >= 4 {
+            return Err(Error::invalid("SOS: Tdj > 3"));
+        }
+        if sc.ac_table >= 4 {
+            return Err(Error::invalid("SOS: Taj > 3"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
@@ -173,12 +243,21 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             // allowance of up to 4 DC/AC Huffman tables falls out of our
             // existing 4-entry table arrays. Treat SOF1 as SOF0.
             SOF0 | SOF1 => {
-                let p = walker.read_segment_payload()?;
-                state.sof = Some(parse_sof(p)?);
-            }
-            SOF2 => {
+                if state.sof.is_some() {
+                    return Err(Error::invalid("JPEG: multiple SOF segments"));
+                }
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                state.sof = Some(sof);
+            }
+            SOF2 => {
+                if state.sof.is_some() {
+                    return Err(Error::invalid("JPEG: multiple SOF segments"));
+                }
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
                 if sof.components.len() > 3 {
                     return Err(Error::unsupported(
                         "progressive JPEG: 4+ component scans not supported",
@@ -195,8 +274,12 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 state.progressive = true;
             }
             SOF3 => {
+                if state.sof.is_some() {
+                    return Err(Error::invalid("JPEG: multiple SOF segments"));
+                }
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
                 if !(2..=16).contains(&sof.precision) {
                     return Err(Error::unsupported(format!(
                         "lossless JPEG: precision {} out of range 2..=16",
@@ -234,8 +317,12 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             // progressive / non-interleaved baseline path so that
             // `render_from_coefs` can do the dequant + IDCT pass at EOI.
             SOF9 => {
+                if state.sof.is_some() {
+                    return Err(Error::invalid("JPEG: multiple SOF segments"));
+                }
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
                 if sof.precision != 8 {
                     return Err(Error::unsupported(format!(
                         "arithmetic JPEG: precision {} (only 8 is supported)",
@@ -260,6 +347,7 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             SOS => {
                 let p = walker.read_segment_payload()?;
                 let sos = parse_sos(p)?;
+                validate_sos(&sos)?;
                 let scan = walker.read_scan_data()?;
                 if state.lossless {
                     return decode_lossless_scan(&state, &sos, scan, pts);
@@ -414,6 +502,15 @@ impl<'a> BitReader<'a> {
     }
 
     fn fill(&mut self, needed: u32) -> Result<()> {
+        // The shift `24 - self.nbits` in the refill below underflows
+        // for `self.nbits > 24`. JPEG entropy tokens never need more
+        // than 16 bits at a time (`extend` symbols cap at 16, and the
+        // Annex F lossless residual is the only 16-bit slot — handled
+        // out-of-band), so requesting more than 24 here is always a
+        // caller bug. Refuse rather than panic.
+        if needed > 24 {
+            return Err(Error::invalid("BitReader: requested > 24 bits"));
+        }
         while self.nbits < needed {
             match self.next_byte_with_stuff()? {
                 Some(b) => {
@@ -434,6 +531,17 @@ impl<'a> BitReader<'a> {
     }
 
     fn get_bits(&mut self, n: u32) -> Result<u32> {
+        // `n == 0` would compute `self.bits >> 32` which is UB on u32
+        // (debug-panic, release-wraparound). Both fuzz and real-world
+        // Huffman tables can decode a SSSS of 0 ("magnitude zero" → no
+        // extra bits to read), so short-circuit cleanly here rather
+        // than push the guard onto every caller.
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 24 {
+            return Err(Error::invalid("BitReader: get_bits(n > 24)"));
+        }
         self.fill(n)?;
         let v = self.bits >> (32 - n);
         self.bits <<= n;
@@ -2107,6 +2215,14 @@ fn decode_lossless_scan(
                 };
 
                 let s = decode_huff(&mut br, dc_tables[ci])? as u32;
+                if s > 16 {
+                    // Annex H Table H.2: SSSS = magnitude in 0..16. A
+                    // Huffman table that produces a value > 16 here is
+                    // either corrupt or maliciously crafted; the
+                    // existing extend / get_bits machinery has no
+                    // defined behaviour for it.
+                    return Err(Error::invalid("lossless: SSSS > 16"));
+                }
                 let residual: i32 = if s == 0 {
                     0
                 } else if s == 16 {

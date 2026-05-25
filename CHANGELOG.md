@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fuzz/fuzz_targets/decode.rs`: cargo-fuzz robustness target that drives
+  arbitrary bytes (capped at 64 KiB) through the public `Decoder` trait
+  (`make_decoder` → `send_packet` → `receive_frame`). The contract is
+  "no panic": any malformed input must yield `Err(_)` rather than an
+  unwrap, slice-OOB, integer overflow, or unbounded `Vec::with_capacity`
+  / `vec![0; n]` allocation. 60 000 runs reach coverage 1 830 / 6 667
+  without a crash. The harness is registered as a fifth bin in
+  `fuzz/Cargo.toml` alongside the existing round-trip / cross-decode
+  targets, so the daily reusable fuzz workflow's auto-discovery picks
+  it up without further wiring.
+
+### Fixed
+
+- Decoder panic surfaces uncovered during fuzz harness bring-up:
+  - **SOS `Tdj` / `Taj` selectors** outside `0..=3` no longer panic
+    indexing the 4-wide `dc_huff` / `ac_huff` / `arith_dc` / `arith_ac`
+    arrays; a new `validate_sos` rejects them as `Error::Invalid`
+    before scan dispatch.
+  - **SOF `Tq` selectors** outside `0..=3` no longer panic indexing
+    `state.quant`; a new `validate_sof` rejects them up-front.
+  - **SOS `Ns = 0` / `Ns > 4`** rejected by `validate_sos` (an empty
+    component list otherwise produced an empty `prev_dc` whose first
+    index panicked).
+  - **SOF `Nf = 0` / `Nf > 4`** and **`Hi/Vi` outside `1..=4`**
+    rejected by `validate_sof` (zero sampling factors previously hit
+    `unwrap_or(1)` fallbacks before downstream MCU arithmetic divided
+    by them).
+  - **Repeated SOF segments** in a single JPEG now return
+    `Error::Invalid("JPEG: multiple SOF segments")` rather than
+    overwriting `state.sof` while a stale `coef_buf` allocated against
+    the prior SOF stayed live — the geometry mismatch would later
+    OOB the per-block accumulator.
+  - **SOF pixel-budget DoS**: `Wt × Ht × Nf > 64 Mpx` rejected as
+    `Error::Unsupported("SOF: pixel budget exceeded")`. A 16-byte SOF
+    segment could previously request `~17 GiB` of per-component output
+    buffers.
+  - **`BitReader::get_bits(n)` underflow**: a Huffman-decoded SSSS of
+    `0` was a `>> 32` UB on `u32` (debug-panic, release-wrap);
+    `n > 24` underflowed the `24 - self.nbits` shift in the refill
+    loop. Both bounds are now checked: `n == 0` short-circuits to
+    `Ok(0)`, `n > 24` returns `Error::Invalid`.
+  - **Lossless SSSS > 16**: Annex H Table H.2 limits SSSS to `0..=16`,
+    but a crafted DHT can deliver any byte; the lossless scan decoder
+    now rejects out-of-range SSSS rather than calling `get_bits(s)`
+    with a value the `extend` / shift machinery has no defined
+    behaviour for.
+
 - `rtp::JpegDepacketizer`: cross-frame in-band quantization-table caching
   (RFC 2435 §4.2). For a *static* Q value (128..=254) the sender may carry the
   Quantization Table header once and then omit the tables (`Length = 0`) on

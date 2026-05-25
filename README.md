@@ -321,8 +321,9 @@ Decoder:
   component) — transparently routed through the shared coefficient
   accumulator.
 - **12-bit precision** sequential JPEGs (SOF0/SOF1, `P=12`) → 16-bit-LE
-  `Gray12Le` for grayscale and `Yuv420P12Le` for 4:2:0 YUV. Level shift
-  is 2048 as per the spec.
+  `Gray12Le` for grayscale and `Yuv444P12Le` / `Yuv422P12Le` /
+  `Yuv420P12Le` for three-component YUV at 4:4:4 / 4:2:2 / 4:2:0 chroma
+  sampling. Level shift is 2048 as per the spec.
 - **Lossless JPEG (SOF3)** — single-component grayscale at any
   precision `P ∈ 2..=16`. Annex H predictor reconstruction (bit-exact).
   Output: `Gray8` at P=8, `Gray10Le` / `Gray12Le` at P=10/12, else
@@ -373,7 +374,7 @@ Encoder:
 Not supported (decoder returns `Error::Unsupported`):
 
 - Hierarchical (SOF5+), arithmetic-coded (SOF9..SOF15).
-- 12-bit progressive (SOF2 with `P=12`), 12-bit 4:2:2 / 4:4:4 YUV.
+- 12-bit progressive (SOF2 with `P=12`).
 - Progressive 4-component JPEGs.
 - Multi-component lossless decode at `P > 8` (encoder side covers
   every `P ∈ 2..=16`, decoder side is 8-bit packed-RGB only until a

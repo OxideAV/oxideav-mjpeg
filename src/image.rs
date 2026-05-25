@@ -71,4 +71,8 @@ pub enum MjpegPixelFormat {
     Yuv444P,
     /// 12-bit planar 4:2:0 YUV (16-bit storage per sample, little-endian).
     Yuv420P12Le,
+    /// 12-bit planar 4:2:2 YUV (16-bit storage per sample, little-endian).
+    Yuv422P12Le,
+    /// 12-bit planar 4:4:4 YUV (16-bit storage per sample, little-endian).
+    Yuv444P12Le,
 }

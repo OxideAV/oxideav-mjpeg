@@ -61,7 +61,6 @@
 //!   arithmetic, lossless arithmetic, and the 12-bit arithmetic
 //!   precisions)
 //! - 12-bit progressive (SOF2 with `P=12`)
-//! - 12-bit 4:2:2 / 4:4:4 YUV (no matching output `PixelFormat`)
 //! - Progressive 4-component JPEGs
 //! - Multi-component lossless JPEGs (only grayscale is supported)
 //!

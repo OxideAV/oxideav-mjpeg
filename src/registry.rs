@@ -65,6 +65,8 @@ impl From<MjpegPixelFormat> for PixelFormat {
             MjpegPixelFormat::Yuv422P => PixelFormat::Yuv422P,
             MjpegPixelFormat::Yuv444P => PixelFormat::Yuv444P,
             MjpegPixelFormat::Yuv420P12Le => PixelFormat::Yuv420P12Le,
+            MjpegPixelFormat::Yuv422P12Le => PixelFormat::Yuv422P12Le,
+            MjpegPixelFormat::Yuv444P12Le => PixelFormat::Yuv444P12Le,
         }
     }
 }
@@ -86,6 +88,8 @@ fn pix_to_local(p: PixelFormat) -> Option<MjpegPixelFormat> {
         PixelFormat::Yuv422P => MjpegPixelFormat::Yuv422P,
         PixelFormat::Yuv444P => MjpegPixelFormat::Yuv444P,
         PixelFormat::Yuv420P12Le => MjpegPixelFormat::Yuv420P12Le,
+        PixelFormat::Yuv422P12Le => MjpegPixelFormat::Yuv422P12Le,
+        PixelFormat::Yuv444P12Le => MjpegPixelFormat::Yuv444P12Le,
         _ => return None,
     })
 }

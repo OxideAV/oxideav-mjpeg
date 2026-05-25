@@ -1907,6 +1907,160 @@ fn write_sos_grayscale(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+/// Test-only: emit a three-component (YUV) 12-bit precision extended-sequential
+/// JPEG (SOF1). `y_samples` / `cb_samples` / `cr_samples` carry u16 values in
+/// `[0, 4095]`. Caller must keep inputs moderate enough that per-block DC/AC
+/// Huffman categories stay ≤ 11 — we reuse the 8-bit Annex K luma/chroma
+/// Huffman tables rather than carrying a separate 12-bit table set. The
+/// `(h_factor, v_factor)` argument controls the luma sampling factor:
+///   * `(1, 1)` → 4:4:4 (`Yuv444P12Le`)
+///   * `(2, 1)` → 4:2:2 (`Yuv422P12Le`)
+///   * `(2, 2)` → 4:2:0 (`Yuv420P12Le`)
+///
+/// Chroma is always declared `H=V=1`. Plane strides are the row width in
+/// samples (i.e. `stride_y = y_w`, `stride_c = c_w`).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_yuv_jpeg_12bit(
+    width: u32,
+    height: u32,
+    y_samples: &[u16],
+    cb_samples: &[u16],
+    cr_samples: &[u16],
+    h_factor: u8,
+    v_factor: u8,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    // Permit the three supported decode subsamplings plus 4:1:1 (luma 4×1)
+    // so the test surface can exercise the decoder's reject path for
+    // non-PixelFormat-mapped sampling factors. Beyond that we don't carry
+    // encoder helpers for arbitrary `(H, V)` grids.
+    if !matches!((h_factor, v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
+        return Err(Error::invalid(
+            "12-bit YUV helper: unsupported sampling factor",
+        ));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let c_w = w.div_ceil(h_factor as usize);
+    let c_h = h.div_ceil(v_factor as usize);
+    if y_samples.len() < w * h || cb_samples.len() < c_w * c_h || cr_samples.len() < c_w * c_h {
+        return Err(Error::invalid(
+            "12-bit YUV helper: samples buffer too short",
+        ));
+    }
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(32_768);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof1_yuv_12bit(&mut out, w as u16, h as u16, h_factor, v_factor);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
+    write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+    write_sos_yuv(&mut out);
+
+    // MCU geometry: an MCU covers `h_factor * 8` × `v_factor * 8` luma
+    // pixels plus one 8×8 block per chroma component.
+    let mcu_w_px = 8 * h_factor as usize;
+    let mcu_h_px = 8 * v_factor as usize;
+    let mcus_x = w.div_ceil(mcu_w_px);
+    let mcus_y = h.div_ceil(mcu_h_px);
+
+    let mut bw = BitWriter::new(&mut out);
+    let mut prev_dc_y: i32 = 0;
+    let mut prev_dc_cb: i32 = 0;
+    let mut prev_dc_cr: i32 = 0;
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            // Luma blocks: `h_factor` × `v_factor` per MCU.
+            for jy in 0..v_factor as usize {
+                for ix in 0..h_factor as usize {
+                    let x0 = mx * mcu_w_px + ix * 8;
+                    let y0 = my * mcu_h_px + jy * 8;
+                    let mut blk = [0.0f32; 64];
+                    fill_block_u16_levelshift_2048(&mut blk, y_samples, w, w, h, x0, y0);
+                    encode_block(
+                        &mut bw,
+                        &mut blk,
+                        &luma_q,
+                        &mut prev_dc_y,
+                        &huff.luma_dc,
+                        &huff.luma_ac,
+                    );
+                }
+            }
+            // Chroma blocks: one each per MCU at the chroma's own resolution.
+            let cx0 = mx * 8;
+            let cy0 = my * 8;
+            let mut cb_blk = [0.0f32; 64];
+            fill_block_u16_levelshift_2048(&mut cb_blk, cb_samples, c_w, c_w, c_h, cx0, cy0);
+            encode_block(
+                &mut bw,
+                &mut cb_blk,
+                &chroma_q,
+                &mut prev_dc_cb,
+                &huff.chroma_dc,
+                &huff.chroma_ac,
+            );
+            let mut cr_blk = [0.0f32; 64];
+            fill_block_u16_levelshift_2048(&mut cr_blk, cr_samples, c_w, c_w, c_h, cx0, cy0);
+            encode_block(
+                &mut bw,
+                &mut cr_blk,
+                &chroma_q,
+                &mut prev_dc_cr,
+                &huff.chroma_dc,
+                &huff.chroma_ac,
+            );
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn write_sof1_yuv_12bit(out: &mut Vec<u8>, width: u16, height: u16, h_factor: u8, v_factor: u8) {
+    let mut payload = Vec::with_capacity(8 + 9);
+    payload.push(12); // precision = 12
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // Nf = 3 components
+                     // Y component (id=1) carries the variable sampling factor; chroma is
+                     // always H=V=1.
+    payload.push(1);
+    payload.push((h_factor << 4) | v_factor);
+    payload.push(0); // qt = 0 (luma)
+    payload.push(2);
+    payload.push(0x11);
+    payload.push(1); // qt = 1 (chroma)
+    payload.push(3);
+    payload.push(0x11);
+    payload.push(1);
+    write_length_prefix(out, markers::SOF1, &payload);
+}
+
+#[cfg(test)]
+fn write_sos_yuv(out: &mut Vec<u8>) {
+    let payload: [u8; 10] = [
+        3, // Ns
+        1, 0x00, // Y → DC=0 AC=0
+        2, 0x11, // Cb → DC=1 AC=1
+        3, 0x11, // Cr → DC=1 AC=1
+        0, 63, 0, // Ss, Se, Ah|Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
 // ---- Lossless JPEG encoder (SOF3, single-component grayscale) -----------
 
 /// Custom DC Huffman table for the lossless (SOF3) encoder.

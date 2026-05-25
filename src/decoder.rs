@@ -1936,9 +1936,10 @@ fn render_from_coefs(
 
 /// 12-bit precision render path. Mirrors `render_from_coefs` but keeps
 /// sample buffers in `u16` and applies a level shift of 2048 (spec value
-/// for P=12). Only grayscale and YUV 4:2:0 are supported on output —
-/// there are no 12-bit planar-YUV 4:2:2/4:4:4 variants in the shared
-/// PixelFormat enum yet.
+/// for P=12 per T.81 §A.3.1). Grayscale and three-component planar YUV at
+/// 4:2:0 / 4:2:2 / 4:4:4 chroma sampling are supported on output (the
+/// shared `PixelFormat` enum carries `Gray12Le` / `Yuv420P12Le` /
+/// `Yuv422P12Le` / `Yuv444P12Le` 16-bit-LE variants).
 fn render_from_coefs_12bit(
     state: &JpegState,
     coefs: &[Vec<[i32; 64]>],
@@ -1974,10 +1975,12 @@ fn render_from_coefs_12bit(
             ));
         }
         match (y.h_factor, y.v_factor) {
+            (1, 1) => PixelFormat::Yuv444P12Le,
+            (2, 1) => PixelFormat::Yuv422P12Le,
             (2, 2) => PixelFormat::Yuv420P12Le,
             _ => {
                 return Err(Error::unsupported(format!(
-                    "12-bit: only 4:2:0 chroma sampling supported (got {}x{})",
+                    "12-bit: only 4:4:4 / 4:2:2 / 4:2:0 chroma sampling supported (got {}x{})",
                     y.h_factor, y.v_factor
                 )))
             }
@@ -2061,10 +2064,14 @@ fn render_from_coefs_12bit(
         PixelFormat::Gray12Le => {
             planes.push(emit_plane(&comp_buf[0], comp_stride[0], width, height));
         }
-        PixelFormat::Yuv420P12Le => {
+        PixelFormat::Yuv420P12Le | PixelFormat::Yuv422P12Le | PixelFormat::Yuv444P12Le => {
+            let (c_w, c_h) = match out_format {
+                PixelFormat::Yuv444P12Le => (width, height),
+                PixelFormat::Yuv422P12Le => (width.div_ceil(2), height),
+                PixelFormat::Yuv420P12Le => (width.div_ceil(2), height.div_ceil(2)),
+                _ => unreachable!(),
+            };
             planes.push(emit_plane(&comp_buf[0], comp_stride[0], width, height));
-            let c_w = width.div_ceil(2);
-            let c_h = height.div_ceil(2);
             planes.push(emit_plane(&comp_buf[1], comp_stride[1], c_w, c_h));
             planes.push(emit_plane(&comp_buf[2], comp_stride[2], c_w, c_h));
         }
@@ -2793,9 +2800,9 @@ mod cmyk_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod precision_12_tests {
-    use crate::encoder::encode_grayscale_jpeg_12bit;
+    use crate::encoder::{encode_grayscale_jpeg_12bit, encode_yuv_jpeg_12bit};
     use crate::registry::make_decoder;
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 
     /// Decoder should accept a 12-bit precision grayscale JPEG and output
     /// `Gray12Le` with 16-bit LE samples. We feed a smooth gradient
@@ -2842,6 +2849,151 @@ mod precision_12_tests {
             let diff = (*orig as i32 - *dec as i32).abs();
             assert!(diff < 16, "12-bit roundtrip diff too large: {diff}");
         }
+    }
+
+    /// Build a smooth 12-bit YUV test image whose DCT/AC categories stay
+    /// well under 11 (so the encoder helper can reuse the 8-bit Annex K
+    /// Huffman tables without overflowing). Y / Cb / Cr are gentle
+    /// gradients centred near 2048.
+    fn build_yuv_12bit(
+        w: usize,
+        h: usize,
+        h_factor: u8,
+        v_factor: u8,
+    ) -> (Vec<u16>, Vec<u16>, Vec<u16>, usize, usize) {
+        let c_w = w.div_ceil(h_factor as usize);
+        let c_h = h.div_ceil(v_factor as usize);
+        let mut y = vec![0u16; w * h];
+        let mut cb = vec![0u16; c_w * c_h];
+        let mut cr = vec![0u16; c_w * c_h];
+        for j in 0..h {
+            for i in 0..w {
+                // Luma in [2000..2100].
+                y[j * w + i] = 2000 + ((i + j) as u16);
+            }
+        }
+        for j in 0..c_h {
+            for i in 0..c_w {
+                // Chroma near the 2048 mid-point with a different slope so
+                // a wrong plane lookup would be obvious.
+                cb[j * c_w + i] = 2040 + ((i ^ j) as u16 & 0x07);
+                cr[j * c_w + i] = 2056 + (((i + 2 * j) as u16) & 0x07);
+            }
+        }
+        (y, cb, cr, c_w, c_h)
+    }
+
+    fn unpack_le_u16_plane(data: &[u8], stride: usize, w: usize, h: usize) -> Vec<u16> {
+        let mut out = Vec::with_capacity(w * h);
+        for j in 0..h {
+            for i in 0..w {
+                let o = j * stride + i * 2;
+                out.push(data[o] as u16 | ((data[o + 1] as u16) << 8));
+            }
+        }
+        out
+    }
+
+    fn assert_plane_close(label: &str, orig: &[u16], dec: &[u16]) {
+        assert_eq!(orig.len(), dec.len(), "{label}: length mismatch");
+        for (k, (o, d)) in orig.iter().zip(dec.iter()).enumerate() {
+            let diff = (*o as i32 - *d as i32).abs();
+            assert!(
+                diff < 24,
+                "{label}: idx {k} diff too large (orig={o} dec={d})"
+            );
+        }
+    }
+
+    fn run_yuv_12bit_roundtrip(
+        w: u32,
+        h: u32,
+        h_factor: u8,
+        v_factor: u8,
+        expect_pix: PixelFormat,
+    ) {
+        let (y, cb, cr, c_w, c_h) = build_yuv_12bit(w as usize, h as usize, h_factor, v_factor);
+        let data = encode_yuv_jpeg_12bit(w, h, &y, &cb, &cr, h_factor, v_factor, 90)
+            .expect("encode 12-bit yuv");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("decoder did not emit a video frame")
+        };
+        assert_eq!(v.planes.len(), 3, "expected three planes");
+        // Each plane is 16-bit LE, so stride is the plane width × 2.
+        assert_eq!(v.planes[0].stride, (w * 2) as usize, "Y stride");
+        assert_eq!(v.planes[1].stride, c_w * 2, "Cb stride");
+        assert_eq!(v.planes[2].stride, c_w * 2, "Cr stride");
+
+        // The crate-public Frame doesn't carry a pixel-format tag (the
+        // shape-only slim VideoFrame), but the per-plane geometry uniquely
+        // identifies the format. Use `expect_pix` to size the chroma plane
+        // for cross-checks.
+        let _ = expect_pix;
+
+        let got_y = unpack_le_u16_plane(
+            &v.planes[0].data,
+            v.planes[0].stride,
+            w as usize,
+            h as usize,
+        );
+        let got_cb = unpack_le_u16_plane(&v.planes[1].data, v.planes[1].stride, c_w, c_h);
+        let got_cr = unpack_le_u16_plane(&v.planes[2].data, v.planes[2].stride, c_w, c_h);
+
+        assert_plane_close("Y", &y, &got_y);
+        assert_plane_close("Cb", &cb, &got_cb);
+        assert_plane_close("Cr", &cr, &got_cr);
+    }
+
+    /// 12-bit 4:4:4 YUV (`Yuv444P12Le`) end-to-end roundtrip via the
+    /// crate's own encoder helper and the registry-side decoder.
+    #[test]
+    fn yuv444_12bit_roundtrip() {
+        run_yuv_12bit_roundtrip(16, 16, 1, 1, PixelFormat::Yuv444P12Le);
+    }
+
+    /// 12-bit 4:2:2 YUV (`Yuv422P12Le`) end-to-end roundtrip.
+    #[test]
+    fn yuv422_12bit_roundtrip() {
+        run_yuv_12bit_roundtrip(16, 16, 2, 1, PixelFormat::Yuv422P12Le);
+    }
+
+    /// 12-bit 4:2:0 YUV (`Yuv420P12Le`) is the previously-supported case;
+    /// keep it in the new roundtrip-test surface as a regression guard
+    /// against the render-path refactor.
+    #[test]
+    fn yuv420_12bit_roundtrip_via_yuv_helper() {
+        run_yuv_12bit_roundtrip(16, 16, 2, 2, PixelFormat::Yuv420P12Le);
+    }
+
+    /// Non-2x luma sampling at P=12 (e.g. 4:1:1) is still rejected with
+    /// `Unsupported` — the matrix only covers the three common YUV
+    /// subsamplings the workspace `PixelFormat` enum carries at 12 bits.
+    #[test]
+    fn yuv_12bit_4x1_luma_rejected() {
+        let w = 16u32;
+        let h = 16u32;
+        let (y, cb, cr, _c_w, _c_h) = build_yuv_12bit(w as usize, h as usize, 4, 1);
+        let data =
+            encode_yuv_jpeg_12bit(w, h, &y, &cb, &cr, 4, 1, 90).expect("encode 12-bit yuv 4:1:1");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let err = dec.receive_frame().expect_err("expected Unsupported");
+        assert!(
+            matches!(err, oxideav_core::Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 }
 

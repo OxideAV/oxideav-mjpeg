@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 12-bit precision decoder: 4:2:2 (`Yuv422P12Le`) and 4:4:4 (`Yuv444P12Le`)
+  chroma sampling, alongside the previously-supported 4:2:0
+  (`Yuv420P12Le`). All three formats run through the shared
+  `render_from_coefs_12bit` path with the spec's `P=12` level shift of
+  `2^(P-1) = 2048` and a `[0, 4095]` output clamp (T.81 §A.3.1). The
+  decoder accepts any sequential 12-bit JPEG (SOF0/SOF1) declaring
+  three components with `Cb`/`Cr` at `H=V=1` and luma at `(1,1)`,
+  `(2,1)`, or `(2,2)`; non-2x luma sampling at 12-bit (e.g. 4:1:1)
+  still returns `Error::Unsupported`. `MjpegPixelFormat::Yuv422P12Le`
+  and `MjpegPixelFormat::Yuv444P12Le` join the standalone enum with
+  `From` conversions against `oxideav_core::PixelFormat` in both
+  directions. New roundtrip tests in `decoder::precision_12_tests`
+  cover all three sampling factors plus the 4:1:1-rejection contract.
+- `encoder::encode_yuv_jpeg_12bit` (test-only crate helper): emits a
+  standalone three-component SOF1 JPEG at `P=12` for any sampling
+  factor in `{(1,1), (2,1), (2,2), (4,1)}`. Reuses the Annex K luma /
+  chroma Huffman tables (callers must keep per-block DC/AC categories
+  ≤ 11). Drives the decoder-side roundtrip tests; not exposed in the
+  public API.
 - `fuzz/fuzz_targets/decode.rs`: cargo-fuzz robustness target that drives
   arbitrary bytes (capped at 64 KiB) through the public `Decoder` trait
   (`make_decoder` → `send_packet` → `receive_frame`). The contract is

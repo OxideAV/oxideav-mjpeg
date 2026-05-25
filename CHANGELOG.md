@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fuzz/fuzz_targets/decode.rs`: cargo-fuzz robustness target that
+  feeds arbitrary bytes into the public decoder via `make_decoder` +
+  `send_packet` + `receive_frame` and asserts the decoder never
+  panics. Auto-picked up by the daily `OxideAV/.github` fuzz workflow
+  (filesystem-discovered targets). Caps input at 64 KiB per
+  iteration; reads no oracle (round-trip targets cover output
+  correctness).
+
 - `rtp::JpegDepacketizer`: cross-frame in-band quantization-table caching
   (RFC 2435 §4.2). For a *static* Q value (128..=254) the sender may carry the
   Quantization Table header once and then omit the tables (`Length = 0`) on
@@ -136,6 +144,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests in `tests/seek.rs` cover zero-reset, mid-stream seek, past-end
   clamp, byte-stuffed `FF D8` false-positives, and byte-for-byte
   parity with a baseline drain.
+
+### Fixed
+
+- Decoder: `BitReader::get_bits` rejects read widths `> 16` instead of
+  underflowing the `24 - nbits` shift expression. A malformed DHT
+  whose DC table places a byte value (e.g. 100) into `huffval`
+  previously crashed the bit-buffer arithmetic on the corresponding
+  `extend` read. Now returns `Err(Error::invalid)`.
+
+- Decoder: nine `state.{quant,dc_huff,ac_huff,arith_dc,arith_ac}[idx]`
+  call sites switched from direct indexing to `.get(idx).and_then
+  (Option::as_ref)`. JPEG entropy / quant selectors are 4-bit fields
+  (0..=15) but the in-memory arrays are sized 4; a malformed SOS or
+  SOF that selects table 4..15 now returns `Err("table missing")`
+  instead of panicking with an out-of-bounds index.
+
+- Decoder: every SOF0 / SOF1 / SOF2 / SOF3 / SOF9 arm now clears
+  `state.{arithmetic,progressive,seq_accum,lossless}` and the
+  coefficient accumulator before installing the fresh `SofInfo`. A
+  malformed stream that chains SOF9 (sets `arithmetic = true` and
+  allocates `coef_buf` for component 0) followed by SOF0 (overwrites
+  `state.sof` but left the flags + buffer intact) previously
+  dispatched the next SOS to `decode_arith_scan` against the *new*
+  SOF dimensions but the *old* (small) `coef_buf`, OOB-indexing on
+  the first MCU. The fresh re-init keeps mode flags + buffer in sync
+  with `state.sof`.
+
+- Decoder: `parse_sos` rejects `Ns = 0` (and `Ns > 4`). The previous
+  permissive parse left every scan-decode function's non-interleaved
+  branch indexing `sos_map[0]` into an empty `Vec`, panicking with
+  `index out of bounds: the len is 0 but the index is 0`.
+
+- Decoder: 256-megapixel total-pixel budget check (`check_pixel_budget`)
+  applied at every SOF parse. A SOF declaring 65535 × 65535 /
+  3-component / 4:4:4 would have asked for ≈ 12 GiB of plane memory
+  in `decode_scan`'s per-component `vec![0u8; w*h]`; the budget rejects
+  it with `Err::unsupported` before the allocation. 256 MP
+  (16384 × 16384) is well past any real-world JPEG.
 
 ## [0.1.6](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.5...v0.1.6) - 2026-05-06
 

@@ -87,6 +87,16 @@ pub fn parse_sos(payload: &[u8]) -> Result<SosInfo> {
         return Err(Error::invalid("SOS: empty"));
     }
     let ns = payload[0] as usize;
+    if ns == 0 {
+        // T.81 §B.2.3 Ns: 1..4. Allowing zero would leave every
+        // scan-decode function indexing `sos_map[0]` into an empty
+        // `Vec` on the non-interleaved branch — a clean Err at parse
+        // time short-circuits the OOB without touching each scan.
+        return Err(Error::invalid("SOS: Ns = 0"));
+    }
+    if ns > 4 {
+        return Err(Error::invalid("SOS: Ns > 4"));
+    }
     if payload.len() < 1 + ns * 2 + 3 {
         return Err(Error::invalid("SOS: truncated"));
     }

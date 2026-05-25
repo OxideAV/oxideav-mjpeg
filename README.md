@@ -382,6 +382,27 @@ Not supported (decoder returns `Error::Unsupported`):
   sampling factors (the spec permits this but no real-world corpus
   exercises it; rejected with `Unsupported`).
 
+## Fuzzing
+
+In addition to the encode/decode round-trip and cross-decode targets
+under `fuzz/fuzz_targets/`, a `decode` robustness target feeds
+arbitrary bytes (≤ 64 KiB) into the public decoder factory and asserts
+the decoder never panics — every input must return either a valid
+`Frame::Video` or a clean `Err`. The target exercises the classic JPEG
+crash surfaces called out by the daily fuzz brief: Huffman DC/AC
+symbol-value overflow, DRI restart-interval arithmetic, EXIF / JFIF
+APP-segment skipping, progressive AC/DC scan parameters, SOF↔SOS
+component-id mismatches, 12-bit precision paths, and the SOF0 → SOF9 →
+SOF2 mode-flag interaction.
+
+The round 126 dispatch surfaced four panics that the same commit
+fixed: a `BitReader::get_bits` shift-underflow on > 16-bit reads, a
+table-id OOB across nine `state.{quant,dc_huff,ac_huff,arith_dc,
+arith_ac}` lookups, a stale `coef_buf` after `SOF*` re-parse mid-
+stream, and a `sos_map[0]` OOB on `Ns = 0` SOS payloads. A 256-MP
+total-pixel-budget guard rejects pathological SOF dimensions before
+the per-component plane allocation can blow the host's RSS.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

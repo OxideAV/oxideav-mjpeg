@@ -53,3 +53,13 @@ name = "jpeg_progressive_self_roundtrip"
 path = "fuzz_targets/jpeg_progressive_self_roundtrip.rs"
 test = false
 doc = false
+
+# Robustness target — arbitrary bytes into the public decoder; the
+# bar is "no panic". No oracle, no round-trip; round-trip coverage
+# lives in the other targets in this same directory. See
+# `fuzz_targets/decode.rs` for the documented crash surfaces.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false

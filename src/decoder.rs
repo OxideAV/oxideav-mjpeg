@@ -110,6 +110,20 @@ impl JpegState {
     }
 }
 
+/// Upper bound on the declared image size we are willing to allocate for.
+/// JPEG's `width` and `height` fields are `u16`, so a worst-case 4:4:4
+/// 3-component frame would ask for `65535 × 65535 × 3 ≈ 12 GiB` of plane
+/// memory — every real JPEG fits in a tiny fraction of that, so reject
+/// pathological dimensions before the per-component `vec![0u8; w*h]` in
+/// `decode_scan` / `render_from_coefs` blows the host's RSS.
+///
+/// 256 megapixels (16384 × 16384) is well past anything a real-world
+/// camera or scanner produces and matches the ballpark of other Rust
+/// image decoders' default safety nets. The limit is on the *total*
+/// pixel count across luma + chroma so 4:2:2 / 4:2:0 inputs at the same
+/// luma resolution stay inside the budget.
+const MAX_TOTAL_PIXELS: usize = 256 * 1024 * 1024;
+
 pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
@@ -173,8 +187,25 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             // allowance of up to 4 DC/AC Huffman tables falls out of our
             // existing 4-entry table arrays. Treat SOF1 as SOF0.
             SOF0 | SOF1 => {
+                // Reset all mode flags + the coefficient accumulator
+                // when a fresh SOF arrives. A malformed stream can
+                // chain SOF9/SOF2 (which set `arithmetic`/
+                // `progressive` and size `coef_buf`) followed by a
+                // SOF0/SOF1 whose component geometry is completely
+                // different. Without a reset, the subsequent SOS
+                // would dispatch to `decode_arith_scan` /
+                // `decode_progressive_scan` against the *new* SOF
+                // dimensions but the *old* (stale, smaller) coef
+                // buffer, OOB-indexing it on the first MCU.
                 let p = walker.read_segment_payload()?;
-                state.sof = Some(parse_sof(p)?);
+                let sof = parse_sof(p)?;
+                check_pixel_budget(&sof)?;
+                state.sof = Some(sof);
+                state.arithmetic = false;
+                state.progressive = false;
+                state.seq_accum = false;
+                state.lossless = false;
+                coef_buf.clear();
             }
             SOF2 => {
                 let p = walker.read_segment_payload()?;
@@ -190,9 +221,16 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                         sof.precision
                     )));
                 }
+                check_pixel_budget(&sof)?;
+                // Re-init coef_buf for this SOF + clear any prior
+                // mode flags. Same rationale as the SOF0 arm above —
+                // a malformed stream may chain different SOF types.
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
+                state.arithmetic = false;
                 state.progressive = true;
+                state.seq_accum = false;
+                state.lossless = false;
             }
             SOF3 => {
                 let p = walker.read_segment_payload()?;
@@ -224,8 +262,15 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                         }
                     }
                 }
+                check_pixel_budget(&sof)?;
+                // Same reset rationale as the SOF0 arm — a
+                // malformed stream may chain SOF9/SOF2 then SOF3.
                 state.sof = Some(sof);
+                state.arithmetic = false;
+                state.progressive = false;
+                state.seq_accum = false;
                 state.lossless = true;
+                coef_buf.clear();
             }
             // SOF9 — extended sequential, arithmetic-coded (T.81 §F.1.4).
             // Same DCT machinery as SOF1, but the entropy coder is the
@@ -247,9 +292,14 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                         "arithmetic JPEG: 4+ component scans not supported",
                     ));
                 }
+                check_pixel_budget(&sof)?;
+                // Same reset rationale as the SOF0 arm.
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
                 state.arithmetic = true;
+                state.progressive = false;
+                state.seq_accum = false;
+                state.lossless = false;
             }
             0xC5..=0xC7 | 0xCA..=0xCB | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
@@ -317,6 +367,36 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             }
         }
     }
+}
+
+/// Reject a SOF whose declared dimensions would push past
+/// [`MAX_TOTAL_PIXELS`]. Uses the per-component sampling-factor product so
+/// that 4:4:4 + 4:2:0 + 4:2:2 all sit honestly under the same byte budget
+/// (rather than only counting luma). Multiplies are `saturating_mul` /
+/// `checked_mul` so a `u16::MAX × u16::MAX × max-factor` declaration
+/// can't itself overflow `usize` arithmetic before the threshold check.
+fn check_pixel_budget(sof: &SofInfo) -> Result<()> {
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let area = width.saturating_mul(height);
+    let mut total = 0usize;
+    for c in &sof.components {
+        let h = c.h_factor.max(1) as usize;
+        let v = c.v_factor.max(1) as usize;
+        let comp = area.saturating_mul(h).saturating_mul(v);
+        total = total.saturating_add(comp);
+    }
+    if total > MAX_TOTAL_PIXELS {
+        return Err(Error::unsupported(format!(
+            "SOF: declared dimensions {}x{} × {} components × subsampling \
+             exceeds {} total pixel budget — refusing to allocate",
+            sof.width,
+            sof.height,
+            sof.components.len(),
+            MAX_TOTAL_PIXELS
+        )));
+    }
+    Ok(())
 }
 
 /// Allocate a coefficient-accumulator plane for each component in the SOF.
@@ -434,6 +514,24 @@ impl<'a> BitReader<'a> {
     }
 
     fn get_bits(&mut self, n: u32) -> Result<u32> {
+        // JPEG entropy-coded reads are at most 16 bits per Annex F (DC
+        // magnitude category ≤ 15 → up to 15 amplitude bits; AC SSSS
+        // ≤ 15; progressive EOBn `r` ≤ 14). A malformed DHT can put a
+        // larger byte value (e.g. 100) into a DC table's `huffval`,
+        // which then propagates here as a 100-bit read and overflows
+        // the bit-buffer arithmetic (`24 - self.nbits` underflows once
+        // `nbits` passes 24, and the final `bits >> (32 - n)` would
+        // shift past the type width). Reject anything past the spec
+        // maximum up front and surface it as an `invalid` error — the
+        // caller's `Err` propagation handles bitstream rejection
+        // cleanly and the scan loop terminates without touching any
+        // partially-decoded coefficients.
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 16 {
+            return Err(Error::invalid("bit reader: read width > 16 bits"));
+        }
         self.fill(n)?;
         let v = self.bits >> (32 - n);
         self.bits <<= n;
@@ -578,13 +676,21 @@ fn decode_scan(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Resolve Huffman tables.
+    // Resolve Huffman tables. Use `.get(...)` rather than direct
+    // indexing — `sc.dc_table` / `sc.ac_table` / `c.qt_id` come from
+    // the bitstream and a malformed SOF/SOS can carry an out-of-range
+    // selector. Per T.81 baseline allows Td/Ta ∈ {0,1} and extended
+    // allows {0..=3}; the state arrays are sized 4. A direct
+    // `state.dc_huff[100]` would panic; `.get(100)` returns `None` and
+    // funnels into the same "missing table" error path.
     let dc_tables: Vec<&HuffTable> = sos
         .components
         .iter()
         .map(|sc| {
-            state.dc_huff[sc.dc_table as usize]
-                .as_ref()
+            state
+                .dc_huff
+                .get(sc.dc_table as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("SOS: DC Huffman table missing"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -592,8 +698,10 @@ fn decode_scan(
         .components
         .iter()
         .map(|sc| {
-            state.ac_huff[sc.ac_table as usize]
-                .as_ref()
+            state
+                .ac_huff
+                .get(sc.ac_table as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("SOS: AC Huffman table missing"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -602,8 +710,10 @@ fn decode_scan(
         .components
         .iter()
         .map(|c| {
-            state.quant[c.qt_id as usize]
-                .as_ref()
+            state
+                .quant
+                .get(c.qt_id as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("quant table missing for component"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -853,12 +963,16 @@ fn decode_sequential_scan_accum(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // `.get(...)` bounds-checked: see the comment on the same lookup
+    // pattern in `decode_scan` above.
     let dc_tables: Vec<&HuffTable> = sos
         .components
         .iter()
         .map(|sc| {
-            state.dc_huff[sc.dc_table as usize]
-                .as_ref()
+            state
+                .dc_huff
+                .get(sc.dc_table as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("SOS: DC Huffman table missing"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -866,8 +980,10 @@ fn decode_sequential_scan_accum(
         .components
         .iter()
         .map(|sc| {
-            state.ac_huff[sc.ac_table as usize]
-                .as_ref()
+            state
+                .ac_huff
+                .get(sc.ac_table as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("SOS: AC Huffman table missing"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1034,7 +1150,11 @@ fn decode_arith_scan(
                     .map(|j| j == i)
                     .unwrap_or(false)
             }) {
-                if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
+                if let Some(cond) = state
+                    .arith_dc
+                    .get(sc.dc_table as usize)
+                    .and_then(Option::as_ref)
+                {
                     s.l = cond.l;
                     s.u = cond.u;
                 }
@@ -1052,7 +1172,11 @@ fn decode_arith_scan(
                     .map(|j| j == i)
                     .unwrap_or(false)
             }) {
-                if let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref() {
+                if let Some(cond) = state
+                    .arith_ac
+                    .get(sc.ac_table as usize)
+                    .and_then(Option::as_ref)
+                {
                     s.kx = cond.kx;
                 }
             }
@@ -1250,13 +1374,18 @@ fn decode_progressive_scan(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Resolve Huffman tables per selected component.
+    // Resolve Huffman tables per selected component. `.get(...)`
+    // bounds-checked: see the comment on the same lookup pattern in
+    // `decode_scan` above.
     let dc_tables: Vec<Option<&HuffTable>> = sos
         .components
         .iter()
         .map(|sc| {
             if is_dc_scan {
-                state.dc_huff[sc.dc_table as usize].as_ref()
+                state
+                    .dc_huff
+                    .get(sc.dc_table as usize)
+                    .and_then(Option::as_ref)
             } else {
                 None
             }
@@ -1269,7 +1398,10 @@ fn decode_progressive_scan(
             if is_dc_scan {
                 None
             } else {
-                state.ac_huff[sc.ac_table as usize].as_ref()
+                state
+                    .ac_huff
+                    .get(sc.ac_table as usize)
+                    .and_then(Option::as_ref)
             }
         })
         .collect();
@@ -1641,13 +1773,16 @@ fn render_from_coefs(
         return Err(Error::unsupported("2-component JPEG"));
     };
 
-    // Resolve quant tables.
+    // Resolve quant tables. `.get(...)` bounds-checked: see the
+    // comment on the same lookup pattern in `decode_scan` above.
     let quant_tables: Vec<&QuantTable> = sof
         .components
         .iter()
         .map(|c| {
-            state.quant[c.qt_id as usize]
-                .as_ref()
+            state
+                .quant
+                .get(c.qt_id as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("quant table missing for component"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1880,12 +2015,16 @@ fn render_from_coefs_12bit(
         )));
     };
 
+    // `.get(...)` bounds-checked: see the comment on the same lookup
+    // pattern in `decode_scan` above.
     let quant_tables: Vec<&QuantTable> = sof
         .components
         .iter()
         .map(|c| {
-            state.quant[c.qt_id as usize]
-                .as_ref()
+            state
+                .quant
+                .get(c.qt_id as usize)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| Error::invalid("quant table missing for component"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2029,10 +2168,14 @@ fn decode_lossless_scan(
 
     // Resolve one DC Huffman table per scan component (selectors are
     // independent per Annex H; the encoder may share the same table).
+    // `.get(...)` bounds-checked: see the comment on the same lookup
+    // pattern in `decode_scan` above.
     let mut dc_tables: Vec<&HuffTable> = Vec::with_capacity(nc);
     for sc in &sos.components {
-        let t = state.dc_huff[sc.dc_table as usize]
-            .as_ref()
+        let t = state
+            .dc_huff
+            .get(sc.dc_table as usize)
+            .and_then(Option::as_ref)
             .ok_or_else(|| Error::invalid("lossless: DC Huffman table missing"))?;
         dc_tables.push(t);
     }

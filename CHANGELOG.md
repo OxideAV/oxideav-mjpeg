@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/docs_corpus.rs`: the fixture-corpus harness now gates on
+  numerical floors instead of merely reporting. Two new `Tier` variants:
+  - `Tier::Exact` asserts every sample matches the reference. Five
+    fixtures land here today — `tiny-baseline-1x1`,
+    `baseline-grayscale-32x32`, `lossless-1986-mode`,
+    `arithmetic-coded` (SOF9 Q-coder Decode path), and
+    `baseline-yuv411-32x32` — all already at 100 % exact.
+  - `Tier::PsnrFloor { db, exact_pct }` asserts both `total.psnr >= db`
+    and `total.match_pct() >= exact_pct`. Eleven lossy fixtures land here
+    with floors set ~0.5–2 dB below the observed PSNR and ~1–2 pp
+    below the observed exact-sample percentage; tight enough to catch
+    a real regression, loose enough to absorb normal floating-point
+    jitter.
+  Both new tiers fail CI on a regression rather than silently
+  degrading the corpus baseline. `ReportOnly` and `Ignored` remain for
+  forward-flexibility but are unused at present.
 - 12-bit precision decoder: 4:2:2 (`Yuv422P12Le`) and 4:4:4 (`Yuv444P12Le`)
   chroma sampling, alongside the previously-supported 4:2:0
   (`Yuv420P12Le`). All three formats run through the shared

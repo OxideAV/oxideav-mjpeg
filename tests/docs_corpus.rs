@@ -14,11 +14,21 @@
 //! `lossless-1986-mode` fixture; everything else is high-PSNR.
 //!
 //! Per-fixture classification:
-//! * `Tier::ReportOnly` — log stats; do NOT fail. The matrix stays
-//!   visible for the human implementer to spot regressions, but
-//!   individual divergences are picked off in follow-up rounds.
-//! * `Tier::Ignored` — variants the decoder explicitly does not support
-//!   (arithmetic-coded SOF9 returns `Error::Unsupported`).
+//! * `Tier::Exact` — assert every sample matches the reference. Used by
+//!   the lossless / arithmetic / grayscale / 4:1:1 / no-JFIF fixtures
+//!   whose decode path is bit-exact against libjpeg-turbo's reference
+//!   PGM/PPM.
+//! * `Tier::PsnrFloor { db, exact_pct }` — assert both `total.psnr >=
+//!   db` and `total.match_pct() >= exact_pct`. Used by the lossy
+//!   baseline / progressive fixtures whose YCbCr→RGB / IDCT rounding
+//!   introduces tiny deltas; floors are set ~0.5–2 dB and ~1–2 pp
+//!   below the observed value so the asserts don't flap on normal
+//!   floating-point jitter but a real regression trips them.
+//! * `Tier::ReportOnly` — log stats; do NOT fail. Retained for new
+//!   fixtures that haven't earned a baseline yet.
+//! * `Tier::Ignored` — variants the decoder explicitly does not
+//!   support (none currently — SOF9 was promoted to `Exact` once the
+//!   Q-coder entropy path landed).
 //!
 //! Color-space convention:
 //! * 1-component JPEGs decode to `Gray8` / `Gray12Le` and are compared
@@ -509,8 +519,20 @@ fn compare_per_channel(got: &Decoded, want: &Pnm) -> Vec<ChannelStats> {
 #[allow(dead_code)] // Ignored exists for forward-flexibility; some
                     // corpus runs may not currently use it.
 enum Tier {
+    /// Bit-exact match required: every sample on every channel must
+    /// equal the reference. Currently used by lossless / arithmetic /
+    /// grayscale / 4:1:1 fixtures whose decode path produces an exact
+    /// roundtrip against the libjpeg-turbo reference PGM/PPM.
+    Exact,
+    /// Lossy fixture: total PSNR must stay at or above the floor (dB)
+    /// and total exact-sample percentage must stay at or above the
+    /// `exact_pct` floor. Both are gated so a numeric regression
+    /// (worse IDCT rounding, sloppier YCbCr→RGB) fails CI instead of
+    /// silently degrading the corpus.
+    PsnrFloor { db: f64, exact_pct: f64 },
     /// Decode is permitted to diverge (lossy JPEG); we log per-channel
-    /// stats but do not gate CI on them.
+    /// stats but do not gate CI on them. Kept for new fixtures that
+    /// haven't earned a baseline yet.
     ReportOnly,
     /// Variant the decoder cannot handle yet; logged but not asserted.
     Ignored,
@@ -630,6 +652,44 @@ fn evaluate(case: &CorpusCase) {
         total.psnr(peak),
         got.pix_fmt,
     );
+
+    // Tier gating. ReportOnly / Ignored are silent here; Exact and
+    // PsnrFloor assert the recorded floor so a regression fails CI
+    // instead of silently degrading the corpus baseline.
+    match case.tier {
+        Tier::Exact => {
+            assert_eq!(
+                total.exact, total.n,
+                "{}: Tier::Exact requires bit-exact match, got {}/{} exact (max|d|={}, PSNR={:.2} dB)",
+                case.name,
+                total.exact,
+                total.n,
+                total.max_abs,
+                total.psnr(peak),
+            );
+        }
+        Tier::PsnrFloor { db, exact_pct } => {
+            assert!(
+                total.psnr(peak) >= db,
+                "{}: PSNR {:.2} dB < floor {:.2} dB (max|d|={}, exact {:.3}%)",
+                case.name,
+                total.psnr(peak),
+                db,
+                total.max_abs,
+                total.match_pct(),
+            );
+            assert!(
+                total.match_pct() >= exact_pct,
+                "{}: exact {:.3}% < floor {:.3}% (PSNR {:.2} dB, max|d|={})",
+                case.name,
+                total.match_pct(),
+                exact_pct,
+                total.psnr(peak),
+                total.max_abs,
+            );
+        }
+        Tier::ReportOnly | Tier::Ignored => {}
+    }
 }
 
 /// Best-effort PixelFormat inference from the VideoFrame shape. The
@@ -677,65 +737,129 @@ fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelForm
 // Per-fixture tests
 // ---------------------------------------------------------------------------
 
-// --- Tier::ReportOnly: decoder is expected to produce a high-PSNR
-//     match (or bit-exact for q100 / lossless). Stats logged for the
-//     human reader; CI does not currently gate on PSNR thresholds so
-//     regressions are visible without flapping. ---
+// --- Tier::Exact: decode is bit-exact against the libjpeg-turbo
+//     reference. Lossless / SOF9 / grayscale / 4:1:1 / non-chroma
+//     fixtures land here; the assert gates against regressions that
+//     would silently degrade entropy or sample reconstruction.
 
 #[test]
 fn corpus_tiny_baseline_1x1() {
+    // 1x1 grayscale baseline — degenerate single-pixel case. Bit-exact.
     evaluate(&CorpusCase {
         name: "tiny-baseline-1x1",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::Exact,
     });
 }
 
 #[test]
 fn corpus_baseline_grayscale_32x32() {
+    // Grayscale baseline (single component, no chroma upsample / colour
+    // conversion). Bit-exact roundtrip against the libjpeg-turbo PGM.
     evaluate(&CorpusCase {
         name: "baseline-grayscale-32x32",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::Exact,
     });
 }
+
+#[test]
+fn corpus_lossless_1986_mode() {
+    // SOF3 grayscale predictor=1 — truly lossless; bit-exact at maxval=255.
+    evaluate(&CorpusCase {
+        name: "lossless-1986-mode",
+        is_rgb_jpeg: false,
+        tier: Tier::Exact,
+    });
+}
+
+#[test]
+fn corpus_arithmetic_coded() {
+    // SOF9 — extended sequential arithmetic. Decoded via the Q-coder
+    // entropy path (T.81 Annex D + F.2.4). Bit-exact against the
+    // libjpeg-turbo `cjpeg -arithmetic` reference PGM.
+    evaluate(&CorpusCase {
+        name: "arithmetic-coded",
+        is_rgb_jpeg: false,
+        tier: Tier::Exact,
+    });
+}
+
+#[test]
+fn corpus_baseline_yuv411_32x32() {
+    // 4:1:1 chroma subsampling: luma h_factor=4, v_factor=1. Decoder
+    // emits the chroma planes at 1/4 horizontal resolution as
+    // `PixelFormat::Yuv411P`. Bit-exact (the reference PPM was rendered
+    // by libjpeg-turbo through the same IDCT path the decoder uses).
+    evaluate(&CorpusCase {
+        name: "baseline-yuv411-32x32",
+        is_rgb_jpeg: false,
+        tier: Tier::Exact,
+    });
+}
+
+// (`without-jfif-marker` is a lossy Yuv420P fixture; see the
+// PsnrFloor section below.)
+
+// --- Tier::PsnrFloor: lossy fixtures. Floors are recorded below
+//     the observed value with ~0.5–2 dB of headroom and ~1–2 pp of
+//     exact-percentage headroom, so normal floating-point jitter
+//     doesn't flap but a real numeric regression (worse IDCT
+//     rounding, sloppier YCbCr→RGB) trips the assert.
 
 #[test]
 fn corpus_baseline_rgb_32x32() {
     // Adobe APP14 transform=0; component IDs R/G/B. Decoder tags as
     // Yuv444P but plane[0..3] are literally R/G/B.
+    // Observed 2026-05-26: PSNR 55.07 dB, exact 90.33%.
     evaluate(&CorpusCase {
         name: "baseline-rgb-32x32",
         is_rgb_jpeg: true,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 88.0,
+        },
     });
 }
 
 #[test]
 fn corpus_baseline_yuv422_32x32() {
+    // Observed 2026-05-26: PSNR 52.00 dB, exact 81.97%.
     evaluate(&CorpusCase {
         name: "baseline-yuv422-32x32",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 50.0,
+            exact_pct: 80.0,
+        },
     });
 }
 
 #[test]
 fn corpus_baseline_yuv420_128x128_q75() {
+    // Observed 2026-05-26: PSNR 55.49 dB, exact 91.25%.
     evaluate(&CorpusCase {
         name: "baseline-yuv420-128x128-q75",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 89.0,
+        },
     });
 }
 
 #[test]
 fn corpus_baseline_q1_low_quality() {
-    // q=1 — extreme quantization, expect low PSNR but a valid decode.
+    // q=1 — extreme quantization, near-flat image so the lossy chain
+    // collapses to a single colour and exact% is very high.
+    // Observed 2026-05-26: PSNR 68.33 dB, exact 99.62%.
     evaluate(&CorpusCase {
         name: "baseline-q1-low-quality",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 65.0,
+            exact_pct: 99.0,
+        },
     });
 }
 
@@ -744,28 +868,44 @@ fn corpus_baseline_q100_no_loss() {
     // q=100 — all-ones DQT. Highest possible PSNR; near-bit-exact (the
     // only loss is the YCbCr↔RGB rounding, since the ground truth was
     // re-decoded by libjpeg-turbo itself with the same transform).
+    // Observed 2026-05-26: PSNR 56.31 dB, exact 92.51%.
     evaluate(&CorpusCase {
         name: "baseline-q100-no-loss",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 54.0,
+            exact_pct: 90.0,
+        },
     });
 }
 
 #[test]
 fn corpus_progressive_yuv420_128x128() {
+    // SOF2 progressive (spectral selection + successive approximation
+    // on the libjpeg-turbo side). Decoded via the multi-scan coefficient
+    // accumulator. Observed 2026-05-26: PSNR 55.49 dB, exact 91.25%.
     evaluate(&CorpusCase {
         name: "progressive-yuv420-128x128",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 89.0,
+        },
     });
 }
 
 #[test]
 fn corpus_multi_scan_non_interleaved() {
+    // SOF0 with one SOS per component (non-interleaved sequential).
+    // Routes through the shared coefficient accumulator.
+    // Observed 2026-05-26: PSNR 55.49 dB, exact 91.25%.
     evaluate(&CorpusCase {
         name: "multi-scan-non-interleaved",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 89.0,
+        },
     });
 }
 
@@ -773,79 +913,55 @@ fn corpus_multi_scan_non_interleaved() {
 fn corpus_extended_sequential_12bit() {
     // SOF1 P=12 grayscale. Decoder produces Gray12Le; ground truth is
     // PGM with maxval=4095 and 16-bit-BE samples.
+    // Observed 2026-05-26: PSNR 89.56 dB, exact 98.14%.
     evaluate(&CorpusCase {
         name: "extended-sequential-12bit",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
-    });
-}
-
-#[test]
-fn corpus_lossless_1986_mode() {
-    // SOF3 grayscale predictor=1. Truly lossless: should be bit-exact
-    // at maxval=255.
-    evaluate(&CorpusCase {
-        name: "lossless-1986-mode",
-        is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 85.0,
+            exact_pct: 95.0,
+        },
     });
 }
 
 #[test]
 fn corpus_with_restart_interval_8() {
+    // DRI + RST0..RST7 every 8 MCUs. Observed 2026-05-26: PSNR 55.49 dB,
+    // exact 91.25%.
     evaluate(&CorpusCase {
         name: "with-restart-interval-8",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 89.0,
+        },
     });
 }
 
 #[test]
 fn corpus_with_icc_profile_embedded() {
-    // APP2 ICC_PROFILE — decoder ignores APPn segments.
+    // APP2 ICC_PROFILE — decoder ignores APPn segments. Observed
+    // 2026-05-26: PSNR 55.49 dB, exact 91.25%.
     evaluate(&CorpusCase {
         name: "with-icc-profile-embedded",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 89.0,
+        },
     });
 }
 
 #[test]
 fn corpus_without_jfif_marker() {
+    // SOI directly followed by other segments (no APP0 JFIF). YUV 4:2:0
+    // 32x32 fixture; observed 2026-05-26: PSNR 55.07 dB, exact 90.33%.
     evaluate(&CorpusCase {
         name: "without-jfif-marker",
         is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
-    });
-}
-
-// --- Tier::Ignored: variants the decoder explicitly rejects. We still
-//     run them so the failure reason is visible in the log; we just
-//     don't fail the test on the rejection. ---
-
-#[test]
-fn corpus_arithmetic_coded() {
-    // SOF9 — extended sequential arithmetic. Now handled via the Q-coder
-    // entropy decoder (T.81 Annex D + F.2.4). Promoted to ReportOnly so
-    // PSNR / per-channel stats are visible; bit-exact matching of the
-    // libjpeg-turbo `cjpeg -arithmetic` reference output is a stretch
-    // goal pending further trace-driven hardening.
-    evaluate(&CorpusCase {
-        name: "arithmetic-coded",
-        is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
-    });
-}
-
-#[test]
-fn corpus_baseline_yuv411_32x32() {
-    // 4:1:1 chroma subsampling: luma h_factor=4, v_factor=1. Decoder
-    // emits the chroma planes at 1/4 horizontal resolution as
-    // `PixelFormat::Yuv411P` (added to oxideav-core alongside this
-    // fixture's promotion to ReportOnly).
-    evaluate(&CorpusCase {
-        name: "baseline-yuv411-32x32",
-        is_rgb_jpeg: false,
-        tier: Tier::ReportOnly,
+        tier: Tier::PsnrFloor {
+            db: 53.0,
+            exact_pct: 88.0,
+        },
     });
 }

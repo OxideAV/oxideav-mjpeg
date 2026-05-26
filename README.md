@@ -405,6 +405,31 @@ reusable fuzz workflow:
   cross-decode against system `libturbojpeg` (loaded via `libloading`
   at runtime; no `*-sys` crate in the dep tree).
 
+## Fixture corpus
+
+`tests/docs_corpus.rs` decodes every fixture under
+`docs/image/jpeg/fixtures/<name>/` and compares the result against the
+reference PGM/PPM. Each fixture is classified into one of two enforced
+tiers (no more silent reporting):
+
+- **`Tier::Exact`** (5 fixtures): every sample must equal the reference.
+  Covers `tiny-baseline-1x1`, `baseline-grayscale-32x32`,
+  `lossless-1986-mode`, `arithmetic-coded` (the SOF9 Q-coder path), and
+  `baseline-yuv411-32x32`.
+- **`Tier::PsnrFloor { db, exact_pct }`** (11 fixtures): total PSNR and
+  total exact-sample percentage must both meet a floor recorded ~0.5–2 dB
+  / ~1–2 pp below the observed value. A real regression (worse IDCT
+  rounding, sloppier YCbCr→RGB) trips the assert; normal floating-point
+  jitter does not flap the suite. Covers `baseline-rgb-32x32`,
+  `baseline-yuv422-32x32`, `baseline-yuv420-128x128-q75`,
+  `baseline-q1-low-quality`, `baseline-q100-no-loss`,
+  `progressive-yuv420-128x128`, `multi-scan-non-interleaved`,
+  `extended-sequential-12bit`, `with-restart-interval-8`,
+  `with-icc-profile-embedded`, and `without-jfif-marker`.
+
+The two remaining variants `Tier::ReportOnly` and `Tier::Ignored` stay
+in the enum for future fixtures that haven't earned a baseline yet.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

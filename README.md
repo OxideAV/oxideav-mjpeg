@@ -385,9 +385,9 @@ Not supported (decoder returns `Error::Unsupported`):
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs five cargo-fuzz harnesses against the
-public encoder + decoder surface, executed daily by the org-wide
-reusable fuzz workflow:
+The `fuzz/` sub-crate runs six cargo-fuzz harnesses against the
+public encoder + decoder + RTP surface, executed daily by the
+org-wide reusable fuzz workflow:
 
 - `decode` — feeds arbitrary bytes (≤ 64 KiB) through the public
   `Decoder` trait (`make_decoder` → `send_packet` → `receive_frame`).
@@ -398,6 +398,17 @@ reusable fuzz workflow:
   rejection), and the `Pq = 1` (16-bit quantiser) × coefficient dequantise
   multiplication (now in `f32` to skip i32 overflow). Last local 60 s
   baseline: 25 694 runs, 0 crashes (cov 2023 / ft 7670).
+- `rtp_depacketize` — feeds arbitrary bytes (≤ 16 KiB) through the
+  RFC 2435 RTP/JPEG depacketizer (`rtp::parse_main_header`,
+  `rtp::parse_restart_header`, `rtp::JpegDepacketizer::push`),
+  splitting the input into up to 8 synthetic packets per iteration
+  so the §3.1.2 24-bit fragment-offset reassembly buffer, the
+  §3.1.7 Restart Marker header, the §3.1.8 in-band Quantization
+  Table header, the §4.2 static-Q cache, the marker-bit close
+  path, and the `reset()` cache-retention invariant all run on
+  every iteration. Contract: never panic. Assembled frames are
+  asserted SOI..EOI; interior correctness is owned by the unit
+  tests in `src/rtp.rs`.
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
   oxideav-mjpeg encode → oxideav-mjpeg decode round-trip with ±2 LSB
   YUV tolerance.

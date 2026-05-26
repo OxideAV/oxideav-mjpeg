@@ -63,3 +63,16 @@ name = "decode"
 path = "fuzz_targets/decode.rs"
 test = false
 doc = false
+
+# Robustness target — arbitrary bytes into the RFC 2435 RTP/JPEG
+# depacketizer. Exercises `parse_main_header`, `parse_restart_header`,
+# the §3.1.8 in-band quantization-table header parser, the fragment
+# reassembly buffer (24-bit offset), and the §4.2 static-Q table
+# cache across multiple synthetic "packets" per fuzz iteration. Bar
+# is "no panic". See `fuzz_targets/rtp_depacketize.rs` for the
+# documented attack surfaces.
+[[bin]]
+name = "rtp_depacketize"
+path = "fuzz_targets/rtp_depacketize.rs"
+test = false
+doc = false

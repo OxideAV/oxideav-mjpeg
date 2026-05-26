@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fuzz/fuzz_targets/rtp_depacketize.rs`: cargo-fuzz harness covering
+  the RFC 2435 RTP/JPEG depacketizer (`oxideav_mjpeg::rtp`). Feeds
+  arbitrary bytes through `parse_main_header`, `parse_restart_header`,
+  and `JpegDepacketizer::push` — the latter as a sequence of
+  synthetic "packets" so the §3.1.2 fragment-offset reassembly
+  buffer, the §3.1.7 Restart Marker header parser, the §3.1.8
+  Quantization Table header parser, the §4.2 static-Q table cache,
+  the marker-bit close path, and the `reset()` cache-retention
+  invariant are all exercised on every iteration. Contract: no
+  panic, slice OOB, debug-build integer overflow, or buffer
+  allocation the input couldn't plausibly back. Assembled frames
+  (when the marker bit closes a frame) are asserted to begin with
+  SOI and end with EOI; their interior bytes are not validated
+  (round-trip correctness is owned by the unit tests in
+  `src/rtp.rs`). This is now the sixth fuzz harness in `fuzz/`
+  alongside `decode`, `jpeg_self_roundtrip`,
+  `jpeg_progressive_self_roundtrip`,
+  `libjpeg_encode_oxideav_decode`, and
+  `oxideav_encode_libjpeg_decode`.
 - `tests/docs_corpus.rs`: the fixture-corpus harness now gates on
   numerical floors instead of merely reporting. Two new `Tier` variants:
   - `Tier::Exact` asserts every sample matches the reference. Five

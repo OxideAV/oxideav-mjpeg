@@ -683,8 +683,16 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
         match marker {
             markers::SOF0 | markers::SOF1 => {
                 let len = seg_len(jpeg, pos)?;
+                // T.81 §B.2.2: SOF length excludes the marker itself; minimum
+                // is 8 + 3*Nf. A 3-component frame therefore needs at least
+                // 17 bytes inside the segment. Bound `len` first so the
+                // `len - 2` payload arithmetic cannot underflow when an
+                // adversarial header carries a tiny length.
+                if len < 8 {
+                    return Err(Error::invalid("RTP/JPEG packetize: truncated SOF"));
+                }
                 let body = pos + 2;
-                if body + len - 2 > jpeg.len() || len < 8 {
+                if body + (len - 2) > jpeg.len() {
                     return Err(Error::invalid("RTP/JPEG packetize: truncated SOF"));
                 }
                 let precision = jpeg[body];
@@ -702,6 +710,14 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
                     ));
                 }
                 // Component records: id(1) H|V(1) Tq(1), three of them.
+                // The segment must therefore carry 8 + 3*3 = 17 bytes after
+                // its 2-byte length field; refuse anything shorter before
+                // indexing into the component records.
+                if len < 8 + 3 * (nc as usize) {
+                    return Err(Error::invalid(
+                        "RTP/JPEG packetize: truncated SOF components",
+                    ));
+                }
                 let c0 = body + 6;
                 let y_samp = jpeg[c0 + 1];
                 let cb_samp = jpeg[c0 + 3 + 1];
@@ -724,8 +740,11 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
             }
             markers::DQT => {
                 let len = seg_len(jpeg, pos)?;
+                if len < 2 {
+                    return Err(Error::invalid("RTP/JPEG packetize: truncated DQT"));
+                }
                 let body = pos + 2;
-                let end = body + len - 2;
+                let end = body + (len - 2);
                 if end > jpeg.len() {
                     return Err(Error::invalid("RTP/JPEG packetize: truncated DQT"));
                 }
@@ -760,6 +779,9 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
             }
             markers::SOS => {
                 let len = seg_len(jpeg, pos)?;
+                if len < 2 || pos + len > jpeg.len() {
+                    return Err(Error::invalid("RTP/JPEG packetize: truncated SOS"));
+                }
                 let scan_start = pos + len;
                 // Find the EOI that terminates the entropy-coded scan. Skip
                 // 0x00 stuffing and RSTn markers inside the scan.
@@ -822,6 +844,15 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
             _ if markers::is_rst(marker) => { /* stray RSTn outside scan — skip */ }
             _ => {
                 let len = seg_len(jpeg, pos)?;
+                // A well-formed length-prefixed segment carries its own
+                // length-field bytes inside `len`, so `len < 2` is malformed
+                // (and would also fail to advance `pos`, producing an
+                // infinite loop on adversarial input).
+                if len < 2 || pos + len > jpeg.len() {
+                    return Err(Error::invalid(
+                        "RTP/JPEG packetize: truncated/oversized segment",
+                    ));
+                }
                 pos += len;
             }
         }
@@ -1756,5 +1787,97 @@ mod tests {
         let decoded = decode_jpeg(&rebuilt.unwrap(), None).expect("decode");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
+    }
+
+    // -------------------------------------------------------------------
+    // `parse_jpeg` (packetize encode-side parser) panic-surface regression
+    // tests. The packetizer accepts an arbitrary external JPEG; every
+    // length-prefixed segment must validate before indexing.
+    // -------------------------------------------------------------------
+
+    /// Build a stub `SOI ... EOI` byte stream with a single SOF0 segment
+    /// whose declared length is `sof_len`. Used to drive the length /
+    /// component-records bounds checks below.
+    fn jpeg_with_truncated_sof(sof_len: u16) -> Vec<u8> {
+        let mut j = vec![0xFF, markers::SOI, 0xFF, markers::SOF0];
+        j.extend_from_slice(&sof_len.to_be_bytes());
+        // No body bytes — declared length lies about what follows.
+        j.push(0xFF);
+        j.push(markers::EOI);
+        j
+    }
+
+    #[test]
+    fn packetize_rejects_sof_with_underflowing_length() {
+        // `len = 0` would underflow `len - 2` in the SOF arm.
+        let j = jpeg_with_truncated_sof(0);
+        let err = packetize(&j, 1400, QMode::Quality(50)).unwrap_err();
+        assert!(format!("{err}").contains("truncated SOF"));
+    }
+
+    #[test]
+    fn packetize_rejects_sof_with_undersized_component_records() {
+        // A 3-component SOF needs 8 + 3*3 = 17 bytes. Declare 12 (precision +
+        // height + width + Nf + only a half-component) and watch the parser
+        // refuse rather than read past the segment.
+        let mut j = vec![0xFF, markers::SOI, 0xFF, markers::SOF0];
+        j.extend_from_slice(&12u16.to_be_bytes());
+        j.push(8); // precision
+        j.extend_from_slice(&16u16.to_be_bytes()); // height
+        j.extend_from_slice(&16u16.to_be_bytes()); // width
+        j.push(3); // Nf = 3 — but we only carry 4 more bytes, not 9.
+        j.extend_from_slice(&[0, 0, 0, 0]);
+        j.push(0xFF);
+        j.push(markers::EOI);
+        let err = packetize(&j, 1400, QMode::Quality(50)).unwrap_err();
+        assert!(format!("{err}").contains("truncated SOF components"));
+    }
+
+    #[test]
+    fn packetize_rejects_dqt_with_underflowing_length() {
+        let mut j = vec![0xFF, markers::SOI, 0xFF, markers::DQT];
+        j.extend_from_slice(&0u16.to_be_bytes()); // len = 0 → underflow trap
+        j.push(0xFF);
+        j.push(markers::EOI);
+        let err = packetize(&j, 1400, QMode::Quality(50)).unwrap_err();
+        assert!(format!("{err}").contains("truncated DQT"));
+    }
+
+    #[test]
+    fn packetize_rejects_sos_with_underflowing_length() {
+        // SOF0 (minimum-valid 3-comp at 16x16, qt 0/1/1) then SOS with len=0.
+        let mut j = vec![0xFF, markers::SOI];
+        // SOF0
+        j.push(0xFF);
+        j.push(markers::SOF0);
+        j.extend_from_slice(&17u16.to_be_bytes());
+        j.push(8); // precision
+        j.extend_from_slice(&16u16.to_be_bytes());
+        j.extend_from_slice(&16u16.to_be_bytes());
+        j.push(3);
+        // Components 1/2/3 with 4:2:0 sampling. Quant table ids 0/1/1.
+        j.extend_from_slice(&[1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        // SOS with len = 1 (underflow trap on len - 2).
+        j.push(0xFF);
+        j.push(markers::SOS);
+        j.extend_from_slice(&1u16.to_be_bytes());
+        j.push(0xFF);
+        j.push(markers::EOI);
+        let err = packetize(&j, 1400, QMode::Quality(50)).unwrap_err();
+        assert!(format!("{err}").contains("truncated SOS"));
+    }
+
+    #[test]
+    fn packetize_rejects_generic_segment_with_underflowing_length() {
+        // APP0 (catch-all branch) with len = 0 would loop forever in
+        // `pos += len`. The guard turns it into a clean error.
+        let mut j = vec![0xFF, markers::SOI];
+        j.push(0xFF);
+        j.push(0xE0); // APP0 — not specially handled, falls into the `_` arm.
+        j.extend_from_slice(&1u16.to_be_bytes()); // len = 1, too short.
+        j.push(0xFF);
+        j.push(markers::EOI);
+        let err = packetize(&j, 1400, QMode::Quality(50)).unwrap_err();
+        assert!(format!("{err}").contains("truncated/oversized segment"));
     }
 }

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fuzz/fuzz_targets/rtp_packetize.rs`: cargo-fuzz harness covering
+  the RFC 2435 RTP/JPEG packetizer (`oxideav_mjpeg::rtp::packetize`).
+  Drives arbitrary bytes (≤ 16 KiB) through the encode-side JPEG
+  segment walker (`fn parse_jpeg`), which indexes into the input by
+  the big-endian length field of each SOI / SOF / DQT / DRI / SOS /
+  catch-all segment. The harness samples both `QMode::Quality(1..=99)`
+  and `QMode::InBand(128..=255)` (and the rejection paths outside
+  those ranges) and a range of `max_payload` MTUs so the
+  header-room rejection and the fragment-split loop both run on
+  every iteration. Contract: no panic, slice OOB, debug-build
+  integer overflow, or infinite loop from a zero-length segment.
+  Successful returns are shape-checked: first fragment offset 0,
+  marker bit set on the final packet, no payload exceeds the
+  caller's `max_payload`. This is now the seventh fuzz harness in
+  `fuzz/` alongside `decode`, `jpeg_self_roundtrip`,
+  `jpeg_progressive_self_roundtrip`, `libjpeg_encode_oxideav_decode`,
+  `oxideav_encode_libjpeg_decode`, and `rtp_depacketize`. Last
+  local 15 s baseline (debug binary, no sanitizer instrumentation):
+  21 819 067 runs, 0 crashes; the daily reusable fuzz workflow runs
+  the release-instrumented build with proper coverage and pulls the
+  new harness in automatically via `fuzz/Cargo.toml` auto-discovery.
+
 - `fuzz/fuzz_targets/rtp_depacketize.rs`: cargo-fuzz harness covering
   the RFC 2435 RTP/JPEG depacketizer (`oxideav_mjpeg::rtp`). Feeds
   arbitrary bytes through `parse_main_header`, `parse_restart_header`,
@@ -75,6 +97,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it up without further wiring.
 
 ### Fixed
+
+- **RTP/JPEG packetize parser panic surfaces** in `fn parse_jpeg`
+  (`oxideav_mjpeg::rtp`):
+  - **SOF0/SOF1 `len < 2`** previously underflowed `len - 2` in the
+    payload bounds calculation (`body + len - 2 > jpeg.len()`); the
+    check now refuses `len < 8` (the SOF fixed-header minimum, T.81
+    §B.2.2) up-front before any subtraction.
+  - **SOF0/SOF1 with `Nf = 3`** but a declared length too short to
+    carry the three 3-byte component records (`8 + 3 * Nf = 17`)
+    previously indexed `jpeg[body + 13]` past the segment end. A
+    new `len < 8 + 3 * nc` check rejects the truncated header before
+    the component-records read.
+  - **DQT `len < 2`** previously underflowed `len - 2` when computing
+    the table-body slice end; explicit `len < 2` guard added.
+  - **SOS `len < 2`** previously yielded a `scan_start = pos + len`
+    underflow (and the subsequent `&jpeg[scan_start..scan_end]` slice
+    panic inside `packetize`). Bounds-checked.
+  - **Catch-all length-prefixed segment with `len == 0`** (any
+    unsupported marker — APPn, COM, DHT, …) previously caused
+    `pos += 0`, an infinite loop. The arm now requires `len >= 2`
+    (the segment must at least carry its own length field) and
+    refuses any `pos + len > jpeg.len()`. Five regression tests
+    cover the SOF length/component, DQT, SOS, and APP0 cases.
 
 - **Decoder dequantise i32 overflow** (`render_from_coefs` ×3 sites): when a
   DQT carries `Pq = 1` (16-bit precision, T.81 §B.2.4.1) the quant value can

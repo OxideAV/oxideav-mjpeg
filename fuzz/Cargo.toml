@@ -76,3 +76,17 @@ name = "rtp_depacketize"
 path = "fuzz_targets/rtp_depacketize.rs"
 test = false
 doc = false
+
+# Robustness target — arbitrary bytes into the RFC 2435 RTP/JPEG
+# packetizer. Exercises the `fn parse_jpeg` wire-segment walker
+# (SOI / SOF0 / SOF1 / DQT / DRI / SOS / RSTn / EOI parsing with
+# big-endian segment length fields), the QMode validation, and the
+# scan-fragmentation loop. Both `QMode::Quality(1..=99)` and
+# `QMode::InBand(128..=255)` are sampled per iteration. Bar is "no
+# panic". See `fuzz_targets/rtp_packetize.rs` for the documented
+# attack surfaces.
+[[bin]]
+name = "rtp_packetize"
+path = "fuzz_targets/rtp_packetize.rs"
+test = false
+doc = false

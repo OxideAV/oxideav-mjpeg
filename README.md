@@ -385,7 +385,7 @@ Not supported (decoder returns `Error::Unsupported`):
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs six cargo-fuzz harnesses against the
+The `fuzz/` sub-crate runs seven cargo-fuzz harnesses against the
 public encoder + decoder + RTP surface, executed daily by the
 org-wide reusable fuzz workflow:
 
@@ -409,6 +409,20 @@ org-wide reusable fuzz workflow:
   every iteration. Contract: never panic. Assembled frames are
   asserted SOI..EOI; interior correctness is owned by the unit
   tests in `src/rtp.rs`.
+- `rtp_packetize` — feeds arbitrary bytes (≤ 16 KiB) through the
+  RFC 2435 RTP/JPEG packetizer (`rtp::packetize`). The packetizer
+  walks a complete external JPEG byte stream and indexes into it
+  by big-endian segment lengths; the harness exercises SOF /
+  DQT / DRI / SOS / catch-all length-field bounds checks, the
+  `QMode::Quality(1..=99)` and `QMode::InBand(128..=255)`
+  validation branches, and a range of `max_payload` MTU buckets
+  (16 / 256 / 1400 / 8192). Contract: never panic. Successful
+  returns are shape-checked (first fragment offset 0, last
+  fragment marker bit set, no payload exceeds `max_payload`).
+  Round-trip correctness is owned by the unit tests in
+  `src/rtp.rs`. Last local 15 s baseline: 21 819 067 runs, 0
+  crashes (debug build, no instrumentation; daily CI runs the
+  release-instrumented binary).
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
   oxideav-mjpeg encode → oxideav-mjpeg decode round-trip with ±2 LSB
   YUV tolerance.

@@ -73,7 +73,11 @@ fuzz_target!(|data: &[u8]| {
     } else {
         // 128..=255; high bit of knob selects 255 (dynamic) or some
         // middle static value.
-        let q = if knob & 0b10 == 0 { 128 + (knob >> 4) } else { 255 };
+        let q = if knob & 0b10 == 0 {
+            128 + (knob >> 4)
+        } else {
+            255
+        };
         QMode::InBand(q)
     };
 

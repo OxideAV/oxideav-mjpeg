@@ -1,4 +1,7 @@
 #![cfg(feature = "registry")]
+// Parallel-array index loops are idiomatic in these per-component
+// roundtrip checks; skip the lint (same allow as `src/lib.rs`).
+#![allow(clippy::needless_range_loop)]
 //! Bit-exact encode→decode roundtrips for the public lossless JPEG (SOF3)
 //! encoder.
 //!
@@ -263,35 +266,259 @@ fn lossless_rgb_rejects_oversized_sample() {
     );
 }
 
-#[test]
-fn lossless_rgb_rejects_higher_precision_decode() {
-    // The decoder side only emits packed Rgb24 today; multi-component
-    // P > 8 is encoder-only for now. Verify the decoder surfaces a
-    // clean Unsupported when fed a P=12 3-component stream.
-    let w = 4u32;
-    let h = 4u32;
-    let precision = 12u8;
-    // Build a tiny solid plane so the validation doesn't trip first.
-    let bytes_per_sample = 2usize;
-    let plane = vec![0u8; (w as usize) * (h as usize) * bytes_per_sample];
-    let strides = [
-        (w as usize) * bytes_per_sample,
-        (w as usize) * bytes_per_sample,
-        (w as usize) * bytes_per_sample,
+/// Build three textured high-bit-depth planes (one each for the three
+/// SOS components) at the requested precision, packed as little-endian
+/// 16-bit samples with stride = w * 2 bytes per plane. Each plane is
+/// independently textured so a per-component buffer-indexing bug
+/// (cross-talk between components) would produce a visible mismatch.
+fn mk_rgb_wide(w: usize, h: usize, precision: u8) -> [Vec<u8>; 3] {
+    let max = (1u32 << precision) - 1;
+    let mut out: [Vec<u8>; 3] = [
+        vec![0u8; w * h * 2],
+        vec![0u8; w * h * 2],
+        vec![0u8; w * h * 2],
     ];
-    let jpeg = encode_lossless_jpeg_rgb(w, h, [&plane, &plane, &plane], strides, precision, 1)
-        .expect("encode 12-bit 3-component");
-    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
-    params.width = Some(w);
-    params.height = Some(h);
-    let mut dec = make_decoder(&params).unwrap();
-    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), jpeg))
-        .unwrap();
-    let r = dec.receive_frame();
-    assert!(
-        r.is_err(),
-        "decoder should reject 3-component lossless at P>8"
+    for j in 0..h {
+        for i in 0..w {
+            // Three decorrelated textures, one per component. The XOR /
+            // multiply combinations keep residuals from collapsing to
+            // SSSS=0/1 while staying entirely inside `0..=max`.
+            let v0 = ((i as u32 * 5 + j as u32 * 3 + ((i ^ j) as u32)) & max) as u16;
+            let v1 =
+                ((i as u32 * 11 + j as u32 * 7 + ((i.wrapping_mul(j)) as u32 & 63)) & max) as u16;
+            let v2 = ((max ^ ((i as u32 * 2 + j as u32 * 9) & max)) & max) as u16;
+            let pix = j * w + i;
+            out[0][pix * 2] = (v0 & 0xFF) as u8;
+            out[0][pix * 2 + 1] = (v0 >> 8) as u8;
+            out[1][pix * 2] = (v1 & 0xFF) as u8;
+            out[1][pix * 2 + 1] = (v1 >> 8) as u8;
+            out[2][pix * 2] = (v2 & 0xFF) as u8;
+            out[2][pix * 2 + 1] = (v2 >> 8) as u8;
+        }
+    }
+    out
+}
+
+/// Read a little-endian u16 from a plane at logical `(i, j)`.
+fn read_le_u16(plane: &[u8], stride: usize, i: usize, j: usize) -> u16 {
+    let lo = plane[j * stride + i * 2] as u16;
+    let hi = plane[j * stride + i * 2 + 1] as u16;
+    lo | (hi << 8)
+}
+
+#[test]
+fn lossless_rgb_10bit_every_predictor_planar_gbrp10() {
+    // P = 10 three-component decode lands on planar `Gbrp10Le`: three
+    // 16-bit-storage planes in SOS-component order. The decoder is
+    // colour-agnostic — caller plane-order is preserved end-to-end —
+    // so each input plane round-trips bit-exact through the matching
+    // output plane.
+    let w = 12u32;
+    let h = 8u32;
+    let precision = 10u8;
+    let planes = mk_rgb_wide(w as usize, h as usize, precision);
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_jpeg_rgb(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2]],
+            strides,
+            precision,
+            predictor,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(
+            v.planes.len(),
+            3,
+            "predictor={predictor}: expected 3 Gbrp10Le planes"
+        );
+        for ci in 0..3 {
+            assert_eq!(
+                v.planes[ci].stride,
+                (w as usize) * 2,
+                "predictor={predictor} comp={ci}: expected 2 bytes/sample stride"
+            );
+            for j in 0..h as usize {
+                for i in 0..w as usize {
+                    let want = read_le_u16(&planes[ci], (w as usize) * 2, i, j);
+                    let got = read_le_u16(&v.planes[ci].data, v.planes[ci].stride, i, j);
+                    assert_eq!(
+                        got, want,
+                        "predictor={predictor} comp={ci} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_rgb_12bit_predictor_4_planar_gbrp12() {
+    // P = 12 lands on `Gbrp12Le`; predictor 4 exercises the
+    // two-dimensional `Ra + Rb - Rc` form (touches all three neighbour
+    // history slots and the `wrapping_add` / `wrapping_sub` path that
+    // matters at the modulus boundary).
+    let w = 16u32;
+    let h = 12u32;
+    let precision = 12u8;
+    let planes = mk_rgb_wide(w as usize, h as usize, precision);
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    let jpeg = encode_lossless_jpeg_rgb(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        precision,
+        4,
+    )
+    .expect("encode 12-bit 3-component");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 3, "expected 3 Gbrp12Le planes");
+    for ci in 0..3 {
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let want = read_le_u16(&planes[ci], (w as usize) * 2, i, j);
+                let got = read_le_u16(&v.planes[ci].data, v.planes[ci].stride, i, j);
+                assert_eq!(got, want, "comp={ci} mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_rgb_14bit_predictor_7_planar_gbrp14() {
+    // P = 14 lands on `Gbrp14Le`; predictor 7 exercises the
+    // `(Ra + Rb) >> 1` averaging path.
+    let w = 8u32;
+    let h = 8u32;
+    let precision = 14u8;
+    let planes = mk_rgb_wide(w as usize, h as usize, precision);
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    let jpeg = encode_lossless_jpeg_rgb(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        precision,
+        7,
+    )
+    .expect("encode 14-bit 3-component");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 3, "expected 3 Gbrp14Le planes");
+    for ci in 0..3 {
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let want = read_le_u16(&planes[ci], (w as usize) * 2, i, j);
+                let got = read_le_u16(&v.planes[ci].data, v.planes[ci].stride, i, j);
+                assert_eq!(got, want, "comp={ci} mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_rgb_16bit_predictor_1_packed_rgb48() {
+    // P = 16: no `Gbrp16Le` variant exists, so the decoder widens onto
+    // packed `Rgb48Le` (6 bytes per pixel, scan-component order). This
+    // is the "widest container" fallback that mirrors how grayscale
+    // P = 14 widens onto `Gray16Le`. Predictor 1 (left-only) keeps the
+    // test independent of vertical neighbours.
+    let w = 8u32;
+    let h = 6u32;
+    let precision = 16u8;
+    let planes = mk_rgb_wide(w as usize, h as usize, precision);
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    let jpeg = encode_lossless_jpeg_rgb(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        precision,
+        1,
+    )
+    .expect("encode 16-bit 3-component");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 1, "expected 1 packed Rgb48Le plane");
+    let stride = v.planes[0].stride;
+    assert_eq!(
+        stride,
+        (w as usize) * 6,
+        "expected 6 bytes/pixel (Rgb48Le) stride"
     );
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            // Packed layout: c0-low, c0-high, c1-low, c1-high, c2-low, c2-high.
+            let base = j * stride + i * 6;
+            let got_c0 =
+                (v.planes[0].data[base] as u16) | ((v.planes[0].data[base + 1] as u16) << 8);
+            let got_c1 =
+                (v.planes[0].data[base + 2] as u16) | ((v.planes[0].data[base + 3] as u16) << 8);
+            let got_c2 =
+                (v.planes[0].data[base + 4] as u16) | ((v.planes[0].data[base + 5] as u16) << 8);
+            assert_eq!(
+                got_c0,
+                read_le_u16(&planes[0], (w as usize) * 2, i, j),
+                "c0 mismatch at ({i},{j})"
+            );
+            assert_eq!(
+                got_c1,
+                read_le_u16(&planes[1], (w as usize) * 2, i, j),
+                "c1 mismatch at ({i},{j})"
+            );
+            assert_eq!(
+                got_c2,
+                read_le_u16(&planes[2], (w as usize) * 2, i, j),
+                "c2 mismatch at ({i},{j})"
+            );
+        }
+    }
+}
+
+#[test]
+fn lossless_rgb_odd_precision_9_widens_to_rgb48() {
+    // P = 9 has no exact-bit-depth pixel format, so it widens onto
+    // packed `Rgb48Le` just like 11 / 13 / 15. Verify the round-trip
+    // is still bit-exact (samples sit in the low 9 bits of each
+    // 16-bit word).
+    let w = 6u32;
+    let h = 4u32;
+    let precision = 9u8;
+    let planes = mk_rgb_wide(w as usize, h as usize, precision);
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    let jpeg = encode_lossless_jpeg_rgb(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        precision,
+        1,
+    )
+    .expect("encode 9-bit 3-component");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 1, "P=9 should widen to single packed plane");
+    let stride = v.planes[0].stride;
+    assert_eq!(stride, (w as usize) * 6, "expected Rgb48Le stride");
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let base = j * stride + i * 6;
+            for ci in 0..3 {
+                let got = (v.planes[0].data[base + ci * 2] as u16)
+                    | ((v.planes[0].data[base + ci * 2 + 1] as u16) << 8);
+                let want = read_le_u16(&planes[ci], (w as usize) * 2, i, j);
+                // P = 9: only the low 9 bits are meaningful; the top 7
+                // bits of the output word must be zero (no sign-extension
+                // or stray bits from the predictor arithmetic).
+                assert_eq!(
+                    got >> 9,
+                    0,
+                    "P=9 comp={ci} stray high bits at ({i},{j}): got={got:#06x}"
+                );
+                assert_eq!(got, want, "comp={ci} mismatch at ({i},{j})");
+            }
+        }
+    }
 }
 
 #[test]

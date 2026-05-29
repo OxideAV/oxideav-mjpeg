@@ -176,12 +176,19 @@ height, [r, g, b], strides, precision, predictor)` directly:
   (component IDs 1, 2, 3). Output: a standalone SOF3 JPEG with one
   interleaved SOS scan.
 - `precision` is the same `2..=16` range as the grayscale entry point.
-  Output decoding is supported at `P = 8` (packed `Rgb24`); higher
-  precisions are encoder-only today since the decoder lacks an 8-bit
-  planar GBR target format.
-- The encoder is colour-agnostic: callers pass planes in whatever
-  channel order they want (R-G-B, G-B-R, etc.) and the decoder reads
-  them back in the same order via `Rgb24`'s R-G-B byte layout.
+  Decode output is shaped by precision:
+  - `P = 8`     → packed `Rgb24` (one plane, 3 bytes/pixel).
+  - `P = 10`    → planar `Gbrp10Le` (3 planes, 16-bit LE storage).
+  - `P = 12`    → planar `Gbrp12Le`.
+  - `P = 14`    → planar `Gbrp14Le`.
+  - any other P → packed `Rgb48Le` (one plane, 6 bytes/pixel — samples
+    narrower than 16 bits sit in the low bits of each 16-bit word).
+- The codec is colour-agnostic on both sides: callers pass planes in
+  whatever channel order they want (R-G-B, G-B-R, etc.) to the encoder,
+  and the decoder hands them back in the same SOS scan order — both for
+  the 8-bit packed-`Rgb24` path and the high-bit-depth planar paths.
+  Callers that want the canonical G-B-R plane order of `Gbrp*Le` should
+  pass G, B, R to the encoder in that order.
 - For DRI + `RSTn` emission or a non-zero point transform call
   `encode_lossless_jpeg_rgb_with_opts(width, height, [r, g, b],
   strides, precision, predictor, restart_interval, point_transform)`.

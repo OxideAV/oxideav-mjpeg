@@ -61,6 +61,24 @@ pub enum MjpegPixelFormat {
     /// 8-bit packed RGB (3 bytes per pixel, R-G-B order). Produced by the
     /// SOF3 lossless decoder for 8-bit three-component scans.
     Rgb24,
+    /// 16-bit-per-channel packed RGB, little-endian (6 bytes per pixel,
+    /// R-G-B order). Produced by the SOF3 lossless decoder for
+    /// three-component scans at precisions that do not map onto a
+    /// `Gbrp*Le` width (P = 9 / 11 / 13 / 15 / 16). Samples shorter than
+    /// 16 bits sit in the low bits of each 16-bit word.
+    Rgb48Le,
+    /// 10-bit planar GBR (3 planes ordered G, B, R, 16-bit LE storage
+    /// per sample). Produced by the SOF3 lossless decoder for
+    /// three-component P = 10 scans.
+    Gbrp10Le,
+    /// 12-bit planar GBR (3 planes ordered G, B, R, 16-bit LE storage
+    /// per sample). Produced by the SOF3 lossless decoder for
+    /// three-component P = 12 scans.
+    Gbrp12Le,
+    /// 14-bit planar GBR (3 planes ordered G, B, R, 16-bit LE storage
+    /// per sample). Produced by the SOF3 lossless decoder for
+    /// three-component P = 14 scans.
+    Gbrp14Le,
     /// 8-bit planar 4:1:1 YUV (luma 4× chroma horizontally).
     Yuv411P,
     /// 8-bit planar 4:2:0 YUV.

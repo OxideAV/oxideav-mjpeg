@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- High-bit-depth lossless (SOF3) three-component decode. Previously the
+  decoder accepted SOF3 RGB-class scans only at `P = 8` (output:
+  packed `Rgb24`); decoding at higher precisions raised
+  `Error::Unsupported`. The decoder now covers every precision in
+  `2..=16` for three-component lossless, with output shape selected by
+  precision:
+  - `P = 8`      → packed `Rgb24` (one plane, 3 bytes/pixel) —
+    unchanged.
+  - `P = 10`     → planar `Gbrp10Le` (3 planes, 16-bit LE per sample,
+    low 10 bits carry the sample).
+  - `P = 12`     → planar `Gbrp12Le`.
+  - `P = 14`     → planar `Gbrp14Le`.
+  - any other `P` in `2..=16` (i.e. 2..=7, 9, 11, 13, 15, 16)
+                 → packed `Rgb48Le` (one plane, 6 bytes/pixel; samples
+    narrower than 16 bits sit in the low bits of each 16-bit word).
+  Per-component buffer ordering is preserved end-to-end: planes pass
+  through encoder → decoder in the same SOS scan order (mirroring the
+  existing colour-agnostic `Rgb24` behaviour), so a caller that wants
+  canonical `Gbrp*Le` G-B-R layout passes its G, B, R planes to the
+  encoder in that order. Roundtrip bit-exactness verified by five new
+  integration tests in `tests/lossless_roundtrip.rs`:
+  `lossless_rgb_10bit_every_predictor_planar_gbrp10` (every Annex H
+  predictor 1..=7), `lossless_rgb_12bit_predictor_4_planar_gbrp12`,
+  `lossless_rgb_14bit_predictor_7_planar_gbrp14`,
+  `lossless_rgb_16bit_predictor_1_packed_rgb48`, and
+  `lossless_rgb_odd_precision_9_widens_to_rgb48`. The previous
+  `lossless_rgb_rejects_higher_precision_decode` test (which asserted
+  the `Error::Unsupported` for P > 8) is removed in the same commit
+  per the workspace "rewrite, don't `#[ignore]`" guardrail.
+- `MjpegPixelFormat` (standalone API) gains `Rgb48Le`, `Gbrp10Le`,
+  `Gbrp12Le`, and `Gbrp14Le` variants, with bidirectional
+  `From<MjpegPixelFormat> for oxideav_core::PixelFormat` / reverse
+  mapping in `registry.rs` so the registry-side `CodecParameters`
+  surface accepts and produces them.
 - `fuzz/fuzz_targets/rtp_packetize.rs`: cargo-fuzz harness covering
   the RFC 2435 RTP/JPEG packetizer (`oxideav_mjpeg::rtp::packetize`).
   Drives arbitrary bytes (≤ 16 KiB) through the encode-side JPEG

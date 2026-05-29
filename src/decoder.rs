@@ -2101,8 +2101,16 @@ fn render_from_coefs_12bit(
 // shifts samples by `Pt` bits on the wire.
 //
 // This implementation handles single-component grayscale at any precision
-// in `2..=16`, and three-component (RGB-class) interleaved scans at
-// `precision = 8` (output: packed `Rgb24`). T.81 §H.1.2 specifies that
+// in `2..=16`, and three-component (RGB-class) interleaved scans across
+// every precision in `2..=16`. Output format for three-component scans:
+//   * P = 8                     → packed `Rgb24` (R, G, B bytes per pixel).
+//   * P = 10                    → planar `Gbrp10Le` (3 planes G, B, R).
+//   * P = 12                    → planar `Gbrp12Le`.
+//   * P = 14                    → planar `Gbrp14Le`.
+//   * P ∈ {2..=7, 9, 11, 13, 15, 16} → packed `Rgb48Le` (16-bit LE per
+//     channel, low bits carry the sample; matches the grayscale path's
+//     "no-exact-width-format → widest container" policy).
+// T.81 §H.1.2 specifies that
 // "each component in the scan is modeled independently, using predictions
 // derived from neighbouring samples of that component"; with each
 // component declared `H_i = V_i = 1` (E.1.1: lossless data unit is one
@@ -2144,12 +2152,11 @@ fn decode_lossless_scan(
     let height = sof.height as usize;
     let nc = sos.components.len();
 
-    // Multi-component output is currently packed Rgb24 only (P=8).
-    if nc > 1 && precision != 8 {
-        return Err(Error::unsupported(format!(
-            "lossless: 3-component decode requires precision = 8 (got {precision})",
-        )));
-    }
+    // Multi-component output: P = 8 → packed Rgb24, P ∈ {10, 12, 14} →
+    // planar `Gbrp{10,12,14}Le`, every other precision in 2..=16 →
+    // packed `Rgb48Le`. The decoder already validated `precision ∈
+    // 2..=16` at SOF3 parse time (see the `SOF3` arm in `decode_to_eoi`),
+    // so no upper-bound recheck is needed here.
 
     // Resolve one DC Huffman table per scan component (selectors are
     // independent per Annex H; the encoder may share the same table).
@@ -2256,14 +2263,74 @@ fn decode_lossless_scan(
         }
     }
 
-    // Three-component decode emits packed Rgb24.
+    // Three-component decode: shape the output planes by precision.
     if nc == 3 {
-        let stride = width * 3;
+        // P = 8: packed `Rgb24`, one plane, three bytes per pixel
+        // ordered R, G, B (matching `oxideav_core::PixelFormat::Rgb24`'s
+        // R-G-B byte layout and the encoder's component ID = 1/2/3 →
+        // R/G/B scan-order convention).
+        if precision == 8 {
+            let stride = width * 3;
+            let mut data = vec![0u8; stride * height];
+            for i in 0..width * height {
+                data[i * 3] = (samples[0][i] << pt) as u8;
+                data[i * 3 + 1] = (samples[1][i] << pt) as u8;
+                data[i * 3 + 2] = (samples[2][i] << pt) as u8;
+            }
+            return Ok(VideoFrame {
+                pts,
+                planes: vec![VideoPlane { stride, data }],
+            });
+        }
+
+        // P ∈ {10, 12, 14}: planar `Gbrp{10,12,14}Le`. The encoder is
+        // colour-agnostic — it preserves the caller's plane order onto
+        // SOS component IDs 1, 2, 3 — and the decoder mirrors that:
+        // output plane `i` carries the samples for SOS component
+        // `i + 1`. Callers that want canonical G-B-R ordering (matching
+        // the `oxideav_core::PixelFormat::Gbrp*Le` semantic) pass G, B,
+        // R planes to the encoder; the decoder hands them back in the
+        // same order. Each sample is stored as a 16-bit little-endian
+        // word; the low `precision` bits carry the post-Pt-shift
+        // sample, top bits zero (mirroring the grayscale Gray16Le
+        // policy for P = 14).
+        if matches!(precision, 10 | 12 | 14) {
+            let stride = width * 2;
+            let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(3);
+            for si in 0..3 {
+                let mut data = vec![0u8; stride * height];
+                for i in 0..width * height {
+                    let v = (samples[si][i] << pt) as u16;
+                    data[i * 2] = (v & 0xFF) as u8;
+                    data[i * 2 + 1] = (v >> 8) as u8;
+                }
+                out_planes.push(VideoPlane { stride, data });
+            }
+            return Ok(VideoFrame {
+                pts,
+                planes: out_planes,
+            });
+        }
+
+        // Every remaining precision in 2..=16 (i.e. 2..=7, 9, 11, 13,
+        // 15, 16): packed `Rgb48Le`, one plane, six bytes per pixel
+        // ordered c0-low, c0-high, c1-low, c1-high, c2-low, c2-high
+        // where `cN` is the Nth scan-order SOS component. Samples
+        // narrower than 16 bits sit in the low bits of each 16-bit
+        // word — the same policy the grayscale path uses to widen
+        // P = 14 into `Gray16Le`.
+        let stride = width * 6;
         let mut data = vec![0u8; stride * height];
         for i in 0..width * height {
-            data[i * 3] = (samples[0][i] << pt) as u8;
-            data[i * 3 + 1] = (samples[1][i] << pt) as u8;
-            data[i * 3 + 2] = (samples[2][i] << pt) as u8;
+            let c0 = (samples[0][i] << pt) as u16;
+            let c1 = (samples[1][i] << pt) as u16;
+            let c2 = (samples[2][i] << pt) as u16;
+            data[i * 6] = (c0 & 0xFF) as u8;
+            data[i * 6 + 1] = (c0 >> 8) as u8;
+            data[i * 6 + 2] = (c1 & 0xFF) as u8;
+            data[i * 6 + 3] = (c1 >> 8) as u8;
+            data[i * 6 + 4] = (c2 & 0xFF) as u8;
+            data[i * 6 + 5] = (c2 >> 8) as u8;
         }
         return Ok(VideoFrame {
             pts,

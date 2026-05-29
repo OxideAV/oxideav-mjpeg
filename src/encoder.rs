@@ -2453,9 +2453,11 @@ pub fn encode_lossless_jpeg_rgb(
 ///   independently per component).
 ///
 /// Bit-exact roundtrip vs. the SOF3 three-component decoder for every
-/// supported predictor / restart interval / Pt combination at
-/// `precision = 8` (the only precision the decoder currently supports
-/// for multi-component lossless).
+/// supported predictor / restart interval / Pt combination at every
+/// precision in `2..=16`. Decoder output shape varies by precision —
+/// see `decode_lossless_scan` in `src/decoder.rs` for the per-precision
+/// `PixelFormat` mapping (P=8 → packed Rgb24, P∈{10,12,14} → planar
+/// Gbrp*Le, every other P → packed Rgb48Le).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_lossless_jpeg_rgb_with_opts(
     width: u32,

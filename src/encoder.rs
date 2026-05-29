@@ -2061,6 +2061,224 @@ fn write_sos_yuv(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+// ---- Test-only progressive (SOF2) 12-bit YUV encoder ---------------------
+//
+// Exercises the decoder's SOF2-at-P=12 path. T.81 §G.1.1 permits
+// progressive at precision 8 *or* 12; the progressive scan-builder code is
+// precision-agnostic (operates in i32 coefficient space), so the only
+// "new" emission machinery here is the SOF2 segment with `P = 12` and the
+// 2048-centre level shift in the per-block DCT input.
+//
+// The scan decomposition is the simple spectral-selection-only layout
+// (Ah = Al = 0): interleaved DC scan, then three single-component AC
+// scans (Y, Cb, Cr) over [1..=5] then [6..=63]. This matches the
+// non-SA branch of `encode_jpeg_progressive_inner`, which the decoder
+// already round-trips at P = 8.
+
+/// Variant of `fill_coef_grid` that takes 12-bit-precision `u16` samples
+/// and applies the spec level shift of `2 ^ (P − 1) = 2048` per
+/// T.81 §A.3.1.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn fill_coef_grid_u16_2048(
+    coefs: &mut [[i32; 64]],
+    plane: &[u16],
+    stride: usize,
+    w: usize,
+    h: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+    quant: &[u16; 64],
+) {
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let mut block = [0.0f32; 64];
+            fill_block_u16_levelshift_2048(&mut block, plane, stride, w, h, bx * 8, by * 8);
+            fdct8x8(&mut block);
+            let mut q = [0i32; 64];
+            for k in 0..64 {
+                let v = block[k] / quant[k] as f32;
+                q[k] = if v >= 0.0 {
+                    (v + 0.5) as i32
+                } else {
+                    -((-v + 0.5) as i32)
+                };
+            }
+            coefs[by * blocks_x + bx] = q;
+        }
+    }
+}
+
+/// SOF2 (progressive) header at `P = 12`, three components. Shape mirrors
+/// `write_sof2` but with the precision byte set to 12.
+#[cfg(test)]
+fn write_sof2_yuv_12bit(out: &mut Vec<u8>, width: u16, height: u16, h: u8, v: u8) {
+    let mut payload = Vec::with_capacity(8 + 9);
+    payload.push(12); // precision = 12
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // components
+    payload.push(1);
+    payload.push((h << 4) | v);
+    payload.push(0); // luma qt
+    payload.push(2);
+    payload.push(0x11);
+    payload.push(1); // chroma qt
+    payload.push(3);
+    payload.push(0x11);
+    payload.push(1);
+    write_length_prefix(out, markers::SOF2, &payload);
+}
+
+/// Emit a three-component progressive (SOF2) JPEG at `P = 12` precision.
+/// Uses the spectral-selection-only scan decomposition (interleaved DC
+/// pass + Y/Cb/Cr AC bands `[1..=5]` then `[6..=63]`, all with
+/// `Ah = Al = 0`). Caller's samples must lie close to the 2048 midpoint so
+/// post-DCT coefficient magnitudes stay within the Annex K AC table's
+/// SSSS ≤ 10 envelope — same constraint as `encode_yuv_jpeg_12bit` for
+/// the baseline path.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_yuv_jpeg_progressive_12bit(
+    width: u32,
+    height: u32,
+    y_samples: &[u16],
+    cb_samples: &[u16],
+    cr_samples: &[u16],
+    h_factor: u8,
+    v_factor: u8,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    if !matches!((h_factor, v_factor), (1, 1) | (2, 1) | (2, 2)) {
+        return Err(Error::invalid(
+            "12-bit progressive YUV helper: unsupported sampling factor",
+        ));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let c_w = w.div_ceil(h_factor as usize);
+    let c_h = h.div_ceil(v_factor as usize);
+    if y_samples.len() < w * h || cb_samples.len() < c_w * c_h || cr_samples.len() < c_w * c_h {
+        return Err(Error::invalid(
+            "12-bit progressive YUV helper: samples buffer too short",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    // MCU + per-component block-grid geometry mirroring the 8-bit
+    // progressive encoder.
+    let mcu_w_px = 8 * h_factor as usize;
+    let mcu_h_px = 8 * v_factor as usize;
+    let mcus_x = w.div_ceil(mcu_w_px);
+    let mcus_y = h.div_ceil(mcu_h_px);
+
+    let luma_blocks_x = mcus_x * h_factor as usize;
+    let luma_blocks_y = mcus_y * v_factor as usize;
+    let mut y_coefs = vec![[0i32; 64]; luma_blocks_x * luma_blocks_y];
+    fill_coef_grid_u16_2048(
+        &mut y_coefs,
+        y_samples,
+        w,
+        w,
+        h,
+        luma_blocks_x,
+        luma_blocks_y,
+        &luma_q,
+    );
+
+    let chroma_blocks_x = mcus_x;
+    let chroma_blocks_y = mcus_y;
+    let mut cb_coefs = vec![[0i32; 64]; chroma_blocks_x * chroma_blocks_y];
+    let mut cr_coefs = vec![[0i32; 64]; chroma_blocks_x * chroma_blocks_y];
+    fill_coef_grid_u16_2048(
+        &mut cb_coefs,
+        cb_samples,
+        c_w,
+        c_w,
+        c_h,
+        chroma_blocks_x,
+        chroma_blocks_y,
+        &chroma_q,
+    );
+    fill_coef_grid_u16_2048(
+        &mut cr_coefs,
+        cr_samples,
+        c_w,
+        c_w,
+        c_h,
+        chroma_blocks_x,
+        chroma_blocks_y,
+        &chroma_q,
+    );
+
+    // Header.
+    let mut out: Vec<u8> = Vec::with_capacity(32_768);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof2_yuv_12bit(&mut out, w as u16, h as u16, h_factor, v_factor);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
+    write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+
+    // Scan 1: interleaved DC (Ss=0, Se=0, Ah=Al=0).
+    write_sos_progressive_dc_interleaved(&mut out);
+    write_dc_scan_interleaved(
+        &mut out,
+        &y_coefs,
+        luma_blocks_x,
+        h_factor as usize,
+        v_factor as usize,
+        mcus_x,
+        mcus_y,
+        &cb_coefs,
+        &cr_coefs,
+        chroma_blocks_x,
+        &huff,
+    );
+
+    // AC bands, low then high, per component (Y / Cb / Cr).
+    for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
+        write_sos_progressive_ac(&mut out, 1, 0, ss, se);
+        write_ac_scan(
+            &mut out,
+            &y_coefs,
+            luma_blocks_x * luma_blocks_y,
+            &huff.luma_ac,
+            ss as usize,
+            se as usize,
+        );
+        write_sos_progressive_ac(&mut out, 2, 1, ss, se);
+        write_ac_scan(
+            &mut out,
+            &cb_coefs,
+            chroma_blocks_x * chroma_blocks_y,
+            &huff.chroma_ac,
+            ss as usize,
+            se as usize,
+        );
+        write_sos_progressive_ac(&mut out, 3, 1, ss, se);
+        write_ac_scan(
+            &mut out,
+            &cr_coefs,
+            chroma_blocks_x * chroma_blocks_y,
+            &huff.chroma_ac,
+            ss as usize,
+            se as usize,
+        );
+    }
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 // ---- Lossless JPEG encoder (SOF3, single-component grayscale) -----------
 
 /// Custom DC Huffman table for the lossless (SOF3) encoder.

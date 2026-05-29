@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 12-bit precision progressive (SOF2 with `P = 12`) decode. T.81 §G.1.1
+  permits the progressive coding process at precision 8 or 12, but the
+  decoder previously rejected `SOF2` at `P = 12` with `Error::Unsupported`
+  even though `init_coef_buffers` already allocated 12-bit-shaped
+  coefficient accumulator planes and `render_from_coefs` already routed
+  `P = 12` to the dedicated `render_from_coefs_12bit` path (level shift
+  2048, clamp `[0, 4095]`, 16-bit-LE output planes). The progressive
+  scan path itself (`decode_progressive_scan` + `prog_decode_dc` /
+  `prog_decode_ac_first` / `prog_decode_ac_refine`) operates entirely on
+  `i32` coefficient planes, so the increased DC/AC residual magnitude
+  range at `P = 12` fits without numeric changes. The `BitReader::get_bits`
+  24-bit ceiling accommodates the wider DC categories (up to 15) and AC
+  magnitudes (up to 14) the spec admits at `P = 12`.
+
+  Output shape matches the sequential `P = 12` path:
+  - Grayscale → `Gray12Le` (one 16-bit-LE plane, low 12 bits carry the
+    sample).
+  - Three-component YUV at 4:4:4 → `Yuv444P12Le`.
+  - Three-component YUV at 4:2:2 → `Yuv422P12Le`.
+  - Three-component YUV at 4:2:0 → `Yuv420P12Le`.
+  Non-2x luma sampling factors at `P = 12` continue to be rejected with
+  `Error::Unsupported` (no `PixelFormat` enum entry for, e.g., 4:1:1 at
+  12-bit).
+
+  A new test-only encoder helper `encode_yuv_jpeg_progressive_12bit`
+  emits a three-component SOF2 progressive JPEG at `P = 12` with the
+  spectral-selection-only scan decomposition (interleaved DC pass +
+  Y/Cb/Cr AC bands `[1..=5]` then `[6..=63]`, `Ah = Al = 0`), reusing
+  the same Annex K Huffman tables and `DEFAULT_LUMA_Q50` /
+  `DEFAULT_CHROMA_Q50` quant tables as the existing 12-bit baseline
+  helper `encode_yuv_jpeg_12bit`. Three new tests under
+  `decoder::precision_12_tests` (`yuv444_12bit_progressive_roundtrip`,
+  `yuv422_12bit_progressive_roundtrip`, `yuv420_12bit_progressive_roundtrip`)
+  drive a smooth gradient through the helper and decode it back,
+  asserting per-sample closeness against the originals (`diff < 24`,
+  same tolerance as the existing baseline 12-bit YUV roundtrip tests).
+
 - High-bit-depth lossless (SOF3) three-component decode. Previously the
   decoder accepted SOF3 RGB-class scans only at `P = 8` (output:
   packed `Rgb24`); decoding at higher precisions raised

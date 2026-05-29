@@ -321,9 +321,13 @@ Decoder:
 - **SOF0** (baseline sequential, Huffman, 8-bit).
 - **SOF1** (extended sequential, Huffman, 8-bit) — same scan structure
   as SOF0 at 8-bit, so the same code path handles it.
-- **SOF2** (progressive, Huffman, 8-bit) — multi-scan spectral
-  selection and successive approximation (DC first + refinement, AC
-  first + refinement with EOB-run).
+- **SOF2** (progressive, Huffman) — multi-scan spectral selection and
+  successive approximation (DC first + refinement, AC first +
+  refinement with EOB-run). Accepts both `P = 8` and `P = 12`; the
+  scan path is precision-agnostic (i32 coefficient planes) and the
+  EOI render dispatcher routes `P = 12` to the same `Gray12Le` /
+  `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` shape as the
+  sequential 12-bit path below.
 - **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
   component) — transparently routed through the shared coefficient
   accumulator.
@@ -380,8 +384,8 @@ Encoder:
 
 Not supported (decoder returns `Error::Unsupported`):
 
-- Hierarchical (SOF5+), arithmetic-coded (SOF9..SOF15).
-- 12-bit progressive (SOF2 with `P=12`).
+- Hierarchical (SOF5+), arithmetic-coded (SOF10..SOF15). SOF9
+  (extended sequential, arithmetic) is supported at `P=8`.
 - Progressive 4-component JPEGs.
 - Multi-component lossless decode at `P > 8` (encoder side covers
   every `P ∈ 2..=16`, decoder side is 8-bit packed-RGB only until a

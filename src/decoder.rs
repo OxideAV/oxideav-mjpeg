@@ -263,9 +263,15 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                         "progressive JPEG: 4+ component scans not supported",
                     ));
                 }
-                if sof.precision != 8 {
+                // T.81 §G.1.1 permits SOF2 at P = 8 or P = 12. The progressive
+                // scan path operates on i32 coefficient planes, so the
+                // increased magnitude range from a 12-bit DC/AC residual fits
+                // without code changes; the coefficient accumulator + the
+                // EOI render dispatcher both branch on `sof.precision` and
+                // already handle the 12-bit case (`render_from_coefs_12bit`).
+                if sof.precision != 8 && sof.precision != 12 {
                     return Err(Error::unsupported(format!(
-                        "progressive JPEG: precision {} (only 8 is supported)",
+                        "progressive JPEG: precision {} (only 8 and 12 are supported)",
                         sof.precision
                     )));
                 }
@@ -2876,7 +2882,9 @@ mod cmyk_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod precision_12_tests {
-    use crate::encoder::{encode_grayscale_jpeg_12bit, encode_yuv_jpeg_12bit};
+    use crate::encoder::{
+        encode_grayscale_jpeg_12bit, encode_yuv_jpeg_12bit, encode_yuv_jpeg_progressive_12bit,
+    };
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 
@@ -3070,6 +3078,77 @@ mod precision_12_tests {
             matches!(err, oxideav_core::Error::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
+    }
+
+    // ---- Progressive (SOF2) 12-bit precision roundtrip ------------------
+    //
+    // T.81 §G.1.1 permits the progressive coding process at precision 8 or
+    // 12. The decoder originally rejected SOF2 at P=12 with `Unsupported`
+    // even though `init_coef_buffers` already allocated 12-bit-shaped
+    // accumulator planes and `render_from_coefs` already routed P=12 to
+    // `render_from_coefs_12bit`. The three tests below cover the three
+    // YUV subsamplings the workspace `PixelFormat` enum carries at 12
+    // bits (4:4:4 / 4:2:2 / 4:2:0). Each one builds a smooth YUV image
+    // centred near the 2048 midpoint, encodes through
+    // `encode_yuv_jpeg_progressive_12bit` (SOF2 with `P = 12`,
+    // spectral-selection-only scan layout: interleaved DC + Y/Cb/Cr AC
+    // bands [1..=5] then [6..=63]), then decodes back to a planar
+    // 12-bit-LE u16 frame and asserts per-sample closeness against the
+    // originals.
+
+    fn run_progressive_yuv_12bit_roundtrip(
+        w: u32,
+        h: u32,
+        h_factor: u8,
+        v_factor: u8,
+        expect_pix: PixelFormat,
+    ) {
+        let (y, cb, cr, c_w, c_h) = build_yuv_12bit(w as usize, h as usize, h_factor, v_factor);
+        let data = encode_yuv_jpeg_progressive_12bit(w, h, &y, &cb, &cr, h_factor, v_factor, 90)
+            .expect("encode 12-bit progressive yuv");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("decoder did not emit a video frame")
+        };
+        assert_eq!(v.planes.len(), 3, "expected three planes");
+        assert_eq!(v.planes[0].stride, (w * 2) as usize, "Y stride");
+        assert_eq!(v.planes[1].stride, c_w * 2, "Cb stride");
+        assert_eq!(v.planes[2].stride, c_w * 2, "Cr stride");
+        let _ = expect_pix;
+
+        let got_y = unpack_le_u16_plane(
+            &v.planes[0].data,
+            v.planes[0].stride,
+            w as usize,
+            h as usize,
+        );
+        let got_cb = unpack_le_u16_plane(&v.planes[1].data, v.planes[1].stride, c_w, c_h);
+        let got_cr = unpack_le_u16_plane(&v.planes[2].data, v.planes[2].stride, c_w, c_h);
+
+        assert_plane_close("Y", &y, &got_y);
+        assert_plane_close("Cb", &cb, &got_cb);
+        assert_plane_close("Cr", &cr, &got_cr);
+    }
+
+    #[test]
+    fn yuv444_12bit_progressive_roundtrip() {
+        run_progressive_yuv_12bit_roundtrip(16, 16, 1, 1, PixelFormat::Yuv444P12Le);
+    }
+
+    #[test]
+    fn yuv422_12bit_progressive_roundtrip() {
+        run_progressive_yuv_12bit_roundtrip(16, 16, 2, 1, PixelFormat::Yuv422P12Le);
+    }
+
+    #[test]
+    fn yuv420_12bit_progressive_roundtrip() {
+        run_progressive_yuv_12bit_roundtrip(16, 16, 2, 2, PixelFormat::Yuv420P12Le);
     }
 }
 

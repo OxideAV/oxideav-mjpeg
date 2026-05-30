@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.6...v0.1.7) - 2026-05-30
+
+### Other
+
+- 4-component CMYK / YCCK progressive (SOF2) decode
+- 12-bit precision progressive (SOF2 P=12) decode
+- encoder docstring: refresh stale "P=8 only" note for lossless RGB
+- lossless (SOF3) three-component decode at every P in 2..=16
+- rustfmt — split InBand q if-else across lines
+- fuzz packetizer + close five wire-length panic surfaces
+- add rtp_depacketize cargo-fuzz target for RFC 2435 surface
+- gate fixture corpus on Tier::Exact + Tier::PsnrFloor
+- fix i32 overflow in dequantise when Pq=1 (16-bit quantiser)
+- 12-bit 4:2:2 (Yuv422P12Le) + 4:4:4 (Yuv444P12Le) YUV
+- add decode robustness target + fix seven panic surfaces
+- cache static-Q in-band quantization tables across frames (RFC 2435 §4.2)
+- add RFC 2435 RTP/JPEG packetizer (encode side)
+- add RFC 2435 RTP/JPEG depacketizer
+- lossless encoder: restart markers + non-zero point transform
+- rewrite library-citation comments to remove external-library references
+- lossless (SOF3) three-component encoder + decoder
+- lossless (SOF3) grayscale encoder: P=2..=16 + all 7 predictors
+- add multi-frame demuxer with seek_to + marker-aware scanner
+- compare libjpeg cross-decode in YUV space, not RGB
+
 ### Added
 
 - 4-component (CMYK / Adobe YCCK) progressive (SOF2 with `P = 8`)

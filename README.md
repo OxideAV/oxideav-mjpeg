@@ -327,7 +327,9 @@ Decoder:
   scan path is precision-agnostic (i32 coefficient planes) and the
   EOI render dispatcher routes `P = 12` to the same `Gray12Le` /
   `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` shape as the
-  sequential 12-bit path below.
+  sequential 12-bit path below. 4-component CMYK / YCCK is supported
+  at `P = 8` and produces the same packed `Cmyk` output the
+  sequential path emits (Adobe APP14 transform flag honoured).
 - **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
   component) — transparently routed through the shared coefficient
   accumulator.
@@ -339,11 +341,15 @@ Decoder:
   precision `P ∈ 2..=16`. Annex H predictor reconstruction (bit-exact).
   Output: `Gray8` at P=8, `Gray10Le` / `Gray12Le` at P=10/12, else
   `Gray16Le`. Point transform (`Pt = Al`) honoured.
-- **Lossless JPEG (SOF3) three-component** — `P = 8` only, interleaved
-  scan with each component declared `H_i = V_i = 1` (the natural
-  RGB-class layout). Independent per-component predictor buffers per
-  Annex H §H.1.2. Output: packed `PixelFormat::Rgb24` (3 bytes per
-  pixel, R-G-B byte order).
+- **Lossless JPEG (SOF3) three-component** — every precision
+  `P ∈ 2..=16`, interleaved scan with each component declared
+  `H_i = V_i = 1` (the natural RGB-class layout). Independent
+  per-component predictor buffers per Annex H §H.1.2. Output is
+  precision-shaped: packed `Rgb24` at `P = 8`, planar `Gbrp10Le` /
+  `Gbrp12Le` / `Gbrp14Le` at `P = 10`/12/14, packed `Rgb48Le` for
+  every other precision in the valid range (the low `P` bits carry
+  the post-Pt-shift sample, top bits zero — same widen policy the
+  grayscale path uses to land `P = 14` in `Gray16Le`).
 - **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
   Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
@@ -384,12 +390,13 @@ Encoder:
 
 Not supported (decoder returns `Error::Unsupported`):
 
-- Hierarchical (SOF5+), arithmetic-coded (SOF10..SOF15). SOF9
-  (extended sequential, arithmetic) is supported at `P=8`.
-- Progressive 4-component JPEGs.
-- Multi-component lossless decode at `P > 8` (encoder side covers
-  every `P ∈ 2..=16`, decoder side is 8-bit packed-RGB only until a
-  planar GBR target pixel format lands in `oxideav-core`).
+- Hierarchical (SOF5+), arithmetic-coded SOF10..SOF15. SOF9 (extended
+  sequential, arithmetic) is supported at `P=8`.
+- 12-bit 4-component progressive (SOF2 `Nf = 4, P = 12`) — the
+  workspace `PixelFormat` enum has no 12-bit CMYK variant. `P = 8`
+  4-component CMYK / YCCK *is* supported on both the sequential
+  (SOF0 / SOF1) and the progressive (SOF2) scan decompositions, with
+  the Adobe APP14 transform flag honoured on both paths.
 - 4-component lossless (CMYK-class) and lossless with non-unit
   sampling factors (the spec permits this but no real-world corpus
   exercises it; rejected with `Unsupported`).

@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 4-component (CMYK / Adobe YCCK) progressive (SOF2 with `P = 8`)
+  decode. T.81 §G.1.1 permits the progressive coding process at every
+  component-count the spec admits (`Nf ∈ 1..=4`), but the decoder was
+  previously rejecting `SOF2` with `Nf = 4` even though every
+  downstream stage already supported the geometry:
+  `decode_progressive_scan` is component-count agnostic (interleaved
+  DC walks every SOS component, AC scans are always non-interleaved
+  per the spec), `init_coef_buffers` already sizes for up to 4
+  components, and `render_from_coefs` already produces a packed
+  `PixelFormat::Cmyk` plane for `Nf = 4` honouring the Adobe APP14
+  colour-transform flag (plain CMYK, Adobe-inverted CMYK at
+  transform=0, YCCK at transform=2). The SOF2 4-component path
+  therefore lights up by removing the `Nf > 3` rejection; the
+  `Nf = 4 & P = 12` combination is still rejected with
+  `Error::Unsupported` because the workspace `PixelFormat` enum
+  carries no 12-bit CMYK variant.
+
+  A new test-only encoder helper `encode_jpeg_progressive_cmyk_1111`
+  emits a 4-component SOF2 progressive JPEG at `P = 8` with the same
+  spectral-selection-only scan decomposition the existing
+  three-component progressive YUV helpers use: one interleaved DC
+  scan (`Ss = Se = 0, Ah = Al = 0`) followed by per-component AC
+  bands `[1..=5]` then `[6..=63]` for each of the four components
+  (1 + 4 + 4 = 9 SOS segments total). Each component is declared
+  `H_i = V_i = 1` so the MCU equals one data unit per component;
+  component 1 binds quant table 0 (`luma_q`), components 2/3/4 share
+  quant table 1 (`chroma_q`), mirroring the baseline
+  `encode_jpeg_cmyk_1111` policy. The helper accepts the same
+  `adobe_transform: Option<u8>` parameter as the baseline path
+  (`None` → no APP14, `Some(0)` → Adobe CMYK inverted-on-wire,
+  `Some(2)` → Adobe YCCK with K-inversion).
+
+  Three new tests under `decoder::cmyk_tests`
+  (`cmyk_progressive_plain_roundtrip`,
+  `cmyk_progressive_adobe_inverted_roundtrip`,
+  `ycck_progressive_k_plane_matches`) drive each transform variant
+  through the helper and decode it back, asserting per-component
+  PSNR ≥ 30 dB at Q = 90 (same tolerance as the baseline tests they
+  mirror). A fourth test (`cmyk_progressive_p12_rejected`) hand-
+  crafts a minimal SOF2 segment with `P = 12, Nf = 4` and confirms
+  the parser still rejects the unsupported combo with
+  `Error::Unsupported` before any scan is read.
+
 - 12-bit precision progressive (SOF2 with `P = 12`) decode. T.81 §G.1.1
   permits the progressive coding process at precision 8 or 12, but the
   decoder previously rejected `SOF2` at `P = 12` with `Error::Unsupported`

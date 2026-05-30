@@ -1806,6 +1806,198 @@ fn write_sos_4comp(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+#[cfg(test)]
+fn write_sof2_4comp(out: &mut Vec<u8>, width: u16, height: u16) {
+    // Progressive (SOF2) variant of `write_sof0_4comp`: identical 4-component
+    // 1:1:1:1 layout, only the marker byte changes. Component 1 binds quant
+    // table 0; the remaining three share table 1 (mirroring the existing
+    // baseline 4-component encoder's `(luma_q, chroma_q)` policy).
+    let mut payload = Vec::with_capacity(8 + 12);
+    payload.push(8); // precision
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(4); // Nf
+    for (id, qt) in [(1, 0u8), (2, 1), (3, 1), (4, 1)] {
+        payload.push(id);
+        payload.push(0x11); // H=1 V=1
+        payload.push(qt);
+    }
+    write_length_prefix(out, markers::SOF2, &payload);
+}
+
+#[cfg(test)]
+fn write_sos_progressive_dc_4comp_interleaved(out: &mut Vec<u8>) {
+    // Interleaved DC scan over all four 1:1:1:1 components. Td selects
+    // DC=0 for component 1 (matching the SOS used by the baseline
+    // 4-component encoder, and the Annex K luma DC table emitted at
+    // (Tc=0, Th=0)) and DC=1 for components 2/3/4 (the Annex K chroma
+    // DC table emitted at (Tc=0, Th=1)). Ss=Se=0 selects the DC band;
+    // Ah=Al=0 (spectral-selection only, no SA point-transform).
+    let payload: [u8; 12] = [
+        4, // Ns
+        1, 0x00, // comp 1 → DC=0
+        2, 0x10, // comp 2 → DC=1
+        3, 0x10, // comp 3 → DC=1
+        4, 0x10, // comp 4 → DC=1
+        0, 0, 0x00, // Ss, Se, Ah|Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Test-only: emit a 4-component (CMYK / YCCK) **progressive** (SOF2) JPEG.
+///
+/// Mirrors [`encode_jpeg_cmyk_1111`] but uses the progressive frame marker
+/// (SOF2) and the spectral-selection-only scan decomposition used by the
+/// three-component progressive YUV helpers (1 interleaved DC scan + 2
+/// per-component AC bands `[1..=5]` and `[6..=63]` for each of the four
+/// components, `Ah = Al = 0` throughout). Total scans: 1 + 4 + 4 = 9.
+///
+/// All four components are declared `H_i = V_i = 1` so the MCU equals one
+/// data unit per component. Component 1 binds quant table 0; components
+/// 2/3/4 share quant table 1 (same `(luma_q, chroma_q)` policy as the
+/// baseline 4-component helper).
+///
+/// `adobe_transform` controls the Adobe APP14 colour-transform marker
+/// emitted between SOI and DQT (mirrors the baseline helper's semantics):
+///   * `None`     → no APP14 segment, samples passed through unchanged.
+///   * `Some(0)`  → "Adobe CMYK": every component is inverted on the wire
+///     (decoder un-inverts on output).
+///   * `Some(2)`  → "Adobe YCCK": only the K plane (component 4) is
+///     inverted on the wire; components 1..3 carry YCbCr-encoded data
+///     (the decoder converts YCbCr→RGB→CMY and flips K to recover CMYK).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_jpeg_progressive_cmyk_1111(
+    width: u32,
+    height: u32,
+    planes: &[&[u8]; 4],
+    plane_strides: &[usize; 4],
+    quality: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    for (i, p) in planes.iter().enumerate() {
+        if p.len() < plane_strides[i] * h {
+            return Err(Error::invalid(
+                "cmyk progressive helper: plane shorter than height*stride",
+            ));
+        }
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    let needs_invert_all = matches!(adobe_transform, Some(0));
+    let needs_invert_k_only = matches!(adobe_transform, Some(2));
+    let maybe_invert = |plane_idx: usize, samples: &[u8]| -> Vec<u8> {
+        let must = needs_invert_all || (needs_invert_k_only && plane_idx == 3);
+        if !must {
+            return samples.to_vec();
+        }
+        samples.iter().map(|&b| 255 - b).collect()
+    };
+    let owned: [Vec<u8>; 4] = [
+        maybe_invert(0, planes[0]),
+        maybe_invert(1, planes[1]),
+        maybe_invert(2, planes[2]),
+        maybe_invert(3, planes[3]),
+    ];
+
+    // 1:1:1:1 sampling → one block per component per MCU; mcus_x/y is the
+    // ceiling-divided block grid.
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let blocks = mcus_x * mcus_y;
+
+    // Per-component coefficient grid (component 1 uses luma_q; 2/3/4 use chroma_q).
+    let qts: [&[u16; 64]; 4] = [&luma_q, &chroma_q, &chroma_q, &chroma_q];
+    let mut comp_coefs: [Vec<[i32; 64]>; 4] = [
+        vec![[0i32; 64]; blocks],
+        vec![[0i32; 64]; blocks],
+        vec![[0i32; 64]; blocks],
+        vec![[0i32; 64]; blocks],
+    ];
+    for ci in 0..4 {
+        fill_coef_grid(
+            &mut comp_coefs[ci],
+            &owned[ci],
+            plane_strides[ci],
+            w,
+            h,
+            mcus_x,
+            mcus_y,
+            qts[ci],
+        );
+    }
+
+    // Header.
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    if let Some(tx) = adobe_transform {
+        write_adobe_app14(&mut out, tx);
+    }
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof2_4comp(&mut out, w as u16, h as u16);
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    write_dht(&mut out, 0, 1, &STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS);
+    write_dht(&mut out, 1, 1, &STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS);
+
+    // Scan 1 — interleaved DC across all four components (Ss=Se=0, Ah=Al=0).
+    // Component 1 uses DC table 0 (luma); components 2/3/4 use DC table 1
+    // (chroma).
+    write_sos_progressive_dc_4comp_interleaved(&mut out);
+    {
+        let mut bw = BitWriter::new(&mut out);
+        let mut prev_dc = [0i32; 4];
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                let bi = my * mcus_x + mx;
+                for ci in 0..4 {
+                    let dc_t = if ci == 0 {
+                        &huff.luma_dc
+                    } else {
+                        &huff.chroma_dc
+                    };
+                    encode_dc(&mut bw, comp_coefs[ci][bi][0], &mut prev_dc[ci], dc_t);
+                }
+            }
+        }
+        bw.finish();
+    }
+
+    // Scans 2..=9 — per-component AC bands. Component 1 uses AC table 0
+    // (luma); components 2/3/4 use AC table 1 (chroma). Two bands per
+    // component: low [1..=5] then high [6..=63].
+    for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
+        for ci in 0..4 {
+            let (comp_id, ac_table, ac_huff) = if ci == 0 {
+                (1u8, 0u8, &huff.luma_ac)
+            } else {
+                ((ci as u8) + 1, 1u8, &huff.chroma_ac)
+            };
+            write_sos_progressive_ac(&mut out, comp_id, ac_table, ss, se);
+            write_ac_scan(
+                &mut out,
+                &comp_coefs[ci],
+                blocks,
+                ac_huff,
+                ss as usize,
+                se as usize,
+            );
+        }
+    }
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Test-only: emit a single-component, 12-bit precision baseline JPEG.
 /// `samples` carries u16 values in `[0, 4095]`. Caller must keep inputs
 /// moderate enough that per-block DC/AC Huffman categories stay ≤ 11 —

@@ -42,13 +42,18 @@
 //! decoder inspects the APP14 Adobe transform flag to choose among plain
 //! CMYK, Adobe-inverted CMYK, and Adobe YCCK (which is colour-converted
 //! back to CMYK via BT.601 full-range YCbCr→RGB→CMY plus K inversion).
-//! 12-bit precision sequential JPEGs (SOF0/SOF1 with `P=12`) decode to
-//! `Gray12Le` or `Yuv420P12Le`; sample buffers stay 16-bit throughout the
-//! inverse DCT and the level shift uses 2048. Lossless JPEGs (SOF3)
-//! decode single-component grayscale at any precision in 2..=16 bits
-//! via Annex H predictor reconstruction (bit-exact, no DCT); output is
-//! `Gray8` at P=8 and `Gray16Le` / `Gray10Le` / `Gray12Le` at wider
-//! depths.
+//! The 4-component path covers both the sequential (SOF0 / SOF1) and the
+//! progressive (SOF2) scan decompositions at `P = 8`. 12-bit precision
+//! sequential JPEGs (SOF0/SOF1 with `P=12`) decode to `Gray12Le` /
+//! `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le`; sample buffers stay
+//! 16-bit throughout the inverse DCT and the level shift uses 2048.
+//! Lossless JPEGs (SOF3) decode at every precision `P ∈ 2..=16` via
+//! Annex H predictor reconstruction (bit-exact, no DCT). Single-component
+//! grayscale output: `Gray8` at `P = 8`, `Gray10Le` / `Gray12Le` at
+//! `P = 10`/12, `Gray16Le` everywhere else. Three-component (RGB-class,
+//! `H_i = V_i = 1`) output: packed `Rgb24` at `P = 8`, planar
+//! `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` at `P = 10`/12/14, packed
+//! `Rgb48Le` at every other precision in the valid range.
 //!
 //! Extended-sequential arithmetic (SOF9) is decoded via the Q-coder /
 //! arithmetic entropy decoder from T.81 Annex D + F.2.4. The DAC marker
@@ -60,9 +65,10 @@
 //! - SOF10..SOF12 / SOF14..SOF15 arithmetic variants (progressive
 //!   arithmetic, lossless arithmetic, and the 12-bit arithmetic
 //!   precisions)
-//! - 12-bit progressive (SOF2 with `P=12`)
-//! - Progressive 4-component JPEGs
-//! - Multi-component lossless JPEGs (only grayscale is supported)
+//! - 12-bit progressive 4-component JPEGs (the workspace `PixelFormat`
+//!   enum has no 12-bit CMYK variant; `P=8` 4-component CMYK / YCCK
+//!   *is* supported on both the sequential and progressive scan
+//!   decompositions).
 //!
 //! Motion-JPEG carried over RTP (RFC 2435) is supported on the decode
 //! path via [`rtp::JpegDepacketizer`], which reassembles fragmented

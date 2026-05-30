@@ -258,22 +258,34 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
                 validate_sof(&sof)?;
-                if sof.components.len() > 3 {
-                    return Err(Error::unsupported(
-                        "progressive JPEG: 4+ component scans not supported",
-                    ));
-                }
                 // T.81 §G.1.1 permits SOF2 at P = 8 or P = 12. The progressive
                 // scan path operates on i32 coefficient planes, so the
                 // increased magnitude range from a 12-bit DC/AC residual fits
                 // without code changes; the coefficient accumulator + the
                 // EOI render dispatcher both branch on `sof.precision` and
                 // already handle the 12-bit case (`render_from_coefs_12bit`).
+                //
+                // 4-component progressive (CMYK / YCCK) is permitted at
+                // `P = 8`: `decode_progressive_scan` is component-count
+                // agnostic (interleaved DC walks every SOS component,
+                // AC scans are always non-interleaved), the coefficient
+                // accumulator already sizes for up to 4 components, and the
+                // EOI render path (`render_from_coefs`) already produces a
+                // packed `Cmyk` plane for 4-component scans (honouring the
+                // Adobe APP14 transform flag for plain CMYK / inverted CMYK /
+                // YCCK). 4-component progressive at `P = 12` stays
+                // unsupported because the workspace `PixelFormat` enum has
+                // no 12-bit CMYK variant.
                 if sof.precision != 8 && sof.precision != 12 {
                     return Err(Error::unsupported(format!(
                         "progressive JPEG: precision {} (only 8 and 12 are supported)",
                         sof.precision
                     )));
+                }
+                if sof.components.len() == 4 && sof.precision != 8 {
+                    return Err(Error::unsupported(
+                        "progressive JPEG: 4-component scans only at P = 8",
+                    ));
                 }
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
@@ -2714,7 +2726,7 @@ mod non_interleaved_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod cmyk_tests {
-    use crate::encoder::encode_jpeg_cmyk_1111;
+    use crate::encoder::{encode_jpeg_cmyk_1111, encode_jpeg_progressive_cmyk_1111};
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
@@ -2877,6 +2889,199 @@ mod cmyk_tests {
         }
         let p = psnr(&k, &got_k);
         assert!(p >= 30.0, "YCCK K plane PSNR too low: {p:.2}");
+    }
+
+    // ---- Progressive (SOF2) 4-component CMYK / YCCK roundtrip --------
+    //
+    // T.81 §G.1.1 permits the progressive coding process at every
+    // component-count the spec admits (Nf ∈ 1..=4). The decoder was
+    // previously rejecting SOF2 with `Nf = 4` even though
+    // `decode_progressive_scan` is component-count agnostic
+    // (interleaved DC walks every SOS component, AC scans are always
+    // non-interleaved per spec), the coefficient accumulator already
+    // sizes for 4 components, and `render_from_coefs` already produces
+    // a packed `Cmyk` plane for `Nf = 4` honouring the Adobe APP14
+    // colour-transform flag. The three tests below mirror the
+    // baseline (`encode_jpeg_cmyk_1111`-based) CMYK tests above but
+    // route the bitstream through `encode_jpeg_progressive_cmyk_1111`
+    // (SOF2 + 9-scan spectral-selection decomposition: 1 interleaved
+    // DC + 4×2 per-component AC bands).
+
+    /// Plain CMYK (no APP14): every component should round-trip through
+    /// the progressive path at PSNR ≥ 30 dB at Q=90.
+    #[test]
+    fn cmyk_progressive_plain_roundtrip() {
+        let w = 32u32;
+        let h = 16u32;
+        let planes = make_cmyk_planes(w as usize, h as usize);
+        let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+        let strides = [w as usize; 4];
+        let data = encode_jpeg_progressive_cmyk_1111(w, h, &refs, &strides, 90, None)
+            .expect("encode progressive plain CMYK");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v.planes.len(), 1, "expected one packed Cmyk plane");
+        assert_eq!(
+            v.planes[0].stride,
+            (w * 4) as usize,
+            "packed Cmyk row stride = 4 × width"
+        );
+
+        for (ci, src) in planes.iter().enumerate() {
+            let mut got = Vec::with_capacity(src.len());
+            for j in 0..h as usize {
+                for i in 0..w as usize {
+                    got.push(v.planes[0].data[j * v.planes[0].stride + i * 4 + ci]);
+                }
+            }
+            let p = psnr(src, &got);
+            assert!(
+                p >= 30.0,
+                "progressive plain CMYK component {ci} PSNR too low: {p:.2}"
+            );
+        }
+    }
+
+    /// Adobe CMYK (APP14 transform=0) — encoder inverts every component
+    /// on the wire, decoder un-inverts on output. Progressive path must
+    /// match the baseline path's behaviour byte-for-byte modulo DCT
+    /// quantisation noise.
+    #[test]
+    fn cmyk_progressive_adobe_inverted_roundtrip() {
+        let w = 16u32;
+        let h = 16u32;
+        let planes = make_cmyk_planes(w as usize, h as usize);
+        let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+        let strides = [w as usize; 4];
+        let data = encode_jpeg_progressive_cmyk_1111(w, h, &refs, &strides, 90, Some(0))
+            .expect("encode progressive Adobe CMYK");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+
+        for (ci, src) in planes.iter().enumerate() {
+            let mut got = Vec::with_capacity(src.len());
+            for j in 0..h as usize {
+                for i in 0..w as usize {
+                    got.push(v.planes[0].data[j * v.planes[0].stride + i * 4 + ci]);
+                }
+            }
+            let p = psnr(src, &got);
+            assert!(
+                p >= 30.0,
+                "progressive Adobe CMYK component {ci} PSNR too low: {p:.2}"
+            );
+        }
+    }
+
+    /// Adobe YCCK (APP14 transform=2): K plane recovery should mirror
+    /// the baseline path. As in the baseline test we only verify K
+    /// (C/M/Y go through a lossy YCbCr→RGB round-trip irrelevant to
+    /// the scan-decomposition change being tested).
+    #[test]
+    fn ycck_progressive_k_plane_matches() {
+        let w = 16u32;
+        let h = 16u32;
+        let mut yp = vec![0u8; (w * h) as usize];
+        let mut cb = vec![128u8; (w * h) as usize];
+        let mut cr = vec![128u8; (w * h) as usize];
+        let mut k = vec![0u8; (w * h) as usize];
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let idx = j * w as usize + i;
+                yp[idx] = 128;
+                cb[idx] = 128;
+                cr[idx] = 128;
+                k[idx] = ((i * 255 / (w as usize - 1).max(1)) as u32).min(255) as u8;
+            }
+        }
+        let refs: [&[u8]; 4] = [&yp, &cb, &cr, &k];
+        let strides = [w as usize; 4];
+        let data = encode_jpeg_progressive_cmyk_1111(w, h, &refs, &strides, 90, Some(2))
+            .expect("encode progressive YCCK");
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+
+        let mut got_k = Vec::with_capacity((w * h) as usize);
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                got_k.push(v.planes[0].data[j * v.planes[0].stride + i * 4 + 3]);
+            }
+        }
+        let p = psnr(&k, &got_k);
+        assert!(p >= 30.0, "progressive YCCK K plane PSNR too low: {p:.2}");
+    }
+
+    /// SOF2 frames with `Nf = 4` and `P = 12` must still be rejected with
+    /// `Unsupported` — the workspace `PixelFormat` enum has no 12-bit
+    /// CMYK variant. Encoder helper isn't available for that combo, so
+    /// we hand-craft a minimal SOF2 segment with `P = 12, Nf = 4`
+    /// preceded by SOI and verify the parser path returns Unsupported
+    /// before any scan is read.
+    #[test]
+    fn cmyk_progressive_p12_rejected() {
+        // SOI + SOF2 with P=12, 4 components, each H=V=1, all qt=0.
+        // We don't need DQT/DHT/SOS — the SOF2 rejection happens at
+        // segment-parse time, before any scan walks.
+        let mut data: Vec<u8> = vec![
+            0xFF,
+            crate::jpeg::markers::SOI,
+            // SOF2 segment: marker + length + payload.
+            0xFF,
+            crate::jpeg::markers::SOF2,
+        ];
+        // Length = 2 (length itself) + 1 (P) + 2 (Y) + 2 (X) + 1 (Nf) +
+        //          4 × 3 (per-component triplet) = 20.
+        let length: u16 = 2 + 1 + 2 + 2 + 1 + 4 * 3;
+        data.extend_from_slice(&length.to_be_bytes());
+        data.push(12); // precision
+        data.extend_from_slice(&16u16.to_be_bytes()); // height
+        data.extend_from_slice(&16u16.to_be_bytes()); // width
+        data.push(4); // Nf
+        for id in 1u8..=4 {
+            data.push(id);
+            data.push(0x11); // H=V=1
+            data.push(0); // qt id
+        }
+        // EOI — give the marker walker something legal to terminate on,
+        // although the SOF2 reject should fire before EOI is reached.
+        data.push(0xFF);
+        data.push(crate::jpeg::markers::EOI);
+
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(16);
+        dec_params.height = Some(16);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
+            .unwrap();
+        let err = dec.receive_frame().expect_err("expected Unsupported");
+        assert!(
+            matches!(err, oxideav_core::Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 }
 

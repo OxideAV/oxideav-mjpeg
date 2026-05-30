@@ -1,3 +1,4 @@
+#![cfg(feature = "registry")]
 //! Public-API CMYK / YCCK encoder round-trip tests.
 //!
 //! Exercises the four public CMYK entry points landed alongside this

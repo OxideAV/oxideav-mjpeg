@@ -30,7 +30,8 @@ use oxideav_core::{
 use crate::container;
 use crate::decoder::decode_jpeg;
 use crate::encoder::{
-    encode_jpeg_progressive, encode_jpeg_with_opts, encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
+    encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_progressive, encode_jpeg_with_opts,
+    encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
@@ -261,6 +262,19 @@ pub struct MjpegEncoder {
     /// Lossless predictor selector (T.81 Table H.1, 1..=7). Only
     /// consulted on the lossless path. Defaults to 1 (Ra / left).
     lossless_predictor: u8,
+    /// Adobe APP14 colour-transform marker for 4-component
+    /// (`MjpegPixelFormat::Cmyk`) input.
+    ///
+    /// * `None`     — no APP14 segment (plain "regular" CMYK).
+    /// * `Some(0)`  — Adobe CMYK: encoder inverts every component on
+    ///   the wire; decoder un-inverts on output.
+    /// * `Some(2)`  — Adobe YCCK: the packed input is interpreted as
+    ///   `[Y, Cb, Cr, K]` and only the K plane is inverted on the
+    ///   wire; the decoder performs YCbCr→RGB→CMY and flips K to
+    ///   recover CMYK.
+    ///
+    /// Defaults to `None`. Ignored for non-CMYK pixel formats.
+    cmyk_adobe_transform: Option<u8>,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -295,6 +309,12 @@ impl MjpegEncoder {
             | MjpegPixelFormat::Gray10Le
             | MjpegPixelFormat::Gray12Le
             | MjpegPixelFormat::Gray16Le => {}
+            // 4-component CMYK / YCCK input takes the dedicated CMYK
+            // encode path (baseline SOF0 by default, SOF2 when
+            // `set_progressive(true)` is used). Adobe APP14 transform
+            // selection comes from `set_adobe_transform`; default is
+            // no APP14 (plain "regular" CMYK).
+            MjpegPixelFormat::Cmyk => {}
             _ => {
                 return Err(Error::unsupported(format!(
                     "MJPEG encoder: pixel format {pix_core:?} not supported"
@@ -322,6 +342,7 @@ impl MjpegEncoder {
             // input in the future, so default to off.
             lossless: false,
             lossless_predictor: 1,
+            cmyk_adobe_transform: None,
             time_base: params
                 .frame_rate
                 .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
@@ -393,6 +414,38 @@ impl MjpegEncoder {
     pub fn lossless_predictor(&self) -> u8 {
         self.lossless_predictor
     }
+
+    /// Configure the Adobe APP14 colour-transform marker for 4-component
+    /// (`MjpegPixelFormat::Cmyk`) input. Only honoured when the input
+    /// pixel format is `Cmyk`; ignored for every other format.
+    ///
+    /// * `None`     — emit no APP14 segment (the decoder treats the
+    ///   result as plain "regular" CMYK).
+    /// * `Some(0)`  — Adobe CMYK: every component is inverted on the
+    ///   wire; the decoder un-inverts on output.
+    /// * `Some(2)`  — Adobe YCCK: the packed input is interpreted as
+    ///   `[Y, Cb, Cr, K]`, and only the K plane is inverted on the
+    ///   wire. The decoder converts YCbCr→RGB→CMY (BT.601, full-range)
+    ///   and flips K to recover CMYK.
+    ///
+    /// Any other `Some(t)` value is rejected with `Error::InvalidData`
+    /// (only `0` and `2` round-trip through this crate's decoder).
+    pub fn set_adobe_transform(&mut self, transform: Option<u8>) -> Result<()> {
+        if let Some(t) = transform {
+            if t != 0 && t != 2 {
+                return Err(Error::invalid(
+                    "MJPEG encoder: Adobe APP14 transform must be 0 (CMYK) or 2 (YCCK)",
+                ));
+            }
+        }
+        self.cmyk_adobe_transform = transform;
+        Ok(())
+    }
+
+    /// Current Adobe APP14 colour-transform marker selection.
+    pub fn adobe_transform(&self) -> Option<u8> {
+        self.cmyk_adobe_transform
+    }
 }
 
 impl Encoder for MjpegEncoder {
@@ -457,6 +510,44 @@ impl Encoder for MjpegEncoder {
                         return Err(Error::unsupported(
                             "MJPEG encoder: grayscale input requires set_lossless(true)",
                         ));
+                    }
+                    // 4-component CMYK / YCCK input takes the dedicated
+                    // CMYK encode path. The single packed plane is laid
+                    // out as `[C, M, Y, K]` (or `[Y, Cb, Cr, K]` for
+                    // `set_adobe_transform(Some(2))`) at 4 bytes per
+                    // pixel, matching the decoder's output shape.
+                    (MjpegPixelFormat::Cmyk, _) => {
+                        if v.planes.is_empty() {
+                            return Err(Error::invalid(
+                                "MJPEG encoder: CMYK frame missing plane 0",
+                            ));
+                        }
+                        let plane = &v.planes[0];
+                        let min_stride = (self.width as usize) * 4;
+                        if plane.stride < min_stride {
+                            return Err(Error::invalid(
+                                "MJPEG encoder: CMYK plane stride must be at least width * 4",
+                            ));
+                        }
+                        if self.progressive {
+                            encode_jpeg_cmyk_progressive(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                                self.cmyk_adobe_transform,
+                            )?
+                        } else {
+                            encode_jpeg_cmyk(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                                self.cmyk_adobe_transform,
+                            )?
+                        }
                     }
                     // YUV inputs take the baseline / progressive DCT path.
                     _ => {

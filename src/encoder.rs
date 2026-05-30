@@ -1657,20 +1657,49 @@ fn write_component_scan(
     bw.finish();
 }
 
-/// Test-only: emit a 4-component JPEG (1:1:1:1 sampling, all components at
-/// full resolution). The caller supplies four raw sample planes and an
-/// optional Adobe APP14 transform flag:
-/// * `None` → no APP14 written (treated as plain/"regular" CMYK by this
-///   crate's decoder).
-/// * `Some(0)` → APP14 transform=0, i.e. Adobe CMYK where the stored
-///   samples are inverted (the test encoder inverts its inputs to match
-///   that convention before writing).
-/// * `Some(2)` → APP14 transform=2, YCCK. The caller supplies the four
-///   components in Adobe's stored order (Y, Cb, Cr, K); K is inverted
-///   on the way out because Adobe stores it that way.
-#[cfg(test)]
+/// Emit a 4-component JPEG (1:1:1:1 sampling, all components at full
+/// resolution) from four raw planar component buffers.
+///
+/// This is the per-plane "back-end" entry point used by both the
+/// integrated [`MjpegEncoder`](crate::registry::MjpegEncoder) and the
+/// packed-CMYK [`encode_jpeg_cmyk`] convenience wrapper. Most callers
+/// should reach for `encode_jpeg_cmyk` instead, which accepts the same
+/// `[C, M, Y, K]`-packed buffer the decoder produces.
+///
+/// Parameters:
+/// * `planes` — four equal-size sample buffers, one per component, in
+///   the order the caller wants the SOS scan to see them. For plain
+///   CMYK that is `[C, M, Y, K]`; for Adobe YCCK with
+///   `adobe_transform = Some(2)` it is `[Y, Cb, Cr, K]`.
+/// * `plane_strides` — bytes per row for each plane (typically `width`).
+/// * `quality` — IJG quality factor in the same `1..=100` range the
+///   YUV encoder uses (clamped internally to `1..=100`). Q ≥ 90 keeps
+///   visible quantisation artefacts well within the per-component
+///   `PSNR ≥ 30 dB` floor that the round-trip tests enforce.
+/// * `adobe_transform`:
+///   * `None` — no APP14 segment; samples written verbatim. The
+///     [`crate::decoder::decode_jpeg`] side treats the result as plain
+///     "regular" CMYK and round-trips it unchanged.
+///   * `Some(0)` — Adobe CMYK convention. Every sample is inverted on
+///     the wire (`store = 255 − input`) and the decoder un-inverts it
+///     on output, so the function takes the same `[C, M, Y, K]` input
+///     as the no-APP14 path.
+///   * `Some(2)` — Adobe YCCK. Components 0..2 are written verbatim
+///     (interpreted as Y/Cb/Cr); component 3 (K) is inverted on the
+///     wire. The decoder converts the YCbCr triple back to RGB then
+///     CMY (BT.601, full-range) and flips K to recover the original
+///     CMYK quadruple.
+///
+/// The bitstream layout — DQT(0) + DQT(1), SOF0 with `Nf = 4` and
+/// `H_i = V_i = 1` for every component, four Annex K Huffman tables
+/// (luma DC/AC at `Th = 0`, chroma DC/AC at `Th = 1`), one
+/// interleaved SOS scan with `Ss = 0, Se = 63, Ah = Al = 0` — exactly
+/// matches the per-component layout the decoder's CMYK path expects.
+///
+/// Errors: `Error::InvalidData` if any plane is shorter than
+/// `plane_strides[i] * height`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_jpeg_cmyk_1111(
+pub fn encode_jpeg_cmyk_1111(
     width: u32,
     height: u32,
     planes: &[&[u8]; 4],
@@ -1764,7 +1793,6 @@ pub(crate) fn encode_jpeg_cmyk_1111(
     Ok(out)
 }
 
-#[cfg(test)]
 fn write_adobe_app14(out: &mut Vec<u8>, transform: u8) {
     // "Adobe" + version 100 + flags0/flags1 (0) + transform.
     let payload = [
@@ -1777,7 +1805,6 @@ fn write_adobe_app14(out: &mut Vec<u8>, transform: u8) {
     write_length_prefix(out, 0xEE, &payload);
 }
 
-#[cfg(test)]
 fn write_sof0_4comp(out: &mut Vec<u8>, width: u16, height: u16) {
     // 1:1:1:1 sampling, qt 0 for component 1, qt 1 for the rest.
     let mut payload = Vec::with_capacity(8 + 12);
@@ -1793,7 +1820,6 @@ fn write_sof0_4comp(out: &mut Vec<u8>, width: u16, height: u16) {
     write_length_prefix(out, markers::SOF0, &payload);
 }
 
-#[cfg(test)]
 fn write_sos_4comp(out: &mut Vec<u8>) {
     let payload: [u8; 12] = [
         4, // Ns
@@ -1806,7 +1832,6 @@ fn write_sos_4comp(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
-#[cfg(test)]
 fn write_sof2_4comp(out: &mut Vec<u8>, width: u16, height: u16) {
     // Progressive (SOF2) variant of `write_sof0_4comp`: identical 4-component
     // 1:1:1:1 layout, only the marker byte changes. Component 1 binds quant
@@ -1825,7 +1850,6 @@ fn write_sof2_4comp(out: &mut Vec<u8>, width: u16, height: u16) {
     write_length_prefix(out, markers::SOF2, &payload);
 }
 
-#[cfg(test)]
 fn write_sos_progressive_dc_4comp_interleaved(out: &mut Vec<u8>) {
     // Interleaved DC scan over all four 1:1:1:1 components. Td selects
     // DC=0 for component 1 (matching the SOS used by the baseline
@@ -1844,30 +1868,37 @@ fn write_sos_progressive_dc_4comp_interleaved(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
-/// Test-only: emit a 4-component (CMYK / YCCK) **progressive** (SOF2) JPEG.
+/// Emit a 4-component (CMYK / YCCK) **progressive** (SOF2) JPEG from
+/// four raw planar component buffers.
 ///
-/// Mirrors [`encode_jpeg_cmyk_1111`] but uses the progressive frame marker
-/// (SOF2) and the spectral-selection-only scan decomposition used by the
-/// three-component progressive YUV helpers (1 interleaved DC scan + 2
-/// per-component AC bands `[1..=5]` and `[6..=63]` for each of the four
-/// components, `Ah = Al = 0` throughout). Total scans: 1 + 4 + 4 = 9.
+/// Companion to [`encode_jpeg_cmyk_1111`] using SOF2 instead of SOF0,
+/// with the same spectral-selection-only scan decomposition the
+/// three-component progressive YUV helpers use: one interleaved DC
+/// scan (`Ss = Se = 0, Ah = Al = 0`) followed by per-component AC
+/// bands `[1..=5]` then `[6..=63]` for each of the four components.
+/// Total scans: 1 + 4 + 4 = 9.
 ///
-/// All four components are declared `H_i = V_i = 1` so the MCU equals one
-/// data unit per component. Component 1 binds quant table 0; components
-/// 2/3/4 share quant table 1 (same `(luma_q, chroma_q)` policy as the
-/// baseline 4-component helper).
+/// All four components are declared `H_i = V_i = 1` so the MCU equals
+/// one data unit per component. Component 1 binds quant table 0;
+/// components 2/3/4 share quant table 1 (same `(luma_q, chroma_q)`
+/// policy as the baseline 4-component helper).
 ///
-/// `adobe_transform` controls the Adobe APP14 colour-transform marker
-/// emitted between SOI and DQT (mirrors the baseline helper's semantics):
-///   * `None`     → no APP14 segment, samples passed through unchanged.
-///   * `Some(0)`  → "Adobe CMYK": every component is inverted on the wire
-///     (decoder un-inverts on output).
-///   * `Some(2)`  → "Adobe YCCK": only the K plane (component 4) is
-///     inverted on the wire; components 1..3 carry YCbCr-encoded data
-///     (the decoder converts YCbCr→RGB→CMY and flips K to recover CMYK).
-#[cfg(test)]
+/// The `adobe_transform` argument follows the same semantics as
+/// [`encode_jpeg_cmyk_1111`]:
+///   * `None`     — no APP14 segment, samples passed through unchanged.
+///   * `Some(0)`  — Adobe CMYK: every component inverted on the wire.
+///   * `Some(2)`  — Adobe YCCK: K plane inverted; components 0..2 carry
+///     YCbCr-encoded data, decoder converts back via BT.601.
+///
+/// Most callers should reach for the packed-buffer convenience wrapper
+/// [`encode_jpeg_cmyk_progressive`] instead; this entry point is the
+/// per-plane back-end used by both that wrapper and the registry
+/// encoder.
+///
+/// Errors: `Error::InvalidData` if any plane is shorter than
+/// `plane_strides[i] * height`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_jpeg_progressive_cmyk_1111(
+pub fn encode_jpeg_progressive_cmyk_1111(
     width: u32,
     height: u32,
     planes: &[&[u8]; 4],
@@ -1996,6 +2027,141 @@ pub(crate) fn encode_jpeg_progressive_cmyk_1111(
     out.push(0xFF);
     out.push(markers::EOI);
     Ok(out)
+}
+
+// ---- packed-CMYK convenience wrappers ----------------------------------
+//
+// These accept the same packed `[C, M, Y, K]` interleaved buffer the
+// decoder produces (one plane, `stride` bytes per row, 4 bytes per pixel).
+// They de-interleave the source into four owned planes once, then
+// delegate to the planar back-ends above.
+
+/// Decompose a packed 4-byte-per-pixel CMYK buffer into four owned
+/// per-component planes. Each output plane is `width * height` bytes
+/// with `stride = width`. `packed_stride` is the number of bytes per
+/// row in the source buffer; the function errors out if
+/// `packed_stride < width * 4` or the buffer is shorter than
+/// `packed_stride * height`.
+fn unpack_cmyk(
+    width: u32,
+    height: u32,
+    packed: &[u8],
+    packed_stride: usize,
+) -> Result<[Vec<u8>; 4]> {
+    let w = width as usize;
+    let h = height as usize;
+    if packed_stride < w * 4 {
+        return Err(Error::invalid(
+            "encode_jpeg_cmyk: packed stride must be at least width * 4",
+        ));
+    }
+    if packed.len() < packed_stride * h {
+        return Err(Error::invalid(
+            "encode_jpeg_cmyk: packed buffer shorter than height * stride",
+        ));
+    }
+    let mut c = vec![0u8; w * h];
+    let mut m = vec![0u8; w * h];
+    let mut y = vec![0u8; w * h];
+    let mut k = vec![0u8; w * h];
+    for j in 0..h {
+        let row = &packed[j * packed_stride..j * packed_stride + w * 4];
+        for i in 0..w {
+            let o = i * 4;
+            c[j * w + i] = row[o];
+            m[j * w + i] = row[o + 1];
+            y[j * w + i] = row[o + 2];
+            k[j * w + i] = row[o + 3];
+        }
+    }
+    Ok([c, m, y, k])
+}
+
+/// Emit a 4-component CMYK / YCCK baseline (SOF0) JPEG from a packed
+/// `[C, M, Y, K]` interleaved input buffer.
+///
+/// The buffer layout matches what
+/// [`crate::decoder::decode_jpeg`] produces for a 4-component JPEG
+/// (one packed plane, `stride` bytes per row, 4 bytes per pixel in
+/// `C, M, Y, K` order), so round-tripping a decoded CMYK frame back
+/// into a new JPEG is a single call.
+///
+/// `quality` is the IJG quality factor (`1..=100`, clamped). All four
+/// components are coded at full resolution (`H = V = 1` each); the
+/// chroma quant table is shared by components 2/3/4.
+///
+/// `adobe_transform` controls the Adobe APP14 colour-transform marker
+/// emitted between SOI and DQT:
+///   * `None` — no APP14, samples passed through unchanged ("regular"
+///     CMYK).
+///   * `Some(0)` — Adobe CMYK: every sample is inverted on the wire.
+///     The decoder un-inverts the result, so the caller still passes
+///     the same `[C, M, Y, K]` buffer it would pass with `None`.
+///   * `Some(2)` — Adobe YCCK: the function interprets the four
+///     packed components as `[Y, Cb, Cr, K]` rather than `[C, M, Y, K]`
+///     and inverts only the K plane on the wire. Callers wanting a
+///     YCCK output from CMYK input should perform the BT.601 CMY→RGB→
+///     YCbCr conversion themselves before calling.
+///
+/// Errors:
+/// * `Error::InvalidData` if `stride < width * 4` or the buffer is
+///   shorter than `height * stride`.
+/// * `Error::InvalidData` if `adobe_transform` is `Some(t)` with
+///   `t` not equal to `0` or `2` — only those two transform values
+///   round-trip through this crate's decoder.
+pub fn encode_jpeg_cmyk(
+    width: u32,
+    height: u32,
+    packed: &[u8],
+    stride: usize,
+    quality: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    if let Some(t) = adobe_transform {
+        if t != 0 && t != 2 {
+            return Err(Error::invalid(
+                "encode_jpeg_cmyk: adobe_transform must be 0 (CMYK) or 2 (YCCK)",
+            ));
+        }
+    }
+    let planes = unpack_cmyk(width, height, packed, stride)?;
+    let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+    let w = width as usize;
+    let strides = [w; 4];
+    encode_jpeg_cmyk_1111(width, height, &refs, &strides, quality, adobe_transform)
+}
+
+/// Emit a 4-component CMYK / YCCK **progressive** (SOF2) JPEG from a
+/// packed `[C, M, Y, K]` interleaved input buffer.
+///
+/// SOF2 companion of [`encode_jpeg_cmyk`] using the same packed
+/// buffer convention. The scan decomposition is the 9-segment
+/// spectral-selection-only layout described on
+/// [`encode_jpeg_progressive_cmyk_1111`] (one interleaved DC scan plus
+/// per-component AC bands `[1..=5]` and `[6..=63]`, `Ah = Al = 0`
+/// throughout).
+///
+/// Errors mirror [`encode_jpeg_cmyk`].
+pub fn encode_jpeg_cmyk_progressive(
+    width: u32,
+    height: u32,
+    packed: &[u8],
+    stride: usize,
+    quality: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    if let Some(t) = adobe_transform {
+        if t != 0 && t != 2 {
+            return Err(Error::invalid(
+                "encode_jpeg_cmyk_progressive: adobe_transform must be 0 (CMYK) or 2 (YCCK)",
+            ));
+        }
+    }
+    let planes = unpack_cmyk(width, height, packed, stride)?;
+    let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
+    let w = width as usize;
+    let strides = [w; 4];
+    encode_jpeg_progressive_cmyk_1111(width, height, &refs, &strides, quality, adobe_transform)
 }
 
 /// Test-only: emit a single-component, 12-bit precision baseline JPEG.

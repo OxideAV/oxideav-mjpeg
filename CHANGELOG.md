@@ -34,6 +34,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Public 4-component CMYK / YCCK encoder API. The two
+  back-end entry points landed for the round-186 CMYK decoder tests —
+  `encode_jpeg_cmyk_1111` (baseline SOF0) and
+  `encode_jpeg_progressive_cmyk_1111` (SOF2) — were `pub(crate)` and
+  gated behind `#[cfg(test)]`, so the production surface only allowed
+  CMYK input through the *decode* side. They are now `pub` and
+  always-on, joined by two packed-buffer convenience wrappers that
+  accept the same `[C, M, Y, K]` interleaved layout (4 bytes per pixel,
+  `stride` bytes per row) the decoder produces:
+  - `encoder::encode_jpeg_cmyk(width, height, packed, stride, quality,
+    adobe_transform)` — baseline SOF0 path.
+  - `encoder::encode_jpeg_cmyk_progressive(width, height, packed,
+    stride, quality, adobe_transform)` — SOF2 path with the 9-segment
+    spectral-selection-only scan decomposition (1 interleaved DC scan
+    + 2 per-component AC bands `[1..=5]` then `[6..=63]` for each of
+    the four components, `Ah = Al = 0`).
+
+  The `adobe_transform: Option<u8>` argument carries the Adobe APP14
+  colour-transform marker: `None` writes no APP14 segment (plain
+  "regular" CMYK); `Some(0)` selects Adobe CMYK and inverts every
+  sample on the wire; `Some(2)` selects Adobe YCCK, interpreting the
+  packed input as `[Y, Cb, Cr, K]` and inverting only the K plane
+  (the decoder un-does both transforms on output). Any other `Some(t)`
+  is rejected with `Error::InvalidData` since the decoder only
+  round-trips `0` and `2`.
+
+  The `MjpegEncoder` trait-API path now accepts
+  `PixelFormat::Cmyk` input as well. A new
+  `MjpegEncoder::set_adobe_transform(Option<u8>)` knob configures the
+  APP14 marker (defaults to `None`); `set_progressive(true)` switches
+  the CMYK path from SOF0 to SOF2. The plane stride must be at least
+  `width * 4` (the decoder's output stride); shorter strides are
+  rejected with a clear `Error::InvalidData`.
+
+  A new `tests/cmyk_roundtrip.rs` integration suite (14 tests) drives
+  each combination of `{baseline, progressive} × {None, Some(0)} ×
+  {packed wrapper, planar back-end, trait API}` through encode→decode
+  and asserts per-component PSNR ≥ 30 dB at Q = 90 — the same
+  tolerance the internal `decoder::cmyk_tests` suite enforces, so the
+  public-API surface inherits the same correctness floor as the
+  previously test-only back-end paths. Error paths (short stride,
+  short buffer, invalid Adobe transform on both the free-function and
+  trait-API surfaces) are also covered.
+
 - 4-component (CMYK / Adobe YCCK) progressive (SOF2 with `P = 8`)
   decode. T.81 §G.1.1 permits the progressive coding process at every
   component-count the spec admits (`Nf ∈ 1..=4`), but the decoder was

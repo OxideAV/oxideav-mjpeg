@@ -196,6 +196,49 @@ height, [r, g, b], strides, precision, predictor)` directly:
   reset every component's predictor in lockstep, and `Pt` shifts every
   sample of every plane uniformly.
 
+### 4-component CMYK / YCCK encode
+
+The 4-component (CMYK / Adobe YCCK) decode paths landed in earlier
+rounds are now matched by a public encoder API. Both a baseline
+(SOF0) and a progressive (SOF2) variant accept the same packed
+`[C, M, Y, K]` interleaved buffer the decoder produces (4 bytes per
+pixel, `stride` bytes per row), so round-tripping a decoded CMYK
+frame back into a JPEG is a single call:
+
+```rust
+use oxideav_mjpeg::encoder::{encode_jpeg_cmyk, encode_jpeg_cmyk_progressive};
+
+let jpeg = encode_jpeg_cmyk(width, height, &packed, width as usize * 4, 90, None)?;
+let prog = encode_jpeg_cmyk_progressive(width, height, &packed, width as usize * 4, 90, None)?;
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+`adobe_transform` selects the Adobe APP14 colour-transform marker:
+`None` writes no APP14 (plain "regular" CMYK), `Some(0)` selects
+Adobe CMYK and inverts every sample on the wire, `Some(2)` selects
+Adobe YCCK, interpreting the packed input as `[Y, Cb, Cr, K]` and
+inverting only the K plane (the decoder un-does both transforms on
+output). The two per-plane back-end entry points
+`encoder::encode_jpeg_cmyk_1111` / `encode_jpeg_progressive_cmyk_1111`
+are also `pub` for callers that already hold four separate component
+buffers.
+
+The trait-API encoder accepts CMYK input as well:
+
+```rust
+let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+params.width = Some(w);
+params.height = Some(h);
+params.pixel_format = Some(PixelFormat::Cmyk);
+let mut enc = MjpegEncoder::from_params(&params)?;
+enc.set_adobe_transform(Some(2))?; // None / Some(0) / Some(2)
+enc.set_progressive(true);         // optional — SOF2 instead of SOF0
+enc.send_frame(&frame)?;
+```
+
+The plane stride must be at least `width * 4`; shorter strides are
+rejected with `Error::InvalidData`.
+
 ### Metadata pass-through
 
 All encoder entry points have `*_with_meta` variants that accept a
@@ -371,9 +414,15 @@ Decoder:
 Encoder:
 
 - **SOF0** (baseline sequential) — 8-bit Huffman, Annex K tables.
+  3-component YUV at 4:4:4 / 4:2:2 / 4:2:0, plus 4-component CMYK /
+  YCCK at `H_i = V_i = 1` with the Adobe APP14 colour-transform flag
+  configurable via the dedicated public CMYK entry points (and the
+  trait API's `set_adobe_transform`).
 - **SOF2** (progressive) — spectral-selection decomposition (default:
   7 SOS scans, `Ah=0`, `Al=0`) and full successive-approximation
-  decomposition (14 SOS scans, 1-bit point transform). See above.
+  decomposition (14 SOS scans, 1-bit point transform). See above. The
+  CMYK / YCCK variant uses a 9-segment spectral-selection scan
+  decomposition over four components.
 - **SOF3** (lossless) — single-component grayscale at any precision
   `P ∈ 2..=16` and three-component interleaved (RGB-class) at any
   precision `P ∈ 2..=16` with `H_i = V_i = 1` per component, every

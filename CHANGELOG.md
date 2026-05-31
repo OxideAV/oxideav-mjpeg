@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.7...v0.1.8) - 2026-05-31
+
+### Other
+
+- add arith_decode cargo-fuzz target for SOF9 Q-coder surface
+- gate cmyk_roundtrip on the `registry` feature
+- promote 4-component CMYK / YCCK helpers to the public API
+
 ### Added
 
 - New `arith_decode` cargo-fuzz target wraps fuzz-supplied bytes in a

@@ -64,6 +64,21 @@ path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 
+# Robustness target — arbitrary bytes wrapped in a minimal SOF9
+# (extended-sequential arithmetic-coded) JPEG envelope, fed through
+# the public decoder. Drives the per-iteration coverage of
+# `src/jpeg/arith.rs` (`ArithDecoder::new` / `Initdec` /
+# `Renorm_d` / `Byte_in` / `decode_dc_diff` / `decode_ac` /
+# `decode_magnitude`) plus the per-component statistics and
+# restart bookkeeping in `decode_arith_scan`. Bar is "no panic".
+# See `fuzz_targets/arith_decode.rs` for the documented attack
+# surfaces.
+[[bin]]
+name = "arith_decode"
+path = "fuzz_targets/arith_decode.rs"
+test = false
+doc = false
+
 # Robustness target — arbitrary bytes into the RFC 2435 RTP/JPEG
 # depacketizer. Exercises `parse_main_header`, `parse_restart_header`,
 # the §3.1.8 in-band quantization-table header parser, the fragment

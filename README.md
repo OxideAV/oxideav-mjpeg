@@ -452,7 +452,7 @@ Not supported (decoder returns `Error::Unsupported`):
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs seven cargo-fuzz harnesses against the
+The `fuzz/` sub-crate runs eight cargo-fuzz harnesses against the
 public encoder + decoder + RTP surface, executed daily by the
 org-wide reusable fuzz workflow:
 
@@ -465,6 +465,21 @@ org-wide reusable fuzz workflow:
   rejection), and the `Pq = 1` (16-bit quantiser) × coefficient dequantise
   multiplication (now in `f32` to skip i32 overflow). Last local 60 s
   baseline: 25 694 runs, 0 crashes (cov 2023 / ft 7670).
+- `arith_decode` — wraps fuzz-supplied bytes (≤ 16 KiB) in a minimal
+  SOF9 (extended-sequential arithmetic-coded) JPEG envelope and pushes
+  the result through the same `Decoder` trait. A control nibble drives
+  component count (1 vs 3), optional DAC conditioning, optional DRI
+  (restart interval = 1 MCU), the luma sampling factor (4:4:4 vs 4:2:2),
+  and the image dimension (8..=64 px square), so the
+  `src/jpeg/arith.rs` Q-coder (`ArithDecoder::new` / `Initdec` /
+  `Renorm_d` / `Byte_in` / `decode_dc_diff` / `decode_ac` /
+  `decode_magnitude`) and the `decode_arith_scan` per-component
+  statistics + restart-interval bookkeeping execute on every iteration.
+  Contract: never panic; see `fuzz_targets/arith_decode.rs` for the
+  enumerated panic surfaces (per-component bin indexing in
+  `DcStats::bins[0..49]` / `AcStats::bins[0..245]`, the
+  `category > 15` magnitude guard, the `decode_ac` `k > se` bound, and
+  the restart-mid-scan `Err` path).
 - `rtp_depacketize` — feeds arbitrary bytes (≤ 16 KiB) through the
   RFC 2435 RTP/JPEG depacketizer (`rtp::parse_main_header`,
   `rtp::parse_restart_header`, `rtp::JpegDepacketizer::push`),

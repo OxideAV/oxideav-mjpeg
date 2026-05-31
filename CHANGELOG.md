@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `arith_decode` cargo-fuzz target wraps fuzz-supplied bytes in a
+  minimal SOF9 (extended-sequential arithmetic-coded) JPEG envelope so
+  the `src/jpeg/arith.rs` Q-coder (`ArithDecoder::new` / `Initdec` /
+  `Renorm_d` / `Byte_in` / `decode_dc_diff` / `decode_ac` /
+  `decode_magnitude`) and the `decode_arith_scan` per-component
+  statistics + restart bookkeeping execute on every iteration. A
+  fuzz-driven control nibble varies component count (1 vs 3), optional
+  DAC conditioning, optional DRI (restart interval = 1 MCU), the
+  luma sampling factor (4:4:4 vs 4:2:2), and the image dimension
+  (8..=64 px square). Bar is "no panic", same as the existing six
+  robustness targets in `fuzz/fuzz_targets/`.
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.6...v0.1.7) - 2026-05-30
 
 ### Other

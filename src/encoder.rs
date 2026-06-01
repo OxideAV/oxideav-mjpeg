@@ -69,17 +69,19 @@ use crate::jpeg::markers;
 use crate::jpeg::quant::{scale_for_quality, DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50};
 use crate::jpeg::zigzag::ZIGZAG;
 
-/// Quality factor 1..=100 (libjpeg style). 75 is a sensible default.
+/// Quality factor 1..=100, scaled against the Annex K Q=50 base tables.
+/// 75 is a sensible default.
 pub const DEFAULT_QUALITY: u8 = 75;
 
 // ---- Encoding ------------------------------------------------------------
 
 /// Encode a single `VideoFrame` (YUV 4:4:4 / 4:2:2 / 4:2:0) as a complete,
 /// self-contained baseline JPEG byte stream (`FFD8 … FFD9`). `quality` is
-/// the libjpeg-style 1..=100 factor. Exposed publicly so sibling crates
-/// (e.g. `oxideav-amv`, which wraps the same bitstream with a custom
-/// container-level header) can reuse the encoder without going through the
-/// `Encoder` trait's stateful packet/frame plumbing.
+/// the 1..=100 factor scaled against the Annex K Q=50 base tables. Exposed
+/// publicly so sibling crates (e.g. `oxideav-amv`, which wraps the same
+/// bitstream with a custom container-level header) can reuse the encoder
+/// without going through the `Encoder` trait's stateful packet/frame
+/// plumbing.
 ///
 /// Does not emit restart markers. For a restart-marker-aware variant see
 /// [`encode_jpeg_with_opts`].
@@ -258,7 +260,7 @@ pub fn encode_jpeg_with_meta(
 /// non-interleaved AC band scans per component (`Ss=1..=5` then
 /// `Ss=6..=63`), all at `Ah=0, Al=0` — i.e. spectral selection without
 /// successive-approximation refinement. Uses the Annex K Huffman tables.
-/// Quality is the libjpeg-style factor 1..=100.
+/// Quality is the 1..=100 factor scaled against the Annex K Q=50 base tables.
 pub fn encode_jpeg_progressive(
     frame: &VideoFrame,
     width: u32,
@@ -295,10 +297,9 @@ pub fn encode_jpeg_progressive_with_meta(
 /// - Scans 9-11: Per-component AC refinement low band (`Ss=1..5, Ah=1,Al=0`) × 3.
 /// - Scans 12-14: Per-component AC refinement high band (`Ss=6..63, Ah=1,Al=0`) × 3.
 ///
-/// Output round-trips through any conformant SOF2 decoder (ffmpeg, libjpeg,
-/// ImageMagick). The reconstructed image is identical to the spectral-
-/// selection-only output — successive approximation only changes the bit
-/// order, not the quantised coefficients.
+/// Output round-trips through any conformant SOF2 decoder. The reconstructed
+/// image is identical to the spectral-selection-only output — successive
+/// approximation only changes the bit order, not the quantised coefficients.
 pub fn encode_jpeg_progressive_sa(
     frame: &VideoFrame,
     width: u32,

@@ -52,9 +52,8 @@ use crate::jpeg::markers::{self, EOI, SOI};
 use crate::jpeg::parser::{parse_sof, SofInfo};
 
 /// Default frame rate assumed for headerless raw `.mjpeg` files.
-/// 25 fps matches the historical "PAL" cadence ffmpeg uses when
-/// writing a raw MJPEG with `-c:v mjpeg -f mjpeg` and no other
-/// timing hint.
+/// 25 fps matches the historical "PAL" cadence used when timing
+/// is otherwise unspecified.
 const DEFAULT_FRAME_RATE: u32 = 25;
 
 /// Build a `(pts, byte_offset)` waypoint every Nth frame. 5 keeps the

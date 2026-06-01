@@ -22,7 +22,7 @@ pub const DEFAULT_CHROMA_Q50: [u16; 64] = [
     99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
 ];
 
-/// Scale a base Q=50 table by a libjpeg-style quality factor in `1..=100`.
+/// Scale a base Q=50 table by a quality factor in `1..=100`.
 /// Returns a table in natural order.
 pub fn scale_for_quality(base: &[u16; 64], quality: u8) -> [u16; 64] {
     let q = quality.clamp(1, 100) as i32;

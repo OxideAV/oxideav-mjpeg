@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- docs: scrub decorative external-implementation attribution from
+  `src/encoder.rs` (DEFAULT_QUALITY, `encode_jpeg`, `encode_jpeg_progressive`,
+  `encode_jpeg_progressive_sa`), `src/jpeg/quant.rs` (`scale_for_quality`),
+  and `src/mjpeg_container.rs` (DEFAULT_FRAME_RATE). Quality-factor scaling
+  is described against the Annex K Q=50 base tables; conformant-SOF2 round
+  trip phrased neutrally.
+
 ### Added
 
 - New `arith_decode` cargo-fuzz target wraps fuzz-supplied bytes in a

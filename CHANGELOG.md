@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `benches/codec.rs` Criterion harness (`cargo bench -p oxideav-mjpeg
+  --bench codec`) measures the baseline SOF0 encode (4:2:0 256x256 q75,
+  4:4:4 64x64 q75), baseline SOF0 decode (4:2:0 256x256 q75 through
+  the `Decoder` trait), progressive SOF2 encode (4:2:0 64x64 q75), and
+  SOF3 lossless grayscale encode with predictors 1 (Ra) and 4
+  (Ra + Rb − Rc) at 256x256. Every fixture is built deterministically
+  in-bench from an xorshift32 seed plus a low-amplitude triangle-wave
+  gradient (so the entropy coder sees realistic run-length patterns
+  rather than degenerate random-noise worst cases) — no committed
+  payload files, no `docs/` reads, no third-party library calls. Pinned
+  to `criterion = "0.5"` to match the existing cross-codec
+  bench fleet (flac / tta / tiff / magicyuv / huffyuv / pcx / qoi).
+
 - New `arith_decode` cargo-fuzz target wraps fuzz-supplied bytes in a
   minimal SOF9 (extended-sequential arithmetic-coded) JPEG envelope so
   the `src/jpeg/arith.rs` Q-coder (`ArithDecoder::new` / `Initdec` /

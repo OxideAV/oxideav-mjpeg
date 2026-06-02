@@ -537,6 +537,43 @@ tiers (no more silent reporting):
 The two remaining variants `Tier::ReportOnly` and `Tier::Ignored` stay
 in the enum for future fixtures that haven't earned a baseline yet.
 
+## Benchmarks
+
+`benches/codec.rs` is a Criterion harness for the encode + decode hot
+paths. Run with:
+
+```text
+cargo bench -p oxideav-mjpeg --bench codec
+```
+
+Six scenarios, each fed by a deterministically-built in-bench fixture
+(xorshift32 + low-amplitude triangle-wave gradient — no committed
+payload files, no `docs/` reads, no third-party library calls):
+
+- `baseline_encode/yuv420_256x256_q75` — full SOF0 path: forward DCT,
+  AAN-style quantise, Huffman run-length encode, marker emission.
+- `baseline_encode/yuv444_64x64_q75` — same path on a small 4:4:4
+  fixture; isolates per-call header / Huffman-table-construction
+  overhead from the per-block cost.
+- `baseline_decode/yuv420_256x256_q75` — the inverse, driven through
+  the `Decoder` trait so the bench tracks the same code path
+  application callers exercise.
+- `progressive_encode/yuv420_64x64_q75` — SOF2 spectral-selection
+  decomposition (7 SOS scans).
+- `lossless_encode/gray_pred1_256x256` — SOF3 grayscale encode with
+  predictor 1 (Ra / left), the simplest case.
+- `lossless_encode/gray_pred4_256x256` — SOF3 grayscale encode with
+  predictor 4 (Ra + Rb − Rc), the most expensive 2-D Table H.1
+  variant; A/B against `pred1` measures the predictor-loop cost.
+
+Headline numbers on the round-209 dev machine (Apple Silicon, release
+profile, criterion `--quick`): baseline 4:2:0 encode 256x256 q75 runs
+~185 µs / call (≈ 353 Melem/s); the matching decode runs ~248 µs /
+call (≈ 264 Melem/s). The 256x256 lossless grayscale encode runs
+~370 µs / call independent of predictor choice (the magnitude /
+Huffman emission dominates the per-sample cost — the four extra
+predictor arithmetic ops in pred=4 disappear into the noise).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

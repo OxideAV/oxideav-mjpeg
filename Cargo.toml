@@ -42,3 +42,20 @@ registry = ["dep:oxideav-core"]
 # isn't installed. Mirrors the fuzz harness setup in
 # `fuzz/Cargo.toml`.
 libloading = "0.8"
+
+# Round 209 (depth-mode benchmarks): Criterion drives the `codec`
+# bench harness that measures the baseline encode / decode,
+# progressive encode, and lossless-predictor hot paths. Pinned to
+# the same 0.5 line the other OxideAV crates with benches (flac,
+# tta, tiff, magicyuv, huffyuv, pcx, qoi) already track so
+# cross-codec numbers stay comparable.
+criterion = "0.5"
+
+# Round 209 codec hot-path bench. Self-contained — every fixture
+# is synthesised in-bench from a deterministic xorshift seed (no
+# committed payload files, no `docs/` reads, no external library
+# calls). Run with:
+#     cargo bench -p oxideav-mjpeg --bench codec
+[[bench]]
+name = "codec"
+harness = false

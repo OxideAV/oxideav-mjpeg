@@ -323,7 +323,13 @@ Coverage:
 - Luma sampling `2x1` → type 0 (4:2:2), `2x2` → type 1 (4:2:0); chroma must
   be `1x1` (the well-known §4.1 layout).
 - A source DRI promotes the type to 64/65 and writes the §3.1.7 Restart
-  Marker header (whole-frame reassembly: F=L=1, Restart Count 0x3FFF).
+  Marker header. By default the chunks span arbitrary byte boundaries and
+  the header signals whole-frame reassembly (`F = L = 1`, Restart Count
+  `0x3FFF`); pass `PacketizeOpts::new(qmode).with_restart_align(true)` to
+  `packetize_with_opts` to split the scan on restart-interval boundaries
+  instead — each emitted fragment then carries one or more complete
+  intervals, sets `F = L = 1`, and reports its first interval's index in
+  the 14-bit Restart Count (wrapping modulo `0x3FFF`).
 - `QMode::Quality(1..=99)` carries an IJG-quality Q value (receiver
   regenerates the Annex K tables); `QMode::InBand(128..=255)` carries the
   JPEG's own two DQT tables in a §3.1.8 Quantization Table header on the
@@ -333,14 +339,11 @@ Coverage:
 
 Lacks: RTP transport framing itself (the 12-byte RTP fixed header,
 sequence numbering, 90 kHz timestamping stay the caller's job),
-restart-interval-aligned chunk splitting across packets (the scan is
-fragmented on arbitrary byte boundaries, with whole-frame reassembly
-signalled), packetization of progressive / lossless / grayscale / CMYK
-JPEGs (no well-known RTP/JPEG type — `Unsupported`), out-of-band table
-negotiation via a session-setup protocol on depacketize (a static
-`Q ≥ 128` frame whose tables were never sent in-band, nor cached from an
-earlier frame, → `Unsupported`), and the dynamic non-well-known types
-128..=255.
+packetization of progressive / lossless / grayscale / CMYK JPEGs (no
+well-known RTP/JPEG type — `Unsupported`), out-of-band table negotiation
+via a session-setup protocol on depacketize (a static `Q ≥ 128` frame
+whose tables were never sent in-band, nor cached from an earlier frame,
+→ `Unsupported`), and the dynamic non-well-known types 128..=255.
 
 ### Codec / container IDs
 

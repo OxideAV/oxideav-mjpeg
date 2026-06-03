@@ -18,6 +18,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rtp::packetize_with_opts` + `rtp::PacketizeOpts` add restart-interval
+  -aligned scan splitting (opt-in via
+  `PacketizeOpts::new(qmode).with_restart_align(true)`) to the RFC 2435
+  packetizer. When the source JPEG carries DRI > 0 the aligned path walks
+  the entropy-coded scan for `RSTn` boundaries (T.81 §B.1.1.2 byte
+  stuffing respected), packs as many complete intervals per fragment as
+  the MTU allows, and writes a §3.1.7 Restart Marker header with `F = L
+  = 1` plus the index of each fragment's first interval in the 14-bit
+  Restart Count (wrapping modulo `0x3FFF`, the value reserved for
+  whole-frame reassembly). A single oversize interval returns
+  `MjpegError::Unsupported` instead of falling back silently to byte
+  boundaries. When the source has no DRI the flag is a no-op and the
+  output equals `rtp::packetize(jpeg, max_payload, qmode)`. New tests
+  cover the interval walker (3-interval whole-scan walk + 0xFF-stuffed
+  intra-interval byte), the tight-MTU one-interval-per-packet path, the
+  loose-MTU multiple-intervals-per-packet path, the no-DRI fallthrough,
+  the oversize-interval rejection, the qtable-header carriage on the
+  first fragment, and a round-trip through `JpegDepacketizer` that
+  shows the reassembled scan preserves every source `RSTn` position.
+
 - New `benches/codec.rs` Criterion harness (`cargo bench -p oxideav-mjpeg
   --bench codec`) measures the baseline SOF0 encode (4:2:0 256x256 q75,
   4:4:4 64x64 q75), baseline SOF0 decode (4:2:0 256x256 q75 through

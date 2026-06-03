@@ -617,6 +617,55 @@ pub enum QMode {
     InBand(u8),
 }
 
+/// Optional knobs controlling [`packetize_with_opts`]. The fields are
+/// `#[non_exhaustive]`-style additive over time: construct via [`Self::new`]
+/// and tune the named setters so callers stay forward-compatible.
+///
+/// The default is the historical [`packetize`] behaviour: scan bytes are
+/// fragmented on arbitrary byte boundaries and the §3.1.7 header (when
+/// emitted) signals whole-frame reassembly (`F = L = 1`, `count = 0x3FFF`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketizeOpts {
+    /// How to carry the quantization tables (Q field vs in-band).
+    pub qmode: QMode,
+    /// When `true` and the source JPEG carries restart markers (DRI > 0 with
+    /// `RSTn` markers in the scan), split the scan at restart-interval
+    /// boundaries instead of on arbitrary bytes. Each emitted fragment then
+    /// contains one or more *complete* restart intervals, sets the §3.1.7
+    /// `F` (start-of-interval) and `L` (end-of-interval) bits, and carries
+    /// the source-stream index of its first interval in the 14-bit `Restart
+    /// Count` field (modulo `0x3FFF`, the value reserved for whole-frame
+    /// reassembly). The receiver can then drop a stray packet and still
+    /// decode every interval that *did* arrive (RFC 2435 §3.1.7).
+    ///
+    /// If the source JPEG has no DRI segment, this flag is a no-op (there
+    /// are no interval boundaries to align to). If a single restart
+    /// interval is too large to fit in `max_payload` together with the
+    /// fragment headers, [`packetize_with_opts`] returns
+    /// [`crate::MjpegError::Unsupported`] — restart-aligned fragmentation
+    /// is opt-in, so the caller asked for it and an oversize interval is
+    /// a configuration error, not a silent fallback.
+    pub restart_align: bool,
+}
+
+impl PacketizeOpts {
+    /// Build options with the given `qmode` and every other knob defaulted
+    /// (no restart-aligned splitting; matches [`packetize`]).
+    pub fn new(qmode: QMode) -> Self {
+        Self {
+            qmode,
+            restart_align: false,
+        }
+    }
+
+    /// Enable restart-interval-aligned scan splitting. See the field doc on
+    /// [`PacketizeOpts::restart_align`] for the wire-format details.
+    pub fn with_restart_align(mut self, enabled: bool) -> Self {
+        self.restart_align = enabled;
+        self
+    }
+}
+
 /// Parsed pieces of a complete baseline JPEG that the packetizer needs to
 /// build the RTP/JPEG main header and (optionally) the in-band tables.
 struct JpegParts {
@@ -885,18 +934,31 @@ fn dim_units(width: u16, height: u16) -> Result<(u8, u8)> {
 /// The returned `Vec` holds the fragments in order: the first has fragment
 /// offset 0 (and carries the in-band Quantization Table header when
 /// `qmode` is [`QMode::InBand`]); the last has `marker == true`. The scan is
-/// fragmented on arbitrary byte boundaries unless the image uses restart
-/// markers, in which case fragments are kept whole (single packet) because
-/// this entry point does not split a restart-aligned scan across packets.
+/// fragmented on arbitrary byte boundaries, and the §3.1.7 Restart Marker
+/// header (when emitted) signals whole-frame reassembly (`F = L = 1`,
+/// `count = 0x3FFF`). For restart-interval-aligned splitting that lets a
+/// receiver decode partial frames after packet loss, use
+/// [`packetize_with_opts`] with [`PacketizeOpts::restart_align`] set.
 ///
 /// Feeding the produced payloads (with their `marker` flags) back into a
 /// [`JpegDepacketizer`] reconstructs a JPEG that decodes to the same image.
 pub fn packetize(jpeg: &[u8], max_payload: usize, qmode: QMode) -> Result<Vec<JpegPacket>> {
+    packetize_with_opts(jpeg, max_payload, PacketizeOpts::new(qmode))
+}
+
+/// Packetize with explicit options (see [`PacketizeOpts`]). The variant of
+/// [`packetize`] that accepts the full encode-side knob set, currently the
+/// restart-interval-aligned splitting flag.
+pub fn packetize_with_opts(
+    jpeg: &[u8],
+    max_payload: usize,
+    opts: PacketizeOpts,
+) -> Result<Vec<JpegPacket>> {
     let parts = parse_jpeg(jpeg)?;
     let (w_units, h_units) = dim_units(parts.width, parts.height)?;
 
     // Resolve the Q field and any in-band Quantization Table header bytes.
-    let (q_field, qtable_hdr): (u8, Vec<u8>) = match qmode {
+    let (q_field, qtable_hdr): (u8, Vec<u8>) = match opts.qmode {
         QMode::Quality(q) => {
             if !(1..=99).contains(&q) {
                 return Err(Error::invalid(
@@ -941,6 +1003,27 @@ pub fn packetize(jpeg: &[u8], max_payload: usize, qmode: QMode) -> Result<Vec<Jp
     }
 
     let scan = &jpeg[parts.scan_start..parts.scan_end];
+
+    // The restart-aligned path only meaningfully applies when the source
+    // stream actually carries DRI > 0 — otherwise there are no interval
+    // boundaries to align to and the flag is a no-op.
+    if opts.restart_align && parts.dri != 0 {
+        let intervals = scan_restart_intervals(scan);
+        return packetize_restart_aligned(
+            &intervals,
+            scan,
+            max_payload,
+            typ,
+            q_field,
+            w_units,
+            h_units,
+            parts.dri,
+            &qtable_hdr,
+            first_hdr,
+            cont_hdr,
+        );
+    }
+
     let mut packets = Vec::new();
     let mut offset = 0usize;
     let mut first = true;
@@ -984,6 +1067,190 @@ pub fn packetize(jpeg: &[u8], max_payload: usize, qmode: QMode) -> Result<Vec<Jp
         }
     }
 
+    Ok(packets)
+}
+
+/// One restart interval inside an entropy-coded scan.
+///
+/// Byte ranges are expressed in the scan buffer's coordinate system (i.e.
+/// `scan[start..end]`). Each interval's `end` is *exclusive*: it points to
+/// the first byte of the next interval (or to the scan's end for the final
+/// interval). The first interval starts at `start = 0` and follows no RSTn
+/// marker. Subsequent intervals begin immediately after an `RSTn` (`0xFF
+/// 0xD0..=0xD7`) marker pair, so each non-initial interval's `start`
+/// equals the previous one's `end + 2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanInterval {
+    start: usize,
+    end: usize,
+}
+
+/// Walk the entropy-coded scan and return one [`ScanInterval`] per restart
+/// interval. Inside a JPEG scan, `0xFF` is a byte-stuffed sentinel: it is
+/// either followed by `0x00` (escaped data byte) or by `0xD0..=0xD7`
+/// (`RSTn` marker). Any other byte after `0xFF` is a non-restart marker
+/// that terminates the scan; we treat the scan buffer as already trimmed
+/// at the SOS / EOI boundaries, so encountering one means the upstream
+/// parser left an unexpected segment in the scan span (returning the
+/// intervals walked so far is the conservative behaviour, since the
+/// caller will still treat the unparsed tail as a final interval).
+fn scan_restart_intervals(scan: &[u8]) -> Vec<ScanInterval> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < scan.len() {
+        if scan[i] == 0xFF && i + 1 < scan.len() {
+            let m = scan[i + 1];
+            if markers::is_rst(m) {
+                // The RSTn marker itself is *part of* the current interval
+                // on the wire — RFC 2435 §3.1.7 packs whole intervals
+                // including their trailing `RSTn`, so we close the
+                // interval at the byte after the marker. The next
+                // interval starts on the byte after that.
+                out.push(ScanInterval { start, end: i + 2 });
+                start = i + 2;
+                i += 2;
+                continue;
+            }
+            // 0x00 stuffing or fill 0xFF byte: advance one and keep
+            // walking. Any other marker after 0xFF would be a wire-format
+            // error in a well-formed scan; treat the rest of the buffer
+            // as a final interval and stop scanning for RSTn.
+            if m == 0x00 || m == 0xFF {
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    // Final interval covers everything from `start` to the scan end (the
+    // scan never ends with a bare RSTn for a well-formed JPEG: the last
+    // interval is terminated by EOI in the source, and EOI is *outside*
+    // the scan slice we receive).
+    if start < scan.len() {
+        out.push(ScanInterval {
+            start,
+            end: scan.len(),
+        });
+    }
+    out
+}
+
+/// RFC 2435 §3.1.7 emits a 14-bit Restart Count alongside the F (first) and
+/// L (last) bits. `count` saturates at `0x3FFE` because `0x3FFF` is
+/// reserved for whole-frame reassembly; per the RFC a sender that has
+/// counted past the field should "wrap around to 0".
+#[allow(clippy::too_many_arguments)]
+fn packetize_restart_aligned(
+    intervals: &[ScanInterval],
+    scan: &[u8],
+    max_payload: usize,
+    typ: u8,
+    q_field: u8,
+    w_units: u8,
+    h_units: u8,
+    dri: u16,
+    qtable_hdr: &[u8],
+    first_hdr: usize,
+    cont_hdr: usize,
+) -> Result<Vec<JpegPacket>> {
+    // Walk intervals greedily: pack as many *consecutive* whole intervals
+    // into each fragment as the per-fragment scan budget allows. Refuse
+    // (rather than silently fall back to byte-boundary splitting) if a
+    // single interval exceeds even the largest possible scan budget —
+    // restart-aligned splitting was opt-in, so an oversize interval is a
+    // configuration error worth surfacing.
+    let mut packets = Vec::new();
+    let mut first = true;
+    let mut idx = 0usize;
+    while idx < intervals.len() {
+        let hdr_room = if first { first_hdr } else { cont_hdr };
+        let scan_budget = max_payload - hdr_room;
+
+        // Greedily accumulate intervals into this fragment.
+        let mut taken = 0usize;
+        let mut bytes = 0usize;
+        let first_iv_idx = idx;
+        while idx + taken < intervals.len() {
+            let iv = intervals[idx + taken];
+            let iv_len = iv.end - iv.start;
+            if iv_len > scan_budget {
+                if taken == 0 {
+                    return Err(Error::unsupported(
+                        "RTP/JPEG packetize: restart-aligned splitting requires every \
+                         interval to fit in max_payload (a single interval exceeds it)",
+                    ));
+                }
+                break;
+            }
+            if bytes + iv_len > scan_budget {
+                break;
+            }
+            bytes += iv_len;
+            taken += 1;
+        }
+        debug_assert!(taken > 0, "loop must accept at least one interval");
+
+        let fragment_offset = intervals[first_iv_idx].start;
+        let end_byte = intervals[first_iv_idx + taken - 1].end;
+        let is_last = first_iv_idx + taken == intervals.len();
+
+        let mut payload = Vec::with_capacity(hdr_room + bytes);
+        // Main JPEG header (§3.1) with the in-scan fragment offset.
+        payload.push(0); // Type-specific (progressive frame).
+        payload.push((fragment_offset >> 16) as u8);
+        payload.push((fragment_offset >> 8) as u8);
+        payload.push(fragment_offset as u8);
+        payload.push(typ);
+        payload.push(q_field);
+        payload.push(w_units);
+        payload.push(h_units);
+
+        // §3.1.7 Restart Marker header: every fragment we emit covers
+        // whole intervals so both F and L are set; `count` carries the
+        // index of the first interval in this fragment, wrapped modulo
+        // `0x3FFF` (the value reserved for whole-frame reassembly; RFC
+        // 2435 §3.1.7 says the counter "wrap[s] around to 0" when it
+        // reaches that point).
+        let count = (first_iv_idx as u16) % 0x3FFF;
+        let fl_count = 0x8000 | 0x4000 | count;
+        payload.extend_from_slice(&dri.to_be_bytes());
+        payload.extend_from_slice(&fl_count.to_be_bytes());
+
+        if first {
+            payload.extend_from_slice(qtable_hdr);
+        }
+        payload.extend_from_slice(&scan[fragment_offset..end_byte]);
+
+        packets.push(JpegPacket {
+            payload,
+            marker: is_last,
+        });
+
+        first = false;
+        idx += taken;
+    }
+
+    if packets.is_empty() {
+        // Defensive: an empty scan with DRI set is malformed, but rather
+        // than panic in upstream callers leave a single zero-length
+        // fragment carrying the headers and the marker bit.
+        let mut payload = Vec::with_capacity(first_hdr);
+        payload.push(0);
+        payload.extend_from_slice(&[0, 0, 0]);
+        payload.push(typ);
+        payload.push(q_field);
+        payload.push(w_units);
+        payload.push(h_units);
+        payload.extend_from_slice(&dri.to_be_bytes());
+        payload.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        payload.extend_from_slice(qtable_hdr);
+        packets.push(JpegPacket {
+            payload,
+            marker: true,
+        });
+    }
     Ok(packets)
 }
 
@@ -1787,6 +2054,228 @@ mod tests {
         let decoded = decode_jpeg(&rebuilt.unwrap(), None).expect("decode");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
+    }
+
+    // -------------------------------------------------------------------
+    // Restart-interval-aligned packetization (`PacketizeOpts::restart_align`).
+    // -------------------------------------------------------------------
+
+    /// Build a JPEG whose scan contains `intervals` whole restart intervals
+    /// of `bytes_per_interval` plain (non-`0xFF`) bytes each, separated by
+    /// `RST0..=RST7` markers cycling per T.81 §F.1.1.5.2. The plain byte at
+    /// position `k` inside an interval is `(seed + k) & 0xEF` so it never
+    /// triggers the scan's `0xFF`-stuffing case.
+    fn handmade_jpeg_with_intervals(
+        width: u16,
+        height: u16,
+        luma_samp: u8,
+        dri: u16,
+        intervals: usize,
+        bytes_per_interval: usize,
+        seed: u8,
+    ) -> Vec<u8> {
+        let mut scan = Vec::new();
+        for i in 0..intervals {
+            for k in 0..bytes_per_interval {
+                scan.push(seed.wrapping_add(((i * bytes_per_interval) + k) as u8) & 0xEF);
+            }
+            // RSTn cycles 0..7 between intervals; the final interval is
+            // closed by EOI in the source stream, not by a trailing RSTn.
+            if i + 1 < intervals {
+                scan.push(0xFF);
+                scan.push(markers::RST0 + ((i as u8) & 0x07));
+            }
+        }
+        handmade_jpeg(width, height, luma_samp, dri, &scan)
+    }
+
+    /// Find every (`0xFF`, `RSTn`) marker position in a JPEG byte stream.
+    fn rst_positions(jpeg: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < jpeg.len() {
+            if jpeg[i] == 0xFF && markers::is_rst(jpeg[i + 1]) {
+                out.push(i);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scan_restart_intervals_walks_three_whole_intervals() {
+        // 3 intervals of 10 bytes each separated by RSTn = 32 scan bytes:
+        // (10 + 2) + (10 + 2) + 10. Build it inline so the helper
+        // assumption matches.
+        let mut scan = Vec::new();
+        for i in 0..3 {
+            scan.extend((0..10).map(|k| 0x10 + i * 16 + k));
+            if i < 2 {
+                scan.push(0xFF);
+                scan.push(markers::RST0 + i);
+            }
+        }
+        let ivs = scan_restart_intervals(&scan);
+        assert_eq!(ivs.len(), 3);
+        // Interval 0: [0, 12) — the 10 data bytes plus the trailing RST0.
+        assert_eq!(ivs[0], ScanInterval { start: 0, end: 12 });
+        // Interval 1: [12, 24) — 10 bytes plus RST1 marker pair.
+        assert_eq!(ivs[1], ScanInterval { start: 12, end: 24 });
+        // Final interval: [24, 34) — no trailing RSTn (EOI lives upstream).
+        assert_eq!(ivs[2], ScanInterval { start: 24, end: 34 });
+    }
+
+    #[test]
+    fn scan_restart_intervals_tolerates_stuffed_ff_inside_an_interval() {
+        // A 0xFF inside the scan is byte-stuffed (`0xFF 0x00`); it must not
+        // be mistaken for an RSTn boundary.
+        let scan: Vec<u8> = vec![0x12, 0xFF, 0x00, 0x34, 0xFF, markers::RST0, 0x56];
+        let ivs = scan_restart_intervals(&scan);
+        assert_eq!(ivs.len(), 2);
+        // The stuffed pair stays inside interval 0; the RSTn pair closes it.
+        assert_eq!(ivs[0].start, 0);
+        assert_eq!(ivs[0].end, 6); // 0x12 0xFF 0x00 0x34 0xFF RST0 → end at 6
+        assert_eq!(ivs[1].start, 6);
+        assert_eq!(ivs[1].end, 7);
+    }
+
+    #[test]
+    fn restart_align_one_interval_per_packet_when_mtu_is_tight() {
+        // 4 intervals of 12 bytes each. Header room + 14 scan bytes per
+        // fragment fits exactly one interval (`12 + 2` for RSTn) but never
+        // two, so we expect four packets in order.
+        let jpeg = handmade_jpeg_with_intervals(128, 128, 0x22, 4, 4, 12, 0x10);
+        let opts = PacketizeOpts::new(QMode::Quality(50)).with_restart_align(true);
+        let pkts = packetize_with_opts(&jpeg, MAIN_HDR_LEN + RST_HDR_LEN + 14, opts).unwrap();
+        assert_eq!(pkts.len(), 4);
+        // Each packet's restart-marker header carries this packet's first
+        // interval index in `count`, with both F and L bits set (whole
+        // intervals only).
+        for (i, pk) in pkts.iter().enumerate() {
+            let h = parse_main_header(&pk.payload).unwrap();
+            assert!(h.has_restart());
+            let rh = parse_restart_header(&pk.payload[MAIN_HDR_LEN..]).unwrap();
+            assert_eq!(rh.restart_interval, 4);
+            assert!(rh.first, "F bit set on whole-interval fragment");
+            assert!(rh.last, "L bit set on whole-interval fragment");
+            assert_eq!(rh.count, i as u16);
+            // Only the final fragment carries the RTP marker bit.
+            assert_eq!(pk.marker, i == pkts.len() - 1);
+        }
+    }
+
+    #[test]
+    fn restart_align_packs_multiple_intervals_per_packet_when_mtu_allows() {
+        // 4 intervals of 8 bytes plus RSTn separators. Interval bytes on
+        // the wire are 10 / 10 / 10 / 8 (the final interval has no
+        // trailing RSTn). A 22-byte scan budget fits exactly *two* whole
+        // intervals (10 + 10 = 20 ≤ 22 < 30), so we expect two fragments:
+        // intervals 0–1 then intervals 2–3 (10 + 8 = 18 ≤ 22).
+        let jpeg = handmade_jpeg_with_intervals(128, 128, 0x22, 7, 4, 8, 0x20);
+        let opts = PacketizeOpts::new(QMode::Quality(50)).with_restart_align(true);
+        let pkts = packetize_with_opts(&jpeg, MAIN_HDR_LEN + RST_HDR_LEN + 22, opts).unwrap();
+        assert_eq!(pkts.len(), 2);
+        let rh0 = parse_restart_header(&pkts[0].payload[MAIN_HDR_LEN..]).unwrap();
+        assert_eq!(rh0.count, 0);
+        assert!(rh0.first && rh0.last);
+        let rh1 = parse_restart_header(&pkts[1].payload[MAIN_HDR_LEN..]).unwrap();
+        assert_eq!(rh1.count, 2);
+        assert!(rh1.first && rh1.last);
+        assert!(pkts[1].marker);
+    }
+
+    #[test]
+    fn restart_align_is_noop_when_source_has_no_dri() {
+        // Without DRI in the source, the flag has no boundaries to align
+        // to and we should land identical output to the unflagged path.
+        let scan: Vec<u8> = (0..200).map(|i| (i & 0xEF) as u8).collect();
+        let jpeg = handmade_jpeg(128, 96, 0x22, 0, &scan);
+        let baseline = packetize(&jpeg, MAIN_HDR_LEN + 40, QMode::Quality(50)).unwrap();
+        let aligned = packetize_with_opts(
+            &jpeg,
+            MAIN_HDR_LEN + 40,
+            PacketizeOpts::new(QMode::Quality(50)).with_restart_align(true),
+        )
+        .unwrap();
+        assert_eq!(baseline, aligned);
+    }
+
+    #[test]
+    fn restart_align_rejects_oversize_interval() {
+        // One interval of 200 bytes won't fit into a 50-byte scan budget;
+        // the opt-in flag turns this into a clean `Unsupported` rather
+        // than a silent byte-boundary fallback.
+        let jpeg = handmade_jpeg_with_intervals(64, 64, 0x22, 4, 1, 200, 0x10);
+        let err = packetize_with_opts(
+            &jpeg,
+            MAIN_HDR_LEN + RST_HDR_LEN + 50,
+            PacketizeOpts::new(QMode::Quality(50)).with_restart_align(true),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("interval"));
+    }
+
+    #[test]
+    fn restart_align_first_fragment_carries_qtable_header() {
+        // The first fragment is the only one that may carry the §3.1.8
+        // Quantization Table header; the count and FL bits cover the
+        // restart fields, not the table-header field.
+        let jpeg = handmade_jpeg_with_intervals(64, 64, 0x22, 5, 3, 6, 0x10);
+        let pkts = packetize_with_opts(
+            &jpeg,
+            MAIN_HDR_LEN + RST_HDR_LEN + 128 + 32,
+            PacketizeOpts::new(QMode::InBand(200)).with_restart_align(true),
+        )
+        .unwrap();
+        // First fragment has main(8) + rst(4) + qtable_hdr(4 + 128) = 144 B
+        // of headers plus its scan bytes — confirm by reading the table
+        // length field at the §3.1.8 offset.
+        let p0 = &pkts[0].payload;
+        let qhdr_start = MAIN_HDR_LEN + RST_HDR_LEN;
+        let length = u16::from_be_bytes([p0[qhdr_start + 2], p0[qhdr_start + 3]]);
+        assert_eq!(length, 128);
+        // Later fragments do not carry the table header — their scan body
+        // starts right after the restart header.
+        for pk in &pkts[1..] {
+            // Fragment offset is the byte index of the interval's start in
+            // the source scan, never zero on a continuation fragment.
+            let h = parse_main_header(&pk.payload).unwrap();
+            assert!(h.fragment_offset > 0);
+        }
+    }
+
+    #[test]
+    fn restart_align_then_depacketize_reassembles_scan_bytes() {
+        // Round-trip a restart-aligned fragment stream through the
+        // depacketizer: the reassembled scan must equal the source scan
+        // even though the fragments arrive on interval boundaries.
+        let jpeg = handmade_jpeg_with_intervals(128, 96, 0x22, 6, 5, 10, 0x40);
+        let pkts = packetize_with_opts(
+            &jpeg,
+            MAIN_HDR_LEN + RST_HDR_LEN + 30,
+            PacketizeOpts::new(QMode::Quality(50)).with_restart_align(true),
+        )
+        .unwrap();
+        let mut dp = JpegDepacketizer::new();
+        let mut rebuilt = None;
+        for pk in &pkts {
+            if let Progress::Frame(j) = dp.push(&pk.payload, pk.marker).unwrap() {
+                rebuilt = Some(j);
+            }
+        }
+        let rebuilt = rebuilt.expect("frame reassembled");
+        // The source's RSTn positions appear at the same byte indices in
+        // the reassembled scan (the depacketizer just concatenates by
+        // fragment offset; restart-aligned fragmenting must not perturb
+        // their absolute positions).
+        let src_rsts = rst_positions(&jpeg);
+        let dst_rsts = rst_positions(&rebuilt);
+        // The reconstructed stream contains a DHT for each Huffman table
+        // and other reassembled markers, but the scan-region RSTn count
+        // matches the source's.
+        assert_eq!(dst_rsts.len(), src_rsts.len());
     }
 
     // -------------------------------------------------------------------

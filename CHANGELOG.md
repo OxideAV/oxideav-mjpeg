@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `encoder::encode_jpeg_grayscale(width, height, samples, stride, quality)`
+  emits a standalone baseline (SOF0) single-component grayscale JPEG at
+  8-bit precision. The bitstream layout is the usual `SOI / JFIF APP0 /
+  DQT (one luma table, scaled by quality) / SOF0 (Nf=1, H=V=1, P=8) /
+  DHT (Annex K luma DC + AC) / SOS (Ns=1) / scan / EOI`. The companion
+  variants `encode_jpeg_grayscale_with_opts(..., restart_interval)` and
+  `encode_jpeg_grayscale_with_meta(..., restart_interval, meta)` add DRI
+  + `RSTn` emission (same once-per-`restart_interval`-MCUs scheme the
+  YUV baseline path uses, with predictor reset and `RST0..=RST7`
+  cycling per T.81 §F.1.1.5.2) and APP/COM pass-through respectively.
+  Bitstreams round-trip through the existing SOF0 single-component
+  decode path: high quality stays within ±4 LSB on smooth content,
+  default quality (75) sits above 30 dB PSNR on synthetic gradients,
+  and `Q = 100` collapses to the all-1 luma quantiser so any residual
+  error comes from f32 DCT/IDCT rounding alone.
+- `MjpegEncoder::send_frame` (registry-side trait API) now accepts
+  `PixelFormat::Gray8` without `set_lossless(true)` and routes it to
+  the new baseline grayscale path. `set_lossless(true)` keeps the
+  bit-exact SOF3 path for the same input. Higher-precision grayscale
+  (`Gray10Le` / `Gray12Le` / `Gray16Le`) still requires
+  `set_lossless(true)` — the DCT path is 8-bit by spec — and a clear
+  `Unsupported` error surfaces when callers forget. Three new
+  integration tests in `tests/roundtrip.rs` cover the trait-API
+  baseline path (default quality round-trip with PSNR floor), the
+  lossless-flag-still-bit-exact path, and the
+  high-bit-depth-without-lossless rejection. The existing
+  `registry_encoder_gray8_without_lossless_flag_errors` test is
+  rewritten as `registry_encoder_gray8_without_lossless_flag_takes_baseline`
+  to assert the new SOF0 emission shape, paired with a fresh
+  `registry_encoder_gray12_without_lossless_flag_errors` to lock in
+  the high-bit-depth rejection contract.
+
 ### Changed
 
 - docs: scrub decorative external-implementation attribution from

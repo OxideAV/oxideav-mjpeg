@@ -30,8 +30,9 @@ use oxideav_core::{
 use crate::container;
 use crate::decoder::decode_jpeg;
 use crate::encoder::{
-    encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_progressive, encode_jpeg_with_opts,
-    encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
+    encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts,
+    encode_jpeg_progressive, encode_jpeg_with_opts, encode_lossless_jpeg_grayscale,
+    DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
@@ -337,9 +338,10 @@ impl MjpegEncoder {
             quality: DEFAULT_QUALITY,
             restart_interval: 0,
             progressive: false,
-            // Lossless mode is opt-in even for grayscale: callers may
-            // legitimately want a (lossy) baseline encode of `Gray8`
-            // input in the future, so default to off.
+            // Lossless mode is opt-in even for grayscale. `Gray8` input
+            // takes the baseline (SOF0) single-component DCT path by
+            // default; flip `set_lossless(true)` to switch to the
+            // bit-exact SOF3 path instead.
             lossless: false,
             lossless_predictor: 1,
             cmyk_adobe_transform: None,
@@ -385,6 +387,13 @@ impl MjpegEncoder {
     /// the input pixel format is `Gray8` / `Gray10Le` / `Gray12Le` /
     /// `Gray16Le`; ignored for YUV inputs (which always take the
     /// baseline / progressive DCT path).
+    ///
+    /// For `Gray8` input the flag is a real toggle: `false` takes the
+    /// baseline (SOF0) single-component DCT path (lossy, scaled by
+    /// `quality`), `true` takes the bit-exact lossless (SOF3) path.
+    /// The three higher-precision grayscale variants
+    /// (`Gray10Le` / `Gray12Le` / `Gray16Le`) require `set_lossless(true)`
+    /// — the DCT path is 8-bit by spec.
     ///
     /// The lossless path is bit-exact and reuses the predictor selected
     /// by [`Self::set_lossless_predictor`] (default 1 = Ra / left). It
@@ -496,19 +505,41 @@ impl Encoder for MjpegEncoder {
                             self.lossless_predictor,
                         )?
                     }
-                    // Grayscale without lossless enabled is currently
-                    // unsupported on the registry side (the baseline
-                    // DCT encoder still only handles YUV). Surface a
+                    // 8-bit grayscale without lossless mode takes the
+                    // baseline (SOF0) single-component DCT path. The
+                    // bitstream layout mirrors `encode_jpeg` reduced to
+                    // one luma component (one DQT + DC/AC luma Huffman
+                    // tables + a one-entry SOS), so any conformant
+                    // decoder produces a `Gray8` frame round-tripping
+                    // with the usual DCT-quantise distortion floor.
+                    (MjpegPixelFormat::Gray8, false) => {
+                        if v.planes.is_empty() {
+                            return Err(Error::invalid(
+                                "MJPEG encoder: grayscale frame missing plane 0",
+                            ));
+                        }
+                        let plane = &v.planes[0];
+                        encode_jpeg_grayscale_with_opts(
+                            self.width,
+                            self.height,
+                            &plane.data,
+                            plane.stride,
+                            self.quality,
+                            self.restart_interval,
+                        )?
+                    }
+                    // Higher-precision grayscale (10 / 12 / 16-bit)
+                    // still requires `set_lossless(true)` — the
+                    // baseline DCT path is 8-bit by spec. Surface a
                     // clear error rather than silently downgrading.
                     (
-                        MjpegPixelFormat::Gray8
-                        | MjpegPixelFormat::Gray10Le
+                        MjpegPixelFormat::Gray10Le
                         | MjpegPixelFormat::Gray12Le
                         | MjpegPixelFormat::Gray16Le,
                         false,
                     ) => {
                         return Err(Error::unsupported(
-                            "MJPEG encoder: grayscale input requires set_lossless(true)",
+                            "MJPEG encoder: high-bit-depth grayscale input requires set_lossless(true)",
                         ));
                     }
                     // 4-component CMYK / YCCK input takes the dedicated

@@ -3,7 +3,7 @@
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
+    CodecId, CodecParameters, Encoder, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
 };
 
 fn make_gradient_frame(w: u32, h: u32, pix: PixelFormat) -> VideoFrame {
@@ -721,4 +721,165 @@ fn decode_sof1_extended_sequential() {
     dec.send_packet(&in_pkt).unwrap();
     let out = dec.receive_frame().expect("decode SOF1");
     let Frame::Video(_v) = out else { panic!() };
+}
+
+/// Trait-API encode → decode round-trip for the new baseline (SOF0)
+/// `Gray8` path. `set_lossless(false)` (the default) routes single-plane
+/// grayscale input to the lossy DCT path; high quality keeps the
+/// per-sample reconstruction error below a small floor.
+#[test]
+fn roundtrip_gray8_trait_api_high_quality() {
+    let w = 32u32;
+    let h = 32u32;
+    let stride = w as usize;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            samples[y * stride + x] = ((x * 5 + y * 9) % 256) as u8;
+        }
+    }
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride,
+            data: samples.clone(),
+        }],
+    };
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Gray8);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    // Default = lossy baseline; high quality minimises per-sample error.
+    assert!(!enc.lossless(), "Gray8 default must be lossy");
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("recv");
+
+    // SOI + EOI sanity.
+    assert_eq!(&pkt.data[..2], &[0xFF, 0xD8]);
+    assert_eq!(&pkt.data[pkt.data.len() - 2..], &[0xFF, 0xD9]);
+    // SOF0 declares 1 component.
+    let sof0_pos = pkt
+        .data
+        .windows(2)
+        .position(|w| w == [0xFF, 0xC0])
+        .expect("SOF0 present");
+    let nf = pkt.data[sof0_pos + 9];
+    assert_eq!(nf, 1, "SOF0 Nf must equal 1");
+
+    // Decode and verify the recovered frame.
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    assert_eq!(v.planes.len(), 1, "Gray8 frame has one plane");
+    // Default quality (75) → PSNR ≥ 30 dB on this small pseudo-random pattern.
+    let mut sse: f64 = 0.0;
+    let mut count: usize = 0;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let a = samples[y * stride + x] as f64;
+            let b = v.planes[0].data[y * v.planes[0].stride + x] as f64;
+            let d = a - b;
+            sse += d * d;
+            count += 1;
+        }
+    }
+    let mse = sse / count as f64;
+    let psnr = if mse <= f64::EPSILON {
+        99.0
+    } else {
+        20.0 * (255.0_f64 / mse.sqrt()).log10()
+    };
+    assert!(psnr >= 30.0, "Gray8 trait-API PSNR = {psnr:.2} dB");
+}
+
+/// The trait-API path keeps `set_lossless(true)` working — flipping the
+/// flag must route to the bit-exact SOF3 path.
+#[test]
+fn roundtrip_gray8_trait_api_lossless_is_still_exact() {
+    let w = 16u32;
+    let h = 16u32;
+    let stride = w as usize;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            samples[y * stride + x] = ((x * 13 + y * 7) % 256) as u8;
+        }
+    }
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride,
+            data: samples.clone(),
+        }],
+    };
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Gray8);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    enc.set_lossless(true);
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("recv");
+
+    // SOF3 marker present (0xFFC3).
+    assert!(
+        pkt.data.windows(2).any(|w| w == [0xFF, 0xC3]),
+        "lossless mode must emit SOF3"
+    );
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    assert_eq!(v.planes.len(), 1);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let a = samples[y * stride + x];
+            let b = v.planes[0].data[y * v.planes[0].stride + x];
+            assert_eq!(a, b, "lossless mismatch at ({x},{y})");
+        }
+    }
+}
+
+/// 10-bit / 12-bit / 16-bit grayscale still requires `set_lossless(true)`
+/// — the DCT path is 8-bit by spec. The trait API surfaces a clean
+/// `Unsupported` error.
+#[test]
+fn roundtrip_gray10_without_lossless_is_rejected() {
+    let w = 8u32;
+    let h = 8u32;
+    // 16-bit-LE plane (2 bytes per sample).
+    let samples = vec![0u8; (w as usize) * 2 * (h as usize)];
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride: (w as usize) * 2,
+            data: samples,
+        }],
+    };
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Gray10Le);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    // Default = lossy attempt; that's not legal for 10-bit.
+    let err = enc.send_frame(&Frame::Video(frame)).expect_err("must fail");
+    assert!(
+        matches!(err, oxideav_core::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
 }

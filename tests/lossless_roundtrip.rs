@@ -637,10 +637,11 @@ fn registry_encoder_gray8_lossless_roundtrip() {
     }
 }
 
-/// Grayscale without `set_lossless(true)` must surface a clear error
-/// rather than silently fall back to a non-functional code path.
+/// `Gray8` input without `set_lossless(true)` now takes the baseline
+/// (SOF0) single-component DCT path — the encoder emits a complete
+/// SOF0 + SOS bitstream and the decoder recovers a `Gray8` frame.
 #[test]
-fn registry_encoder_gray8_without_lossless_flag_errors() {
+fn registry_encoder_gray8_without_lossless_flag_takes_baseline() {
     use oxideav_core::frame::VideoPlane;
     use oxideav_core::{Encoder, VideoFrame};
 
@@ -651,18 +652,63 @@ fn registry_encoder_gray8_without_lossless_flag_errors() {
     enc_params.height = Some(h);
     enc_params.pixel_format = Some(PixelFormat::Gray8);
     let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).unwrap();
-    // No set_lossless(true) here.
+    // No `set_lossless(true)` here — default is the new baseline path.
     let frame = Frame::Video(VideoFrame {
         pts: Some(0),
         planes: vec![VideoPlane {
             stride: w as usize,
-            data: vec![0u8; (w * h) as usize],
+            data: vec![100u8; (w * h) as usize],
+        }],
+    });
+    enc.send_frame(&frame).expect("send_frame baseline Gray8");
+    let pkt = enc.receive_packet().expect("recv baseline pkt");
+    // Output must carry SOF0 (lossy baseline), not SOF3 (lossless).
+    assert!(pkt.data.windows(2).any(|w| w == [0xFF, 0xC0]));
+    assert!(!pkt.data.windows(2).any(|w| w == [0xFF, 0xC3]));
+
+    // Decode the result back to a `Gray8` frame.
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec.send_packet(&oxideav_core::Packet::new(
+        0,
+        oxideav_core::TimeBase::new(1, 30),
+        pkt.data,
+    ))
+    .expect("send pkt");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video frame")
+    };
+    assert_eq!(v.planes.len(), 1);
+}
+
+/// Higher-precision grayscale (10 / 12 / 16-bit) still requires
+/// `set_lossless(true)` — the baseline DCT path is 8-bit by spec.
+#[test]
+fn registry_encoder_gray12_without_lossless_flag_errors() {
+    use oxideav_core::frame::VideoPlane;
+    use oxideav_core::{Encoder, VideoFrame};
+
+    let w = 8u32;
+    let h = 8u32;
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Gray12Le);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).unwrap();
+    // No set_lossless(true) — 12-bit DCT isn't a thing on this path.
+    let frame = Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride: (w as usize) * 2,
+            data: vec![0u8; (w as usize) * 2 * (h as usize)],
         }],
     });
     let err = enc.send_frame(&frame).unwrap_err();
     assert!(
-        format!("{err:?}").to_lowercase().contains("lossless"),
-        "expected lossless-hint error, got {err:?}"
+        matches!(err, oxideav_core::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
     );
 }
 

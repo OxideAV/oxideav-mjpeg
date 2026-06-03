@@ -2165,6 +2165,199 @@ pub fn encode_jpeg_cmyk_progressive(
     encode_jpeg_progressive_cmyk_1111(width, height, &refs, &strides, quality, adobe_transform)
 }
 
+// ---- Baseline (SOF0) single-component grayscale (Gray8) encoder ---------
+//
+// Single-component sequential JPEG at 8-bit precision. Mirrors the layout
+// of [`encode_jpeg`] but emits only one component (`Y`, id 1, `H=V=1`),
+// one DQT (luma), the standard DC/AC luma Huffman pair, and a one-entry
+// SOS. The MCU is one 8x8 block of luma; the scan walks the picture in
+// raster order with the same per-block path the YUV encoder uses
+// (`fill_block` → `encode_block`).
+
+/// Encode a single-component grayscale image as a standalone **baseline
+/// sequential** JPEG byte stream (`FF D8 … FF D9`). The bitstream layout
+/// is the usual SOI / JFIF APP0 / DQT (luma quantiser scaled by `quality`)
+/// / SOF0 (one component, `H = V = 1`, precision 8) / DHT (Annex K luma
+/// DC and AC) / optional DRI / SOS / entropy scan / EOI sequence — the
+/// exact same shape as [`encode_jpeg`] reduced to one luma component.
+///
+/// Inputs:
+/// - `samples`: tightly-packed grayscale samples in row-major order, each
+///   byte covering one pixel.
+/// - `stride`: bytes per row; must be `>= width`.
+/// - `quality`: 1..=100, scaled against the Annex K Q=50 base table.
+///
+/// Round-trips through the matching SOF0 decoder (which emits
+/// `PixelFormat::Gray8`) with the usual DCT-quantise-IDCT distortion
+/// floor: PSNR climbs above ~40 dB by quality 75 and approaches 60 dB
+/// at quality 100 on smooth content.
+///
+/// No restart markers and no metadata segments are emitted; for the
+/// DRI + `RSTn` and APP-pass-through variants see
+/// [`encode_jpeg_grayscale_with_opts`] and
+/// [`encode_jpeg_grayscale_with_meta`].
+pub fn encode_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    encode_jpeg_grayscale_with_meta(width, height, samples, stride, quality, 0, &[])
+}
+
+/// Like [`encode_jpeg_grayscale`] but also emits a DRI segment and cycles
+/// `RST0..=RST7` markers every `restart_interval` MCUs during the scan.
+/// Passing `0` disables restart marker emission (equivalent to
+/// [`encode_jpeg_grayscale`]).
+pub fn encode_jpeg_grayscale_with_opts(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    restart_interval: u16,
+) -> Result<Vec<u8>> {
+    encode_jpeg_grayscale_with_meta(
+        width,
+        height,
+        samples,
+        stride,
+        quality,
+        restart_interval,
+        &[],
+    )
+}
+
+/// Like [`encode_jpeg_grayscale_with_opts`] but inserts `meta` verbatim
+/// between the SOI and the first DQT segment. `meta` must contain only
+/// APP0..APP15 or COM segments (each starting with `0xFF 0xEn` /
+/// `0xFF 0xFE` followed by a big-endian length). Use
+/// [`extract_app_segments`] to harvest metadata from a source JPEG.
+///
+/// When `meta` is empty this is bit-for-bit identical to
+/// [`encode_jpeg_grayscale_with_opts`].
+pub fn encode_jpeg_grayscale_with_meta(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    restart_interval: u16,
+    meta: &[u8],
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("grayscale encoder: zero-size image"));
+    }
+    if stride < w {
+        return Err(Error::invalid(
+            "grayscale encoder: stride smaller than width",
+        ));
+    }
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "grayscale encoder: samples shorter than stride*h",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(8_192);
+    // SOI.
+    out.push(0xFF);
+    out.push(markers::SOI);
+    // Metadata segments (JFIF APP0 fallback when caller provides nothing).
+    if meta.is_empty() {
+        write_jfif_app0(&mut out);
+    } else {
+        out.extend_from_slice(meta);
+    }
+    // DQT — one table, table id 0, precision 0 (8-bit).
+    write_dqt(&mut out, 0, &luma_q);
+    // SOF0 — single component, `H = V = 1`.
+    write_sof0_grayscale_8bit(&mut out, w as u16, h as u16);
+    // DHT — Annex K luma DC + AC.
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    // DRI before SOS per T.81 §F.2.2.4.
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    // SOS — one component (id 1), DC=0, AC=0.
+    write_sos_grayscale_8bit(&mut out);
+
+    // Scan: one 8x8 block per MCU, walked in raster order. The MCU is
+    // exactly one luma data unit because the single component declares
+    // `H = V = 1`.
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let total_mcus = mcus_x.saturating_mul(mcus_y);
+    let ri = restart_interval as usize;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: usize = 0;
+    let mut mcu_index: usize = 0;
+
+    let mut bw = BitWriter::new(&mut out);
+    let mut prev_dc: i32 = 0;
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            let mut blk = [0.0f32; 64];
+            fill_block(&mut blk, samples, stride, w, h, mx * 8, my * 8);
+            encode_block(
+                &mut bw,
+                &mut blk,
+                &luma_q,
+                &mut prev_dc,
+                &huff.luma_dc,
+                &huff.luma_ac,
+            );
+
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            // Restart boundary — same semantics as `write_scan`: never
+            // emit `RSTn` after the very last MCU because the decoder
+            // expects EOI immediately past the final residual.
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                prev_dc = 0;
+                mcus_since_restart = 0;
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+fn write_sof0_grayscale_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(8); // P = 8
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf = 1
+    payload.push(1); // component id 1 (`Y`)
+    payload.push(0x11); // H = 1, V = 1
+    payload.push(0); // quantiser table 0
+    write_length_prefix(out, markers::SOF0, &payload);
+}
+
+fn write_sos_grayscale_8bit(out: &mut Vec<u8>) {
+    let payload: [u8; 6] = [
+        1, // Ns = 1
+        1, 0x00, // component 1 → DC = 0, AC = 0
+        0, 63, 0, // Ss = 0, Se = 63, Ah = 0 | Al = 0
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
 /// Test-only: emit a single-component, 12-bit precision baseline JPEG.
 /// `samples` carries u16 values in `[0, 4095]`. Caller must keep inputs
 /// moderate enough that per-block DC/AC Huffman categories stay ≤ 11 —
@@ -3591,6 +3784,216 @@ mod tests {
             let (s2, b2) = category_lossless(v + 0x1_0000);
             assert_eq!((s1, b1), (s2, b2), "mod-2^16 alias mismatch at v={v}");
         }
+    }
+
+    // ---- Baseline grayscale (SOF0 single-component, P=8) ----------
+
+    #[test]
+    fn baseline_grayscale_emits_well_formed_jpeg() {
+        // Smooth gradient → small DCT magnitudes, easy on the entropy
+        // coder. We only care that the output is a complete SOI..EOI
+        // bytestream with a SOF0 (`Nf = 1`) frame header.
+        let w = 16usize;
+        let h = 16usize;
+        let mut samples = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                samples[y * w + x] = ((x + y) * 8) as u8;
+            }
+        }
+        let jpeg =
+            encode_jpeg_grayscale(w as u32, h as u32, &samples, w, 75).expect("encode grayscale");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "expected SOI prefix");
+        assert_eq!(
+            &jpeg[jpeg.len() - 2..],
+            &[0xFF, 0xD9],
+            "expected EOI suffix"
+        );
+        // Walk segments up to SOS (the scan body that follows isn't
+        // length-prefixed) and find SOF0 + check its single-component
+        // shape.
+        let mut found_sof0 = false;
+        let mut i = 2;
+        while i + 3 < jpeg.len() {
+            assert_eq!(jpeg[i], 0xFF, "expected marker prefix at {i}");
+            let marker = jpeg[i + 1];
+            // Bail out once we reach SOS — the entropy scan that
+            // follows isn't length-prefixed.
+            if marker == 0xDA {
+                break;
+            }
+            let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+            if marker == 0xC0 {
+                // SOF0 payload: P, Y, X, Nf, then component records.
+                let p = i + 4;
+                let precision = jpeg[p];
+                let nf = jpeg[p + 5];
+                assert_eq!(precision, 8, "SOF0 precision must be 8");
+                assert_eq!(nf, 1, "SOF0 must declare a single component");
+                let comp_id = jpeg[p + 6];
+                let hv = jpeg[p + 7];
+                let tq = jpeg[p + 8];
+                assert_eq!(comp_id, 1, "component id");
+                assert_eq!(hv, 0x11, "H = V = 1");
+                assert_eq!(tq, 0, "single quant table id");
+                found_sof0 = true;
+            }
+            i += 2 + len;
+        }
+        assert!(found_sof0, "expected SOF0 segment in output");
+    }
+
+    #[test]
+    fn baseline_grayscale_high_quality_roundtrip_is_near_lossless() {
+        // High quality → tiny quantiser → near bit-exact reconstruction.
+        // We assert per-sample max-diff stays small; PSNR shoots up so
+        // we don't need a separate dB check.
+        let w = 32usize;
+        let h = 32usize;
+        let mut samples = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                samples[y * w + x] = (((x * 7 + y * 11) % 256) as u8).clamp(0, 255);
+            }
+        }
+        let jpeg =
+            encode_jpeg_grayscale(w as u32, h as u32, &samples, w, 100).expect("encode grayscale");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        assert_eq!(frame.planes.len(), 1, "Gray8 frame has one plane");
+        let recovered = &frame.planes[0].data;
+        assert!(recovered.len() >= w * h, "recovered plane too short");
+        let stride = frame.planes[0].stride;
+        let mut max_diff: u32 = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let a = samples[y * w + x];
+                let b = recovered[y * stride + x];
+                let d = (a as i32 - b as i32).unsigned_abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+            }
+        }
+        // Annex K luma table at Q=100 scales to all-1 quantisers, so any
+        // residual delta comes from f32 DCT/IDCT rounding only. ±4 LSB
+        // is a generous ceiling; we typically see ≤ 2.
+        assert!(max_diff <= 4, "Q=100 max diff = {max_diff} (expected ≤ 4)");
+    }
+
+    #[test]
+    fn baseline_grayscale_q75_roundtrip_psnr_above_30db() {
+        // The standard quality default. Loose floor: PSNR ≥ 30 dB on a
+        // smooth-ish synthetic pattern. The same Annex K matrices the
+        // 3-component YUV path uses, exercised on a single plane.
+        let w = 64usize;
+        let h = 64usize;
+        let mut samples = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x as i32 - 32).abs() + (y as i32 - 32).abs()) as u32;
+                samples[y * w + x] = (128 + (r as i32 - 32).clamp(-127, 127)) as u8;
+            }
+        }
+        let jpeg = encode_jpeg_grayscale(w as u32, h as u32, &samples, w, DEFAULT_QUALITY)
+            .expect("encode grayscale");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let recovered = &frame.planes[0].data;
+        let stride = frame.planes[0].stride;
+        let mut sse: f64 = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                let a = samples[y * w + x] as f64;
+                let b = recovered[y * stride + x] as f64;
+                let d = a - b;
+                sse += d * d;
+            }
+        }
+        let mse = sse / (w * h) as f64;
+        let psnr = if mse <= f64::EPSILON {
+            99.0
+        } else {
+            20.0 * (255.0_f64 / mse.sqrt()).log10()
+        };
+        assert!(psnr >= 30.0, "Q=75 PSNR = {psnr:.2} dB (expected ≥ 30)");
+    }
+
+    #[test]
+    fn baseline_grayscale_rejects_short_stride() {
+        let samples = vec![0u8; 16 * 16];
+        let err =
+            encode_jpeg_grayscale(16, 16, &samples, 8, 75).expect_err("stride < width must fail");
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn baseline_grayscale_rejects_short_buffer() {
+        // Stride OK but the caller passed too few rows.
+        let samples = vec![0u8; 16 * 8];
+        let err = encode_jpeg_grayscale(16, 16, &samples, 16, 75)
+            .expect_err("samples shorter than stride*h must fail");
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn baseline_grayscale_with_opts_emits_dri_and_restart() {
+        // restart_interval = 4 MCUs on a 16x16 image (4 MCUs total per
+        // row → restart fires once per row). Decode must succeed and
+        // round-trip.
+        let w = 32u32;
+        let h = 32u32;
+        let mut samples = vec![0u8; (w * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                samples[y * w as usize + x] = ((x + y) as u8).wrapping_mul(3);
+            }
+        }
+        let jpeg = encode_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 80, 4)
+            .expect("encode grayscale with DRI");
+        // DRI marker = 0xFFDD.
+        let mut found_dri = false;
+        let mut found_rst = false;
+        for i in 0..jpeg.len().saturating_sub(1) {
+            if jpeg[i] == 0xFF && jpeg[i + 1] == 0xDD {
+                found_dri = true;
+            }
+            if jpeg[i] == 0xFF && (0xD0..=0xD7).contains(&jpeg[i + 1]) {
+                found_rst = true;
+            }
+        }
+        assert!(found_dri, "DRI segment must be present when interval > 0");
+        assert!(found_rst, "at least one RSTn marker must be present");
+        // Decode succeeds and shape matches.
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode DRI grayscale");
+        assert_eq!(frame.planes.len(), 1);
+    }
+
+    #[test]
+    fn baseline_grayscale_with_meta_embeds_app_segments() {
+        // Build a fake APP1 (EXIF placeholder) segment and confirm it
+        // appears verbatim in the output ahead of DQT.
+        let w = 16u32;
+        let h = 16u32;
+        let samples = vec![100u8; (w * h) as usize];
+        let app1_body = b"FAKEEXIF";
+        let mut meta = Vec::new();
+        meta.push(0xFF);
+        meta.push(0xE1); // APP1
+        let len = (2 + app1_body.len()) as u16;
+        meta.extend_from_slice(&len.to_be_bytes());
+        meta.extend_from_slice(app1_body);
+        let jpeg = encode_jpeg_grayscale_with_meta(w, h, &samples, w as usize, 90, 0, &meta)
+            .expect("encode with meta");
+        // First marker after SOI must be APP1; default JFIF APP0 must
+        // be absent on this path.
+        assert_eq!(&jpeg[2..4], &[0xFF, 0xE1], "APP1 must follow SOI");
+        // The APP1 body bytes must be present verbatim.
+        assert!(
+            jpeg.windows(app1_body.len()).any(|w| w == app1_body),
+            "APP1 body not embedded"
+        );
+        // And the decoder still consumes the output cleanly.
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
+        assert_eq!(frame.planes.len(), 1);
     }
 
     #[test]

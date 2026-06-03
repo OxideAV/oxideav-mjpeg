@@ -68,13 +68,19 @@ enc.send_frame(&Frame::Video(frame_yuv420))?;
 let pkt = enc.receive_packet()?;
 ```
 
-The encoder accepts `Yuv444P`, `Yuv422P`, or `Yuv420P` planar input and
-emits a standalone baseline JPEG per frame: SOI, JFIF APP0, DQT, SOF0,
-DHT (Annex K typical tables), optional DRI, SOS, entropy scan, EOI.
-Default quality factor is 75 on the Annex K Q=50 base-table scaling
-(see `oxideav_mjpeg::encoder::DEFAULT_QUALITY`); `encoder::encode_jpeg(frame,
-quality)` is also exposed for sibling crates that wrap the same
-bitstream in custom containers.
+The encoder accepts `Yuv444P`, `Yuv422P`, `Yuv420P`, or `Gray8` planar
+input and emits a standalone baseline JPEG per frame: SOI, JFIF APP0,
+DQT, SOF0, DHT (Annex K typical tables), optional DRI, SOS, entropy
+scan, EOI. Default quality factor is 75 on the Annex K Q=50 base-table
+scaling (see `oxideav_mjpeg::encoder::DEFAULT_QUALITY`);
+`encoder::encode_jpeg(frame, quality)` is also exposed for sibling
+crates that wrap the same bitstream in custom containers. For
+single-component `Gray8` callers that already hold a flat row-major
+byte buffer, `encoder::encode_jpeg_grayscale(width, height, samples,
+stride, quality)` is the direct entry point; the corresponding
+`encode_jpeg_grayscale_with_opts(..., restart_interval)` and
+`encode_jpeg_grayscale_with_meta(..., restart_interval, meta)` variants
+add DRI + `RSTn` emission and APP/COM pass-through respectively.
 
 Restart markers (`RSTn` + DRI) are supported for interop and bitstream
 resiliency. They are **off by default** — call
@@ -458,10 +464,11 @@ Decoder:
 Encoder:
 
 - **SOF0** (baseline sequential) — 8-bit Huffman, Annex K tables.
-  3-component YUV at 4:4:4 / 4:2:2 / 4:2:0, plus 4-component CMYK /
-  YCCK at `H_i = V_i = 1` with the Adobe APP14 colour-transform flag
-  configurable via the dedicated public CMYK entry points (and the
-  trait API's `set_adobe_transform`).
+  3-component YUV at 4:4:4 / 4:2:2 / 4:2:0, single-component `Gray8`
+  (`H = V = 1`, one DQT + DC/AC luma Huffman pair + one-entry SOS),
+  plus 4-component CMYK / YCCK at `H_i = V_i = 1` with the Adobe APP14
+  colour-transform flag configurable via the dedicated public CMYK
+  entry points (and the trait API's `set_adobe_transform`).
 - **SOF2** (progressive) — spectral-selection decomposition (default:
   7 SOS scans, `Ah=0`, `Al=0`) and full successive-approximation
   decomposition (14 SOS scans, 1-bit point transform). See above. The
@@ -480,8 +487,9 @@ Encoder:
   `encode_lossless_jpeg_rgb_with_opts` /
   `encode_lossless_jpeg_cmyk_with_opts`. Restart boundaries re-seed
   every component's predictor to `2^(P − Pt − 1)` per T.81 §H.1.2.1.
-- 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths; `Gray8` /
-  `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless path.
+- 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths, plus single-
+  component `Gray8` on the baseline SOF0 path; `Gray8` / `Gray10Le` /
+  `Gray12Le` / `Gray16Le` input on the lossless path.
 - Optional DRI + `RSTn` emission on the baseline path (off by default;
   see the Encoder section above).
 

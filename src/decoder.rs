@@ -304,16 +304,25 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                         sof.precision
                     )));
                 }
-                // Single-component grayscale and three-component RGB-class
-                // interleaved scans (each component declared `H_i = V_i = 1`,
-                // per T.81 §H.1.2) are supported. Components with non-unit
-                // sampling factors are rejected — Annex H pairs lossless
-                // with `data unit = one sample` (E.1.1), so non-1:1 sampling
-                // would not be a well-defined MCU.
-                if !matches!(sof.components.len(), 1 | 3) {
+                // Single-component grayscale, three-component RGB-class and
+                // four-component CMYK-class interleaved scans (each component
+                // declared `H_i = V_i = 1`, per T.81 §H.1.2) are supported.
+                // Components with non-unit sampling factors are rejected —
+                // Annex H pairs lossless with `data unit = one sample`
+                // (E.1.1), so non-1:1 sampling would not be a well-defined
+                // MCU. The four-component path is `P = 8` only because the
+                // workspace `PixelFormat` enum has no high-bit-depth CMYK
+                // variant — wider precisions are rejected here.
+                if !matches!(sof.components.len(), 1 | 3 | 4) {
                     return Err(Error::unsupported(format!(
-                        "lossless JPEG: {} component(s) — only 1 (grayscale) and 3 (RGB-class) are supported",
+                        "lossless JPEG: {} component(s) — only 1 (grayscale), 3 (RGB-class) and 4 (CMYK-class) are supported",
                         sof.components.len()
+                    )));
+                }
+                if sof.components.len() == 4 && sof.precision != 8 {
+                    return Err(Error::unsupported(format!(
+                        "lossless JPEG: 4-component scans require precision 8, got {}",
+                        sof.precision
                     )));
                 }
                 if sof.components.len() > 1 {
@@ -2146,15 +2155,20 @@ fn decode_lossless_scan(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
-    if !matches!(sos.components.len(), 1 | 3) {
+    if !matches!(sos.components.len(), 1 | 3 | 4) {
         return Err(Error::unsupported(format!(
-            "lossless: {} component(s) — only 1 and 3 are supported",
+            "lossless: {} component(s) — only 1, 3 and 4 are supported",
             sos.components.len()
         )));
     }
     if sos.components.len() != sof.components.len() {
         return Err(Error::unsupported(
             "lossless: non-interleaved multi-component scans are not supported",
+        ));
+    }
+    if sos.components.len() == 4 && sof.precision != 8 {
+        return Err(Error::unsupported(
+            "lossless: 4-component scans require precision 8",
         ));
     }
     let predictor = sos.ss;
@@ -2279,6 +2293,59 @@ fn decode_lossless_scan(
             reset_pred = false;
             mcus_since_restart += 1;
         }
+    }
+
+    // Four-component decode: pack the per-component planes into a single
+    // row-major `C M Y K` output (packed `PixelFormat::Cmyk`, 4
+    // bytes/pixel). All components are `H_i = V_i = 1` in the lossless
+    // four-component path, so no upsampling is needed; samples line up
+    // one-per-pixel. The Adobe APP14 colour-transform flag is honoured
+    // identically to the lossy CMYK paths: `transform = 0` un-inverts the
+    // Adobe-CMYK convention, `transform = 2` (YCCK) decodes YCbCr → RGB
+    // via BT.601 and un-inverts K, and the no-APP14 case passes the four
+    // sample bytes through as plain "regular" CMYK. `precision = 8` was
+    // enforced above so each post-`<< pt` byte fits in `u8` without
+    // overflow; with `pt = 0` (the default) the shift is a no-op.
+    if nc == 4 {
+        let stride = width * 4;
+        let mut data = vec![0u8; stride * height];
+        let transform = state.adobe_transform;
+        for i in 0..width * height {
+            let s0 = (samples[0][i] << pt) as u8;
+            let s1 = (samples[1][i] << pt) as u8;
+            let s2 = (samples[2][i] << pt) as u8;
+            let s3 = (samples[3][i] << pt) as u8;
+            let (c, m, yy, k) = match transform {
+                Some(2) => {
+                    // YCCK: BT.601 full-range YCbCr → RGB, then C/M/Y =
+                    // 255 − RGB, K inverted.
+                    let y_s = s0 as i32;
+                    let cb = s1 as i32 - 128;
+                    let cr = s2 as i32 - 128;
+                    let r = (y_s + ((cr * 91881 + 32768) >> 16)).clamp(0, 255);
+                    let g = (y_s + ((-22554 * cb - 46802 * cr + 32768) >> 16)).clamp(0, 255);
+                    let b = (y_s + ((cb * 116130 + 32768) >> 16)).clamp(0, 255);
+                    ((255 - r) as u8, (255 - g) as u8, (255 - b) as u8, 255 - s3)
+                }
+                Some(0) => {
+                    // Adobe CMYK: samples stored inverted.
+                    (255 - s0, 255 - s1, 255 - s2, 255 - s3)
+                }
+                _ => {
+                    // No APP14: plain "regular" CMYK pass-through.
+                    (s0, s1, s2, s3)
+                }
+            };
+            let o = i * 4;
+            data[o] = c;
+            data[o + 1] = m;
+            data[o + 2] = yy;
+            data[o + 3] = k;
+        }
+        return Ok(VideoFrame {
+            pts,
+            planes: vec![VideoPlane { stride, data }],
+        });
     }
 
     // Three-component decode: shape the output planes by precision.

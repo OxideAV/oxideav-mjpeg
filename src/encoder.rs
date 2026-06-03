@@ -3241,6 +3241,240 @@ pub fn encode_lossless_jpeg_rgb_with_opts(
     Ok(out)
 }
 
+/// Encode four planar 8-bit colour channels as a standalone **four-component
+/// lossless** JPEG (SOF3, four-component interleaved scan) byte stream.
+///
+/// The four-component lossless path is the natural extension of the
+/// three-component (RGB-class) encoder to a fourth independently-modelled
+/// component (T.81 §H.1.2 — "each component in the scan is modeled
+/// independently"): four predictor planes share a single DC Huffman table
+/// and a single predictor selector, and one sample per component is
+/// interleaved per MCU position (each component declared with sampling
+/// factors `H_i = V_i = 1`, so each MCU is exactly one sample-quadruple).
+///
+/// * `planes` — four plane slices in scan order. Component IDs in the
+///   bitstream are 1, 2, 3, 4 in that order. The encoder is colour-
+///   agnostic: the caller decides what the four planes represent and the
+///   decoder hands them back in the same SOS scan order, then applies the
+///   APP14 colour transform (if any) on output.
+/// * `strides` — bytes per row per plane; must be at least `width`.
+/// * `predictor` — selector value `1..=7` from Table H.1, shared by every
+///   component (T.81 §B.2.3).
+/// * `adobe_transform` — Adobe APP14 colour-transform flag:
+///   * `None`     — no APP14 segment; samples passed through unchanged
+///     ("regular" CMYK on the decoder side).
+///   * `Some(0)`  — Adobe CMYK convention. The encoder inverts every
+///     input byte before predictive coding, so the on-wire samples
+///     match what an Adobe-CMYK consumer expects. The matching decoder
+///     un-inverts on output.
+///   * `Some(2)`  — Adobe YCCK. The caller passes `[Y, Cb, Cr, K]`
+///     planes (already in YCbCr space); the encoder inverts only the K
+///     plane before predictive coding so the decoder's YCCK → CMYK
+///     un-inversion path lands on the same K value.
+///
+/// Precision is fixed at 8 bits (the only depth the workspace
+/// `PixelFormat` enum's `Cmyk` variant covers). Point transform is fixed
+/// at `Pt = 0` and no restart markers are emitted. For non-zero point
+/// transform or restart-marker emission see
+/// [`encode_lossless_jpeg_cmyk_with_opts`].
+pub fn encode_lossless_jpeg_cmyk(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 4],
+    strides: [usize; 4],
+    predictor: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    encode_lossless_jpeg_cmyk_with_opts(
+        width,
+        height,
+        planes,
+        strides,
+        predictor,
+        adobe_transform,
+        0,
+        0,
+    )
+}
+
+/// Like [`encode_lossless_jpeg_cmyk`] but also accepts `restart_interval`
+/// (in MCUs — and a four-component lossless MCU is exactly one pixel
+/// position) and a `point_transform` (`Pt` in T.81). Both default-to-zero
+/// options match the historical zero-restart, zero-Pt output of
+/// [`encode_lossless_jpeg_cmyk`].
+///
+/// * `point_transform` — `0..=7` and strictly less than 8 (the fixed
+///   precision). With `Pt > 0` every input sample is right-shifted by
+///   `Pt` before prediction; the decoder side later left-shifts the
+///   reconstructed sample by the same `Pt` on output.
+/// * `restart_interval` — number of MCUs (= pixel positions) between
+///   successive `RSTn` markers. On every boundary the encoder
+///   byte-aligns the bitstream, emits the next `RST0..=RST7` marker
+///   (cycling modulo 8 per T.81 §F.1.1.5.2), and re-seeds every
+///   component's predictor history to the per-component origin
+///   `2^(8 − Pt − 1)` (T.81 §H.1.2.1).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_jpeg_cmyk_with_opts(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 4],
+    strides: [usize; 4],
+    predictor: u8,
+    adobe_transform: Option<u8>,
+    restart_interval: u16,
+    point_transform: u8,
+) -> Result<Vec<u8>> {
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless CMYK encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= 8 {
+        return Err(Error::invalid(format!(
+            "lossless CMYK encoder: point_transform {point_transform} must be < precision 8"
+        )));
+    }
+    match adobe_transform {
+        None | Some(0) | Some(2) => {}
+        Some(other) => {
+            return Err(Error::invalid(format!(
+                "lossless CMYK encoder: adobe_transform = {other} (only None / Some(0) / Some(2) are supported)"
+            )));
+        }
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("lossless CMYK encoder: zero-size image"));
+    }
+    for c in 0..4 {
+        if strides[c] < w {
+            return Err(Error::invalid(
+                "lossless CMYK encoder: stride smaller than width",
+            ));
+        }
+        if planes[c].len() < strides[c] * h {
+            return Err(Error::invalid(
+                "lossless CMYK encoder: plane shorter than stride*h",
+            ));
+        }
+    }
+
+    // Apply the on-the-wire transform implied by `adobe_transform` so the
+    // residuals coded below match what the matching decoder expects. The
+    // decoder will re-invert (and YCCK→CMYK convert) on output.
+    let invert_all = matches!(adobe_transform, Some(0));
+    let invert_k_only = matches!(adobe_transform, Some(2));
+
+    // Single shared DC Huffman table (Td = 0).
+    let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 4 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    if let Some(tx) = adobe_transform {
+        write_adobe_app14(&mut out, tx);
+    }
+    write_sof_lossless_multi(&mut out, w as u16, h as u16, 8, 4);
+    write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless_multi(&mut out, predictor, 4, point_transform);
+
+    let pt = point_transform as u32;
+
+    // Apply the adobe-transform inversion (if any) up-front, then the
+    // point-transform right-shift, so the predictor loop sees pre-coded
+    // samples in the 0..2^(8 - Pt) range.
+    let mut src: [Vec<u16>; 4] = [
+        vec![0u16; w * h],
+        vec![0u16; w * h],
+        vec![0u16; w * h],
+        vec![0u16; w * h],
+    ];
+    for c in 0..4 {
+        let invert_this = invert_all || (invert_k_only && c == 3);
+        for y in 0..h {
+            for x in 0..w {
+                let v = planes[c][y * strides[c] + x] as u16;
+                let v = if invert_this { 255 - v } else { v };
+                src[c][y * w + x] = v >> pt;
+            }
+        }
+    }
+
+    // Default prediction for the first sample of each component at scan
+    // start and after every RSTn (T.81 §H.1.2.1): `2^(P − Pt − 1)` with
+    // `P = 8`.
+    let sample_bits = 8u32 - pt;
+    let origin: i32 = 1i32 << (sample_bits - 1);
+
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: u32 = 0;
+    let total_mcus: u64 = w as u64 * h as u64;
+    let mut mcu_index: u64 = 0;
+    let mut reset_pred = true;
+
+    let mut bw = BitWriter::new(&mut out);
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..4 {
+                let plane = &src[c];
+                let actual = plane[y * w + x] as i32;
+                let pred: i32 = if reset_pred {
+                    origin
+                } else if y == 0 {
+                    plane[y * w + x - 1] as i32
+                } else if x == 0 {
+                    plane[(y - 1) * w + x] as i32
+                } else {
+                    let ra = plane[y * w + x - 1] as i32;
+                    let rb = plane[(y - 1) * w + x] as i32;
+                    let rc = plane[(y - 1) * w + x - 1] as i32;
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra + rb - rc,
+                        5 => ra + ((rb - rc) >> 1),
+                        6 => rb + ((ra - rc) >> 1),
+                        7 => (ra + rb) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
+                let diff = actual - pred;
+                let (s, bits) = category_lossless(diff);
+                let hc = dc_huff.encode[s as usize];
+                debug_assert!(hc.len != 0, "DC Huffman code for SSSS={s} must be present");
+                bw.write_bits(hc.code as u32, hc.len as u32);
+                if s != 0 && s != 16 {
+                    bw.write_bits(bits, s as u32);
+                }
+            }
+
+            reset_pred = false;
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                mcus_since_restart = 0;
+                reset_pred = true;
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 fn write_sof_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u8) {
     let mut payload = Vec::with_capacity(8 + 3);
     payload.push(precision);

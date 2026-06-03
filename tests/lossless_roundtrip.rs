@@ -13,8 +13,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_mjpeg::encoder::{
-    encode_lossless_jpeg_grayscale, encode_lossless_jpeg_grayscale_with_opts,
-    encode_lossless_jpeg_rgb, encode_lossless_jpeg_rgb_with_opts,
+    encode_lossless_jpeg_cmyk, encode_lossless_jpeg_cmyk_with_opts, encode_lossless_jpeg_grayscale,
+    encode_lossless_jpeg_grayscale_with_opts, encode_lossless_jpeg_rgb,
+    encode_lossless_jpeg_rgb_with_opts,
 };
 use oxideav_mjpeg::registry::make_decoder;
 
@@ -954,4 +955,217 @@ fn lossless_encoders_reject_pt_ge_precision() {
     assert!(format!("{err:?}")
         .to_lowercase()
         .contains("point_transform"));
+}
+
+/// Build four decorrelated 8-bit planes (C, M, Y, K) so a cross-component
+/// indexing bug would surface as a visible mismatch rather than coincide
+/// with a flat-fill roundtrip.
+fn mk_cmyk_8bit(w: usize, h: usize) -> [Vec<u8>; 4] {
+    let mut c = vec![0u8; w * h];
+    let mut m = vec![0u8; w * h];
+    let mut y = vec![0u8; w * h];
+    let mut k = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            c[j * w + i] = ((i as i32 * 5 + j as i32 * 3 + ((i ^ j) as i32 & 31)) & 0xFF) as u8;
+            m[j * w + i] =
+                ((i as i32 * 11 + j as i32 * 7 + ((i.wrapping_mul(j)) as i32 & 63)) & 0xFF) as u8;
+            y[j * w + i] = ((255 - (i as i32 * 2 + j as i32 * 9)) & 0xFF) as u8;
+            k[j * w + i] =
+                ((i as i32 + j as i32 * 13 + (((i + j) as i32 * 17) & 127)) & 0xFF) as u8;
+        }
+    }
+    [c, m, y, k]
+}
+
+/// Plain ("regular") CMYK: every Annex H Table H.1 predictor 1..=7 must
+/// round-trip bit-exact when no APP14 colour-transform is requested.
+#[test]
+fn lossless_cmyk_no_app14_every_predictor_is_bit_exact() {
+    let w = 24u32;
+    let h = 16u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            predictor,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        // SOF3 marker must be present.
+        assert!(
+            jpeg.windows(2).any(|x| x == [0xFF, 0xC3]),
+            "predictor={predictor}: SOF3 marker missing"
+        );
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(v.planes.len(), 1, "predictor={predictor}");
+        let stride = v.planes[0].stride;
+        assert_eq!(
+            stride,
+            (w as usize) * 4,
+            "predictor={predictor}: expected packed Cmyk stride"
+        );
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                for ci in 0..4 {
+                    let got = v.planes[0].data[j * stride + i * 4 + ci];
+                    let want = planes[ci][j * w as usize + i];
+                    assert_eq!(
+                        got, want,
+                        "predictor={predictor} plane {ci} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Adobe CMYK (APP14 transform = 0): the encoder pre-inverts on the wire
+/// and the decoder un-inverts on output, so the round-trip must still
+/// recover the caller's original samples.
+#[test]
+fn lossless_cmyk_adobe_transform_0_roundtrip_is_bit_exact() {
+    let w = 20u32;
+    let h = 14u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for predictor in [1u8, 4, 7] {
+        let jpeg = encode_lossless_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            predictor,
+            Some(0),
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        let v = decode_to_frame(jpeg, w, h);
+        let stride = v.planes[0].stride;
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                for ci in 0..4 {
+                    let got = v.planes[0].data[j * stride + i * 4 + ci];
+                    let want = planes[ci][j * w as usize + i];
+                    assert_eq!(
+                        got, want,
+                        "predictor={predictor} adobe=0 plane {ci} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Restart-marker emission: the encoder writes DRI + RSTn at the
+/// requested MCU cadence and the decoder reconstructs the same samples.
+#[test]
+fn lossless_cmyk_restart_interval_roundtrip_is_bit_exact() {
+    let w = 16u32;
+    let h = 16u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    let jpeg = encode_lossless_jpeg_cmyk_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2], &planes[3]],
+        strides,
+        1,
+        None,
+        13, // restart every 13 pixels — does not divide width × height evenly
+        0,
+    )
+    .expect("encode with restart interval");
+    // DRI segment marker FF DD must appear in the byte stream.
+    assert!(
+        jpeg.windows(2).any(|x| x == [0xFF, 0xDD]),
+        "DRI marker missing when restart_interval > 0"
+    );
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for ci in 0..4 {
+                let got = v.planes[0].data[j * stride + i * 4 + ci];
+                let want = planes[ci][j * w as usize + i];
+                assert_eq!(got, want, "restart roundtrip plane {ci} at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// Non-zero point transform shifts every sample by Pt on encode; the
+/// decoder shifts back on output. With Pt = 2 only the top 6 bits survive,
+/// so the round-trip must equal each input byte with its low 2 bits
+/// cleared.
+#[test]
+fn lossless_cmyk_point_transform_roundtrips_with_quantization() {
+    let w = 12u32;
+    let h = 8u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    let pt: u8 = 2;
+    let jpeg = encode_lossless_jpeg_cmyk_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2], &planes[3]],
+        strides,
+        1,
+        None,
+        0,
+        pt,
+    )
+    .expect("encode with Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for ci in 0..4 {
+                let got = v.planes[0].data[j * stride + i * 4 + ci];
+                let want = (planes[ci][j * w as usize + i] >> pt) << pt;
+                assert_eq!(got, want, "Pt={pt} plane {ci} at ({i},{j})");
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_cmyk_rejects_bad_predictor() {
+    let w = 4u32;
+    let h = 4u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for bad in [0u8, 8, 9, 255] {
+        let err = encode_lossless_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            bad,
+            None,
+        );
+        assert!(err.is_err(), "expected reject for predictor={bad}");
+    }
+}
+
+#[test]
+fn lossless_cmyk_rejects_invalid_adobe_transform() {
+    let w = 4u32;
+    let h = 4u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for bad in [1u8, 3, 4, 255] {
+        let err = encode_lossless_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            1,
+            Some(bad),
+        );
+        assert!(err.is_err(), "expected reject for adobe_transform={bad}");
+    }
 }

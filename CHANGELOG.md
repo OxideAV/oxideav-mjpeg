@@ -15,8 +15,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `src/mjpeg_container.rs` (DEFAULT_FRAME_RATE). Quality-factor scaling
   is described against the Annex K Q=50 base tables; conformant-SOF2 round
   trip phrased neutrally.
+- README: paraphrase the residual decorative external-implementation
+  attribution from the encoder + progressive sections so the JPEG
+  quality-factor scaling and SOF2 round-trip claim match the language used
+  in `src/`.
 
 ### Added
+
+- `encoder::encode_lossless_jpeg_cmyk(width, height, [c, m, y, k], strides,
+  predictor, adobe_transform)` and its
+  `encode_lossless_jpeg_cmyk_with_opts(.., restart_interval,
+  point_transform)` companion expose a public four-component lossless
+  (SOF3) encoder at 8-bit precision. The four planes share one DC Huffman
+  table and one predictor selector, all components are declared
+  `H_i = V_i = 1` per T.81 §H.1.2, and the Adobe APP14 colour-transform
+  flag is honoured identically to the lossy CMYK helpers (`None` → no
+  APP14 / plain "regular" CMYK, `Some(0)` → Adobe CMYK with on-the-wire
+  inversion, `Some(2)` → Adobe YCCK with K-only on-the-wire inversion).
+  Output: a standalone SOF3 JPEG with one interleaved SOS scan.
+- Decoder side: SOF3 now accepts a 4-component scan at `P = 8` and the
+  shared `decode_lossless_scan` packs the resulting four sample planes
+  into a `PixelFormat::Cmyk` `VideoFrame` (4 bytes/pixel `C M Y K`).
+  The Adobe APP14 colour transform on the resulting frame is applied
+  identically to the existing lossy CMYK render: no APP14 passes the
+  four bytes through, transform=0 un-inverts the Adobe-CMYK convention,
+  and transform=2 (YCCK) decodes BT.601 YCbCr → RGB → CMY and
+  un-inverts K. Wider precisions (`P > 8`) on a 4-component SOF3 are
+  rejected with `Error::Unsupported` because the workspace
+  `PixelFormat` enum has no high-bit-depth CMYK variant.
+- New `lossless_cmyk_*` tests exercise predictor 1..=7 bit-exact
+  roundtrip with no APP14, Adobe-CMYK (transform = 0) bit-exact
+  roundtrip on a representative predictor sample, the DRI + `RSTn`
+  emission path on a width-not-evenly-divided restart interval, the
+  point-transform quantisation path (Pt = 2 / output equals input with
+  the low Pt bits cleared), and the invalid-predictor + invalid-
+  Adobe-transform-byte rejection paths.
 
 - `rtp::packetize_with_opts` + `rtp::PacketizeOpts` add restart-interval
   -aligned scan splitting (opt-in via

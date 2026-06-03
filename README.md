@@ -71,7 +71,8 @@ let pkt = enc.receive_packet()?;
 The encoder accepts `Yuv444P`, `Yuv422P`, or `Yuv420P` planar input and
 emits a standalone baseline JPEG per frame: SOI, JFIF APP0, DQT, SOF0,
 DHT (Annex K typical tables), optional DRI, SOS, entropy scan, EOI.
-Default quality factor is 75 (libjpeg style); `encoder::encode_jpeg(frame,
+Default quality factor is 75 on the Annex K Q=50 base-table scaling
+(see `oxideav_mjpeg::encoder::DEFAULT_QUALITY`); `encoder::encode_jpeg(frame,
 quality)` is also exposed for sibling crates that wrap the same
 bitstream in custom containers.
 
@@ -117,7 +118,7 @@ decomposition uses a 1-bit point transform:
   for pre-existing nonzeros interleaved inline during the decoder's
   zero-history walk (T.81 §G.1.2.3).
 
-Output round-trips through ffmpeg, libjpeg, and ImageMagick with PSNR
+Output round-trips through any conformant SOF2 decoder with PSNR
 ≥ 40 dB relative to the equivalent spectral-selection-only encode.
 
 ### Lossless (SOF3) encode
@@ -195,6 +196,37 @@ height, [r, g, b], strides, precision, predictor)` directly:
   Both options behave identically to the grayscale variant; restarts
   reset every component's predictor in lockstep, and `Pt` shifts every
   sample of every plane uniformly.
+
+### Lossless (SOF3) CMYK / four-component encode
+
+For four-component (C, M, Y, K — or any four independent monochrome
+planes) lossless output at 8-bit precision call
+`encoder::encode_lossless_jpeg_cmyk(width, height, [c, m, y, k], strides,
+predictor, adobe_transform)` directly:
+
+- Each component is modeled independently per T.81 §H.1.2; the four
+  planes share one DC Huffman table and one predictor selector. Each
+  component is declared `H_i = V_i = 1`, so the MCU at every pixel
+  position is exactly one residual per component in scan order
+  (component IDs 1, 2, 3, 4). Output: a standalone SOF3 JPEG with one
+  interleaved SOS scan.
+- `precision` is fixed at 8 bits — the workspace `PixelFormat` enum
+  has no high-bit-depth CMYK variant, so the four-component lossless
+  path is `P = 8` only. Output: packed `PixelFormat::Cmyk` (one plane,
+  4 bytes/pixel in `C, M, Y, K` order).
+- `adobe_transform` selects the APP14 colour-transform marker, identical
+  to the lossy CMYK helpers: `None` writes no APP14 (plain "regular"
+  CMYK), `Some(0)` selects Adobe CMYK and inverts every sample on the
+  wire before predictive coding, `Some(2)` selects Adobe YCCK
+  (interpret the packed input as `[Y, Cb, Cr, K]` and invert only K
+  before coding). The decoder un-does both transforms on output, so a
+  no-APP14 or Adobe-CMYK round-trip is bit-exact.
+- For DRI + `RSTn` emission or a non-zero point transform call
+  `encode_lossless_jpeg_cmyk_with_opts(width, height, [c, m, y, k],
+  strides, predictor, adobe_transform, restart_interval, point_transform)`.
+  Both options behave identically to the grayscale and three-component
+  variants; restarts reset every component's predictor in lockstep, and
+  `Pt` shifts every sample of every plane uniformly.
 
 ### 4-component CMYK / YCCK encode
 
@@ -396,6 +428,15 @@ Decoder:
   every other precision in the valid range (the low `P` bits carry
   the post-Pt-shift sample, top bits zero — same widen policy the
   grayscale path uses to land `P = 14` in `Gray16Le`).
+- **Lossless JPEG (SOF3) four-component** — `P = 8` only (the
+  workspace `PixelFormat` enum has no high-bit-depth CMYK variant),
+  interleaved scan with each component declared `H_i = V_i = 1`.
+  Independent per-component predictor buffers per Annex H §H.1.2.
+  Output: packed `PixelFormat::Cmyk` (4 bytes/pixel). Adobe APP14
+  colour-transform flag honoured identically to the lossy CMYK
+  paths (no APP14 → plain "regular" CMYK, transform=0 → Adobe CMYK
+  un-inverted on output, transform=2 → YCCK converted back to CMYK
+  via BT.601).
 - **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
   Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
@@ -427,13 +468,17 @@ Encoder:
   CMYK / YCCK variant uses a 9-segment spectral-selection scan
   decomposition over four components.
 - **SOF3** (lossless) — single-component grayscale at any precision
-  `P ∈ 2..=16` and three-component interleaved (RGB-class) at any
-  precision `P ∈ 2..=16` with `H_i = V_i = 1` per component, every
-  Annex H Table H.1 predictor `1..=7`. Bit-exact roundtrip including
-  the SSSS=16 / Di=32768 half-modulus case. Optional DRI + `RSTn`
-  emission and non-zero point transform `Pt ∈ 0..=15` (with `Pt < P`)
-  via `encode_lossless_jpeg_grayscale_with_opts` /
-  `encode_lossless_jpeg_rgb_with_opts`. Restart boundaries re-seed
+  `P ∈ 2..=16`, three-component interleaved (RGB-class) at any
+  precision `P ∈ 2..=16`, and four-component interleaved (CMYK-class)
+  at `P = 8`, all with `H_i = V_i = 1` per component and every
+  Annex H Table H.1 predictor `1..=7`. Bit-exact roundtrip on the
+  grayscale, RGB and no-APP14 / Adobe-CMYK four-component paths
+  (YCCK is a lossy interop convention by construction — BT.601
+  YCbCr → RGB → CMY clamps), including the SSSS=16 / Di=32768
+  half-modulus case. Optional DRI + `RSTn` emission and non-zero
+  point transform via `encode_lossless_jpeg_grayscale_with_opts` /
+  `encode_lossless_jpeg_rgb_with_opts` /
+  `encode_lossless_jpeg_cmyk_with_opts`. Restart boundaries re-seed
   every component's predictor to `2^(P − Pt − 1)` per T.81 §H.1.2.1.
 - 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths; `Gray8` /
   `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless path.
@@ -449,9 +494,14 @@ Not supported (decoder returns `Error::Unsupported`):
   4-component CMYK / YCCK *is* supported on both the sequential
   (SOF0 / SOF1) and the progressive (SOF2) scan decompositions, with
   the Adobe APP14 transform flag honoured on both paths.
-- 4-component lossless (CMYK-class) and lossless with non-unit
-  sampling factors (the spec permits this but no real-world corpus
-  exercises it; rejected with `Unsupported`).
+- 4-component lossless above `P = 8` (the workspace `PixelFormat`
+  enum has no high-bit-depth CMYK variant — wider precisions are
+  rejected with `Unsupported`). `P = 8` 4-component lossless *is*
+  supported on both encode and decode with the Adobe APP14 transform
+  flag honoured on output.
+- Lossless with non-unit sampling factors (the spec permits this
+  but no real-world corpus exercises it; rejected with
+  `Unsupported`).
 
 ## Fuzzing
 

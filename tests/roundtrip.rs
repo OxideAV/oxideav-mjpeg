@@ -883,3 +883,155 @@ fn roundtrip_gray10_without_lossless_is_rejected() {
         "expected Unsupported, got {err:?}"
     );
 }
+
+/// Packed `Rgb24` through the trait API at default quality. The
+/// encoder takes the baseline (SOF0) RGB path; the decoder hands the
+/// frame back as a single packed `Rgb24` plane (`stride = width * 3`).
+/// PSNR sits comfortably above 30 dB on a smooth synthetic gradient.
+#[test]
+fn roundtrip_rgb24_trait_api_default_quality() {
+    let w = 32u32;
+    let h = 32u32;
+    let stride = (w as usize) * 3;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let o = y * stride + x * 3;
+            samples[o] = ((x * 8) & 0xFF) as u8; // R
+            samples[o + 1] = ((y * 8) & 0xFF) as u8; // G
+            samples[o + 2] = (((x + y) * 4) & 0xFF) as u8; // B
+        }
+    }
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride,
+            data: samples.clone(),
+        }],
+    };
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Rgb24);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("recv");
+
+    // SOF0 + Adobe APP14 must be present.
+    assert!(
+        pkt.data.windows(2).any(|w| w == [0xFF, 0xC0]),
+        "baseline RGB must emit SOF0"
+    );
+    assert!(
+        pkt.data.windows(2).any(|w| w == [0xFF, 0xEE]),
+        "baseline RGB must emit APP14"
+    );
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    assert_eq!(v.planes.len(), 1, "Rgb24 frame has one plane");
+    assert_eq!(v.planes[0].stride, stride, "expected packed RGB stride");
+
+    let mut sse: f64 = 0.0;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            for ch in 0..3 {
+                let a = samples[y * stride + x * 3 + ch] as f64;
+                let b = v.planes[0].data[y * v.planes[0].stride + x * 3 + ch] as f64;
+                let d = a - b;
+                sse += d * d;
+            }
+        }
+    }
+    let mse = sse / (w as f64 * h as f64 * 3.0);
+    let psnr = if mse <= f64::EPSILON {
+        99.0
+    } else {
+        20.0 * (255.0_f64 / mse.sqrt()).log10()
+    };
+    assert!(psnr >= 30.0, "PSNR = {psnr:.2} dB (expected ≥ 30)");
+}
+
+/// `Rgb24` input ignores `set_lossless(true)` — that flag is grayscale-
+/// only. The trait API still takes the baseline RGB path and returns
+/// packed Rgb24 from the decoder.
+#[test]
+fn roundtrip_rgb24_trait_api_lossless_flag_still_baseline() {
+    let w = 16u32;
+    let h = 16u32;
+    let stride = (w as usize) * 3;
+    let samples = vec![128u8; stride * h as usize];
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride,
+            data: samples,
+        }],
+    };
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Rgb24);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    enc.set_lossless(true); // ignored for RGB input
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("recv");
+
+    // SOF0 marker (0xFFC0) — the lossless SOF3 (0xFFC3) must NOT be
+    // emitted on this path.
+    assert!(
+        pkt.data.windows(2).any(|w| w == [0xFF, 0xC0]),
+        "RGB lossy must emit SOF0"
+    );
+    assert!(
+        !pkt.data.windows(2).any(|w| w == [0xFF, 0xC3]),
+        "lossless flag must be ignored on RGB input"
+    );
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    assert_eq!(v.planes.len(), 1);
+    assert_eq!(v.planes[0].stride, stride);
+}
+
+/// Short stride is rejected before the encoder runs.
+#[test]
+fn roundtrip_rgb24_short_stride_rejected() {
+    let w = 16u32;
+    let h = 16u32;
+    let bad_stride = (w as usize) * 2; // width * 2 — too small for RGB.
+    let samples = vec![0u8; bad_stride * h as usize];
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride: bad_stride,
+            data: samples,
+        }],
+    };
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Rgb24);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    let err = enc.send_frame(&Frame::Video(frame)).expect_err("must fail");
+    assert!(
+        matches!(err, oxideav_core::Error::InvalidData(_)),
+        "expected InvalidData, got {err:?}"
+    );
+}

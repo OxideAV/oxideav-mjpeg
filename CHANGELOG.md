@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encoder::encode_jpeg_rgb24(width, height, samples, stride, quality)`
+  emits a standalone baseline (SOF0) three-component RGB JPEG at 8-bit
+  precision from a packed RGB triple buffer. Components are written with
+  IDs `'R' / 'G' / 'B'` (`82 / 71 / 66`), each declared `H = V = 1`, and
+  all three bind the single luma quantiser table — the chroma table is
+  never emitted. An Adobe APP14 segment with `transform = 0` flags the
+  stream as plain R/G/B for conformant decoders. The companion variants
+  `encode_jpeg_rgb24_with_opts(.., restart_interval)` and
+  `encode_jpeg_rgb24_with_meta(.., restart_interval, meta)` add `DRI +
+  RSTn` emission (same `RST0..=RST7` cycling and per-component predictor
+  reset the YUV / grayscale paths use, per T.81 §F.1.1.5.2) and APP /
+  COM pass-through respectively. The companion baseline decoder now
+  detects 3-component RGB via either the Adobe APP14 `transform = 0`
+  flag or the `'R'/'G'/'B'` component-id triple and emits a single
+  packed `PixelFormat::Rgb24` plane (`stride = width * 3`) instead of
+  reinterpreting the planes as YCbCr. The matching `tests/docs_corpus.rs`
+  helpers (`infer_pix_fmt` + `flatten_frame`) gain an `Rgb24` branch so
+  the `baseline-rgb-32x32` corpus fixture passes its `PsnrFloor`
+  threshold without the planar-YUV reinterpretation fallback. The
+  registry-side trait API (`MjpegEncoder::send_frame`) accepts
+  `PixelFormat::Rgb24` input and routes it through the new baseline RGB
+  path; `set_lossless(true)` is ignored for RGB input (lossless mode
+  stays grayscale-only). Seven new unit tests cover the encoder shape
+  (SOF0 RGB header walker, APP14 transform=0 emission, single DQT, luma
+  DC + AC DHT only), Q=100 ±4 LSB near-lossless ceiling, Q=75 ≥30 dB
+  PSNR floor, short stride / short buffer rejection, DRI + RSTn
+  emission round-trip, and APP1 pass-through (with component-id
+  fallback signalling RGB to the decoder). Three new integration tests
+  in `tests/roundtrip.rs` cover the trait-API default-quality round
+  trip, the lossless-flag-ignored-on-RGB path, and the short-stride
+  rejection.
 - `encoder::encode_jpeg_grayscale(width, height, samples, stride, quality)`
   emits a standalone baseline (SOF0) single-component grayscale JPEG at
   8-bit precision. The bitstream layout is the usual `SOI / JFIF APP0 /

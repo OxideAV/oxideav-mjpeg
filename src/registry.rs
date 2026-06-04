@@ -31,8 +31,8 @@ use crate::container;
 use crate::decoder::decode_jpeg;
 use crate::encoder::{
     encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts,
-    encode_jpeg_progressive, encode_jpeg_with_opts, encode_lossless_jpeg_grayscale,
-    DEFAULT_QUALITY,
+    encode_jpeg_progressive, encode_jpeg_rgb24_with_opts, encode_jpeg_with_opts,
+    encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
@@ -316,6 +316,17 @@ impl MjpegEncoder {
             // selection comes from `set_adobe_transform`; default is
             // no APP14 (plain "regular" CMYK).
             MjpegPixelFormat::Cmyk => {}
+            // Packed `Rgb24` input takes the baseline-SOF0 RGB encode
+            // path: three components at IDs 'R'/'G'/'B', all H = V = 1,
+            // all bound to one quant table + one DC/AC Huffman pair.
+            // Adobe APP14 with transform = 0 is emitted so any
+            // conformant decoder honouring the colour-transform flag
+            // round-trips the samples as plain R/G/B. Progressive (SOF2)
+            // emission of RGB stays a follow-up for now; the lossless
+            // (SOF3) path is already available via `set_lossless(true)`
+            // on the existing 3-component lossless encoder if a caller
+            // needs bit-exactness.
+            MjpegPixelFormat::Rgb24 => {}
             _ => {
                 return Err(Error::unsupported(format!(
                     "MJPEG encoder: pixel format {pix_core:?} not supported"
@@ -541,6 +552,35 @@ impl Encoder for MjpegEncoder {
                         return Err(Error::unsupported(
                             "MJPEG encoder: high-bit-depth grayscale input requires set_lossless(true)",
                         ));
+                    }
+                    // Packed `Rgb24` input takes the baseline-SOF0 RGB
+                    // path. The single plane is laid out as
+                    // `[R, G, B]` at 3 bytes per pixel, matching the
+                    // decoder's `Rgb24` output shape. Progressive
+                    // (SOF2) RGB is not yet wired in here — flipping
+                    // `set_progressive(true)` with `Rgb24` input still
+                    // takes the baseline path.
+                    (MjpegPixelFormat::Rgb24, _) => {
+                        if v.planes.is_empty() {
+                            return Err(Error::invalid(
+                                "MJPEG encoder: RGB24 frame missing plane 0",
+                            ));
+                        }
+                        let plane = &v.planes[0];
+                        let min_stride = (self.width as usize) * 3;
+                        if plane.stride < min_stride {
+                            return Err(Error::invalid(
+                                "MJPEG encoder: RGB24 plane stride must be at least width * 3",
+                            ));
+                        }
+                        encode_jpeg_rgb24_with_opts(
+                            self.width,
+                            self.height,
+                            &plane.data,
+                            plane.stride,
+                            self.quality,
+                            self.restart_interval,
+                        )?
                     }
                     // 4-component CMYK / YCCK input takes the dedicated
                     // CMYK encode path. The single packed plane is laid

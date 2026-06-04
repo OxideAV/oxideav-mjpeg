@@ -2358,6 +2358,271 @@ fn write_sos_grayscale_8bit(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+// ---- Baseline (SOF0) packed-RGB24 encoder --------------------------------
+//
+// Three-component, all `H_i = V_i = 1` (MCU = 1 luma block per component =
+// one 8×8 pixel tile). Component IDs are ASCII `'R' / 'G' / 'B'` =
+// `82 / 71 / 66`, matching the convention exercised by the
+// `baseline-rgb-32x32` clean-room fixture under
+// `docs/image/jpeg/fixtures/baseline-rgb-32x32/`. All three components
+// bind quantiser table 0 (the luma table) so a single DQT segment carries
+// the whole image, and all three use the Annex K luma DC + luma AC
+// Huffman tables (DC table 0, AC table 0).
+//
+// An Adobe APP14 segment with `transform = 0` is emitted alongside the
+// JFIF APP0 so any conformant decoder that honours the APP14 colour-
+// transform flag treats the three planes as plain R / G / B (instead of
+// Y / Cb / Cr). The companion baseline-decoder change in
+// `crate::decoder` also keys on the component IDs as a fallback, so
+// dropping the APP14 (e.g. via custom `meta`) still round-trips.
+
+/// Encode a single packed-RGB24 buffer as a complete, self-contained
+/// baseline (SOF0) JPEG byte stream (`FFD8 … FFD9`).
+///
+/// * `samples` — row-major packed RGB triples: byte 0 = `R`, byte 1 =
+///   `G`, byte 2 = `B`, repeating for `width` pixels per row.
+/// * `stride` — bytes between successive rows; must be at least
+///   `width * 3`. Pass `width * 3` for a tightly-packed buffer.
+/// * `quality` — JPEG quality factor `1..=100` scaled against the
+///   Annex K Q=50 luma base table. Only the luma quantiser is used; the
+///   chroma table is never emitted.
+///
+/// The output round-trips through any baseline decoder that recognises
+/// the Adobe APP14 `transform = 0` flag or that interprets a 3-component
+/// SOS with IDs `'R'/'G'/'B'` as plain RGB. Conformant decoders that
+/// only know JFIF YCbCr will return the three planes "as is" and treat
+/// them as Y / Cb / Cr — callers in that situation should pair the
+/// JPEG with explicit colour-space metadata at the container level.
+///
+/// No restart markers and no metadata segments beyond the default JFIF
+/// APP0 + Adobe APP14 are emitted; for the `DRI + RSTn` and APP-
+/// pass-through variants see [`encode_jpeg_rgb24_with_opts`] and
+/// [`encode_jpeg_rgb24_with_meta`].
+pub fn encode_jpeg_rgb24(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    encode_jpeg_rgb24_with_meta(width, height, samples, stride, quality, 0, &[])
+}
+
+/// Like [`encode_jpeg_rgb24`] but also emits a DRI segment and cycles
+/// `RST0..=RST7` markers every `restart_interval` MCUs during the scan.
+/// Passing `0` disables restart marker emission (equivalent to
+/// [`encode_jpeg_rgb24`]).
+pub fn encode_jpeg_rgb24_with_opts(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    restart_interval: u16,
+) -> Result<Vec<u8>> {
+    encode_jpeg_rgb24_with_meta(
+        width,
+        height,
+        samples,
+        stride,
+        quality,
+        restart_interval,
+        &[],
+    )
+}
+
+/// Like [`encode_jpeg_rgb24_with_opts`] but inserts `meta` verbatim
+/// between the SOI and the first DQT segment, replacing the default
+/// JFIF APP0 + Adobe APP14 pair. `meta` must contain only APP0..APP15
+/// or COM segments (each starting with `0xFF 0xEn` / `0xFF 0xFE`
+/// followed by a big-endian length).
+///
+/// When `meta` is empty this is bit-for-bit identical to
+/// [`encode_jpeg_rgb24_with_opts`].
+///
+/// Note: when `meta` is non-empty the encoder does **not** synthesise
+/// an Adobe APP14 segment — the caller is expected to either include
+/// one in `meta` or rely on the `'R'/'G'/'B'` component-id fallback to
+/// signal the colour space. The companion decoder accepts either.
+pub fn encode_jpeg_rgb24_with_meta(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    restart_interval: u16,
+    meta: &[u8],
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("RGB24 encoder: zero-size image"));
+    }
+    let min_stride = w.checked_mul(3).ok_or_else(|| {
+        Error::invalid("RGB24 encoder: width * 3 overflow when computing min stride")
+    })?;
+    if stride < min_stride {
+        return Err(Error::invalid(
+            "RGB24 encoder: stride smaller than width * 3",
+        ));
+    }
+    if samples.len() < stride.saturating_mul(h) {
+        return Err(Error::invalid(
+            "RGB24 encoder: samples shorter than stride*h",
+        ));
+    }
+
+    // Single quantiser table — the luma Q=50 base scaled by `quality`.
+    // All three components bind table 0, so the chroma table is never
+    // referenced and is not emitted.
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    // SOI.
+    out.push(0xFF);
+    out.push(markers::SOI);
+    // Metadata: caller-supplied `meta` overrides the default APP0 +
+    // APP14 pair entirely (so callers passing their own APP14 don't
+    // end up with two of them).
+    if meta.is_empty() {
+        write_jfif_app0(&mut out);
+        // Adobe APP14 transform = 0 → "three components are R/G/B"
+        // (matching the `baseline-rgb-32x32` clean-room fixture).
+        write_adobe_app14(&mut out, 0);
+    } else {
+        out.extend_from_slice(meta);
+    }
+    // Single DQT — luma table only, ID 0, precision 0 (8-bit).
+    write_dqt(&mut out, 0, &luma_q);
+    // SOF0 — three components at IDs 82/71/66 ('R'/'G'/'B'), each H=V=1,
+    // all binding QT 0.
+    write_sof0_rgb24_8bit(&mut out, w as u16, h as u16);
+    // DHT — Annex K luma DC + luma AC only (both classes at ID 0). All
+    // three SOS components reference this single pair.
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+    // DRI before SOS per T.81 §F.2.2.4.
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    // SOS — three components (R/G/B), each DC=0/AC=0, full AC band, no SA.
+    write_sos_rgb24_8bit(&mut out);
+
+    // Scan: one MCU = one 8×8 R block + one 8×8 G block + one 8×8 B block
+    // (interleaved). Walked in raster order over MCUs.
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let total_mcus = mcus_x.saturating_mul(mcus_y);
+    let ri = restart_interval as usize;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: usize = 0;
+    let mut mcu_index: usize = 0;
+
+    let mut bw = BitWriter::new(&mut out);
+    let mut prev_dc = [0i32; 3];
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for ch in 0..3 {
+                let mut blk = [0.0f32; 64];
+                fill_block_packed_channel(&mut blk, samples, stride, w, h, mx * 8, my * 8, ch);
+                encode_block(
+                    &mut bw,
+                    &mut blk,
+                    &luma_q,
+                    &mut prev_dc[ch],
+                    &huff.luma_dc,
+                    &huff.luma_ac,
+                );
+            }
+
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            // Restart boundary — same semantics as `write_scan`: never
+            // emit `RSTn` after the very last MCU because the decoder
+            // expects EOI immediately past the final residual.
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                for d in prev_dc.iter_mut() {
+                    *d = 0;
+                }
+                mcus_since_restart = 0;
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// SOF0 payload for a 3-component packed-RGB24 baseline JPEG. Component
+/// IDs are `'R' / 'G' / 'B'` (82 / 71 / 66), every component declares
+/// `H = V = 1`, every component binds quant table 0.
+fn write_sof0_rgb24_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 9);
+    payload.push(8); // P = 8
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // Nf = 3
+                     // R
+    payload.push(b'R');
+    payload.push(0x11); // H=1 V=1
+    payload.push(0); // qt = 0
+                     // G
+    payload.push(b'G');
+    payload.push(0x11);
+    payload.push(0);
+    // B
+    payload.push(b'B');
+    payload.push(0x11);
+    payload.push(0);
+    write_length_prefix(out, markers::SOF0, &payload);
+}
+
+/// SOS payload for the 3-component packed-RGB24 baseline JPEG. Every
+/// SOS component binds DC table 0 + AC table 0, spectral band
+/// `Ss = 0 .. Se = 63`, `Ah = Al = 0` (no successive approximation).
+fn write_sos_rgb24_8bit(out: &mut Vec<u8>) {
+    let payload: [u8; 10] = [
+        3, // Ns = 3
+        b'R', 0x00, // component R → DC=0 AC=0
+        b'G', 0x00, // component G → DC=0 AC=0
+        b'B', 0x00, // component B → DC=0 AC=0
+        0, 63, 0, // Ss, Se, Ah|Al
+    ];
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Fill an 8×8 f32 block from one channel of a packed 3-byte-per-pixel
+/// RGB buffer. `channel` selects R/G/B (0/1/2). Edge pixels are
+/// replicated for MCU blocks that extend past the picture boundary.
+/// Subtracts 128 (level shift) before returning, matching `fill_block`.
+#[allow(clippy::too_many_arguments)]
+fn fill_block_packed_channel(
+    dst: &mut [f32; 64],
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    channel: usize,
+) {
+    for j in 0..8 {
+        let y = (y0 + j).min(h.saturating_sub(1));
+        for i in 0..8 {
+            let x = (x0 + i).min(w.saturating_sub(1));
+            let v = plane[y * stride + x * 3 + channel] as i32;
+            dst[j * 8 + i] = (v - 128) as f32;
+        }
+    }
+}
+
 /// Test-only: emit a single-component, 12-bit precision baseline JPEG.
 /// `samples` carries u16 values in `[0, 4095]`. Caller must keep inputs
 /// moderate enough that per-block DC/AC Huffman categories stay ≤ 11 —
@@ -3994,6 +4259,263 @@ mod tests {
         // And the decoder still consumes the output cleanly.
         let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
         assert_eq!(frame.planes.len(), 1);
+    }
+
+    // ---- Baseline RGB24 (SOF0 three-component, P=8) --------------
+
+    /// Encode `samples` and walk the segment list confirming the
+    /// SOF0 three-component shape (IDs 82/71/66, every H=V=1, every
+    /// component binding qt 0), the presence of an Adobe APP14
+    /// segment with transform = 0, and that only one DQT + the luma
+    /// DC + luma AC DHT pair are emitted.
+    fn walk_rgb24_header(jpeg: &[u8]) {
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "expected SOI prefix");
+        assert_eq!(
+            &jpeg[jpeg.len() - 2..],
+            &[0xFF, 0xD9],
+            "expected EOI suffix"
+        );
+        let mut found_sof0 = false;
+        let mut found_app14 = false;
+        let mut dqt_count = 0usize;
+        let mut dht_pairs: Vec<(u8, u8)> = Vec::new();
+        let mut i = 2;
+        while i + 3 < jpeg.len() {
+            assert_eq!(jpeg[i], 0xFF, "expected marker prefix at {i}");
+            let marker = jpeg[i + 1];
+            if marker == 0xDA {
+                break;
+            }
+            let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+            let payload = &jpeg[i + 4..i + 2 + len];
+            match marker {
+                0xC0 => {
+                    // SOF0: P, Y, X, Nf, then component records.
+                    assert_eq!(payload[0], 8, "P must be 8");
+                    assert_eq!(payload[5], 3, "Nf must be 3");
+                    let comps = [
+                        (payload[6], payload[7], payload[8]),
+                        (payload[9], payload[10], payload[11]),
+                        (payload[12], payload[13], payload[14]),
+                    ];
+                    assert_eq!(comps[0].0, b'R', "component 0 id must be 'R'");
+                    assert_eq!(comps[1].0, b'G', "component 1 id must be 'G'");
+                    assert_eq!(comps[2].0, b'B', "component 2 id must be 'B'");
+                    for c in &comps {
+                        assert_eq!(c.1, 0x11, "H = V = 1 on every component");
+                        assert_eq!(c.2, 0, "qt 0 on every component");
+                    }
+                    found_sof0 = true;
+                }
+                0xEE if payload.len() >= 12 && &payload[0..5] == b"Adobe" => {
+                    // APP14 — confirm Adobe magic + transform = 0.
+                    assert_eq!(payload[11], 0, "Adobe APP14 transform must be 0");
+                    found_app14 = true;
+                }
+                0xDB => {
+                    dqt_count += 1;
+                    assert_eq!(payload[0] & 0xF0, 0, "DQT precision must be 0 (8-bit)");
+                    assert_eq!(payload[0] & 0x0F, 0, "DQT table id must be 0");
+                }
+                0xC4 => {
+                    let class = payload[0] >> 4;
+                    let id = payload[0] & 0x0F;
+                    dht_pairs.push((class, id));
+                }
+                _ => {}
+            }
+            i += 2 + len;
+        }
+        assert!(found_sof0, "expected SOF0 segment");
+        assert!(found_app14, "expected Adobe APP14 transform=0 segment");
+        assert_eq!(dqt_count, 1, "expected exactly one DQT (luma only)");
+        assert_eq!(
+            dht_pairs,
+            vec![(0u8, 0u8), (1u8, 0u8)],
+            "expected luma DC + luma AC only"
+        );
+    }
+
+    #[test]
+    fn baseline_rgb24_header_is_well_formed() {
+        let w = 16usize;
+        let h = 16usize;
+        let mut samples = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                samples[o] = ((x * 8) & 0xFF) as u8;
+                samples[o + 1] = ((y * 8) & 0xFF) as u8;
+                samples[o + 2] = (((x + y) * 4) & 0xFF) as u8;
+            }
+        }
+        let jpeg =
+            encode_jpeg_rgb24(w as u32, h as u32, &samples, w * 3, 75).expect("encode rgb24");
+        walk_rgb24_header(&jpeg);
+    }
+
+    #[test]
+    fn baseline_rgb24_q100_roundtrip_is_near_lossless() {
+        // Annex K luma table at Q=100 reduces to all-1 quantisers — any
+        // residual delta is f32 DCT/IDCT rounding only. Mirror the
+        // grayscale ±4 LSB ceiling; per-channel diff is checked
+        // independently.
+        let w = 32usize;
+        let h = 32usize;
+        let mut samples = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                samples[o] = ((x * 7 + y * 11) % 256) as u8;
+                samples[o + 1] = ((x * 11 + y * 7) % 256) as u8;
+                samples[o + 2] = ((x * 13 + y * 5) % 256) as u8;
+            }
+        }
+        let jpeg =
+            encode_jpeg_rgb24(w as u32, h as u32, &samples, w * 3, 100).expect("encode rgb24");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        assert_eq!(frame.planes.len(), 1, "Rgb24 frame has one plane");
+        let recovered = &frame.planes[0].data;
+        let stride = frame.planes[0].stride;
+        assert_eq!(stride, w * 3, "expected packed RGB stride");
+        let mut max_diff: u32 = 0;
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..3 {
+                    let a = samples[(y * w + x) * 3 + ch];
+                    let b = recovered[y * stride + x * 3 + ch];
+                    let d = (a as i32 - b as i32).unsigned_abs();
+                    if d > max_diff {
+                        max_diff = d;
+                    }
+                }
+            }
+        }
+        assert!(max_diff <= 4, "Q=100 max diff = {max_diff} (expected ≤ 4)");
+    }
+
+    #[test]
+    fn baseline_rgb24_q75_roundtrip_psnr_above_30db() {
+        // PSNR floor on a smooth gradient at the default quality. RGB
+        // baseline binds every component to the luma quant table, so the
+        // chroma channels see the same numeric quantisation the luma
+        // path sees — looser than YUV 4:2:0 baseline at the same Q.
+        let w = 64usize;
+        let h = 64usize;
+        let mut samples = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                let r = ((x as i32 - 32).abs() + (y as i32 - 32).abs()) as u32;
+                samples[o] = (128 + (r as i32 - 32).clamp(-127, 127)) as u8;
+                samples[o + 1] = ((x * 4) & 0xFF) as u8;
+                samples[o + 2] = ((y * 4) & 0xFF) as u8;
+            }
+        }
+        let jpeg = encode_jpeg_rgb24(w as u32, h as u32, &samples, w * 3, DEFAULT_QUALITY)
+            .expect("encode rgb24");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let recovered = &frame.planes[0].data;
+        let stride = frame.planes[0].stride;
+        let mut sse: f64 = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..3 {
+                    let a = samples[(y * w + x) * 3 + ch] as f64;
+                    let b = recovered[y * stride + x * 3 + ch] as f64;
+                    let d = a - b;
+                    sse += d * d;
+                }
+            }
+        }
+        let mse = sse / (w * h * 3) as f64;
+        let psnr = if mse <= f64::EPSILON {
+            99.0
+        } else {
+            20.0 * (255.0_f64 / mse.sqrt()).log10()
+        };
+        assert!(psnr >= 30.0, "Q=75 PSNR = {psnr:.2} dB (expected ≥ 30)");
+    }
+
+    #[test]
+    fn baseline_rgb24_rejects_short_stride() {
+        let samples = vec![0u8; 16 * 16 * 3];
+        let err =
+            encode_jpeg_rgb24(16, 16, &samples, 16, 75).expect_err("stride < width * 3 must fail");
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn baseline_rgb24_rejects_short_buffer() {
+        // Stride OK but the caller passed too few rows.
+        let samples = vec![0u8; 16 * 8 * 3];
+        let err = encode_jpeg_rgb24(16, 16, &samples, 16 * 3, 75)
+            .expect_err("samples shorter than stride*h must fail");
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn baseline_rgb24_with_opts_emits_dri_and_restart() {
+        // 32×32 image at 4 MCUs per row, restart_interval = 4 MCUs →
+        // RSTn fires three times per row. DRI segment must be present,
+        // at least one RSTn marker emitted, decoder still round-trips.
+        let w = 32u32;
+        let h = 32u32;
+        let mut samples = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let o = (y * w as usize + x) * 3;
+                samples[o] = ((x + y) as u8).wrapping_mul(3);
+                samples[o + 1] = ((x + y) as u8).wrapping_mul(5);
+                samples[o + 2] = ((x + y) as u8).wrapping_mul(7);
+            }
+        }
+        let jpeg = encode_jpeg_rgb24_with_opts(w, h, &samples, (w * 3) as usize, 80, 4)
+            .expect("encode rgb24 with DRI");
+        let mut found_dri = false;
+        let mut found_rst = false;
+        for i in 0..jpeg.len().saturating_sub(1) {
+            if jpeg[i] == 0xFF && jpeg[i + 1] == 0xDD {
+                found_dri = true;
+            }
+            if jpeg[i] == 0xFF && (0xD0..=0xD7).contains(&jpeg[i + 1]) {
+                found_rst = true;
+            }
+        }
+        assert!(found_dri, "DRI segment must be present when interval > 0");
+        assert!(found_rst, "at least one RSTn marker must be present");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode DRI rgb24");
+        assert_eq!(frame.planes.len(), 1);
+        assert_eq!(frame.planes[0].stride, (w * 3) as usize);
+    }
+
+    #[test]
+    fn baseline_rgb24_with_meta_embeds_app_segments() {
+        // Caller-supplied meta replaces the default APP0 + APP14 pair
+        // entirely. The component-id fallback (`'R'/'G'/'B'`) still
+        // signals RGB to the decoder so it round-trips as `Rgb24`.
+        let w = 16u32;
+        let h = 16u32;
+        let samples = vec![100u8; (w * h * 3) as usize];
+        let app1_body = b"FAKEEXIF";
+        let mut meta = Vec::new();
+        meta.push(0xFF);
+        meta.push(0xE1); // APP1
+        let len = (2 + app1_body.len()) as u16;
+        meta.extend_from_slice(&len.to_be_bytes());
+        meta.extend_from_slice(app1_body);
+        let jpeg = encode_jpeg_rgb24_with_meta(w, h, &samples, (w * 3) as usize, 90, 0, &meta)
+            .expect("encode rgb24 with meta");
+        assert_eq!(&jpeg[2..4], &[0xFF, 0xE1], "APP1 must follow SOI");
+        assert!(
+            jpeg.windows(app1_body.len()).any(|win| win == app1_body),
+            "APP1 body not embedded"
+        );
+        // No Adobe APP14 was emitted on this path; the decoder still
+        // recognises RGB via component IDs.
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
+        assert_eq!(frame.planes.len(), 1);
+        assert_eq!(frame.planes[0].stride, (w * 3) as usize);
     }
 
     #[test]

@@ -329,6 +329,28 @@ fn flatten_frame(
                 data,
             }
         }
+        PixelFormat::Rgb24 => {
+            // Packed RGB triples — pass through to the PPM comparison
+            // path with no colour conversion. `is_rgb_jpeg` is implied
+            // here (the decoder only emits Rgb24 for an RGB-marked
+            // JPEG), so the caller's flag is consulted purely for
+            // documentation parity.
+            let _ = is_rgb_jpeg;
+            assert_eq!(vf.planes.len(), 1, "Rgb24 frame should have 1 plane");
+            let stride = vf.planes[0].stride;
+            let mut data = Vec::with_capacity(w * h * 3);
+            for y in 0..h {
+                data.extend_from_slice(&vf.planes[0].data[y * stride..y * stride + w * 3]);
+            }
+            Decoded {
+                pix_fmt: fmt,
+                width,
+                height,
+                channels: 3,
+                bytes_per_sample: 1,
+                data,
+            }
+        }
         PixelFormat::Yuv444P
         | PixelFormat::Yuv422P
         | PixelFormat::Yuv420P
@@ -541,9 +563,11 @@ enum Tier {
 struct CorpusCase {
     name: &'static str,
     /// Set to `true` for fixtures whose JPEG carries R/G/B components
-    /// (Adobe APP14 transform=0, component IDs 82/71/66) — the decoder
-    /// will tag the frame as `Yuv444P` but the planes are R/G/B and we
-    /// must skip colour conversion.
+    /// (Adobe APP14 transform=0, component IDs 82/71/66). The decoder
+    /// emits a packed `Rgb24` plane for these so the YCbCr→RGB
+    /// conversion path is skipped — the flag is kept for documentation
+    /// parity and to gate the planar-YUV reinterpretation fallback
+    /// (see `flatten_frame::Yuv444P`).
     is_rgb_jpeg: bool,
     tier: Tier,
 }
@@ -697,17 +721,20 @@ fn evaluate(case: &CorpusCase) {
 /// Cmyk, Gray*Le} but doesn't tag the frame; we re-derive it here just
 /// for human-readable logging + to drive `flatten_frame`.
 fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelFormat {
+    let _ = h;
     match vf.planes.len() {
         1 => {
             // Stride in bytes. Gray8 → stride == width; Gray12Le →
-            // stride == width * 2.
+            // stride == width * 2; packed Rgb24 → stride == width * 3.
             let s = vf.planes[0].stride;
             if s == w {
                 PixelFormat::Gray8
             } else if s == w * 2 {
                 PixelFormat::Gray12Le
+            } else if s == w * 3 {
+                PixelFormat::Rgb24
             } else {
-                panic!("infer_pix_fmt: unexpected gray stride {s} for width {w}");
+                panic!("infer_pix_fmt: unexpected single-plane stride {s} for width {w}");
             }
         }
         3 => {
@@ -809,8 +836,8 @@ fn corpus_baseline_yuv411_32x32() {
 
 #[test]
 fn corpus_baseline_rgb_32x32() {
-    // Adobe APP14 transform=0; component IDs R/G/B. Decoder tags as
-    // Yuv444P but plane[0..3] are literally R/G/B.
+    // Adobe APP14 transform=0; component IDs R/G/B. Decoder now tags
+    // the frame as packed `Rgb24` (single plane, stride = width * 3).
     // Observed 2026-05-26: PSNR 55.07 dB, exact 90.33%.
     evaluate(&CorpusCase {
         name: "baseline-rgb-32x32",

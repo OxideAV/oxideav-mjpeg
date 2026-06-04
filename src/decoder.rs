@@ -640,6 +640,7 @@ fn decode_scan(
 
     let n_comp = sof.components.len();
     let grayscale = n_comp == 1;
+    let is_rgb = detect_rgb_3comp(sof, state.adobe_transform);
 
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
     let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
@@ -650,6 +651,21 @@ fn decode_scan(
     // Output pixel format (subsampling is implied).
     let pix_fmt = if grayscale {
         PixelFormat::Gray8
+    } else if is_rgb {
+        // 3-component RGB baseline: every component is sampled at
+        // `H = V = 1` (no chroma subsampling concept), output is packed
+        // `Rgb24`. The encoder we ship enforces 1×1 on every component;
+        // reject any conformant-but-exotic RGB JPEG that mixes
+        // sampling factors so we never silently reinterpret a
+        // subsampled "RGB" stream as 1:1.
+        for c in &sof.components {
+            if c.h_factor != 1 || c.v_factor != 1 {
+                return Err(Error::unsupported(
+                    "RGB baseline JPEG: every component must declare H = V = 1",
+                ));
+            }
+        }
+        PixelFormat::Rgb24
     } else if n_comp == 3 {
         let y = sof.components[0];
         let cb = sof.components[1];
@@ -860,6 +876,27 @@ fn decode_scan(
             }
             planes.push(VideoPlane { stride, data });
         }
+        PixelFormat::Rgb24 => {
+            // Pack the three full-resolution component buffers into a
+            // single packed-RGB output plane (`stride = width * 3`).
+            // Sample ordering is `byte 0 = R`, `byte 1 = G`, `byte 2 = B`
+            // — i.e. the SOS scan order from the encoder, which writes
+            // components 1/2/3 = R/G/B. Per the SOF validation above
+            // every component is sampled at H = V = 1, so no upsampling
+            // is required.
+            let stride = width * 3;
+            let mut data = vec![0u8; stride * height];
+            let src_strides = [comp_stride[0], comp_stride[1], comp_stride[2]];
+            for y in 0..height {
+                let off = y * stride;
+                for x in 0..width {
+                    data[off + x * 3] = comp_buf[0][y * src_strides[0] + x];
+                    data[off + x * 3 + 1] = comp_buf[1][y * src_strides[1] + x];
+                    data[off + x * 3 + 2] = comp_buf[2][y * src_strides[2] + x];
+                }
+            }
+            planes.push(VideoPlane { stride, data });
+        }
         PixelFormat::Yuv444P
         | PixelFormat::Yuv422P
         | PixelFormat::Yuv420P
@@ -899,6 +936,34 @@ fn decode_scan(
     }
 
     Ok(VideoFrame { pts, planes })
+}
+
+/// True when a 3-component baseline / sequential SOF should be decoded as
+/// packed RGB (`PixelFormat::Rgb24`) instead of planar YCbCr. RGB is
+/// signalled in either of two ways:
+///
+/// * Adobe APP14 segment with `transform = 0` — declares "no colour
+///   transform applied", i.e. samples are R/G/B in scan order.
+/// * Component IDs `'R' / 'G' / 'B'` (`82 / 71 / 66`) in the SOF, the
+///   convention exercised by the `baseline-rgb-32x32` clean-room fixture
+///   under `docs/image/jpeg/fixtures/baseline-rgb-32x32/`. The encoder's
+///   `encode_jpeg_rgb24_*` entry points also emit this pair.
+///
+/// Returns `false` for every YUV / monochrome / unknown shape so the
+/// existing YCbCr path stays the default.
+fn detect_rgb_3comp(sof: &SofInfo, adobe_transform: Option<u8>) -> bool {
+    if sof.components.len() != 3 {
+        return false;
+    }
+    if adobe_transform == Some(0) {
+        return true;
+    }
+    let ids: [u8; 3] = [
+        sof.components[0].id,
+        sof.components[1].id,
+        sof.components[2].id,
+    ];
+    ids == [b'R', b'G', b'B']
 }
 
 fn decode_block(
@@ -1741,8 +1806,21 @@ fn render_from_coefs(
     let mcus_y = height.div_ceil(8 * v_max);
 
     // Determine output pixel format (same rules as baseline).
+    let is_rgb = detect_rgb_3comp(sof, state.adobe_transform);
     let out_format = if grayscale {
         PixelFormat::Gray8
+    } else if is_rgb {
+        // 3-component RGB baseline / progressive: every component is
+        // sampled at H = V = 1, output is packed `Rgb24` (see
+        // `decode_scan` for the matching constraint and rationale).
+        for c in &sof.components {
+            if c.h_factor != 1 || c.v_factor != 1 {
+                return Err(Error::unsupported(
+                    "RGB JPEG: every component must declare H = V = 1",
+                ));
+            }
+        }
+        PixelFormat::Rgb24
     } else if n_comp == 3 {
         let y = sof.components[0];
         let cb = sof.components[1];
@@ -1846,6 +1924,24 @@ fn render_from_coefs(
             for y in 0..height {
                 data[y * stride..y * stride + width]
                     .copy_from_slice(&comp_buf[0][y * src_stride..y * src_stride + width]);
+            }
+            planes.push(VideoPlane { stride, data });
+        }
+        PixelFormat::Rgb24 => {
+            // Pack the three full-resolution component buffers into a
+            // single packed-RGB output plane. SOS scan order on the
+            // encoder side is R/G/B, so plane[0]/[1]/[2] line up to the
+            // byte triples here.
+            let stride = width * 3;
+            let mut data = vec![0u8; stride * height];
+            let src_strides = [comp_stride[0], comp_stride[1], comp_stride[2]];
+            for y in 0..height {
+                let off = y * stride;
+                for x in 0..width {
+                    data[off + x * 3] = comp_buf[0][y * src_strides[0] + x];
+                    data[off + x * 3 + 1] = comp_buf[1][y * src_strides[1] + x];
+                    data[off + x * 3 + 2] = comp_buf[2][y * src_strides[2] + x];
+                }
             }
             planes.push(VideoPlane { stride, data });
         }

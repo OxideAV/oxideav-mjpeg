@@ -408,6 +408,42 @@ whose tables were never sent in-band, nor cached from an earlier frame,
   entropy bytes) and a lazy `(pts, byte_offset)` waypoint index
   (one entry every 5 frames).
 
+### Decode-free inspector
+
+`oxideav_mjpeg::inspect_jpeg(bytes) -> Result<JpegInfo>` walks the
+marker prefix of a JPEG buffer up to the first SOS (T.81 §B.1) and
+returns a typed summary — `SofKind` (Baseline / ExtendedSequential /
+Progressive / Lossless / ExtendedSequentialArith /  ProgressiveArith /
+LosslessArith / HierarchicalDct / HierarchicalArith), `precision`,
+`width`, `height`, per-component sampling / quant-table descriptors,
+a `ChromaSubsampling` discriminator (4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 /
+GrayscaleOnly / Custom), a `ColorHint` from JFIF (T.871) and Adobe
+APP14 (T.872 §6.5.3) tags, and the `restart_interval` from a DRI
+segment if present. No entropy decoding, no DCT, no allocation
+proportional to the scan body — O(prefix-length). Useful for
+pipeline triage (pick a target pixel format), fallback-decoder
+routing without spinning up the full decode path, and corpus
+summarisation. The `SofKind` exposes `is_supported_by_decoder()`,
+`is_dct()`, and `is_arithmetic()` helpers so callers can negotiate
+without matching on every variant by hand. Standalone surface — the
+inspector requires neither the `registry` feature nor an
+`oxideav-core` dep.
+
+```rust
+use oxideav_mjpeg::{inspect_jpeg, SofKind, ChromaSubsampling};
+
+let info = inspect_jpeg(&jpeg_bytes)?;
+println!(
+    "{}x{} P={} comps={} subsampling={:?} kind={:?}",
+    info.width, info.height, info.precision,
+    info.num_components(), info.subsampling, info.sof_kind,
+);
+if !info.sof_kind.is_supported_by_decoder() {
+    // fall back to a different decoder before allocating
+}
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
 ## Format coverage
 
 Decoder:

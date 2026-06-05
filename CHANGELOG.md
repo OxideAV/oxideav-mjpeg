@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `inspect_jpeg(bytes) -> Result<JpegInfo>` — decode-free typed
+  inspector. Walks the JPEG marker prefix (T.81 §B.1) up to the first
+  SOS and returns a `JpegInfo` carrying a `SofKind` discriminator
+  (Baseline / ExtendedSequential / Progressive / Lossless /
+  ExtendedSequentialArith / ProgressiveArith / LosslessArith /
+  HierarchicalDct / HierarchicalArith) plus precision / width / height /
+  per-component sampling and quant-table selectors, a
+  `ChromaSubsampling` discriminator (4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 /
+  GrayscaleOnly / Custom) derived from the SOF sampling factors per
+  T.81 §A.1.1, a `ColorHint` from the APP0 JFIF (T.871) and APP14
+  Adobe (T.872 §6.5.3) tags, and the `restart_interval` from any DRI
+  segment before SOS. No entropy decoding, no DCT, no allocation
+  proportional to the scan body — the walk is O(prefix-length) and
+  stops at the first SOS marker. `SofKind::is_supported_by_decoder` /
+  `is_dct` / `is_arithmetic` expose the routing-relevant predicates so
+  callers can negotiate fallback without matching every variant by
+  hand. Standalone surface — built without the `registry` Cargo
+  feature, no `oxideav-core` dep. Exercised by 23 new unit tests in
+  `src/jpeg/inspect.rs` covering all SOFn variants + all chroma-
+  subsampling classes + APP0/APP14 colour-hint extraction +
+  malformed-input rejection (missing SOI, EOI before SOS, SOS before
+  SOF, malformed SOF length), plus 8 new integration tests in
+  `tests/inspect.rs` that round-trip the inspector against the
+  in-tree encoder's baseline / progressive / lossless outputs at
+  multiple chroma subsamplings.
 - `encoder::encode_jpeg_rgb24(width, height, samples, stride, quality)`
   emits a standalone baseline (SOF0) three-component RGB JPEG at 8-bit
   precision from a packed RGB triple buffer. Components are written with

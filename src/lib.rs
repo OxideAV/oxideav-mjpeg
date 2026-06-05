@@ -111,6 +111,14 @@ pub const CODEC_ID_STR: &str = "mjpeg";
 pub use error::{MjpegError, Result};
 pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 
+// Decode-free JPEG inspector — classifies the SOF variant + reports
+// dimensions / components / chroma-subsampling / colour hint without
+// running the entropy decoder. Standalone surface, no `oxideav-core`
+// dependency.
+pub use jpeg::inspect::{
+    inspect_jpeg, ChromaSubsampling, ColorHint, InspectedComponent, JpegInfo, SofKind,
+};
+
 // Framework-integrated API (`oxideav-core`-dependent). Gated behind
 // `registry` so image-library callers can build the crate without
 // dragging in `oxideav-core`.

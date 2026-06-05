@@ -4,6 +4,7 @@ pub mod arith;
 pub mod color;
 pub mod dct;
 pub mod huffman;
+pub mod inspect;
 pub mod markers;
 pub mod parser;
 pub mod quant;

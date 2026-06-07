@@ -1035,3 +1035,83 @@ fn roundtrip_rgb24_short_stride_rejected() {
         "expected InvalidData, got {err:?}"
     );
 }
+
+/// Trait-API `Gray8` input + `set_progressive(true)` routes to the new
+/// single-component SOF2 path. The output bitstream must carry the SOF2
+/// marker (0xFFC2) and must NOT carry SOF0 (0xFFC0) or SOF3 (0xFFC3);
+/// it must round-trip through the matching SOF2 decoder as a single
+/// `Gray8` plane.
+#[test]
+fn roundtrip_grayscale_progressive_trait_api() {
+    let w = 32u32;
+    let h = 32u32;
+    let stride = w as usize;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            samples[y * stride + x] = ((x * 7 + y * 11) % 256) as u8;
+        }
+    }
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride,
+            data: samples.clone(),
+        }],
+    };
+
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    enc_params.width = Some(w);
+    enc_params.height = Some(h);
+    enc_params.pixel_format = Some(PixelFormat::Gray8);
+    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
+    enc.set_progressive(true);
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("recv");
+
+    assert!(
+        pkt.data.windows(2).any(|w| w == [0xFF, 0xC2]),
+        "progressive grayscale must emit SOF2"
+    );
+    assert!(
+        !pkt.data.windows(2).any(|w| w == [0xFF, 0xC0]),
+        "set_progressive(true) must NOT take the SOF0 path"
+    );
+    assert!(
+        !pkt.data.windows(2).any(|w| w == [0xFF, 0xC3]),
+        "lossless flag is off; SOF3 must NOT be emitted"
+    );
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    assert_eq!(v.planes.len(), 1, "single Gray8 plane");
+    // Loose floor — see `progressive_grayscale_q75_roundtrip_psnr_above_30db`
+    // for the tight unit-test floor on a smooth gradient. The Q-default
+    // here gives PSNR ≥ ~25 dB on a synthetic xorshift-ish pattern.
+    let stride_out = v.planes[0].stride;
+    let mut sse: f64 = 0.0;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let a = samples[y * stride + x] as f64;
+            let b = v.planes[0].data[y * stride_out + x] as f64;
+            sse += (a - b) * (a - b);
+        }
+    }
+    let mse = sse / ((w as f64) * (h as f64));
+    let psnr = if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    };
+    assert!(
+        psnr >= 20.0,
+        "PSNR = {psnr:.2} dB (expected ≥ 20 on noisy pattern)"
+    );
+}

@@ -2358,6 +2358,170 @@ fn write_sos_grayscale_8bit(out: &mut Vec<u8>) {
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+// ---- Progressive (SOF2) single-component grayscale encoder ---------------
+//
+// T.81 §G.1.1 permits the progressive coding process at every component
+// count `Nf ∈ 1..=4` (one image-wide DCT coefficient grid per component,
+// shipped across multiple SOS scans). The 3-component YUV path in
+// [`encode_jpeg_progressive`] above generalises straight to a single
+// component: every block carries one DC and 63 ACs; the spectral-
+// selection decomposition keeps the same `(Ss, Se)` band split. We emit
+// three single-component SOS scans:
+//
+// 1. DC-only       — `Ss=0, Se=0, Ah=0, Al=0`
+// 2. AC low band   — `Ss=1, Se=5, Ah=0, Al=0`
+// 3. AC high band  — `Ss=6, Se=63, Ah=0, Al=0`
+//
+// All blocks use the Annex K luma quantiser, the Annex K luma DC + AC
+// Huffman tables, and the standard `H = V = 1` shape (so the MCU is
+// exactly one 8×8 block, matching the baseline grayscale encoder above).
+// No DRI / `RSTn` emission on this path; the 3-component progressive
+// path doesn't expose restart markers either, so this stays consistent.
+
+/// Encode a single-component (`Gray8`) buffer as a complete,
+/// self-contained progressive (SOF2) JPEG byte stream (`FFD8 … FFD9`).
+///
+/// * `samples` — row-major 8-bit luma; byte `samples[y * stride + x]` is
+///   the pixel at `(x, y)`.
+/// * `stride`  — bytes between successive rows; must be at least
+///   `width`. Pass `width` for a tightly-packed buffer.
+/// * `quality` — JPEG quality factor `1..=100` scaled against the
+///   Annex K Q=50 luma base table. Only the luma quantiser is used; the
+///   chroma table is never emitted.
+///
+/// The bitstream layout is `SOI / JFIF APP0 / DQT (luma) / SOF2
+/// (Nf = 1, H = V = 1, P = 8) / DHT (Annex K luma DC + AC) / SOS_DC /
+/// dc-scan / SOS_AC_low (Ss=1, Se=5) / ac-low-scan / SOS_AC_high
+/// (Ss=6, Se=63) / ac-high-scan / EOI`. The output round-trips through
+/// any conformant SOF2 decoder — including the matching SOF2 path in
+/// `crate::decoder` — as a single-plane `Gray8` frame.
+///
+/// No restart markers and no metadata segments beyond the default JFIF
+/// APP0 are emitted; for APP-pass-through see
+/// [`encode_jpeg_progressive_grayscale_with_meta`].
+pub fn encode_jpeg_progressive_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    encode_jpeg_progressive_grayscale_with_meta(width, height, samples, stride, quality, &[])
+}
+
+/// Like [`encode_jpeg_progressive_grayscale`] but inserts `meta`
+/// verbatim between the SOI and the first DQT segment. `meta` must
+/// contain only APP0..APP15 or COM segments (each starting with
+/// `0xFF 0xEn` / `0xFF 0xFE` followed by a big-endian length). Use
+/// [`extract_app_segments`] to harvest metadata from a source JPEG.
+///
+/// When `meta` is empty this is bit-for-bit identical to
+/// [`encode_jpeg_progressive_grayscale`].
+pub fn encode_jpeg_progressive_grayscale_with_meta(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    meta: &[u8],
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid(
+            "progressive grayscale encoder: zero-size image",
+        ));
+    }
+    if stride < w {
+        return Err(Error::invalid(
+            "progressive grayscale encoder: stride smaller than width",
+        ));
+    }
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "progressive grayscale encoder: samples shorter than stride*h",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let huff = DefaultHuffman::build()?;
+
+    // Build the DCT-quantised coefficient grid: one [i32; 64] per block,
+    // walked in raster order. The progressive path needs the *entire*
+    // image's coefficients available before the AC scans run, since each
+    // AC scan walks the block grid independently.
+    let blocks_x = w.div_ceil(8);
+    let blocks_y = h.div_ceil(8);
+    let mut coefs = vec![[0i32; 64]; blocks_x * blocks_y];
+    fill_coef_grid(
+        &mut coefs, samples, stride, w, h, blocks_x, blocks_y, &luma_q,
+    );
+
+    let mut out: Vec<u8> = Vec::with_capacity(8_192);
+    // SOI.
+    out.push(0xFF);
+    out.push(markers::SOI);
+    // Metadata segments (JFIF APP0 fallback when caller provides nothing).
+    if meta.is_empty() {
+        write_jfif_app0(&mut out);
+    } else {
+        out.extend_from_slice(meta);
+    }
+    // DQT — one luma table at id 0.
+    write_dqt(&mut out, 0, &luma_q);
+    // SOF2 — single component, `H = V = 1`, P = 8, Tq = 0.
+    write_sof2_grayscale_8bit(&mut out, w as u16, h as u16);
+    // DHT — Annex K luma DC + AC.
+    write_dht(&mut out, 0, 0, &STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS);
+    write_dht(&mut out, 1, 0, &STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS);
+
+    // ---- Scan 1: DC-only, Ss = 0, Se = 0, Ah = 0, Al = 0 ----
+    // The 3-component variant uses `write_sos_progressive_dc_interleaved`
+    // because all three DCs ship in one scan; the single-component case
+    // is identical to a generic AC SOS at (Ss=0, Se=0) — one Cs, no
+    // interleaving. Td|Ta nibbles both reference the only luma table id 0
+    // — the high nibble (Td, the DC table) is the one actually used in
+    // this DC-only scan; the low nibble (Ta, AC table) is unread by the
+    // decoder when Ss = 0, Se = 0.
+    write_sos_progressive_ac(&mut out, 1, 0, 0, 0);
+    {
+        let mut bw = BitWriter::new(&mut out);
+        let mut prev_dc: i32 = 0;
+        for bi in 0..coefs.len() {
+            encode_dc(&mut bw, coefs[bi][0], &mut prev_dc, &huff.luma_dc);
+        }
+        bw.finish();
+    }
+
+    // ---- Scan 2: AC low band, Ss = 1, Se = 5 ----
+    write_sos_progressive_ac(&mut out, 1, 0, 1, 5);
+    write_ac_scan(&mut out, &coefs, coefs.len(), &huff.luma_ac, 1, 5);
+
+    // ---- Scan 3: AC high band, Ss = 6, Se = 63 ----
+    write_sos_progressive_ac(&mut out, 1, 0, 6, 63);
+    write_ac_scan(&mut out, &coefs, coefs.len(), &huff.luma_ac, 6, 63);
+
+    // EOI.
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+fn write_sof2_grayscale_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    // Same component-record shape as `write_sof0_grayscale_8bit`; the
+    // only on-wire difference vs. SOF0 is the marker byte. T.81 §G.1.1
+    // permits the progressive process at every `Nf ∈ 1..=4`.
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(8); // P = 8
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf = 1
+    payload.push(1); // component id 1 (`Y`)
+    payload.push(0x11); // H = 1, V = 1
+    payload.push(0); // quantiser table 0
+    write_length_prefix(out, markers::SOF2, &payload);
+}
+
 // ---- Baseline (SOF0) packed-RGB24 encoder --------------------------------
 //
 // Three-component, all `H_i = V_i = 1` (MCU = 1 luma block per component =
@@ -4257,6 +4421,236 @@ mod tests {
             "APP1 body not embedded"
         );
         // And the decoder still consumes the output cleanly.
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
+        assert_eq!(frame.planes.len(), 1);
+    }
+
+    // ---- Progressive (SOF2) single-component grayscale --------------
+
+    /// Confirm the progressive grayscale encoder emits a well-formed
+    /// JPEG bytestream: SOI prefix, EOI suffix, single SOF2 segment
+    /// with `Nf = 1, P = 8, H = V = 1, Tq = 0`, single DQT, the Annex K
+    /// luma DC + luma AC DHT pair only (no chroma tables), and exactly
+    /// three SOS scans laid out as the `(Ss, Se)` pairs `(0, 0)`,
+    /// `(1, 5)`, `(6, 63)`.
+    #[test]
+    fn progressive_grayscale_emits_well_formed_sof2_scan_layout() {
+        let w = 16usize;
+        let h = 16usize;
+        let mut samples = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                samples[y * w + x] = ((x + y) * 8) as u8;
+            }
+        }
+        let jpeg = encode_jpeg_progressive_grayscale(w as u32, h as u32, &samples, w, 75)
+            .expect("encode progressive grayscale");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "expected SOI prefix");
+        assert_eq!(
+            &jpeg[jpeg.len() - 2..],
+            &[0xFF, 0xD9],
+            "expected EOI suffix"
+        );
+
+        // Walk segments up to the first SOS, then re-scan the rest of
+        // the bytestream for additional SOS markers (the scan body
+        // between SOS segments isn't length-prefixed, so we use the
+        // unstuffed `0xFF 0xDA` pattern).
+        let mut found_sof2 = false;
+        let mut dqt_count = 0usize;
+        let mut dht_pairs: Vec<(u8, u8)> = Vec::new();
+        let mut sos_ssse: Vec<(u8, u8)> = Vec::new();
+        let mut i = 2;
+        while i + 3 < jpeg.len() {
+            assert_eq!(jpeg[i], 0xFF, "expected marker prefix at {i}");
+            let marker = jpeg[i + 1];
+            if marker == 0xDA {
+                // Capture this SOS's Ss/Se and skip past it via the
+                // length-prefixed payload so we land on the next
+                // segment / scan boundary.
+                let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+                let payload = &jpeg[i + 4..i + 2 + len];
+                // payload: [Ns, (Cs, Td|Ta) * Ns, Ss, Se, Ah|Al]
+                let ns = payload[0] as usize;
+                let ss = payload[1 + 2 * ns];
+                let se = payload[2 + 2 * ns];
+                sos_ssse.push((ss, se));
+                // Skip past the SOS marker and its payload, then walk
+                // the scan body until the next `FF xx` with `xx != 00`
+                // and `xx not in RST0..=RST7` — that's the next SOS or
+                // EOI.
+                let mut j = i + 2 + len;
+                while j + 1 < jpeg.len() {
+                    if jpeg[j] == 0xFF && jpeg[j + 1] != 0x00 {
+                        let m = jpeg[j + 1];
+                        // RSTn (0xD0..=0xD7) doesn't end the scan.
+                        if (0xD0..=0xD7).contains(&m) {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+            let payload = &jpeg[i + 4..i + 2 + len];
+            match marker {
+                0xC2 => {
+                    // SOF2 — single-component shape.
+                    assert_eq!(payload[0], 8, "SOF2 precision must be 8");
+                    assert_eq!(payload[5], 1, "SOF2 must declare Nf = 1");
+                    assert_eq!(payload[6], 1, "component id");
+                    assert_eq!(payload[7], 0x11, "H = V = 1");
+                    assert_eq!(payload[8], 0, "quant table id");
+                    found_sof2 = true;
+                }
+                0xDB => {
+                    dqt_count += 1;
+                }
+                0xC4 => {
+                    // DHT: first byte = class<<4 | id.
+                    let class = payload[0] >> 4;
+                    let id = payload[0] & 0x0F;
+                    dht_pairs.push((class, id));
+                }
+                _ => {}
+            }
+            i += 2 + len;
+        }
+        assert!(found_sof2, "expected SOF2 segment in output");
+        assert_eq!(dqt_count, 1, "exactly one DQT expected (luma only)");
+        assert_eq!(dht_pairs.len(), 2, "exactly two DHTs expected");
+        assert!(
+            dht_pairs.contains(&(0, 0)),
+            "luma DC DHT (class=0, id=0) missing"
+        );
+        assert!(
+            dht_pairs.contains(&(1, 0)),
+            "luma AC DHT (class=1, id=0) missing"
+        );
+        assert_eq!(
+            sos_ssse,
+            vec![(0, 0), (1, 5), (6, 63)],
+            "SOS scans must be DC / AC-low / AC-high in order",
+        );
+    }
+
+    /// Progressive grayscale round-trip at Q = 100 — the matching SOF2
+    /// decoder must reconstruct the input to within a few LSBs (Annex
+    /// K table at Q=100 scales to all-1 quantisers, so any residual
+    /// delta comes from f32 DCT/IDCT rounding only).
+    #[test]
+    fn progressive_grayscale_high_quality_roundtrip_is_near_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut samples = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                samples[y * w + x] = (((x * 7 + y * 11) % 256) as u8).clamp(0, 255);
+            }
+        }
+        let jpeg = encode_jpeg_progressive_grayscale(w as u32, h as u32, &samples, w, 100)
+            .expect("encode progressive grayscale");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        assert_eq!(frame.planes.len(), 1, "Gray8 frame has one plane");
+        let recovered = &frame.planes[0].data;
+        let stride = frame.planes[0].stride;
+        let mut max_diff: u32 = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let a = samples[y * w + x];
+                let b = recovered[y * stride + x];
+                let d = (a as i32 - b as i32).unsigned_abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+            }
+        }
+        assert!(max_diff <= 4, "Q=100 max diff = {max_diff} (expected ≤ 4)");
+    }
+
+    /// Progressive grayscale round-trip at Q = 75 — PSNR ≥ 30 dB on a
+    /// smooth synthetic gradient. Matches the floor `encode_jpeg_progressive`
+    /// achieves on YUV at the same quality.
+    #[test]
+    fn progressive_grayscale_q75_roundtrip_psnr_above_30db() {
+        let w = 64usize;
+        let h = 64usize;
+        let mut samples = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x as i32 - 32).abs() + (y as i32 - 32).abs()) as u32;
+                samples[y * w + x] = (128 + (r as i32 - 32).clamp(-127, 127)) as u8;
+            }
+        }
+        let jpeg =
+            encode_jpeg_progressive_grayscale(w as u32, h as u32, &samples, w, DEFAULT_QUALITY)
+                .expect("encode progressive grayscale");
+        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let recovered = &frame.planes[0].data;
+        let stride = frame.planes[0].stride;
+        let mut sse: f64 = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                let a = samples[y * w + x] as f64;
+                let b = recovered[y * stride + x] as f64;
+                sse += (a - b) * (a - b);
+            }
+        }
+        let mse = sse / ((w * h) as f64);
+        // PSNR = 10*log10(255^2 / mse).
+        let psnr = if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0_f64 * 255.0 / mse).log10()
+        };
+        assert!(psnr >= 30.0, "Q=75 PSNR = {psnr:.2} dB (expected ≥ 30)");
+    }
+
+    /// The progressive grayscale encoder rejects strides shorter than
+    /// `width` and buffers shorter than `stride * height`.
+    #[test]
+    fn progressive_grayscale_rejects_short_stride() {
+        let samples = vec![0u8; 64];
+        let err = encode_jpeg_progressive_grayscale(16, 4, &samples, 8, 75).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn progressive_grayscale_rejects_short_buffer() {
+        let samples = vec![0u8; 30];
+        let err = encode_jpeg_progressive_grayscale(8, 8, &samples, 8, 75).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// The `_with_meta` variant places the caller-supplied metadata
+    /// segments right after SOI, suppressing the default JFIF APP0,
+    /// and the bytestream still round-trips through the decoder.
+    #[test]
+    fn progressive_grayscale_with_meta_embeds_app_segments() {
+        let w = 16u32;
+        let h = 16u32;
+        let samples = vec![100u8; (w * h) as usize];
+        let app1_body = b"FAKEEXIF";
+        let mut meta = Vec::new();
+        meta.push(0xFF);
+        meta.push(0xE1); // APP1
+        let len = (2 + app1_body.len()) as u16;
+        meta.extend_from_slice(&len.to_be_bytes());
+        meta.extend_from_slice(app1_body);
+        let jpeg =
+            encode_jpeg_progressive_grayscale_with_meta(w, h, &samples, w as usize, 90, &meta)
+                .expect("encode with meta");
+        // First marker after SOI must be APP1; default JFIF APP0 must
+        // be absent on this path.
+        assert_eq!(&jpeg[2..4], &[0xFF, 0xE1], "APP1 must follow SOI");
+        assert!(
+            jpeg.windows(app1_body.len()).any(|win| win == app1_body),
+            "APP1 body not embedded"
+        );
         let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
         assert_eq!(frame.planes.len(), 1);
     }

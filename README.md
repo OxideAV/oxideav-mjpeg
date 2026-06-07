@@ -137,6 +137,40 @@ decomposition uses a 1-bit point transform:
 Output round-trips through any conformant SOF2 decoder with PSNR
 ≥ 40 dB relative to the equivalent spectral-selection-only encode.
 
+### Progressive (SOF2) single-component grayscale encode
+
+For single-component (`Gray8`) input call
+`encoder::encode_jpeg_progressive_grayscale(width, height, samples,
+stride, quality)` directly. The bitstream layout is `SOI / JFIF APP0 /
+DQT (luma) / SOF2 (Nf = 1, H = V = 1, P = 8) / DHT (Annex K luma DC +
+AC) / SOS_DC (Ss=0, Se=0) / scan / SOS_AC_low (Ss=1, Se=5) / scan /
+SOS_AC_high (Ss=6, Se=63) / scan / EOI` — three spectral-selection
+scans, no successive approximation, no DRI / `RSTn`. The output
+round-trips through any conformant SOF2 decoder as a single `Gray8`
+plane (max-diff ≤ 4 LSBs at `Q=100` on smooth content; PSNR ≥ 30 dB
+at the default `Q=75`). The companion `_with_meta` variant
+(`encode_jpeg_progressive_grayscale_with_meta(..., meta)`) replaces
+the default JFIF APP0 with caller-supplied APP/COM segments harvested
+via [`extract_app_segments`](#metadata-pass-through).
+
+The trait-API encoder routes `Gray8` input + `set_progressive(true)`
+to the same path:
+
+```rust
+let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+params.width = Some(w);
+params.height = Some(h);
+params.pixel_format = Some(PixelFormat::Gray8);
+let mut enc = MjpegEncoder::from_params(&params)?;
+enc.set_progressive(true);
+enc.send_frame(&Frame::Video(frame_gray8))?;
+```
+
+`set_lossless(true)` continues to override `set_progressive` for
+grayscale (the SOF3 lossless path wins), and `set_restart_interval`
+is ignored on the progressive path — neither the 3-component nor the
+1-component SOF2 encoder emits DRI / `RSTn`.
+
 ### Lossless (SOF3) encode
 
 For single-component grayscale input call
@@ -526,10 +560,13 @@ Encoder:
   flag configurable via the dedicated public CMYK entry points (and
   the trait API's `set_adobe_transform`).
 - **SOF2** (progressive) — spectral-selection decomposition (default:
-  7 SOS scans, `Ah=0`, `Al=0`) and full successive-approximation
-  decomposition (14 SOS scans, 1-bit point transform). See above. The
-  CMYK / YCCK variant uses a 9-segment spectral-selection scan
-  decomposition over four components.
+  7 SOS scans, `Ah=0`, `Al=0`) for 3-component YUV, and a 3-scan
+  variant (DC + AC-low + AC-high, `Ss/Se ∈ {(0,0), (1,5), (6,63)}`)
+  for single-component `Gray8`. The CMYK / YCCK variant uses a
+  9-segment spectral-selection scan decomposition over four components.
+  Full successive-approximation decomposition (14 SOS scans, 1-bit
+  point transform) is available on the YUV path via
+  `encode_jpeg_progressive_sa`. See above.
 - **SOF3** (lossless) — single-component grayscale at any precision
   `P ∈ 2..=16`, three-component interleaved (RGB-class) at any
   precision `P ∈ 2..=16`, and four-component interleaved (CMYK-class)

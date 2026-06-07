@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encoder::encode_jpeg_progressive_grayscale(width, height, samples,
+  stride, quality)` emits a standalone progressive (SOF2)
+  single-component grayscale JPEG at 8-bit precision. T.81 §G.1.1
+  permits the progressive coding process at every `Nf ∈ 1..=4`; the
+  single-component case ships every block's DC and AC coefficients
+  across three spectral-selection scans with `(Ss, Se) = (0, 0)` /
+  `(1, 5)` / `(6, 63)`, all at `Ah = 0, Al = 0`. The bitstream layout
+  is `SOI / JFIF APP0 / DQT (luma) / SOF2 (Nf = 1, H = V = 1, P = 8)
+  / DHT (Annex K luma DC + AC) / SOS_DC / scan / SOS_AC_low / scan /
+  SOS_AC_high / scan / EOI` — one DQT, one DC + one AC DHT, no chroma
+  table, no DRI / `RSTn`. The companion variant
+  `encode_jpeg_progressive_grayscale_with_meta(.., meta)` replaces
+  the default JFIF APP0 with caller-supplied APP/COM segments
+  harvested via [`extract_app_segments`]. The trait-API encoder
+  (`MjpegEncoder::send_frame`) now routes `Gray8` input +
+  `set_progressive(true)` through the new path; `set_lossless(true)`
+  continues to win over progressive (SOF3 lossless takes priority) and
+  `set_restart_interval` is ignored on the progressive path (the
+  3-component progressive encoder doesn't expose DRI emission either,
+  kept consistent so the flag has the same meaning across every
+  progressive variant). Six new unit tests cover the SOF2 single-
+  component header walker (SOF2 + single DQT + luma DC+AC DHT only +
+  exactly three SOS scans at `(0,0)`/`(1,5)`/`(6,63)`), Q=100 ±4 LSB
+  near-lossless ceiling, Q=75 ≥30 dB PSNR floor, short-stride and
+  short-buffer rejection, and the `_with_meta` APP1 pass-through; one
+  new integration test in `tests/roundtrip.rs` covers the trait-API
+  routing (SOF2 present, SOF0 + SOF3 absent, round-trip ≥ 20 dB).
+
 - `inspect_jpeg(bytes) -> Result<JpegInfo>` — decode-free typed
   inspector. Walks the JPEG marker prefix (T.81 §B.1) up to the first
   SOS and returns a `JpegInfo` carrying a `SofKind` discriminator

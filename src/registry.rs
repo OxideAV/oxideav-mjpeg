@@ -31,8 +31,8 @@ use crate::container;
 use crate::decoder::decode_jpeg;
 use crate::encoder::{
     encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts,
-    encode_jpeg_progressive, encode_jpeg_rgb24_with_opts, encode_jpeg_with_opts,
-    encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
+    encode_jpeg_progressive, encode_jpeg_progressive_grayscale, encode_jpeg_rgb24_with_opts,
+    encode_jpeg_with_opts, encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
@@ -517,12 +517,20 @@ impl Encoder for MjpegEncoder {
                         )?
                     }
                     // 8-bit grayscale without lossless mode takes the
-                    // baseline (SOF0) single-component DCT path. The
-                    // bitstream layout mirrors `encode_jpeg` reduced to
-                    // one luma component (one DQT + DC/AC luma Huffman
-                    // tables + a one-entry SOS), so any conformant
-                    // decoder produces a `Gray8` frame round-tripping
-                    // with the usual DCT-quantise distortion floor.
+                    // baseline (SOF0) or progressive (SOF2) single-
+                    // component DCT path. The baseline bitstream layout
+                    // mirrors `encode_jpeg` reduced to one luma component
+                    // (one DQT + DC/AC luma Huffman tables + a one-entry
+                    // SOS); flipping `set_progressive(true)` takes the
+                    // matching SOF2 path (DC + AC-low + AC-high scans,
+                    // spectral-selection decomposition). Either way any
+                    // conformant decoder produces a `Gray8` frame
+                    // round-tripping with the usual DCT-quantise
+                    // distortion floor. `restart_interval` is ignored
+                    // on the progressive path because the 3-component
+                    // progressive encoder doesn't expose DRI emission
+                    // either — kept consistent so the flag has the same
+                    // meaning across every progressive variant.
                     (MjpegPixelFormat::Gray8, false) => {
                         if v.planes.is_empty() {
                             return Err(Error::invalid(
@@ -530,14 +538,24 @@ impl Encoder for MjpegEncoder {
                             ));
                         }
                         let plane = &v.planes[0];
-                        encode_jpeg_grayscale_with_opts(
-                            self.width,
-                            self.height,
-                            &plane.data,
-                            plane.stride,
-                            self.quality,
-                            self.restart_interval,
-                        )?
+                        if self.progressive {
+                            encode_jpeg_progressive_grayscale(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                            )?
+                        } else {
+                            encode_jpeg_grayscale_with_opts(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                                self.restart_interval,
+                            )?
+                        }
                     }
                     // Higher-precision grayscale (10 / 12 / 16-bit)
                     // still requires `set_lossless(true)` — the

@@ -452,16 +452,25 @@ LosslessArith / HierarchicalDct / HierarchicalArith), `precision`,
 `width`, `height`, per-component sampling / quant-table descriptors,
 a `ChromaSubsampling` discriminator (4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 /
 GrayscaleOnly / Custom), a `ColorHint` from JFIF (T.871) and Adobe
-APP14 (T.872 §6.5.3) tags, and the `restart_interval` from a DRI
-segment if present. No entropy decoding, no DCT, no allocation
+APP14 (T.872 §6.5.3) tags, the `restart_interval` from a DRI
+segment if present, and — when the leading APP0 is a structurally
+valid JFIF segment per T.871 §10.1 — an optional `JfifApp0` typed
+view (`version_major`/`_minor`, `units: JfifUnits` ∈
+{`AspectRatio`, `DotsPerInch`, `DotsPerCm`}, `h_density`/`v_density`,
+`thumbnail_width`/`_height`, plus `has_thumbnail()`,
+`thumbnail_payload_len()`, `h_density_dpi()` / `v_density_dpi()`
+unit-normalised accessors and `pixel_aspect_ratio()` for the
+units-= 0 case). No entropy decoding, no DCT, no allocation
 proportional to the scan body — O(prefix-length). Useful for
 pipeline triage (pick a target pixel format), fallback-decoder
-routing without spinning up the full decode path, and corpus
-summarisation. The `SofKind` exposes `is_supported_by_decoder()`,
-`is_dct()`, and `is_arithmetic()` helpers so callers can negotiate
-without matching on every variant by hand. Standalone surface — the
-inspector requires neither the `registry` feature nor an
-`oxideav-core` dep.
+routing without spinning up the full decode path, DPI-aware
+thumbnail sizing, and corpus summarisation. The `SofKind` exposes
+`is_supported_by_decoder()`, `is_dct()`, and `is_arithmetic()`
+helpers so callers can negotiate without matching on every variant
+by hand. A standalone `parse_jfif_app0(payload) -> Result<JfifApp0>`
+validator is also re-exported for callers that already have the APP0
+payload bytes in hand. Standalone surface — the inspector requires
+neither the `registry` feature nor an `oxideav-core` dep.
 
 ```rust
 use oxideav_mjpeg::{inspect_jpeg, SofKind, ChromaSubsampling};

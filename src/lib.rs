@@ -116,7 +116,8 @@ pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 // running the entropy decoder. Standalone surface, no `oxideav-core`
 // dependency.
 pub use jpeg::inspect::{
-    inspect_jpeg, ChromaSubsampling, ColorHint, InspectedComponent, JpegInfo, SofKind,
+    inspect_jpeg, parse_jfif_app0, ChromaSubsampling, ColorHint, InspectedComponent, JfifApp0,
+    JfifUnits, JpegInfo, SofKind,
 };
 
 // Framework-integrated API (`oxideav-core`-dependent). Gated behind

@@ -215,6 +215,143 @@ pub struct InspectedComponent {
     pub quant_table: u8,
 }
 
+/// Units field of the JFIF APP0 segment (T.871 §10.1).
+///
+/// JFIF's `units` byte selects what the `Hdensity` / `Vdensity`
+/// numbers mean. The three encodings are exhaustive — every other
+/// value is illegal and produces an `Err` from `parse_jfif_app0`,
+/// matching the spec's "shall be one of" wording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JfifUnits {
+    /// `units = 0x00` — densities express only the pixel aspect
+    /// ratio (`width:height = Vdensity:Hdensity`). The numerical
+    /// values are in arbitrary units.
+    AspectRatio,
+    /// `units = 0x01` — densities are dots per inch (1 inch = 2.54
+    /// cm).
+    DotsPerInch,
+    /// `units = 0x02` — densities are dots per cm.
+    DotsPerCm,
+}
+
+impl JfifUnits {
+    /// The literal `units` byte (T.871 §10.1) this variant represents.
+    /// Provided so callers building a JFIF APP0 segment from a typed
+    /// view can re-encode the byte they parsed without a side table.
+    pub fn as_byte(self) -> u8 {
+        match self {
+            Self::AspectRatio => 0x00,
+            Self::DotsPerInch => 0x01,
+            Self::DotsPerCm => 0x02,
+        }
+    }
+}
+
+/// Typed view of a JFIF APP0 marker segment (T.871 §10.1).
+///
+/// Parsed from the bytes that follow the APP0 marker's two-byte
+/// length field, **including** the `"JFIF\0"` identifier — i.e. the
+/// `payload` slice the inspector's marker walker hands to
+/// `parse_jfif_app0`. Decode-only: the inspector never builds one
+/// from caller input.
+///
+/// All numeric fields are reported as they appeared on the wire; the
+/// only validation is the structural one the spec mandates (identifier
+/// equals `"JFIF\0"`, `units ∈ {0, 1, 2}`, both densities non-zero,
+/// `Lp` accounts for the optional thumbnail RGB triples). The
+/// thumbnail RGB payload itself is **not** copied out — callers that
+/// want it can read it from the source buffer using the offsets
+/// computed from `thumbnail_width × thumbnail_height × 3`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JfifApp0 {
+    /// Major version byte (T.871 §10.1 `version` field, MSB). The
+    /// recommendation requires `0x01`; observed JFIF files in the
+    /// wild always carry `0x01` here and a parser that rejects
+    /// otherwise would lose interoperability with the long tail of
+    /// pre-T.871 1.0x writers — so the field is reported, not
+    /// validated.
+    pub version_major: u8,
+    /// Minor version byte (T.871 §10.1 `version` field, LSB).
+    /// Common values are `0x00` (JFIF 1.00), `0x01` (1.01), and
+    /// `0x02` (1.02 — the version T.871 normalises).
+    pub version_minor: u8,
+    /// Units selector (T.871 §10.1 `units` field).
+    pub units: JfifUnits,
+    /// Horizontal pixel density. T.871 §10.1 says this "must be
+    /// non-zero"; `parse_jfif_app0` enforces it.
+    pub h_density: u16,
+    /// Vertical pixel density. Must also be non-zero per T.871
+    /// §10.1.
+    pub v_density: u16,
+    /// Horizontal thumbnail pixel count (`HthumbnailA`, T.871
+    /// §10.1). May be zero — `0` together with `thumbnail_height = 0`
+    /// signals "no thumbnail" and the trailing `(R, G, B) * k`
+    /// payload is empty.
+    pub thumbnail_width: u8,
+    /// Vertical thumbnail pixel count (`VthumbnailA`).
+    pub thumbnail_height: u8,
+}
+
+impl JfifApp0 {
+    /// True when both thumbnail-pixel-count fields are zero, i.e. the
+    /// segment carries no embedded RGB thumbnail (the common case for
+    /// real-world JFIF files — most writers emit the extension APP0
+    /// `"JFXX"` thumbnail instead).
+    pub fn has_thumbnail(self) -> bool {
+        self.thumbnail_width != 0 && self.thumbnail_height != 0
+    }
+
+    /// Total bytes of trailing RGB-thumbnail payload that follow the
+    /// fixed header (T.871 §10.1: `3 * HthumbnailA * VthumbnailA`). Zero
+    /// when no thumbnail is present.
+    pub fn thumbnail_payload_len(self) -> usize {
+        (self.thumbnail_width as usize) * (self.thumbnail_height as usize) * 3
+    }
+
+    /// `(version_major, version_minor)` as a `(u8, u8)` tuple, in case
+    /// the caller wants to pattern-match against `(1, 2)` etc. without
+    /// reading both fields.
+    pub fn version(self) -> (u8, u8) {
+        (self.version_major, self.version_minor)
+    }
+
+    /// Horizontal density in dots-per-inch, if the segment's `units`
+    /// permits the conversion. Returns the raw `h_density` for
+    /// `DotsPerInch`, the converted value for `DotsPerCm` (`× 2.54`,
+    /// rounded), and `None` for `AspectRatio` since aspect-only
+    /// density numbers have no DPI meaning.
+    pub fn h_density_dpi(self) -> Option<u32> {
+        match self.units {
+            JfifUnits::AspectRatio => None,
+            JfifUnits::DotsPerInch => Some(self.h_density as u32),
+            // 1 inch = 2.54 cm → dpi = dpcm × 2.54. Compute with
+            // integer arithmetic, rounding half to even via the
+            // standard `(a * 254 + 50) / 100` trick.
+            JfifUnits::DotsPerCm => Some(((self.h_density as u32).saturating_mul(254) + 50) / 100),
+        }
+    }
+
+    /// Vertical density in dots-per-inch — see `h_density_dpi`.
+    pub fn v_density_dpi(self) -> Option<u32> {
+        match self.units {
+            JfifUnits::AspectRatio => None,
+            JfifUnits::DotsPerInch => Some(self.v_density as u32),
+            JfifUnits::DotsPerCm => Some(((self.v_density as u32).saturating_mul(254) + 50) / 100),
+        }
+    }
+
+    /// Width:height pixel aspect ratio expressed as the raw
+    /// `(v_density, h_density)` pair. T.871 §10.1 explicitly states
+    /// "pixel aspect ratio = Vdensity:Hdensity"; the helper returns
+    /// the same numbers in source order so a caller computing a
+    /// floating-point ratio (`w as f32 / h as f32 * v as f32 /
+    /// h_density as f32`) doesn't have to remember which way the
+    /// spec writes it.
+    pub fn pixel_aspect_ratio(self) -> (u16, u16) {
+        (self.v_density, self.h_density)
+    }
+}
+
 /// Result of a successful `inspect_jpeg` call.
 #[derive(Clone, Debug)]
 pub struct JpegInfo {
@@ -246,6 +383,17 @@ pub struct JpegInfo {
     /// before SOS (T.81 §B.2.4.4), or `0` if no DRI was seen —
     /// matching the spec's "DRI absent ⇒ no restarts" default.
     pub restart_interval: u16,
+    /// Typed view of the JFIF APP0 segment (T.871 §10.1) when one
+    /// was present at the head of the marker prefix and structurally
+    /// well-formed. `None` for streams with no JFIF magic, a
+    /// truncated APP0 payload, an illegal `units` byte, or a zero
+    /// density.
+    ///
+    /// Disjoint from `color_hint`: an Adobe-tagged stream that lacks
+    /// JFIF reports `color_hint = AdobeYCbCr` and `jfif = None`;
+    /// a JFIF + Adobe stream reports both with the colour hint
+    /// preferring Adobe (the existing inspector policy).
+    pub jfif: Option<JfifApp0>,
 }
 
 impl JpegInfo {
@@ -264,6 +412,102 @@ const JFIF_MAGIC: &[u8; 5] = b"JFIF\0";
 /// Five bytes: `"Adobe"`. The 6th byte and onwards carry version /
 /// flags / colour-transform.
 const ADOBE_MAGIC: &[u8; 5] = b"Adobe";
+
+/// Parse a JFIF APP0 payload (T.871 §10.1) into a typed view.
+///
+/// `payload` is the byte slice that the marker walker hands to the
+/// inspector for the APP0 segment — the bytes after the marker's
+/// two-byte length field, starting with the `"JFIF\0"` identifier.
+/// The function returns `Ok(JfifApp0)` when the segment is
+/// structurally valid per T.871 §10.1:
+///
+/// * Identifier equals `b"JFIF\0"`.
+/// * `Lp = 16 + 3 * HthumbnailA * VthumbnailA`, i.e. the fixed-header
+///   portion (identifier + version + units + densities + thumbnail
+///   dims) is followed by exactly `3 * Hthumb * Vthumb` bytes of
+///   trailing RGB.
+/// * `units ∈ {0x00, 0x01, 0x02}`.
+/// * Both `Hdensity` and `Vdensity` are non-zero.
+///
+/// Errors:
+/// * `Invalid` when the payload is shorter than the 14-byte fixed
+///   header.
+/// * `Invalid` when the identifier doesn't match `"JFIF\0"` (the
+///   caller is expected to gate on the magic first, but the validator
+///   re-checks so direct calls aren't a footgun).
+/// * `Invalid` for an illegal `units` byte.
+/// * `Invalid` for a zero density on either axis.
+/// * `Invalid` when the declared trailing thumbnail size doesn't fit
+///   in the remaining payload bytes.
+///
+/// The `version` field is reported as `(major, minor)` without
+/// rejecting non-1.02 writers: the wild-corpus 1.00 / 1.01 streams
+/// are too common for a parser that refuses them to be useful.
+///
+/// The validator never allocates; the returned `JfifApp0` is `Copy`.
+pub fn parse_jfif_app0(payload: &[u8]) -> Result<JfifApp0> {
+    // T.871 §10.1 fixed-header layout, byte offsets relative to the
+    // start of the APP0 payload (i.e. *after* the marker + length):
+    //
+    //   0..5    identifier "JFIF\0"
+    //   5..7    version    (major, minor)
+    //   7       units      (0 | 1 | 2)
+    //   8..10   Hdensity   (big-endian u16, non-zero)
+    //  10..12   Vdensity   (big-endian u16, non-zero)
+    //  12       HthumbnailA
+    //  13       VthumbnailA
+    //  14..     trailing (R, G, B) * (Hthumb * Vthumb)
+    //
+    // Hence 14 bytes is the absolute minimum for a thumbnail-less
+    // JFIF APP0.
+    if payload.len() < 14 {
+        return Err(Error::invalid("parse_jfif_app0: payload too short"));
+    }
+    if &payload[..5] != JFIF_MAGIC {
+        return Err(Error::invalid("parse_jfif_app0: identifier != JFIF\\0"));
+    }
+
+    let version_major = payload[5];
+    let version_minor = payload[6];
+
+    let units = match payload[7] {
+        0x00 => JfifUnits::AspectRatio,
+        0x01 => JfifUnits::DotsPerInch,
+        0x02 => JfifUnits::DotsPerCm,
+        _ => return Err(Error::invalid("parse_jfif_app0: illegal units byte")),
+    };
+
+    let h_density = u16::from_be_bytes([payload[8], payload[9]]);
+    let v_density = u16::from_be_bytes([payload[10], payload[11]]);
+    if h_density == 0 || v_density == 0 {
+        return Err(Error::invalid("parse_jfif_app0: zero density"));
+    }
+
+    let thumbnail_width = payload[12];
+    let thumbnail_height = payload[13];
+
+    // Thumbnail body length must fit in the payload tail. T.871
+    // §10.1's `Lp = 16 + 3 * k` is equivalent to "payload length =
+    // 14 (fixed) + 3 * k", since Lp excludes the marker itself but
+    // includes its own 2-byte length field, so payload-bytes ==
+    // Lp - 2 == 14 + 3*k.
+    let thumb_bytes = (thumbnail_width as usize) * (thumbnail_height as usize) * 3;
+    if payload.len() < 14 + thumb_bytes {
+        return Err(Error::invalid(
+            "parse_jfif_app0: declared thumbnail overflows payload",
+        ));
+    }
+
+    Ok(JfifApp0 {
+        version_major,
+        version_minor,
+        units,
+        h_density,
+        v_density,
+        thumbnail_width,
+        thumbnail_height,
+    })
+}
 
 /// Walk a JPEG byte buffer's marker prefix and report the variant +
 /// descriptive metadata, without entropy decoding.
@@ -300,6 +544,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut components: Vec<InspectedComponent> = Vec::new();
     let mut color_hint = ColorHint::Unspecified;
     let mut restart_interval: u16 = 0;
+    let mut jfif: Option<JfifApp0> = None;
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -371,6 +616,19 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                 if color_hint == ColorHint::Unspecified {
                     color_hint = ColorHint::JfifYCbCr;
                 }
+                // Attempt to also extract the typed JFIF view. A
+                // structurally malformed JFIF segment is reported as
+                // `jfif = None` but the colour hint above is left in
+                // place — the JFIF magic is enough to confirm the
+                // colour convention even when downstream fields are
+                // truncated, and refusing the entire stream over a
+                // bad-density JFIF would be more disruptive than
+                // useful. Only the first JFIF segment wins.
+                if jfif.is_none() {
+                    if let Ok(parsed) = parse_jfif_app0(payload) {
+                        jfif = Some(parsed);
+                    }
+                }
                 continue;
             }
             if marker == markers::APP14 && payload.len() >= 12 && &payload[..5] == ADOBE_MAGIC {
@@ -418,6 +676,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         subsampling,
         color_hint,
         restart_interval,
+        jfif,
     })
 }
 
@@ -566,6 +825,21 @@ mod tests {
         assert_eq!(info.subsampling, ChromaSubsampling::Yuv420);
         assert_eq!(info.color_hint, ColorHint::JfifYCbCr);
         assert_eq!(info.restart_interval, 0);
+        // The fixture's APP0 payload — version 1.02, units = 0
+        // (aspect ratio only), Hdensity = Vdensity = 1, no thumbnail.
+        let jfif = info.jfif.expect("baseline JFIF view populated");
+        assert_eq!(jfif.version(), (1, 2));
+        assert_eq!(jfif.units, JfifUnits::AspectRatio);
+        assert_eq!(jfif.h_density, 1);
+        assert_eq!(jfif.v_density, 1);
+        assert_eq!(jfif.thumbnail_width, 0);
+        assert_eq!(jfif.thumbnail_height, 0);
+        assert!(!jfif.has_thumbnail());
+        assert_eq!(jfif.thumbnail_payload_len(), 0);
+        // AspectRatio units => no DPI conversion is possible.
+        assert_eq!(jfif.h_density_dpi(), None);
+        assert_eq!(jfif.v_density_dpi(), None);
+        assert_eq!(jfif.pixel_aspect_ratio(), (1, 1));
     }
 
     #[test]
@@ -581,6 +855,8 @@ mod tests {
         let info = inspect_jpeg(&buf).expect("inspect baseline 4:2:2");
         assert_eq!(info.subsampling, ChromaSubsampling::Yuv422);
         assert_eq!(info.color_hint, ColorHint::Unspecified);
+        // No APP0 → no typed JFIF view.
+        assert!(info.jfif.is_none());
     }
 
     #[test]
@@ -827,6 +1103,174 @@ mod tests {
         buf.extend_from_slice(&[0, 0, 0, 0]);
         buf.extend_from_slice(&[0xFF, markers::SOS]);
         assert!(inspect_jpeg(&buf).is_err());
+    }
+
+    #[test]
+    fn jfif_dots_per_inch_parsed() {
+        // version 1.01, units = 0x01 (DPI), 72 dpi both axes, no thumbnail.
+        let payload = b"JFIF\0\x01\x01\x01\x00\x48\x00\x48\x00\x00";
+        let extras = [(markers::APP0, &payload[..])];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            32,
+            32,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect JFIF dpi");
+        let jfif = info.jfif.expect("JFIF view present");
+        assert_eq!(jfif.units, JfifUnits::DotsPerInch);
+        assert_eq!(jfif.h_density, 72);
+        assert_eq!(jfif.v_density, 72);
+        assert_eq!(jfif.version(), (1, 1));
+        assert_eq!(jfif.h_density_dpi(), Some(72));
+        assert_eq!(jfif.v_density_dpi(), Some(72));
+        assert_eq!(jfif.units.as_byte(), 0x01);
+    }
+
+    #[test]
+    fn jfif_dots_per_cm_converted_to_dpi() {
+        // units = 0x02 (DPCM). 100 dpcm = 254 dpi exactly. 39 dpcm
+        // tests the rounding path: 39 × 2.54 = 99.06 → expected 99.
+        let payload = b"JFIF\0\x01\x02\x02\x00\x64\x00\x27\x00\x00";
+        let parsed = parse_jfif_app0(payload).expect("dpcm");
+        assert_eq!(parsed.units, JfifUnits::DotsPerCm);
+        assert_eq!(parsed.h_density, 100);
+        assert_eq!(parsed.v_density, 39);
+        assert_eq!(parsed.h_density_dpi(), Some(254));
+        assert_eq!(parsed.v_density_dpi(), Some(99));
+        assert_eq!(parsed.units.as_byte(), 0x02);
+    }
+
+    #[test]
+    fn jfif_rejects_illegal_units() {
+        let payload = b"JFIF\0\x01\x02\x05\x00\x48\x00\x48\x00\x00"; // units = 5
+        assert!(parse_jfif_app0(payload).is_err());
+    }
+
+    #[test]
+    fn jfif_rejects_zero_density() {
+        let payload = b"JFIF\0\x01\x02\x01\x00\x00\x00\x48\x00\x00"; // Hdensity = 0
+        assert!(parse_jfif_app0(payload).is_err());
+        let payload = b"JFIF\0\x01\x02\x01\x00\x48\x00\x00\x00\x00"; // Vdensity = 0
+        assert!(parse_jfif_app0(payload).is_err());
+    }
+
+    #[test]
+    fn jfif_rejects_truncated_header() {
+        // 13 bytes — one byte short of the minimum fixed header.
+        let payload = b"JFIF\0\x01\x02\x01\x00\x48\x00\x48\x00";
+        assert!(parse_jfif_app0(payload).is_err());
+    }
+
+    #[test]
+    fn jfif_rejects_bad_identifier() {
+        // "JFXX" extension marker is NOT the JFIF APP0 marker.
+        let payload = b"JFXX\0\x01\x02\x01\x00\x48\x00\x48\x00\x00";
+        assert!(parse_jfif_app0(payload).is_err());
+    }
+
+    #[test]
+    fn jfif_with_2x2_thumbnail() {
+        // 2×2 thumbnail = 12 RGB bytes appended. Total payload =
+        // 14 (header) + 12 = 26 bytes.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFIF\0");
+        payload.push(0x01);
+        payload.push(0x02);
+        payload.push(0x01); // dpi
+        payload.extend_from_slice(&96u16.to_be_bytes());
+        payload.extend_from_slice(&96u16.to_be_bytes());
+        payload.push(2); // Hthumb
+        payload.push(2); // Vthumb
+        for i in 0..12 {
+            payload.push(i as u8);
+        }
+        let parsed = parse_jfif_app0(&payload).expect("parse 2x2 thumb");
+        assert!(parsed.has_thumbnail());
+        assert_eq!(parsed.thumbnail_width, 2);
+        assert_eq!(parsed.thumbnail_height, 2);
+        assert_eq!(parsed.thumbnail_payload_len(), 12);
+        assert_eq!(parsed.h_density_dpi(), Some(96));
+    }
+
+    #[test]
+    fn jfif_rejects_thumbnail_overflowing_payload() {
+        // Declare a 2×2 thumbnail (needs 12 bytes) but only attach 5.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFIF\0");
+        payload.push(0x01);
+        payload.push(0x02);
+        payload.push(0x01);
+        payload.extend_from_slice(&72u16.to_be_bytes());
+        payload.extend_from_slice(&72u16.to_be_bytes());
+        payload.push(2);
+        payload.push(2);
+        payload.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert!(parse_jfif_app0(&payload).is_err());
+    }
+
+    #[test]
+    fn jfif_view_disjoint_from_adobe_when_only_adobe_present() {
+        let mut adobe = Vec::new();
+        adobe.extend_from_slice(b"Adobe");
+        adobe.extend_from_slice(&[0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 1]);
+        let extras = [(markers::APP14, adobe.as_slice())];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 2, 2, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect Adobe-only");
+        assert_eq!(info.color_hint, ColorHint::AdobeYCbCr);
+        // No JFIF segment → no typed view, even though Adobe is set.
+        assert!(info.jfif.is_none());
+    }
+
+    #[test]
+    fn jfif_malformed_segment_still_sets_color_hint() {
+        // APP0 payload starts with "JFIF\0" magic but is truncated to
+        // 8 bytes — the colour hint should still flip to JfifYCbCr
+        // (the magic is the colour-convention signal), but the typed
+        // view stays `None`.
+        let payload = b"JFIF\0\x01\x02\x01"; // 8 bytes
+        let extras = [(markers::APP0, &payload[..])];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect truncated JFIF");
+        assert_eq!(info.color_hint, ColorHint::JfifYCbCr);
+        assert!(info.jfif.is_none());
+    }
+
+    #[test]
+    fn jfif_only_first_segment_wins() {
+        // Two APP0 JFIF segments back-to-back; the second has
+        // different density. The inspector picks the first.
+        let payload1 = &b"JFIF\0\x01\x02\x01\x00\x48\x00\x48\x00\x00"[..]; // 72 dpi
+        let payload2 = &b"JFIF\0\x01\x02\x01\x01\x90\x01\x90\x00\x00"[..]; // 400 dpi
+        let extras = [(markers::APP0, payload1), (markers::APP0, payload2)];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect dup JFIF");
+        let jfif = info.jfif.expect("typed view");
+        assert_eq!(jfif.h_density, 72);
+        assert_eq!(jfif.v_density, 72);
     }
 
     #[test]

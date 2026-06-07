@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `JfifApp0` typed view of the JFIF APP0 marker segment (T.871 §10.1)
+  on `JpegInfo::jfif`. Carries the `version_major` / `version_minor`
+  bytes, a `JfifUnits` enum (`AspectRatio` / `DotsPerInch` /
+  `DotsPerCm`, exhaustive per the spec's "shall be one of" wording
+  with `as_byte()` for re-encoding), `h_density` / `v_density`, and
+  the `thumbnail_width` / `thumbnail_height` pair, plus
+  `has_thumbnail()`, `thumbnail_payload_len()`, `version()`,
+  `pixel_aspect_ratio()`, and `h_density_dpi()` / `v_density_dpi()`
+  unit-aware accessors that convert `DotsPerCm` to dots-per-inch via
+  integer `(d × 254 + 50) / 100` and return `None` for the
+  aspect-ratio case where DPI has no meaning. A new top-level
+  `parse_jfif_app0(payload) -> Result<JfifApp0>` validator is
+  exported for callers that already hold the APP0 payload bytes; it
+  enforces the four T.871 §10.1 invariants (`identifier == "JFIF\0"`,
+  `units ∈ {0, 1, 2}`, both densities non-zero, trailing
+  `3 × Hthumb × Vthumb` bytes fit in the payload) and never
+  allocates. `inspect_jpeg` populates `JpegInfo.jfif` automatically
+  when the leading APP0 carries valid JFIF; structurally malformed
+  JFIF segments still flip the existing `ColorHint::JfifYCbCr` hint
+  but leave the typed view as `None` (the magic alone is a sufficient
+  colour-convention signal). Nine new tests cover the DPI / DPCM /
+  aspect-ratio variants, illegal-units / zero-density / truncated-
+  header / bad-identifier / thumbnail-overflow rejection paths, the
+  2×2-thumbnail success case, the only-first-segment-wins rule for
+  duplicate APP0s, the malformed-but-magic-present hint-still-set
+  case, and a JFIF-disjoint Adobe-only stream.
+
 - `encoder::encode_jpeg_progressive_grayscale(width, height, samples,
   stride, quality)` emits a standalone progressive (SOF2)
   single-component grayscale JPEG at 8-bit precision. T.81 §G.1.1

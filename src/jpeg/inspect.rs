@@ -352,6 +352,99 @@ impl JfifApp0 {
     }
 }
 
+/// Colour-transform byte from the Adobe APP14 segment (T.872 §6.5.3).
+///
+/// The same three values that `ColorHint`'s `Adobe*` variants surface,
+/// but exposed as a self-contained typed enum so downstream code can
+/// pattern-match on the transform without first having to disambiguate
+/// JFIF-vs-Adobe at the colour-hint level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdobeColorTransform {
+    /// `transform = 0x00` — components are not colour-transformed.
+    /// For `Nf = 3` the samples are RGB; for `Nf = 4` they are CMYK.
+    Unknown,
+    /// `transform = 0x01` — `Nf = 3` components are YCbCr per the
+    /// Adobe ColorTransform convention. Equivalent to JFIF's BT.601
+    /// full-range tag for the YCbCr arrangement.
+    YCbCr,
+    /// `transform = 0x02` — `Nf = 4` components are YCCK (Y, Cb, Cr,
+    /// K) — Adobe's CMYK colour-transform variant.
+    Ycck,
+}
+
+impl AdobeColorTransform {
+    /// The literal `transform` byte (T.872 §6.5.3) this variant
+    /// represents. Provided so callers building an APP14 segment
+    /// from a typed view can re-encode the byte they parsed without
+    /// a side table.
+    pub fn as_byte(self) -> u8 {
+        match self {
+            Self::Unknown => 0x00,
+            Self::YCbCr => 0x01,
+            Self::Ycck => 0x02,
+        }
+    }
+}
+
+/// Typed view of an Adobe APP14 marker segment (T.872 §6.5.3 /
+/// Adobe Technical Note 5116 §18).
+///
+/// Parsed from the bytes that follow the APP14 marker's two-byte
+/// length field, **including** the `"Adobe"` identifier — i.e. the
+/// `payload` slice the inspector's marker walker hands to
+/// `parse_adobe_app14`. Decode-only: the inspector never builds one
+/// from caller input.
+///
+/// All numeric fields are reported as they appeared on the wire; the
+/// only validation is the structural one the spec mandates (identifier
+/// equals `"Adobe"`, payload is at least 12 bytes, `transform ∈
+/// {0, 1, 2}`). Unknown transform bytes — Photoshop has emitted
+/// reserved values historically — produce an `Err` so direct callers
+/// can fall back to the `ColorHint`-level inference (which tolerates
+/// the byte by treating reserved values as `AdobeUntransformed`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdobeApp14 {
+    /// DCT encoding version (T.872 §6.5.3 `DCTEncodeVersion`).
+    /// Common values: `100` (Adobe Technical Note 5116, the
+    /// near-universal default) and `101` (a Photoshop revision).
+    /// Reported as the raw big-endian `u16` without validation —
+    /// the field is informational.
+    pub dct_encode_version: u16,
+    /// APP14 encoder hint flags 0 (T.872 §6.5.3 `APP14Flags0`).
+    /// Bit 0x4000 indicates the encoder applied chroma blurring;
+    /// bit 0x8000 indicates the encoder used the dampened-edge
+    /// quantization. The inspector reports the raw word; callers
+    /// that care can bit-test.
+    pub flags_0: u16,
+    /// APP14 encoder hint flags 1 (T.872 §6.5.3 `APP14Flags1`).
+    /// Currently unused; reserved-zero in conformant writers.
+    pub flags_1: u16,
+    /// Colour-transform byte (T.872 §6.5.3 `ColorTransform`).
+    pub transform: AdobeColorTransform,
+}
+
+impl AdobeApp14 {
+    /// True when the segment declares the universally-used Adobe
+    /// Technical Note 5116 DCT encoding version (`100`). Streams with
+    /// other versions remain valid; this is a convenience predicate
+    /// for diagnostics.
+    pub fn is_standard_version(self) -> bool {
+        self.dct_encode_version == 100
+    }
+
+    /// Equivalent `ColorHint` projection for callers that want to
+    /// unify the two colour-convention conventions into the single
+    /// inspector-level enum (which is what `inspect_jpeg`'s
+    /// `color_hint` field is already exposing).
+    pub fn as_color_hint(self) -> ColorHint {
+        match self.transform {
+            AdobeColorTransform::Unknown => ColorHint::AdobeUntransformed,
+            AdobeColorTransform::YCbCr => ColorHint::AdobeYCbCr,
+            AdobeColorTransform::Ycck => ColorHint::AdobeYcck,
+        }
+    }
+}
+
 /// Result of a successful `inspect_jpeg` call.
 #[derive(Clone, Debug)]
 pub struct JpegInfo {
@@ -394,6 +487,18 @@ pub struct JpegInfo {
     /// a JFIF + Adobe stream reports both with the colour hint
     /// preferring Adobe (the existing inspector policy).
     pub jfif: Option<JfifApp0>,
+    /// Typed view of the Adobe APP14 segment (T.872 §6.5.3) when one
+    /// was present in the marker prefix and structurally well-formed
+    /// (identifier `"Adobe"`, payload ≥ 12 bytes, `transform ∈
+    /// {0, 1, 2}`). `None` for streams with no APP14 magic, a
+    /// truncated payload, or a reserved transform byte.
+    ///
+    /// Independent of `jfif`: a stream may carry both segments,
+    /// either one, or neither. The `color_hint` field aggregates the
+    /// two signals (preferring Adobe when both are present); the
+    /// typed views are reported individually so callers building a
+    /// faithful re-encoder can replay the originals.
+    pub adobe: Option<AdobeApp14>,
 }
 
 impl JpegInfo {
@@ -509,6 +614,74 @@ pub fn parse_jfif_app0(payload: &[u8]) -> Result<JfifApp0> {
     })
 }
 
+/// Parse an Adobe APP14 payload (T.872 §6.5.3) into a typed view.
+///
+/// `payload` is the byte slice that the marker walker hands to the
+/// inspector for the APP14 segment — the bytes after the marker's
+/// two-byte length field, starting with the `"Adobe"` identifier.
+/// The function returns `Ok(AdobeApp14)` when the segment is
+/// structurally valid:
+///
+/// * Identifier equals `b"Adobe"`.
+/// * Payload is at least 12 bytes long (5 identifier + 2 version +
+///   2 flags0 + 2 flags1 + 1 transform).
+/// * `transform ∈ {0x00, 0x01, 0x02}`.
+///
+/// Errors:
+/// * `Invalid` when the payload is shorter than the 12-byte fixed
+///   header.
+/// * `Invalid` when the identifier doesn't match `"Adobe"` (the
+///   caller is expected to gate on the magic first, but the validator
+///   re-checks so direct calls aren't a footgun).
+/// * `Invalid` for a reserved `transform` byte. Real-world streams
+///   occasionally carry `3` (some Photoshop revisions); a strict
+///   typed view refuses while the inspector's coarse `ColorHint`
+///   path tolerates the byte by defaulting to `AdobeUntransformed`.
+///
+/// The `dct_encode_version` and the two `flags_*` words are reported
+/// as raw big-endian `u16`s without validation: the fields are
+/// informational and writers do not always agree on their values.
+///
+/// The validator never allocates; the returned `AdobeApp14` is `Copy`.
+pub fn parse_adobe_app14(payload: &[u8]) -> Result<AdobeApp14> {
+    // T.872 §6.5.3 / Adobe Technical Note 5116 §18 layout, byte
+    // offsets relative to the start of the APP14 payload (i.e.
+    // *after* the marker + length):
+    //
+    //   0..5    identifier "Adobe"
+    //   5..7    DCTEncodeVersion (big-endian u16)
+    //   7..9    APP14Flags0      (big-endian u16)
+    //   9..11   APP14Flags1      (big-endian u16)
+    //  11       ColorTransform   (0 | 1 | 2)
+    //
+    // Exactly 12 bytes when no implementation-specific trailing data
+    // is appended; some encoders pad with zeroes, which we tolerate.
+    if payload.len() < 12 {
+        return Err(Error::invalid("parse_adobe_app14: payload too short"));
+    }
+    if &payload[..5] != ADOBE_MAGIC {
+        return Err(Error::invalid("parse_adobe_app14: identifier != Adobe"));
+    }
+
+    let dct_encode_version = u16::from_be_bytes([payload[5], payload[6]]);
+    let flags_0 = u16::from_be_bytes([payload[7], payload[8]]);
+    let flags_1 = u16::from_be_bytes([payload[9], payload[10]]);
+
+    let transform = match payload[11] {
+        0x00 => AdobeColorTransform::Unknown,
+        0x01 => AdobeColorTransform::YCbCr,
+        0x02 => AdobeColorTransform::Ycck,
+        _ => return Err(Error::invalid("parse_adobe_app14: reserved transform byte")),
+    };
+
+    Ok(AdobeApp14 {
+        dct_encode_version,
+        flags_0,
+        flags_1,
+        transform,
+    })
+}
+
 /// Walk a JPEG byte buffer's marker prefix and report the variant +
 /// descriptive metadata, without entropy decoding.
 ///
@@ -545,6 +718,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut color_hint = ColorHint::Unspecified;
     let mut restart_interval: u16 = 0;
     let mut jfif: Option<JfifApp0> = None;
+    let mut adobe: Option<AdobeApp14> = None;
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -650,6 +824,18 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                         }
                     }
                 };
+                // Attempt to also extract the typed Adobe view. A
+                // payload that fails strict validation (reserved
+                // transform byte, identifier mismatch after the
+                // gate above) is reported as `adobe = None` while
+                // the colour hint above remains in place — the
+                // coarse signal is more tolerant by design. Only
+                // the first APP14 segment wins.
+                if adobe.is_none() {
+                    if let Ok(parsed) = parse_adobe_app14(payload) {
+                        adobe = Some(parsed);
+                    }
+                }
                 continue;
             }
             // Other APPn segments: ignored. Their payloads do not
@@ -677,6 +863,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         color_hint,
         restart_interval,
         jfif,
+        adobe,
     })
 }
 
@@ -840,6 +1027,8 @@ mod tests {
         assert_eq!(jfif.h_density_dpi(), None);
         assert_eq!(jfif.v_density_dpi(), None);
         assert_eq!(jfif.pixel_aspect_ratio(), (1, 1));
+        // No APP14 segment → no typed Adobe view.
+        assert!(info.adobe.is_none());
     }
 
     #[test]
@@ -1050,6 +1239,14 @@ mod tests {
         let info = inspect_jpeg(&buf).expect("inspect Adobe YCCK");
         assert_eq!(info.color_hint, ColorHint::AdobeYcck);
         assert_eq!(info.num_components(), 4);
+        let adobe = info.adobe.expect("typed Adobe view");
+        assert_eq!(adobe.dct_encode_version, 0x0065);
+        assert_eq!(adobe.flags_0, 0);
+        assert_eq!(adobe.flags_1, 0);
+        assert_eq!(adobe.transform, AdobeColorTransform::Ycck);
+        assert_eq!(adobe.transform.as_byte(), 0x02);
+        assert_eq!(adobe.as_color_hint(), ColorHint::AdobeYcck);
+        assert!(!adobe.is_standard_version()); // 0x65 = 101
     }
 
     #[test]
@@ -1071,6 +1268,10 @@ mod tests {
         );
         let info = inspect_jpeg(&buf).expect("inspect Adobe untransformed");
         assert_eq!(info.color_hint, ColorHint::AdobeUntransformed);
+        let adobe = info.adobe.expect("typed Adobe view");
+        assert_eq!(adobe.transform, AdobeColorTransform::Unknown);
+        assert_eq!(adobe.transform.as_byte(), 0x00);
+        assert_eq!(adobe.as_color_hint(), ColorHint::AdobeUntransformed);
     }
 
     #[test]
@@ -1229,6 +1430,9 @@ mod tests {
         assert_eq!(info.color_hint, ColorHint::AdobeYCbCr);
         // No JFIF segment → no typed view, even though Adobe is set.
         assert!(info.jfif.is_none());
+        // Adobe view IS populated for an Adobe-only stream.
+        let adobe = info.adobe.expect("Adobe typed view");
+        assert_eq!(adobe.transform, AdobeColorTransform::YCbCr);
     }
 
     #[test]
@@ -1271,6 +1475,132 @@ mod tests {
         let jfif = info.jfif.expect("typed view");
         assert_eq!(jfif.h_density, 72);
         assert_eq!(jfif.v_density, 72);
+    }
+
+    #[test]
+    fn parse_adobe_app14_standard_version() {
+        // "Adobe" + version 100 + flags0 0 + flags1 0 + transform 1.
+        let payload = b"Adobe\x00\x64\x00\x00\x00\x00\x01";
+        let parsed = parse_adobe_app14(payload).expect("parse standard Adobe");
+        assert!(parsed.is_standard_version());
+        assert_eq!(parsed.dct_encode_version, 100);
+        assert_eq!(parsed.flags_0, 0);
+        assert_eq!(parsed.flags_1, 0);
+        assert_eq!(parsed.transform, AdobeColorTransform::YCbCr);
+        assert_eq!(parsed.transform.as_byte(), 0x01);
+        assert_eq!(parsed.as_color_hint(), ColorHint::AdobeYCbCr);
+    }
+
+    #[test]
+    fn parse_adobe_app14_with_flags() {
+        // Flags0 = 0xC000 (chroma-blur + dampened-edge bits set).
+        let payload = b"Adobe\x00\x64\xC0\x00\x00\x00\x00";
+        let parsed = parse_adobe_app14(payload).expect("parse flags");
+        assert_eq!(parsed.flags_0, 0xC000);
+        assert_eq!(parsed.transform, AdobeColorTransform::Unknown);
+        assert_eq!(parsed.as_color_hint(), ColorHint::AdobeUntransformed);
+    }
+
+    #[test]
+    fn parse_adobe_app14_rejects_too_short() {
+        // 11 bytes — one short of the 12-byte fixed header.
+        let payload = b"Adobe\x00\x64\x00\x00\x00\x00";
+        assert!(parse_adobe_app14(payload).is_err());
+    }
+
+    #[test]
+    fn parse_adobe_app14_rejects_bad_identifier() {
+        let payload = b"Other\x00\x64\x00\x00\x00\x00\x01";
+        assert!(parse_adobe_app14(payload).is_err());
+    }
+
+    #[test]
+    fn parse_adobe_app14_rejects_reserved_transform() {
+        let payload = b"Adobe\x00\x64\x00\x00\x00\x00\x05"; // transform = 5
+        assert!(parse_adobe_app14(payload).is_err());
+    }
+
+    #[test]
+    fn inspect_adobe_with_reserved_transform_byte_keeps_color_hint() {
+        // The inspector's coarse colour-hint path tolerates a
+        // reserved transform byte by falling back to
+        // AdobeUntransformed, but the typed view must refuse it
+        // (so `info.adobe` is `None`).
+        let mut adobe = Vec::new();
+        adobe.extend_from_slice(b"Adobe");
+        adobe.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x05]);
+        let extras = [(markers::APP14, adobe.as_slice())];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect reserved transform");
+        assert_eq!(info.color_hint, ColorHint::AdobeUntransformed);
+        assert!(info.adobe.is_none());
+    }
+
+    #[test]
+    fn inspect_jfif_and_adobe_both_populated() {
+        // A stream with both APP0 JFIF and APP14 Adobe — typed views
+        // for both are populated, and the colour hint takes the
+        // Adobe one per the inspector's existing precedence policy.
+        let jfif_payload = &b"JFIF\0\x01\x02\x01\x00\x48\x00\x48\x00\x00"[..];
+        let mut adobe = Vec::new();
+        adobe.extend_from_slice(b"Adobe");
+        adobe.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let extras = [
+            (markers::APP0, jfif_payload),
+            (markers::APP14, adobe.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect dual");
+        let jfif = info.jfif.expect("typed JFIF");
+        let adobe_view = info.adobe.expect("typed Adobe");
+        assert_eq!(jfif.h_density, 72);
+        assert!(adobe_view.is_standard_version());
+        assert_eq!(adobe_view.transform, AdobeColorTransform::YCbCr);
+        // Inspector precedence: Adobe wins when JFIF appears first.
+        // Existing behaviour — APP0 sets JfifYCbCr, then APP14
+        // overrides to AdobeYCbCr.
+        assert_eq!(info.color_hint, ColorHint::AdobeYCbCr);
+    }
+
+    #[test]
+    fn inspect_adobe_first_segment_wins() {
+        // Two APP14 Adobe segments back-to-back with different
+        // transform bytes; the first one populates the typed view.
+        let mut a1 = Vec::new();
+        a1.extend_from_slice(b"Adobe");
+        a1.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let mut a2 = Vec::new();
+        a2.extend_from_slice(b"Adobe");
+        a2.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        let extras = [
+            (markers::APP14, a1.as_slice()),
+            (markers::APP14, a2.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect dup Adobe");
+        let adobe = info.adobe.expect("typed Adobe view");
+        assert_eq!(adobe.transform, AdobeColorTransform::YCbCr);
     }
 
     #[test]

@@ -460,17 +460,24 @@ view (`version_major`/`_minor`, `units: JfifUnits` ∈
 `thumbnail_width`/`_height`, plus `has_thumbnail()`,
 `thumbnail_payload_len()`, `h_density_dpi()` / `v_density_dpi()`
 unit-normalised accessors and `pixel_aspect_ratio()` for the
-units-= 0 case). No entropy decoding, no DCT, no allocation
-proportional to the scan body — O(prefix-length). Useful for
-pipeline triage (pick a target pixel format), fallback-decoder
-routing without spinning up the full decode path, DPI-aware
-thumbnail sizing, and corpus summarisation. The `SofKind` exposes
-`is_supported_by_decoder()`, `is_dct()`, and `is_arithmetic()`
-helpers so callers can negotiate without matching on every variant
-by hand. A standalone `parse_jfif_app0(payload) -> Result<JfifApp0>`
-validator is also re-exported for callers that already have the APP0
-payload bytes in hand. Standalone surface — the inspector requires
-neither the `registry` feature nor an `oxideav-core` dep.
+units-= 0 case). When an APP14 Adobe segment is present and
+structurally valid per T.872 §6.5.3, an optional `AdobeApp14`
+typed view is also exposed (`dct_encode_version`, `flags_0`,
+`flags_1`, `transform: AdobeColorTransform` ∈ {`Unknown`,
+`YCbCr`, `Ycck`}, plus `is_standard_version()` and
+`as_color_hint()` projections). No entropy decoding, no DCT, no
+allocation proportional to the scan body — O(prefix-length).
+Useful for pipeline triage (pick a target pixel format),
+fallback-decoder routing without spinning up the full decode
+path, DPI-aware thumbnail sizing, and corpus summarisation. The
+`SofKind` exposes `is_supported_by_decoder()`, `is_dct()`, and
+`is_arithmetic()` helpers so callers can negotiate without
+matching on every variant by hand. Standalone
+`parse_jfif_app0(payload) -> Result<JfifApp0>` and
+`parse_adobe_app14(payload) -> Result<AdobeApp14>` validators are
+also re-exported for callers that already have the APP0 / APP14
+payload bytes in hand. Standalone surface — the inspector
+requires neither the `registry` feature nor an `oxideav-core` dep.
 
 ```rust
 use oxideav_mjpeg::{inspect_jpeg, SofKind, ChromaSubsampling};

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AdobeApp14` typed view of the Adobe APP14 marker segment (T.872
+  §6.5.3 / Adobe Technical Note 5116 §18) on `JpegInfo::adobe`.
+  Carries the raw `dct_encode_version` `u16` (commonly `100`), the
+  two encoder-hint flag words `flags_0` and `flags_1`, and an
+  `AdobeColorTransform` enum (`Unknown` / `YCbCr` / `Ycck`,
+  exhaustive over the spec's three legal `transform` bytes with
+  `as_byte()` for re-encoding), plus `is_standard_version()` (true
+  for the universally-used `100`) and an `as_color_hint()`
+  projection back to the inspector-level `ColorHint` enum. A new
+  top-level `parse_adobe_app14(payload) -> Result<AdobeApp14>`
+  validator is exported for callers that already hold the APP14
+  payload bytes; it enforces the three structural invariants
+  (`identifier == "Adobe"`, payload ≥ 12 bytes, `transform ∈
+  {0, 1, 2}`) and never allocates. `inspect_jpeg` populates
+  `JpegInfo.adobe` automatically when an APP14 carries a structurally
+  valid Adobe segment; reserved `transform` bytes leave the typed
+  view as `None` but the inspector's coarse `ColorHint` path still
+  flips to `AdobeUntransformed` as before, since the colour-hint
+  signal is more tolerant by design. Independent of the JFIF view —
+  streams with both an APP0 JFIF and an APP14 Adobe populate both
+  typed views, and the colour hint continues to prefer Adobe when
+  both are present (existing inspector precedence). Eight new tests
+  cover the standard-version success path, the encoder-flag bits,
+  payload-too-short / bad-identifier / reserved-transform rejection,
+  the inspector's reserved-transform tolerance, the JFIF+Adobe
+  dual-segment case, and the only-first-segment-wins rule for
+  duplicate APP14s.
+
 - `JfifApp0` typed view of the JFIF APP0 marker segment (T.871 §10.1)
   on `JpegInfo::jfif`. Carries the `version_major` / `version_minor`
   bytes, a `JfifUnits` enum (`AspectRatio` / `DotsPerInch` /

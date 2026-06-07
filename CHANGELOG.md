@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `parse_jfif_app0(payload) -> Result<JfifApp0>` plus the matching
+  `JfifApp0` / `JfifUnits` types — a typed parser for the JFIF APP0
+  marker payload per T.871 §10.1. Surfaces the JFIF version
+  (`version_major` / `version_minor`), the density unit selector
+  (`AspectRatio` / `DotsPerInch` / `DotsPerCm`), `h_density` /
+  `v_density` as big-endian `u16`, and the `thumbnail_width` /
+  `thumbnail_height` byte pair (`has_thumbnail()` / `thumbnail_byte_len()`
+  helpers included). The fixed 14-byte header is validated against the
+  spec layout, the identifier must literally be `"JFIF\0"` (the `JFXX`
+  extension marker is rejected by this entry point), and a claimed
+  thumbnail body that overshoots the payload is refused. The decode-free
+  `inspect_jpeg` walker now surfaces the typed APP0 view on
+  `JpegInfo::jfif` (`Option<JfifApp0>`); the older `ColorHint::JfifYCbCr`
+  classification is unchanged. Nine new unit tests cover the typed
+  parser (v1.02 / dpi / dpcm / aspect-ratio / pre-v1.02 versions /
+  short-payload / wrong-magic / bad-units / 2×2 embedded thumbnail /
+  truncated thumbnail) and three new inspector tests check the new
+  `JpegInfo::jfif` field (populated on a v1.02 dpi prefix, absent when
+  the APP0 carries a non-JFIF identifier such as `AVI1`, dropped to
+  `None` when the JFIF magic is present but the units byte is malformed
+  so the inspector still returns the rest of the summary).
+
 - `encoder::encode_jpeg_progressive_grayscale(width, height, samples,
   stride, quality)` emits a standalone progressive (SOF2)
   single-component grayscale JPEG at 8-bit precision. T.81 §G.1.1

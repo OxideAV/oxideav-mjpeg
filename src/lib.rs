@@ -116,8 +116,15 @@ pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 // running the entropy decoder. Standalone surface, no `oxideav-core`
 // dependency.
 pub use jpeg::inspect::{
-    inspect_jpeg, ChromaSubsampling, ColorHint, InspectedComponent, JpegInfo, SofKind,
+    inspect_jpeg, ChromaSubsampling, ColorHint, InspectedComponent, JfifUnits, JpegInfo, SofKind,
 };
+
+// Typed parser for the JFIF APP0 marker segment (T.871 §10.1). The
+// inspector calls this internally and surfaces the result on
+// `JpegInfo::jfif`; the parser itself is also re-exported so callers
+// who only want APP0 metadata (e.g. extracting density / thumbnail
+// dimensions from a known APP0 payload buffer) can use it directly.
+pub use jpeg::parser::{parse_jfif_app0, JfifApp0};
 
 // Framework-integrated API (`oxideav-core`-dependent). Gated behind
 // `registry` so image-library callers can build the crate without

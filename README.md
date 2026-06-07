@@ -452,8 +452,15 @@ LosslessArith / HierarchicalDct / HierarchicalArith), `precision`,
 `width`, `height`, per-component sampling / quant-table descriptors,
 a `ChromaSubsampling` discriminator (4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 /
 GrayscaleOnly / Custom), a `ColorHint` from JFIF (T.871) and Adobe
-APP14 (T.872 §6.5.3) tags, and the `restart_interval` from a DRI
-segment if present. No entropy decoding, no DCT, no allocation
+APP14 (T.872 §6.5.3) tags, the `restart_interval` from a DRI
+segment if present, and a typed `Option<JfifApp0>` view of the JFIF
+APP0 marker payload (T.871 §10.1): version, density-unit selector
+(`AspectRatio` / `DotsPerInch` / `DotsPerCm`), `h_density` /
+`v_density`, and `thumbnail_width` / `thumbnail_height`. The standalone
+`parse_jfif_app0(payload) -> Result<JfifApp0>` is also re-exported so
+callers who already have an APP0 buffer in hand (e.g. from a
+container's per-frame metadata) can decode just the JFIF view without
+a full marker walk. No entropy decoding, no DCT, no allocation
 proportional to the scan body — O(prefix-length). Useful for
 pipeline triage (pick a target pixel format), fallback-decoder
 routing without spinning up the full decode path, and corpus

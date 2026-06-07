@@ -44,7 +44,9 @@
 use crate::error::{MjpegError as Error, Result};
 
 use super::markers;
-use super::parser::{parse_dri, parse_sof, MarkerWalker};
+use super::parser::{parse_dri, parse_jfif_app0, parse_sof, JfifApp0, MarkerWalker};
+
+pub use super::parser::JfifUnits;
 
 /// Coarse classification of the SOF marker that opened the frame.
 ///
@@ -246,6 +248,11 @@ pub struct JpegInfo {
     /// before SOS (T.81 §B.2.4.4), or `0` if no DRI was seen —
     /// matching the spec's "DRI absent ⇒ no restarts" default.
     pub restart_interval: u16,
+    /// Typed view of the JFIF APP0 marker (T.871 §10.1) when one is
+    /// present in the prefix. `None` if no APP0 carried the literal
+    /// `"JFIF\0"` identifier (the older `JFXX` extension marker, the
+    /// Adobe APP14 tag, and every other APPn segment are silent here).
+    pub jfif: Option<JfifApp0>,
 }
 
 impl JpegInfo {
@@ -300,6 +307,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut components: Vec<InspectedComponent> = Vec::new();
     let mut color_hint = ColorHint::Unspecified;
     let mut restart_interval: u16 = 0;
+    let mut jfif: Option<JfifApp0> = None;
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -371,6 +379,21 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                 if color_hint == ColorHint::Unspecified {
                     color_hint = ColorHint::JfifYCbCr;
                 }
+                // Surface the typed APP0 view. Only the first
+                // JFIF APP0 wins; T.871 §6.3 requires the JFIF
+                // marker to immediately follow SOI and §6.4 limits
+                // subsequent APP0 segments to the `JFXX` extension
+                // identifier, so a second JFIF APP0 in the prefix
+                // would be malformed. Parse failure (e.g. unknown
+                // units byte) is suppressed here so the inspector
+                // still returns the other fields the caller asked
+                // for; callers that need a strict JFIF check call
+                // `parse_jfif_app0` directly.
+                if jfif.is_none() {
+                    if let Ok(parsed) = parse_jfif_app0(payload) {
+                        jfif = Some(parsed);
+                    }
+                }
                 continue;
             }
             if marker == markers::APP14 && payload.len() >= 12 && &payload[..5] == ADOBE_MAGIC {
@@ -418,6 +441,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         subsampling,
         color_hint,
         restart_interval,
+        jfif,
     })
 }
 
@@ -566,6 +590,93 @@ mod tests {
         assert_eq!(info.subsampling, ChromaSubsampling::Yuv420);
         assert_eq!(info.color_hint, ColorHint::JfifYCbCr);
         assert_eq!(info.restart_interval, 0);
+        // The same APP0 supplies the typed JFIF surface: v1.02,
+        // units=0 (aspect-ratio), 1:1 density, no thumbnail.
+        let jfif = info.jfif.expect("APP0 carried JFIF magic → typed view");
+        assert_eq!(jfif.version_major, 1);
+        assert_eq!(jfif.version_minor, 2);
+        assert_eq!(jfif.units, JfifUnits::AspectRatio);
+        assert_eq!(jfif.h_density, 1);
+        assert_eq!(jfif.v_density, 1);
+        assert!(!jfif.has_thumbnail());
+    }
+
+    #[test]
+    fn jfif_app0_dpi_surface() {
+        // v1.02 @ 96 dpi, no thumbnail — the typed JFIF view should
+        // report DotsPerInch.
+        let mut app0 = Vec::new();
+        app0.extend_from_slice(b"JFIF\0");
+        app0.push(1);
+        app0.push(2);
+        app0.push(1); // units = dpi
+        app0.extend_from_slice(&96u16.to_be_bytes());
+        app0.extend_from_slice(&96u16.to_be_bytes());
+        app0.push(0);
+        app0.push(0);
+        let extras = [(markers::APP0, app0.as_slice())];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            32,
+            32,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect dpi");
+        let jfif = info.jfif.expect("JFIF v1.02 dpi");
+        assert_eq!(jfif.units, JfifUnits::DotsPerInch);
+        assert_eq!(jfif.h_density, 96);
+        assert_eq!(jfif.v_density, 96);
+    }
+
+    #[test]
+    fn jfif_app0_absent_when_no_jfif_magic() {
+        // APP0 with a non-JFIF identifier (e.g. AVI1) — the typed
+        // surface must stay `None`.
+        let app0 = b"AVI1\0\0\0\0\0\0\0\0\0\0";
+        let extras = [(markers::APP0, &app0[..])];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            32,
+            32,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect AVI1");
+        assert!(info.jfif.is_none());
+        assert_eq!(info.color_hint, ColorHint::Unspecified);
+    }
+
+    #[test]
+    fn jfif_app0_malformed_units_silently_drops_typed_view() {
+        // APP0 carries the JFIF magic but the units byte is 3 (not
+        // in {0,1,2}). The typed parser refuses; the inspector
+        // suppresses the failure to keep producing the SOF / DRI
+        // summary it owes the caller. ColorHint still reports JFIF
+        // because the magic was present.
+        let mut app0 = Vec::new();
+        app0.extend_from_slice(b"JFIF\0");
+        app0.push(1);
+        app0.push(2);
+        app0.push(3); // invalid units
+        app0.extend_from_slice(&72u16.to_be_bytes());
+        app0.extend_from_slice(&72u16.to_be_bytes());
+        app0.push(0);
+        app0.push(0);
+        let extras = [(markers::APP0, app0.as_slice())];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            32,
+            32,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect malformed-units JFIF");
+        assert_eq!(info.color_hint, ColorHint::JfifYCbCr);
+        assert!(info.jfif.is_none());
     }
 
     #[test]

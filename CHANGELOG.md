@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.7...v0.1.8) - 2026-06-07
+
+### Other
+
+- typed JFIF APP0 view on JpegInfo (T.871 §10.1)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- progressive (SOF2) single-component grayscale encode
+- decode-free JPEG SOF discriminator + metadata inspector
+- baseline (SOF0) packed-Rgb24 lossy encode + decoder RGB tag
+- baseline (SOF0) single-component Gray8 lossy encode
+- four-component lossless (SOF3, P=8) round trip
+- restart-interval-aligned scan splitting for the packetizer
+- criterion harness for encode + decode hot paths
+- scrub decorative external-implementation attribution
+- add arith_decode cargo-fuzz target for SOF9 Q-coder surface
+- gate cmyk_roundtrip on the `registry` feature
+- promote 4-component CMYK / YCCK helpers to the public API
+
 ### Added
 
 - `parse_jfif_app0(payload) -> Result<JfifApp0>` plus the matching

@@ -445,6 +445,162 @@ impl AdobeApp14 {
     }
 }
 
+/// Typed view of one ICC profile APP2 marker segment (T.872 / Annex L of
+/// T.871; see `docs/image/jpeg/jpeg-fixtures-and-traces.md` §3.11).
+///
+/// ICC profiles are conventionally embedded in APP2 segments whose
+/// payloads start with the 12-byte ASCII identifier `"ICC_PROFILE\0"`
+/// followed by a one-byte sequence number `seq_no ∈ 1..=total`, a one-
+/// byte total chunk count `total ∈ 1..=255`, and then the next slice of
+/// the ICC profile bytes. Profiles longer than ~64 KB are split across
+/// multiple consecutive APP2 segments; smaller profiles fit in one. The
+/// JPEG decoder never parses the ICC content — it is passed through to
+/// the application as an opaque byte run.
+///
+/// The typed view reports the segment-level chunk header (`seq_no`,
+/// `total`, and the byte length of the profile slice this segment
+/// carries) and a borrowed slice into the source payload that holds the
+/// profile bytes themselves. The inspector's higher-level accumulator
+/// (`JpegInfo::icc_profile`) joins consecutive segments into the
+/// complete profile blob when one is present.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IccProfileApp2Chunk<'a> {
+    /// Chunk-sequence number (`seq_no`) from the APP2 header. Spec
+    /// convention numbers chunks `1..=total` (one-based); the inspector
+    /// reports the literal byte without remapping.
+    pub seq_no: u8,
+    /// Total chunk count (`total`) declared by this segment's header.
+    /// Every APP2 ICC segment in a well-formed stream agrees on the
+    /// same `total`; the inspector reports the byte from this segment
+    /// only.
+    pub total: u8,
+    /// Borrowed slice of the ICC profile bytes carried by this segment
+    /// — the payload tail after the 12-byte signature and the two-byte
+    /// chunk header. The inspector does not interpret the bytes; the
+    /// slice's lifetime is the source buffer's.
+    pub profile_bytes: &'a [u8],
+}
+
+/// ICC profile identifier from the start of an APP2 payload (T.872 /
+/// Annex L of T.871). Twelve bytes: `"ICC_PROFILE\0"` (eleven ASCII
+/// characters plus one NUL terminator).
+const ICC_PROFILE_MAGIC: &[u8; 12] = b"ICC_PROFILE\0";
+
+/// Parse an APP2 ICC_PROFILE payload (T.872 / Annex L of T.871) into a
+/// typed chunk view borrowing from the input buffer.
+///
+/// `payload` is the byte slice that the marker walker hands to the
+/// inspector for the APP2 segment — the bytes after the marker's
+/// two-byte length field, starting with the `"ICC_PROFILE\0"`
+/// identifier. The function returns `Ok(IccProfileApp2Chunk)` when the
+/// segment is structurally valid:
+///
+/// * Identifier equals `b"ICC_PROFILE\0"`.
+/// * Payload is at least 14 bytes long (12 identifier + 1 seq_no + 1
+///   total).
+/// * `total ≥ 1` and `1 ≤ seq_no ≤ total` (one-based, inclusive
+///   bounds; a chunk with `seq_no = 0` or `seq_no > total` is malformed).
+///
+/// Errors:
+/// * `Invalid` when the payload is shorter than the 14-byte fixed
+///   header.
+/// * `Invalid` when the identifier doesn't match `"ICC_PROFILE\0"`
+///   (the caller is expected to gate on the magic first, but the
+///   validator re-checks so direct calls aren't a footgun).
+/// * `Invalid` when `total = 0` (a profile must have at least one
+///   chunk).
+/// * `Invalid` when `seq_no = 0` or `seq_no > total`.
+///
+/// The returned `profile_bytes` slice borrows from `payload`; the
+/// function never copies the ICC body. The validator never allocates.
+pub fn parse_icc_profile_app2(payload: &[u8]) -> Result<IccProfileApp2Chunk<'_>> {
+    // §3.11 layout, byte offsets relative to the start of the APP2
+    // payload (i.e. *after* the marker + length):
+    //
+    //   0..12   identifier "ICC_PROFILE\0"
+    //  12       seq_no   (1..=total)
+    //  13       total    (>=1)
+    //  14..     ICC profile bytes for this chunk
+    //
+    // Hence 14 bytes is the absolute minimum for a (degenerate)
+    // zero-body ICC chunk.
+    if payload.len() < 14 {
+        return Err(Error::invalid("parse_icc_profile_app2: payload too short"));
+    }
+    if &payload[..12] != ICC_PROFILE_MAGIC {
+        return Err(Error::invalid(
+            "parse_icc_profile_app2: identifier != ICC_PROFILE\\0",
+        ));
+    }
+    let seq_no = payload[12];
+    let total = payload[13];
+    if total == 0 {
+        return Err(Error::invalid("parse_icc_profile_app2: total = 0"));
+    }
+    if seq_no == 0 || seq_no > total {
+        return Err(Error::invalid(
+            "parse_icc_profile_app2: seq_no outside 1..=total",
+        ));
+    }
+    Ok(IccProfileApp2Chunk {
+        seq_no,
+        total,
+        profile_bytes: &payload[14..],
+    })
+}
+
+/// Aggregated view of every APP2 `"ICC_PROFILE\0"` segment seen in the
+/// marker prefix, in order of appearance.
+///
+/// The chunks vector preserves the on-wire order — the typed view does
+/// not sort by `seq_no` because well-formed writers already emit them in
+/// order, and reporting the source order is more useful for diagnostics
+/// (a stream with a re-ordered or repeated chunk reveals the issue
+/// directly). Each entry carries its segment's `seq_no` / `total` so a
+/// caller can confirm contiguity itself.
+///
+/// The `total` advertised by every entry must agree — `inspect_jpeg`
+/// rejects a stream whose APP2 segments declare different totals.
+/// Beyond that the inspector is permissive: missing or duplicate
+/// chunks are reported via `is_complete()` rather than refused, since
+/// the spec leaves application-level recovery to the caller and
+/// surfacing a partial summary is more useful than a hard refusal.
+#[derive(Clone, Debug)]
+pub struct IccProfileChunks {
+    /// Total chunk count declared by the segments (every chunk's
+    /// `total` byte agrees).
+    pub total: u8,
+    /// Number of profile bytes summed across every collected chunk.
+    pub total_payload_len: usize,
+    /// Per-segment `(seq_no, payload_len)` pairs in source order.
+    pub chunks: Vec<(u8, usize)>,
+}
+
+impl IccProfileChunks {
+    /// True when every sequence number from `1..=total` appears
+    /// exactly once across the collected chunks. A `false` return
+    /// signals a missing / duplicate / re-ordered chunk; the typed
+    /// view itself remains usable but the assembled profile would be
+    /// suspect.
+    pub fn is_complete(&self) -> bool {
+        if self.total == 0 {
+            return false;
+        }
+        if self.chunks.len() != self.total as usize {
+            return false;
+        }
+        let mut seen = [false; 256];
+        for (seq, _) in &self.chunks {
+            let idx = *seq as usize;
+            if idx == 0 || idx > self.total as usize || seen[idx] {
+                return false;
+            }
+            seen[idx] = true;
+        }
+        true
+    }
+}
+
 /// Result of a successful `inspect_jpeg` call.
 #[derive(Clone, Debug)]
 pub struct JpegInfo {
@@ -499,6 +655,15 @@ pub struct JpegInfo {
     /// typed views are reported individually so callers building a
     /// faithful re-encoder can replay the originals.
     pub adobe: Option<AdobeApp14>,
+    /// Aggregated summary of every APP2 `"ICC_PROFILE\0"` segment
+    /// the inspector encountered in the marker prefix (T.872 / Annex L
+    /// of T.871). `None` for streams with no APP2 ICC segments; a
+    /// `Some(IccProfileChunks)` otherwise reports the declared chunk
+    /// total, the cumulative profile-body length, and the per-chunk
+    /// `(seq_no, payload_len)` ordering. The ICC profile bytes are
+    /// not copied into `JpegInfo`; callers that need the assembled
+    /// blob can re-walk the buffer with `parse_icc_profile_app2`.
+    pub icc_profile: Option<IccProfileChunks>,
 }
 
 impl JpegInfo {
@@ -719,6 +884,9 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut restart_interval: u16 = 0;
     let mut jfif: Option<JfifApp0> = None;
     let mut adobe: Option<AdobeApp14> = None;
+    let mut icc_total: Option<u8> = None;
+    let mut icc_payload_len: usize = 0;
+    let mut icc_chunks: Vec<(u8, usize)> = Vec::new();
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -780,9 +948,34 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         }
 
         if markers::is_app(marker) {
-            // APP0 = JFIF, APP14 = Adobe. The two carry colour-space
-            // hints; other APPn segments (APP1 EXIF / XMP, APP2 ICC,
-            // APP13 IPTC) are silent on colour transform and skipped.
+            // APP0 = JFIF, APP14 = Adobe, APP2 = (optional) ICC profile.
+            // APP2 does not affect `color_hint` directly (it carries the
+            // colour-management profile separately from the YCbCr/RGB
+            // mapping signalled by APP0/APP14); the inspector reports
+            // it as a separate aggregated `icc_profile` summary.
+            if marker == markers::APP2 && payload.len() >= 12 && &payload[..12] == ICC_PROFILE_MAGIC
+            {
+                if let Ok(chunk) = parse_icc_profile_app2(payload) {
+                    // First-seen segment pins `total`. Later segments
+                    // with a disagreeing `total` are dropped from the
+                    // aggregate to keep the summary self-consistent —
+                    // a stream with mismatched totals is malformed and
+                    // not something the inspector should silently
+                    // average away.
+                    let accept = match icc_total {
+                        None => {
+                            icc_total = Some(chunk.total);
+                            true
+                        }
+                        Some(t) => t == chunk.total,
+                    };
+                    if accept {
+                        icc_chunks.push((chunk.seq_no, chunk.profile_bytes.len()));
+                        icc_payload_len = icc_payload_len.saturating_add(chunk.profile_bytes.len());
+                    }
+                }
+                continue;
+            }
             if marker == markers::APP0 && payload.len() >= 5 && &payload[..5] == JFIF_MAGIC {
                 // Don't overwrite an earlier Adobe tag — both should
                 // not appear together but if they do, the Adobe tag
@@ -853,6 +1046,12 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
 
     let subsampling = classify_subsampling(&components);
 
+    let icc_profile = icc_total.map(|total| IccProfileChunks {
+        total,
+        total_payload_len: icc_payload_len,
+        chunks: icc_chunks,
+    });
+
     Ok(JpegInfo {
         sof_kind,
         precision,
@@ -864,6 +1063,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         restart_interval,
         jfif,
         adobe,
+        icc_profile,
     })
 }
 
@@ -1601,6 +1801,240 @@ mod tests {
         let info = inspect_jpeg(&buf).expect("inspect dup Adobe");
         let adobe = info.adobe.expect("typed Adobe view");
         assert_eq!(adobe.transform, AdobeColorTransform::YCbCr);
+    }
+
+    // --- APP2 ICC_PROFILE typed view ---
+
+    /// Build an APP2 payload carrying the `"ICC_PROFILE\0"` signature,
+    /// followed by the (seq_no, total) chunk header, then `body`.
+    /// Returns the bytes the inspector's marker walker would hand to
+    /// `parse_icc_profile_app2`.
+    fn icc_payload(seq_no: u8, total: u8, body: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(14 + body.len());
+        p.extend_from_slice(ICC_PROFILE_MAGIC);
+        p.push(seq_no);
+        p.push(total);
+        p.extend_from_slice(body);
+        p
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_minimal() {
+        // 14 bytes — identifier + (seq=1, total=1) + empty body.
+        let payload = icc_payload(1, 1, &[]);
+        let chunk = parse_icc_profile_app2(&payload).expect("parse minimal ICC");
+        assert_eq!(chunk.seq_no, 1);
+        assert_eq!(chunk.total, 1);
+        assert_eq!(chunk.profile_bytes.len(), 0);
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_with_body() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let payload = icc_payload(1, 1, &body);
+        let chunk = parse_icc_profile_app2(&payload).expect("parse body ICC");
+        assert_eq!(chunk.seq_no, 1);
+        assert_eq!(chunk.total, 1);
+        assert_eq!(chunk.profile_bytes, body.as_slice());
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_rejects_too_short() {
+        // 13 bytes — one short of the 14-byte fixed header.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(ICC_PROFILE_MAGIC);
+        payload.push(1);
+        assert!(parse_icc_profile_app2(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_rejects_bad_identifier() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"OtherProfile"); // 12 bytes, wrong
+        payload.push(1);
+        payload.push(1);
+        assert!(parse_icc_profile_app2(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_rejects_zero_total() {
+        // seq_no = 1, total = 0 (invalid: a profile must have ≥ 1 chunk).
+        let payload = icc_payload(1, 0, &[]);
+        assert!(parse_icc_profile_app2(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_rejects_zero_seq_no() {
+        // seq_no = 0 (one-based numbering — zero is invalid).
+        let payload = icc_payload(0, 1, &[]);
+        assert!(parse_icc_profile_app2(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_icc_profile_app2_rejects_seq_no_above_total() {
+        let payload = icc_payload(3, 2, &[]);
+        assert!(parse_icc_profile_app2(&payload).is_err());
+    }
+
+    #[test]
+    fn inspect_single_icc_chunk_populates_summary() {
+        let body: Vec<u8> = (0..128u8).collect();
+        let payload = icc_payload(1, 1, &body);
+        let extras = [(markers::APP2, payload.as_slice())];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 2, 2, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect single ICC");
+        let icc = info.icc_profile.expect("typed ICC summary");
+        assert_eq!(icc.total, 1);
+        assert_eq!(icc.total_payload_len, body.len());
+        assert_eq!(icc.chunks.len(), 1);
+        assert_eq!(icc.chunks[0], (1, body.len()));
+        assert!(icc.is_complete());
+        // APP2 ICC does not influence colour-hint signalling.
+        assert_eq!(info.color_hint, ColorHint::Unspecified);
+    }
+
+    #[test]
+    fn inspect_multi_chunk_icc_concatenates_lengths() {
+        // A 256-byte profile split across three chunks: 100 + 100 + 56.
+        let p1 = icc_payload(1, 3, &[0xAA; 100]);
+        let p2 = icc_payload(2, 3, &[0xBB; 100]);
+        let p3 = icc_payload(3, 3, &[0xCC; 56]);
+        let extras = [
+            (markers::APP2, p1.as_slice()),
+            (markers::APP2, p2.as_slice()),
+            (markers::APP2, p3.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect multi-chunk ICC");
+        let icc = info.icc_profile.expect("typed ICC summary");
+        assert_eq!(icc.total, 3);
+        assert_eq!(icc.total_payload_len, 256);
+        assert_eq!(icc.chunks, vec![(1u8, 100usize), (2, 100), (3, 56)]);
+        assert!(icc.is_complete());
+    }
+
+    #[test]
+    fn inspect_missing_icc_chunk_marks_incomplete() {
+        // total=3 but only seq 1 and 3 present — `is_complete` is false
+        // and the summary still aggregates what's there.
+        let p1 = icc_payload(1, 3, &[0x11; 10]);
+        let p3 = icc_payload(3, 3, &[0x33; 30]);
+        let extras = [
+            (markers::APP2, p1.as_slice()),
+            (markers::APP2, p3.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect partial ICC");
+        let icc = info.icc_profile.expect("partial ICC summary");
+        assert_eq!(icc.total, 3);
+        assert_eq!(icc.chunks.len(), 2);
+        assert!(!icc.is_complete());
+    }
+
+    #[test]
+    fn inspect_duplicate_icc_seq_marks_incomplete() {
+        // Two chunks both numbered seq=1 of total=2; the aggregate
+        // refuses to call this complete.
+        let p1 = icc_payload(1, 2, &[0xAA; 10]);
+        let p1_dup = icc_payload(1, 2, &[0xBB; 10]);
+        let extras = [
+            (markers::APP2, p1.as_slice()),
+            (markers::APP2, p1_dup.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect dup ICC");
+        let icc = info.icc_profile.expect("typed ICC summary");
+        assert_eq!(icc.total, 2);
+        assert_eq!(icc.chunks.len(), 2);
+        assert!(!icc.is_complete());
+    }
+
+    #[test]
+    fn inspect_mismatched_icc_totals_drops_second() {
+        // Two APP2 ICC segments declaring different totals — the
+        // inspector pins `total` to the first and drops the second
+        // from the aggregate (its bytes are not double-counted).
+        let p1 = icc_payload(1, 2, &[0xAA; 10]);
+        let p_bad = icc_payload(1, 5, &[0xCC; 20]);
+        let extras = [
+            (markers::APP2, p1.as_slice()),
+            (markers::APP2, p_bad.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect mismatched totals");
+        let icc = info.icc_profile.expect("ICC summary");
+        // First segment pinned total to 2; the second's payload was
+        // dropped, so total_payload_len reflects only the first chunk.
+        assert_eq!(icc.total, 2);
+        assert_eq!(icc.total_payload_len, 10);
+        assert_eq!(icc.chunks.len(), 1);
+        assert_eq!(icc.chunks[0], (1, 10));
+        assert!(!icc.is_complete()); // missing seq=2
+    }
+
+    #[test]
+    fn inspect_app2_without_icc_magic_is_ignored() {
+        // APP2 carrying an unrelated identifier ("FPXR\0" — FlashPix
+        // — for example). The inspector ignores it and reports no
+        // ICC summary.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"FPXR\0extra-bytes-go-here");
+        let extras = [(markers::APP2, payload.as_slice())];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 1, 1, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect non-ICC APP2");
+        assert!(info.icc_profile.is_none());
+    }
+
+    #[test]
+    fn inspect_no_icc_segment_leaves_field_none() {
+        // Sanity: the existing baseline-grayscale path still reports
+        // `icc_profile = None` so callers can use it as the no-ICC
+        // sentinel.
+        let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &[]);
+        let info = inspect_jpeg(&buf).expect("inspect no-ICC");
+        assert!(info.icc_profile.is_none());
     }
 
     #[test]

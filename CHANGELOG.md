@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `IccProfileChunks` aggregated view of every APP2 `"ICC_PROFILE\0"`
+  marker segment seen in the prefix (T.872 / Annex L of T.871; see
+  `docs/image/jpeg/jpeg-fixtures-and-traces.md` §3.11) on
+  `JpegInfo::icc_profile`. The summary reports the declared chunk
+  `total` (every segment must agree — mismatches drop the dissenting
+  chunks), the cumulative `total_payload_len` of profile bytes seen
+  across the segments, and the per-segment `(seq_no, payload_len)`
+  ordering in source order, plus `is_complete()` returning true when
+  the chunks cover every sequence number `1..=total` exactly once. A
+  borrowing `IccProfileApp2Chunk<'a>` (`seq_no`, `total`,
+  `profile_bytes: &'a [u8]`) plus a new top-level
+  `parse_icc_profile_app2(payload) -> Result<IccProfileApp2Chunk<'_>>`
+  validator are exported for callers that already hold the APP2 payload
+  bytes; the validator enforces the structural invariants (identifier
+  equals `"ICC_PROFILE\0"`, payload ≥ 14 bytes, `total ≥ 1`,
+  `1 ≤ seq_no ≤ total`) and never allocates or copies the ICC body.
+  `inspect_jpeg` populates the summary automatically; APP2 segments
+  whose identifier is not `"ICC_PROFILE\0"` (FPXR, IPTC-bearing APP2,
+  etc.) are silently ignored and APP2 does not influence `color_hint`
+  (the ICC profile is colour-management metadata, separate from the
+  YCbCr/RGB mapping signalled by APP0 JFIF / APP14 Adobe). Twelve new
+  tests cover the minimal one-chunk success path, body propagation,
+  payload-too-short / bad-identifier / `total = 0` / zero-seq /
+  seq-above-total rejection, the inspector's aggregation across one
+  / three / partial / duplicate / mismatched-total streams, the
+  non-ICC APP2 ignore path, the no-APP2 baseline, plus an integration
+  test against the docs corpus' `with-icc-profile-embedded` Ghostscript
+  sRGB fixture (one chunk of `total_payload_len = 2576`).
+
+- `markers::APP2 = 0xE2` constant, the standard JPEG APPn byte that
+  carries the embedded ICC profile (in addition to the existing APP0
+  / APP14 constants).
+
 - `AdobeApp14` typed view of the Adobe APP14 marker segment (T.872
   §6.5.3 / Adobe Technical Note 5116 §18) on `JpegInfo::adobe`.
   Carries the raw `dct_encode_version` `u16` (commonly `100`), the

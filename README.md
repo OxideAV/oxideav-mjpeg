@@ -465,7 +465,14 @@ structurally valid per T.872 §6.5.3, an optional `AdobeApp14`
 typed view is also exposed (`dct_encode_version`, `flags_0`,
 `flags_1`, `transform: AdobeColorTransform` ∈ {`Unknown`,
 `YCbCr`, `Ycck`}, plus `is_standard_version()` and
-`as_color_hint()` projections). No entropy decoding, no DCT, no
+`as_color_hint()` projections). When one or more APP2 segments
+carrying the `"ICC_PROFILE\0"` signature (T.872 / Annex L of
+T.871) appear, an `IccProfileChunks` summary on
+`JpegInfo::icc_profile` reports the declared chunk `total`, the
+cumulative `total_payload_len`, the per-segment
+`(seq_no, payload_len)` ordering, and an `is_complete()`
+predicate that returns true when the sequence numbers cover
+`1..=total` exactly once. No entropy decoding, no DCT, no
 allocation proportional to the scan body — O(prefix-length).
 Useful for pipeline triage (pick a target pixel format),
 fallback-decoder routing without spinning up the full decode
@@ -473,11 +480,13 @@ path, DPI-aware thumbnail sizing, and corpus summarisation. The
 `SofKind` exposes `is_supported_by_decoder()`, `is_dct()`, and
 `is_arithmetic()` helpers so callers can negotiate without
 matching on every variant by hand. Standalone
-`parse_jfif_app0(payload) -> Result<JfifApp0>` and
-`parse_adobe_app14(payload) -> Result<AdobeApp14>` validators are
-also re-exported for callers that already have the APP0 / APP14
-payload bytes in hand. Standalone surface — the inspector
-requires neither the `registry` feature nor an `oxideav-core` dep.
+`parse_jfif_app0(payload) -> Result<JfifApp0>`,
+`parse_adobe_app14(payload) -> Result<AdobeApp14>`, and
+`parse_icc_profile_app2(payload) -> Result<IccProfileApp2Chunk<'_>>`
+validators are also re-exported for callers that already have the
+APP0 / APP14 / APP2 payload bytes in hand. Standalone surface —
+the inspector requires neither the `registry` feature nor an
+`oxideav-core` dep.
 
 ```rust
 use oxideav_mjpeg::{inspect_jpeg, SofKind, ChromaSubsampling};

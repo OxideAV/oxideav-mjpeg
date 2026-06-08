@@ -35,6 +35,12 @@ pub const SOF9: u8 = 0xC9;
 
 /// Application-specific markers APP0..APP15 (0xE0..0xEF).
 pub const APP0: u8 = 0xE0;
+/// APP2 — conventionally carries the embedded ICC colour profile.
+/// Payload begins with the 12-byte ASCII identifier `"ICC_PROFILE\0"`
+/// followed by a one-byte chunk-sequence number, a one-byte total-chunk
+/// count, and then the next slice of the ICC profile bytes (T.872 / Annex
+/// L of T.871 — see docs/image/jpeg/jpeg-fixtures-and-traces.md §3.11).
+pub const APP2: u8 = 0xE2;
 /// APP14 — conventionally carries the Adobe colour-transform tag.
 pub const APP14: u8 = 0xEE;
 pub const APP15: u8 = 0xEF;

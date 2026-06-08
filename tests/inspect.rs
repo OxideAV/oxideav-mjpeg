@@ -23,15 +23,6 @@ use oxideav_mjpeg::encoder::{
 };
 use oxideav_mjpeg::{inspect_jpeg, ChromaSubsampling, ColorHint, JpegInfo, SofKind};
 
-/// The Ghostscript-bundled sRGB ICC fixture (`with-icc-profile-embedded`)
-/// from the project's docs corpus, embedded here so the integration
-/// test does not rely on the docs submodule being checked out at test
-/// time. See `docs/image/jpeg/jpeg-fixtures-and-traces.md` §3.11 for
-/// the segment layout (12-byte `"ICC_PROFILE\0"` + (seq, total) +
-/// 2576-byte ICC body in one APP2 segment, declared length 2590).
-const ICC_FIXTURE: &[u8] =
-    include_bytes!("../../../docs/image/jpeg/fixtures/with-icc-profile-embedded/input.jpg");
-
 /// xorshift32 PRNG — matches the shape used by other tests in this
 /// crate so fixture content stays reproducible.
 fn xorshift32(state: &mut u32) -> u32 {
@@ -243,12 +234,28 @@ fn inspector_is_cheap_relative_to_decode() {
 
 #[test]
 fn inspect_real_fixture_reports_embedded_icc_profile() {
-    // The `with-icc-profile-embedded` fixture wraps Ghostscript's
-    // 2576-byte sRGB ICC inside a single APP2 segment whose payload
-    // is `"ICC_PROFILE\0"` + (seq=1, total=1) + 2576 ICC bytes.
-    // The inspector should surface a complete one-chunk summary with
-    // `total_payload_len == 2576`.
-    let info = inspect_jpeg(ICC_FIXTURE).expect("inspect real ICC fixture");
+    // The `with-icc-profile-embedded` fixture (docs/image/jpeg/) wraps
+    // Ghostscript's 2576-byte sRGB ICC inside a single APP2 segment
+    // whose payload is `"ICC_PROFILE\0"` + (seq=1, total=1) + 2576
+    // ICC bytes. The inspector should surface a complete one-chunk
+    // summary with `total_payload_len == 2576`.
+    //
+    // The crate's CI clones each sibling repo without the umbrella's
+    // docs/ submodule, so the file is conditionally read at runtime
+    // and the test exits early (matching the pattern in
+    // `tests/docs_corpus.rs`) when the path is absent. The umbrella
+    // checkout used for local development picks it up.
+    let path = std::path::PathBuf::from(
+        "../../docs/image/jpeg/fixtures/with-icc-profile-embedded/input.jpg",
+    );
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skip: missing {} ({e})", path.display());
+            return;
+        }
+    };
+    let info = inspect_jpeg(&bytes).expect("inspect real ICC fixture");
     let icc = info
         .icc_profile
         .as_ref()

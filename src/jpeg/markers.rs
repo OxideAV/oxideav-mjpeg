@@ -28,10 +28,13 @@ pub const SOF0: u8 = 0xC0;
 pub const SOF1: u8 = 0xC1;
 /// Progressive DCT.
 pub const SOF2: u8 = 0xC2;
-/// Lossless sequential (not implemented — uses predictor+Huffman, not DCT).
+/// Lossless sequential, Huffman-coded (T.81 Annex H — predictor-based, no DCT).
 pub const SOF3: u8 = 0xC3;
 /// Extended sequential DCT, arithmetic-coded (T.81 §F.1.4).
 pub const SOF9: u8 = 0xC9;
+/// Lossless sequential, arithmetic-coded (T.81 §H.1.2.3 two-dimensional
+/// statistical model over the Annex D Q-coder).
+pub const SOF11: u8 = 0xCB;
 
 /// Application-specific markers APP0..APP15 (0xE0..0xEF).
 pub const APP0: u8 = 0xE0;

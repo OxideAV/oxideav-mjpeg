@@ -2,8 +2,9 @@
 
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
 decodes baseline (SOF0), extended-sequential (SOF1), progressive (SOF2)
-and lossless (SOF3) JPEGs (single-component grayscale at any precision
-`P ∈ 2..=16` plus three-component RGB-class at `P = 8`), encodes
+and lossless (SOF3 Huffman + SOF11 arithmetic) JPEGs (single-component
+grayscale at any precision `P ∈ 2..=16` plus three-component RGB-class
+at `P = 8`), encodes
 baseline, progressive **and** lossless JPEG (the lossless path covers
 single-component grayscale at every precision `P ∈ 2..=16` and
 three-component interleaved RGB at every precision `P ∈ 2..=16`, with
@@ -548,6 +549,21 @@ Decoder:
   paths (no APP14 → plain "regular" CMYK, transform=0 → Adobe CMYK
   un-inverted on output, transform=2 → YCCK converted back to CMYK
   via BT.601).
+- **Lossless arithmetic JPEG (SOF11)** — the same Annex H coding model
+  (grayscale `P ∈ 2..=16`, three-component RGB-class `P ∈ 2..=16`,
+  four-component CMYK-class `P = 8`, all predictors, point transform,
+  restart intervals) with the modulo-2^16 prediction differences
+  entropy-coded by the Annex D Q-coder under the T.81 §H.1.2.3
+  two-dimensional statistical model: each binary decision is
+  conditioned on the classifications of the differences coded for the
+  sample to the left and the sample in the line above (the 5 × 5
+  `L_Context(Da, Db)` array of Figure H.2, 158 statistics bins per
+  component per Table H.3), with the DAC marker's DC-conditioning
+  `(L, U)` bounds honoured (defaults `(0, 1)` per §H.1.2.3.3). The
+  first line of the scan and of each restart interval uses the 1-D
+  horizontal predictor per §H.1.2.1. Output shaping is shared with
+  the SOF3 path (bit-exact reconstruction, same precision-driven
+  pixel-format policy).
 - **CMYK / YCCK** 4-component JPEGs → packed `PixelFormat::Cmyk`.
   Adobe APP14 transform flag honoured: transform=0 (Adobe CMYK, stored
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
@@ -614,8 +630,10 @@ Encoder:
 
 Not supported (decoder returns `Error::Unsupported`):
 
-- Hierarchical (SOF5+), arithmetic-coded SOF10..SOF15. SOF9 (extended
-  sequential, arithmetic) is supported at `P=8`.
+- Hierarchical (SOF5..SOF7, SOF13..SOF15) and progressive arithmetic
+  (SOF10). SOF9 (extended sequential, arithmetic) is supported at
+  `P=8` and SOF11 (lossless, arithmetic) at every Annex H precision —
+  see the decoder coverage list above.
 - 12-bit 4-component progressive (SOF2 `Nf = 4, P = 12`) — the
   workspace `PixelFormat` enum has no 12-bit CMYK variant. `P = 8`
   4-component CMYK / YCCK *is* supported on both the sequential

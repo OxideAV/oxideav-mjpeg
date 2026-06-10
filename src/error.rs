@@ -27,7 +27,7 @@ pub enum MjpegError {
     /// invalid Huffman code length, etc.).
     InvalidData(String),
     /// The bitstream uses a feature this codec doesn't implement
-    /// (hierarchical SOF, lossless arithmetic, etc.) or the encoder
+    /// (hierarchical SOF, progressive arithmetic, etc.) or the encoder
     /// was asked to emit a frame in a format it doesn't support.
     Unsupported(String),
     /// Catch-all for misuse errors that aren't bitstream-level

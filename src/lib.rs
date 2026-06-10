@@ -58,13 +58,17 @@
 //! Extended-sequential arithmetic (SOF9) is decoded via the Q-coder /
 //! arithmetic entropy decoder from T.81 Annex D + F.2.4. The DAC marker
 //! (Define Arithmetic Conditioning) is parsed when present; if absent the
-//! decoder uses the spec defaults `(L=0, U=1)` for DC and `Kx=5` for AC.
+//! decoder uses the spec defaults `(L=0, U=1)` for DC / lossless
+//! conditioning and `Kx=5` for AC. Lossless arithmetic (SOF11) is
+//! decoded via the same Q-coder under the two-dimensional statistical
+//! model of §H.1.2.3 (binary decisions conditioned on the left / above
+//! difference classifications through the Figure H.2 array), covering
+//! the full Annex H surface the SOF3 path handles: every precision,
+//! every predictor, point transform and restart intervals.
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Hierarchical (SOF5..SOF7, SOF13..SOF15) JPEGs
-//! - SOF10..SOF12 / SOF14..SOF15 arithmetic variants (progressive
-//!   arithmetic, lossless arithmetic, and the 12-bit arithmetic
-//!   precisions)
+//! - SOF10 (progressive arithmetic)
 //! - 12-bit progressive 4-component JPEGs (the workspace `PixelFormat`
 //!   enum has no 12-bit CMYK variant; `P=8` 4-component CMYK / YCCK
 //!   *is* supported on both the sequential and progressive scan

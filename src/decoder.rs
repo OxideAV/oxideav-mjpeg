@@ -30,8 +30,9 @@ use crate::image::{
 pub use crate::registry::make_decoder;
 
 use crate::jpeg::arith::{
-    decode_ac as arith_decode_ac, decode_dc_diff as arith_decode_dc_diff, AcStats, ArithDecoder,
-    DcStats,
+    decode_ac as arith_decode_ac, decode_dc_diff as arith_decode_dc_diff,
+    decode_lossless_diff as arith_decode_lossless_diff, AcStats, ArithDecoder, DcStats,
+    LosslessStats,
 };
 use crate::jpeg::dct::idct8x8;
 use crate::jpeg::huffman::{parse_dht, HuffTable};
@@ -57,10 +58,15 @@ struct JpegState {
     /// all subsequent scans also accumulate and we render at EOI (same path
     /// as progressive, just with single-pass coefficients).
     seq_accum: bool,
-    /// True when SOF3 (lossless) was parsed. Mutually exclusive with
-    /// `progressive` / `seq_accum` — lossless JPEGs use predictor-based
-    /// coding rather than DCT and take their own scan decoder.
+    /// True when SOF3 or SOF11 (lossless) was parsed. Mutually exclusive
+    /// with `progressive` / `seq_accum` — lossless JPEGs use
+    /// predictor-based coding rather than DCT and take their own scan
+    /// decoder. SOF11 additionally sets `lossless_arith`.
     lossless: bool,
+    /// True when SOF11 (lossless, arithmetic-coded) was parsed. The
+    /// lossless scan dispatcher takes the §H.1.2.3 Q-coder path instead
+    /// of the Annex H Huffman path.
+    lossless_arith: bool,
     /// Adobe APP14 transform flag. `None` if no Adobe marker was seen;
     /// `Some(0)` for direct (CMYK / RGB, samples stored as-is but
     /// Adobe-inverted for CMYK); `Some(1)` for YCbCr (3-component);
@@ -102,6 +108,7 @@ impl JpegState {
             progressive: false,
             seq_accum: false,
             lossless: false,
+            lossless_arith: false,
             adobe_transform: None,
             arithmetic: false,
             arith_dc: Default::default(),
@@ -149,6 +156,47 @@ fn validate_sof(sof: &SofInfo) -> Result<()> {
     let nf = sof.components.len() as u64;
     if w.saturating_mul(h).saturating_mul(nf) > MAX_PIXEL_BUDGET {
         return Err(Error::unsupported("SOF: pixel budget exceeded"));
+    }
+    Ok(())
+}
+
+/// Shared frame-header constraints for the lossless processes (SOF3
+/// Huffman and SOF11 arithmetic — T.81 Annex H):
+///   * precision 2..=16 (§H.1.1);
+///   * single-component grayscale, three-component RGB-class and
+///     four-component CMYK-class interleaved frames. Components with
+///     non-unit sampling factors are rejected — Annex H pairs lossless
+///     with `data unit = one sample` (E.1.1), so non-1:1 sampling would
+///     not be a well-defined MCU;
+///   * the four-component path is `P = 8` only because the workspace
+///     `PixelFormat` enum has no high-bit-depth CMYK variant.
+fn validate_lossless_sof(sof: &SofInfo) -> Result<()> {
+    if !(2..=16).contains(&sof.precision) {
+        return Err(Error::unsupported(format!(
+            "lossless JPEG: precision {} out of range 2..=16",
+            sof.precision
+        )));
+    }
+    if !matches!(sof.components.len(), 1 | 3 | 4) {
+        return Err(Error::unsupported(format!(
+            "lossless JPEG: {} component(s) — only 1 (grayscale), 3 (RGB-class) and 4 (CMYK-class) are supported",
+            sof.components.len()
+        )));
+    }
+    if sof.components.len() == 4 && sof.precision != 8 {
+        return Err(Error::unsupported(format!(
+            "lossless JPEG: 4-component scans require precision 8, got {}",
+            sof.precision
+        )));
+    }
+    if sof.components.len() > 1 {
+        for c in &sof.components {
+            if c.h_factor != 1 || c.v_factor != 1 {
+                return Err(Error::unsupported(
+                    "lossless JPEG: multi-component scans require H_i = V_i = 1",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -291,51 +339,23 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 state.sof = Some(sof);
                 state.progressive = true;
             }
-            SOF3 => {
+            // SOF3 — lossless, Huffman-coded; SOF11 — lossless,
+            // arithmetic-coded (T.81 §H.1.2.3 two-dimensional statistical
+            // model over the Annex D Q-coder). Both share the Annex H
+            // predictor-based coding model and the same frame-header
+            // constraints; only the entropy layer of the scan decoder
+            // differs.
+            SOF3 | markers::SOF11 => {
                 if state.sof.is_some() {
                     return Err(Error::invalid("JPEG: multiple SOF segments"));
                 }
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
                 validate_sof(&sof)?;
-                if !(2..=16).contains(&sof.precision) {
-                    return Err(Error::unsupported(format!(
-                        "lossless JPEG: precision {} out of range 2..=16",
-                        sof.precision
-                    )));
-                }
-                // Single-component grayscale, three-component RGB-class and
-                // four-component CMYK-class interleaved scans (each component
-                // declared `H_i = V_i = 1`, per T.81 §H.1.2) are supported.
-                // Components with non-unit sampling factors are rejected —
-                // Annex H pairs lossless with `data unit = one sample`
-                // (E.1.1), so non-1:1 sampling would not be a well-defined
-                // MCU. The four-component path is `P = 8` only because the
-                // workspace `PixelFormat` enum has no high-bit-depth CMYK
-                // variant — wider precisions are rejected here.
-                if !matches!(sof.components.len(), 1 | 3 | 4) {
-                    return Err(Error::unsupported(format!(
-                        "lossless JPEG: {} component(s) — only 1 (grayscale), 3 (RGB-class) and 4 (CMYK-class) are supported",
-                        sof.components.len()
-                    )));
-                }
-                if sof.components.len() == 4 && sof.precision != 8 {
-                    return Err(Error::unsupported(format!(
-                        "lossless JPEG: 4-component scans require precision 8, got {}",
-                        sof.precision
-                    )));
-                }
-                if sof.components.len() > 1 {
-                    for c in &sof.components {
-                        if c.h_factor != 1 || c.v_factor != 1 {
-                            return Err(Error::unsupported(
-                                "lossless JPEG: multi-component scans require H_i = V_i = 1",
-                            ));
-                        }
-                    }
-                }
+                validate_lossless_sof(&sof)?;
                 state.sof = Some(sof);
                 state.lossless = true;
+                state.lossless_arith = marker == markers::SOF11;
             }
             // SOF9 — extended sequential, arithmetic-coded (T.81 §F.1.4).
             // Same DCT machinery as SOF1, but the entropy coder is the
@@ -365,10 +385,10 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 state.sof = Some(sof);
                 state.arithmetic = true;
             }
-            0xC5..=0xC7 | 0xCA..=0xCB | 0xCD..=0xCF => {
+            0xC5..=0xC7 | 0xCA | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "JPEG: hierarchical and SOF10..15 arithmetic variants are not supported",
+                    "JPEG: hierarchical and SOF10/SOF13..15 arithmetic variants are not supported",
                 ));
             }
             SOS => {
@@ -377,6 +397,9 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 validate_sos(&sos)?;
                 let scan = walker.read_scan_data()?;
                 if state.lossless {
+                    if state.lossless_arith {
+                        return decode_lossless_arith_scan(&state, &sos, scan, pts);
+                    }
                     return decode_lossless_scan(&state, &sos, scan, pts);
                 }
                 if state.arithmetic {
@@ -2391,6 +2414,24 @@ fn decode_lossless_scan(
         }
     }
 
+    shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
+}
+
+/// Shape the reconstructed per-component lossless sample planes into the
+/// output `VideoFrame`. Shared by the Huffman (SOF3) and arithmetic
+/// (SOF11) lossless scan decoders — the Annex H coding model is identical
+/// past the entropy layer, so the precision-driven output policy is too.
+#[allow(clippy::too_many_arguments)]
+fn shape_lossless_frame(
+    samples: &[Vec<u32>],
+    nc: usize,
+    width: usize,
+    height: usize,
+    pt: u32,
+    precision: u32,
+    state: &JpegState,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
     // Four-component decode: pack the per-component planes into a single
     // row-major `C M Y K` output (packed `PixelFormat::Cmyk`, 4
     // bytes/pixel). All components are `H_i = V_i = 1` in the lossless
@@ -2400,7 +2441,7 @@ fn decode_lossless_scan(
     // Adobe-CMYK convention, `transform = 2` (YCCK) decodes YCbCr → RGB
     // via BT.601 and un-inverts K, and the no-APP14 case passes the four
     // sample bytes through as plain "regular" CMYK. `precision = 8` was
-    // enforced above so each post-`<< pt` byte fits in `u8` without
+    // enforced at SOF time so each post-`<< pt` byte fits in `u8` without
     // overflow; with `pt = 0` (the default) the shift is a no-op.
     if nc == 4 {
         let stride = width * 4;
@@ -2552,6 +2593,166 @@ fn decode_lossless_scan(
         pts,
         planes: vec![plane],
     })
+}
+
+// ---- Lossless arithmetic JPEG (SOF11) -------------------------------------
+//
+// Same Annex H predictor-based coding model as SOF3, but the modulo-2^16
+// prediction differences are coded with the Annex D Q-coder under the
+// two-dimensional statistical model of T.81 §H.1.2.3: each binary decision
+// is conditioned on the classifications of Da (the difference coded for
+// the sample to the left) and Db (the difference coded for the sample in
+// the line above) via the 5 × 5 array of Figure H.2, with the magnitude
+// bins selected by X1_Context(Db). Per §H.2.2 the decoder mirrors the
+// encoder's coding model; per §H.1.2.3.4 / §H.2.1 all statistics are
+// re-initialised at the start of the scan and at each restart, and per
+// §H.1.2.3.1 the line-above conditioning is zero for the first line of
+// the scan and of each restart interval, with the left conditioning zero
+// at the start of each line.
+//
+// Prediction (§H.1.2.1): the first sample of the scan and of each restart
+// interval is predicted as 2^(P − Pt − 1); the rest of the first line of
+// the scan / interval uses the one-dimensional horizontal predictor (Ra);
+// the first sample of every other line uses Rb; everywhere else the
+// scan-header-selected predictor applies. Restart intervals are an
+// integer multiple of the samples per MCU-row (§H.1.1), so interval
+// boundaries are line-aligned in conformant streams.
+fn decode_lossless_arith_scan(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    if sos.components.len() != sof.components.len() {
+        return Err(Error::unsupported(
+            "lossless arith: non-interleaved multi-component scans are not supported",
+        ));
+    }
+    let predictor = sos.ss;
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(
+            "lossless arith: predictor Ss must be in 1..=7",
+        ));
+    }
+    let pt = sos.al as u32; // point transform
+    let precision = sof.precision as u32;
+    if pt >= precision {
+        return Err(Error::invalid("lossless arith: Pt >= precision"));
+    }
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let nc = sos.components.len();
+
+    // One statistics area per scan component (§H.1.2.3.2), with the L / U
+    // conditioning bounds taken from the DAC DC-conditioning entry the
+    // component's Td selector points at (§H.1.2.3.3; defaults L=0, U=1).
+    let mut stats: Vec<LosslessStats> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            let mut s = LosslessStats::new();
+            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
+                s.l = cond.l;
+                s.u = cond.u;
+            }
+            s
+        })
+        .collect();
+
+    // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
+    let sample_bits = precision - pt;
+    let sample_max: u32 = 1u32 << sample_bits;
+    let sample_mask: u32 = sample_max - 1;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    let mut samples: Vec<Vec<u32>> = (0..nc).map(|_| vec![0u32; width * height]).collect();
+
+    // Per-component conditioning history: the differences coded for the
+    // line above (Db source) and for the current line so far (Da via
+    // column x-1). Zeroed at scan start and at each restart (§H.1.2.3.1).
+    let mut prev_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; width]).collect();
+    let mut cur_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; width]).collect();
+
+    // Restart bookkeeping mirrors decode_arith_scan: track the byte offset
+    // of the current entropy segment within `scan` and re-Initdec past
+    // each RSTn marker.
+    let mut scan_pos = 0usize;
+    let mut decoder = ArithDecoder::new(scan);
+    let mut samples_since_restart: u32 = 0;
+    let mut reset_pred = true; // true at scan start and after each RSTn
+    let mut first_line_y = 0usize; // first line of the current restart interval
+
+    for y in 0..height {
+        for x in 0..width {
+            if state.restart_interval != 0
+                && samples_since_restart != 0
+                && samples_since_restart % state.restart_interval as u32 == 0
+            {
+                scan_pos = locate_next_marker_after(scan, scan_pos);
+                if scan_pos >= scan.len() {
+                    return Err(Error::invalid(
+                        "lossless arith: missing restart marker mid-scan",
+                    ));
+                }
+                for s in stats.iter_mut() {
+                    s.reset();
+                }
+                for row in prev_diff.iter_mut() {
+                    row.fill(0);
+                }
+                for row in cur_diff.iter_mut() {
+                    row.fill(0);
+                }
+                decoder = ArithDecoder::new(&scan[scan_pos..]);
+                reset_pred = true;
+                first_line_y = y;
+            }
+
+            for ci in 0..nc {
+                let plane = &samples[ci];
+                let pred: u32 = if reset_pred {
+                    origin
+                } else if y == first_line_y {
+                    // First line of the scan / restart interval: 1-D
+                    // horizontal predictor (Ra) per §H.1.2.1.
+                    plane[y * width + x - 1]
+                } else if x == 0 {
+                    plane[(y - 1) * width + x]
+                } else {
+                    let ra = plane[y * width + x - 1];
+                    let rb = plane[(y - 1) * width + x];
+                    let rc = plane[(y - 1) * width + x - 1];
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                        7 => (ra.wrapping_add(rb)) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
+
+                let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
+                let db = prev_diff[ci][x];
+                let diff = arith_decode_lossless_diff(&mut decoder, &mut stats[ci], da, db)?;
+                cur_diff[ci][x] = diff;
+
+                let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
+                samples[ci][y * width + x] = sv;
+            }
+            reset_pred = false;
+            samples_since_restart += 1;
+        }
+        std::mem::swap(&mut prev_diff, &mut cur_diff);
+    }
+
+    shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
 }
 
 #[cfg(all(test, feature = "registry"))]
@@ -3522,6 +3723,7 @@ mod precision_12_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod lossless_tests {
+    use super::{decode_jpeg, Error};
     use crate::encoder::encode_lossless_grayscale_jpeg_8bit;
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -3568,6 +3770,319 @@ mod lossless_tests {
                 assert_eq!(got, want, "mismatch at ({i},{j})");
             }
         }
+    }
+
+    /// Append one length-prefixed marker segment (T.81 §B.1.1.4).
+    fn put_seg(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+        out.extend_from_slice(&[0xFF, marker]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    /// Build a complete SOF11 (lossless, arithmetic-coded) JPEG from
+    /// pre-Pt-shift component planes — the encoder-side mirror of
+    /// `decode_lossless_arith_scan` per T.81 §H.1.2 (prediction) +
+    /// §H.1.2.3 (two-dimensional statistical model), used as test
+    /// scaffolding for round-trip verification.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sof11_jpeg(
+        width: usize,
+        height: usize,
+        planes: &[Vec<u32>],
+        precision: u8,
+        predictor: u8,
+        pt: u8,
+        restart_interval: u16,
+        dac_lu: Option<(u8, u8)>,
+    ) -> Vec<u8> {
+        use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+        let nc = planes.len();
+        let mut out = vec![0xFF, 0xD8]; // SOI
+        if let Some((l, u)) = dac_lu {
+            // DAC entry: Tc = 0 (DC / lossless conditioning), Tb = 0,
+            // Cs = (U << 4) | L (T.81 §B.2.4.3).
+            put_seg(&mut out, 0xCC, &[0x00, (u << 4) | l]);
+        }
+        if restart_interval != 0 {
+            put_seg(&mut out, 0xDD, &restart_interval.to_be_bytes());
+        }
+        let mut sof = vec![precision];
+        sof.extend_from_slice(&(height as u16).to_be_bytes());
+        sof.extend_from_slice(&(width as u16).to_be_bytes());
+        sof.push(nc as u8);
+        for ci in 0..nc {
+            sof.extend_from_slice(&[ci as u8 + 1, 0x11, 0]);
+        }
+        put_seg(&mut out, 0xCB, &sof); // SOF11
+        let mut sos = vec![nc as u8];
+        for ci in 0..nc {
+            sos.extend_from_slice(&[ci as u8 + 1, 0x00]);
+        }
+        // Ss = predictor, Se = 0, Ah = 0, Al = Pt (§B.2.3 for lossless).
+        sos.extend_from_slice(&[predictor, 0, pt]);
+        put_seg(&mut out, 0xDA, &sos);
+
+        let sample_bits = (precision - pt) as u32;
+        let origin: u32 = 1 << (sample_bits - 1);
+        let (l, u) = dac_lu.unwrap_or((0, 1));
+        let mut stats: Vec<LosslessStats> = (0..nc)
+            .map(|_| {
+                let mut s = LosslessStats::new();
+                s.l = l;
+                s.u = u;
+                s
+            })
+            .collect();
+        let mut prev_diff = vec![vec![0i32; width]; nc];
+        let mut cur_diff = vec![vec![0i32; width]; nc];
+        let mut enc = ArithEncoder::new();
+        let mut since_restart = 0u32;
+        let mut rst = 0u8;
+        let mut reset_pred = true;
+        let mut first_line_y = 0usize;
+        for y in 0..height {
+            for x in 0..width {
+                if restart_interval != 0
+                    && since_restart != 0
+                    && since_restart % restart_interval as u32 == 0
+                {
+                    // Flush the entropy segment, append RSTn, restart the
+                    // coder + statistics + conditioning + prediction
+                    // (§H.1.1 / §H.1.2.3.4).
+                    out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                    out.extend_from_slice(&[0xFF, 0xD0 + rst]);
+                    rst = (rst + 1) % 8;
+                    for s in stats.iter_mut() {
+                        s.reset();
+                    }
+                    for r in prev_diff.iter_mut() {
+                        r.fill(0);
+                    }
+                    for r in cur_diff.iter_mut() {
+                        r.fill(0);
+                    }
+                    reset_pred = true;
+                    first_line_y = y;
+                }
+                for ci in 0..nc {
+                    let plane = &planes[ci];
+                    let pred: u32 = if reset_pred {
+                        origin
+                    } else if y == first_line_y {
+                        plane[y * width + x - 1]
+                    } else if x == 0 {
+                        plane[(y - 1) * width + x]
+                    } else {
+                        let ra = plane[y * width + x - 1];
+                        let rb = plane[(y - 1) * width + x];
+                        let rc = plane[(y - 1) * width + x - 1];
+                        match predictor {
+                            1 => ra,
+                            2 => rb,
+                            3 => rc,
+                            4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                            5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                            6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                            7 => (ra.wrapping_add(rb)) >> 1,
+                            _ => unreachable!(),
+                        }
+                    };
+                    let px = plane[y * width + x];
+                    // Modulo-2^16 difference (§H.1.2.1) reduced to the
+                    // -32768..=32767 representative.
+                    let dm = (px.wrapping_sub(pred) & 0xFFFF) as i32;
+                    let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
+                    let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
+                    let db = prev_diff[ci][x];
+                    encode_lossless_diff(&mut enc, &mut stats[ci], da, db, dm).unwrap();
+                    cur_diff[ci][x] = dm;
+                }
+                reset_pred = false;
+                since_restart += 1;
+            }
+            std::mem::swap(&mut prev_diff, &mut cur_diff);
+        }
+        out.extend_from_slice(&enc.finish());
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    /// SOF11 grayscale 8-bit: every Annex H Table H.1 predictor must
+    /// round-trip bit-exact through the arithmetic lossless decoder.
+    #[test]
+    fn sof11_gray8_exact_roundtrip_all_predictors() {
+        let w = 24usize;
+        let h = 16usize;
+        let mut plane = vec![0u32; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                plane[j * w + i] =
+                    ((i as i32 * 3 + j as i32 * 5 + ((i ^ j) as i32 & 7)) & 0xFF) as u32;
+            }
+        }
+        for predictor in 1..=7u8 {
+            let data = encode_sof11_jpeg(w, h, &[plane.clone()], 8, predictor, 0, 0, None);
+            assert!(
+                data.windows(2).any(|x| x == [0xFF, 0xCB]),
+                "SOF11 marker missing"
+            );
+            let v = decode_jpeg(&data, None).unwrap();
+            assert_eq!(v.planes.len(), 1);
+            assert_eq!(v.planes[0].stride, w);
+            for j in 0..h {
+                for i in 0..w {
+                    assert_eq!(
+                        v.planes[0].data[j * w + i] as u32,
+                        plane[j * w + i],
+                        "pred {predictor} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SOF11 grayscale at the full 16-bit precision: pseudorandom samples
+    /// drive large modulo-2^16 differences through the deep end of the
+    /// Table H.3 magnitude tree.
+    #[test]
+    fn sof11_gray16_exact_roundtrip() {
+        let w = 16usize;
+        let h = 12usize;
+        let mut s = 0x9E37_79B9u32;
+        let mut plane = vec![0u32; w * h];
+        for v in plane.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *v = s & 0xFFFF;
+        }
+        let data = encode_sof11_jpeg(w, h, &[plane.clone()], 16, 4, 0, 0, None);
+        let v = decode_jpeg(&data, None).unwrap();
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w * 2);
+        for i in 0..w * h {
+            let got =
+                u16::from_le_bytes([v.planes[0].data[i * 2], v.planes[0].data[i * 2 + 1]]) as u32;
+            assert_eq!(got, plane[i], "mismatch at sample {i}");
+        }
+    }
+
+    /// SOF11 three-component 8-bit (RGB-class): decodes to one packed
+    /// `Rgb24` plane carrying the SOS scan-order components, bit-exact.
+    #[test]
+    fn sof11_rgb8_exact_roundtrip() {
+        let w = 20usize;
+        let h = 14usize;
+        let mut planes = vec![vec![0u32; w * h]; 3];
+        for j in 0..h {
+            for i in 0..w {
+                planes[0][j * w + i] = ((i * 11 + j * 3) & 0xFF) as u32;
+                planes[1][j * w + i] = ((i * 2 + j * 17) & 0xFF) as u32;
+                planes[2][j * w + i] = (((i ^ j) * 29) & 0xFF) as u32;
+            }
+        }
+        let data = encode_sof11_jpeg(w, h, &planes, 8, 1, 0, 0, None);
+        let v = decode_jpeg(&data, None).unwrap();
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w * 3);
+        for i in 0..w * h {
+            for (ci, plane) in planes.iter().enumerate() {
+                assert_eq!(
+                    v.planes[0].data[i * 3 + ci] as u32,
+                    plane[i],
+                    "component {ci} mismatch at sample {i}"
+                );
+            }
+        }
+    }
+
+    /// SOF11 with a DRI restart interval (one MCU-row per interval —
+    /// §H.1.1 requires the interval be a multiple of the MCUs per row):
+    /// each RSTn re-seeds the coder, statistics, conditioning and
+    /// prediction, and the stream still round-trips bit-exact.
+    #[test]
+    fn sof11_restart_interval_roundtrip() {
+        let w = 16usize;
+        let h = 24usize;
+        let mut plane = vec![0u32; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                plane[j * w + i] = ((i * 7 + j * 13 + (i & j)) & 0xFF) as u32;
+            }
+        }
+        // Interval = 2 MCU-rows; 24 lines → 11 restart markers.
+        let data = encode_sof11_jpeg(w, h, &[plane.clone()], 8, 5, 0, (w * 2) as u16, None);
+        assert!(
+            data.windows(2)
+                .any(|x| x[0] == 0xFF && (0xD0..=0xD7).contains(&x[1])),
+            "no RSTn marker found in the scan"
+        );
+        let v = decode_jpeg(&data, None).unwrap();
+        for i in 0..w * h {
+            assert_eq!(v.planes[0].data[i] as u32, plane[i], "mismatch at {i}");
+        }
+    }
+
+    /// SOF11 with DAC-overridden conditioning bounds (L = 2, U = 5):
+    /// both sides must classify Da / Db with the same non-default
+    /// small/large boundaries or the bin streams desynchronise.
+    #[test]
+    fn sof11_dac_conditioning_roundtrip() {
+        let w = 24usize;
+        let h = 16usize;
+        let mut plane = vec![0u32; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                plane[j * w + i] = ((i * 19 + j * 31 + ((i * j) & 15)) & 0xFF) as u32;
+            }
+        }
+        let data = encode_sof11_jpeg(w, h, &[plane.clone()], 8, 2, 0, 0, Some((2, 5)));
+        let v = decode_jpeg(&data, None).unwrap();
+        for i in 0..w * h {
+            assert_eq!(v.planes[0].data[i] as u32, plane[i], "mismatch at {i}");
+        }
+    }
+
+    /// SOF11 with a non-zero point transform: samples are coded in
+    /// `P − Pt` bits and the decoder output is left-shifted by Pt
+    /// (§H.2.2).
+    #[test]
+    fn sof11_point_transform_roundtrip() {
+        let w = 12usize;
+        let h = 10usize;
+        let pt = 2u8;
+        // Pre-shift samples: 6 significant bits at P = 8, Pt = 2.
+        let mut plane = vec![0u32; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                plane[j * w + i] = ((i * 5 + j * 9) & 0x3F) as u32;
+            }
+        }
+        let data = encode_sof11_jpeg(w, h, &[plane.clone()], 8, 1, pt, 0, None);
+        let v = decode_jpeg(&data, None).unwrap();
+        for i in 0..w * h {
+            assert_eq!(
+                v.planes[0].data[i] as u32,
+                plane[i] << pt,
+                "mismatch at {i}"
+            );
+        }
+    }
+
+    /// SOF10 (progressive, arithmetic) is still rejected — adding SOF11
+    /// must not have widened the accept matcher to its neighbour.
+    #[test]
+    fn sof10_progressive_arithmetic_still_rejected() {
+        let bytes = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xCA, 0x00, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, // SOF10 stub
+            0xFF, 0xD9, // EOI
+        ];
+        let err = decode_jpeg(&bytes, None).expect_err("expected decode error");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 
     /// Hierarchical (SOF5/6/7) and SOF10..15 arithmetic variants must

@@ -1,9 +1,13 @@
-//! JPEG arithmetic-coded entropy decoder (T.81 Annex D + Annex F.2.4).
+//! JPEG arithmetic-coded entropy coder (T.81 Annex D + Annex F + Annex H).
 //!
-//! Implements the Q-coder probability-estimation state machine (Table D.3)
-//! and the Decode(S) / Initdec / Renorm_d / Byte_in / Unstuff_0 procedures
-//! from Figures D.16–D.22, then the JPEG-specific DC-difference and AC-band
-//! decoding sequences from Figures F.19–F.24.
+//! Implements the Q-coder probability-estimation state machine (Table D.3),
+//! the decoder-side Decode(S) / Initdec / Renorm_d / Byte_in / Unstuff_0
+//! procedures from Figures D.16–D.22, the encoder-side Code_0(S) /
+//! Code_1(S) / Code_MPS / Code_LPS / Renorm_e / Byte_out / Initenc / Flush
+//! procedures from Figures D.1–D.15, the JPEG-specific DC-difference and
+//! AC-band decoding sequences from Figures F.19–F.24, and the
+//! two-dimensional lossless statistical model from §H.1.2.3
+//! (L_Context(Da,Db) / X1_Context(Db), Table H.3).
 //!
 //! Workspace policy bars consulting any external library implementation;
 //! the only references used here are the T.81 spec PDF (in
@@ -414,6 +418,176 @@ impl<'a> ArithDecoder<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Q-coder encoder state (T.81 §D.1).
+// ---------------------------------------------------------------------------
+
+/// Arithmetic entropy encoder per T.81 Annex D §D.1: Initenc (Figure D.12),
+/// Code_MPS / Code_LPS with conditional exchange (Figures D.3 / D.4),
+/// Renorm_e (Figure D.7), Byte_out with carry resolution + `0xFF 0x00`
+/// stuffing (Figures D.8–D.11), and Flush / Clear_final_bits /
+/// Discard_final_zeros termination (Figures D.13–D.15).
+pub struct ArithEncoder {
+    out: Vec<u8>,
+    /// Probability-interval register. Initialised to the full X'10000'
+    /// (Figure D.12); always > X'7FFF' between events.
+    a: u32,
+    /// Code register (Figure D.2 layout: output bits surface at C >> 19).
+    c: u32,
+    /// Bit counter until the next Byte_out. Initenc sets 11 — three spacer
+    /// bits plus eight output bits (§D.1.7).
+    ct: i32,
+    /// Stack counter ST — number of X'FF' bytes withheld pending carry
+    /// resolution (Figure D.8).
+    st: u32,
+}
+
+impl ArithEncoder {
+    /// Initenc (Figure D.12): A = X'10000', C = 0, CT = 11, ST = 0.
+    pub fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            a: 0x10000,
+            c: 0,
+            ct: 11,
+            st: 0,
+        }
+    }
+
+    /// Code one binary decision `d` (0 or 1) against the statistics bin
+    /// `ctx`. This is Code_1(S) / Code_0(S) (Figures D.1 / D.2) folded into
+    /// one entry point: `d == MPS(S)` takes the Code_MPS path (Figure D.4),
+    /// otherwise Code_LPS (Figure D.3).
+    pub fn code_bit(&mut self, ctx: &mut Context, d: u8) {
+        let entry = QE_TABLE[ctx.idx as usize];
+        let qe = entry.qe as u32;
+        if d == ctx.mps {
+            // Code_MPS (Figure D.4): A = A - Qe; renormalise only when the
+            // interval drops below X'8000', applying conditional exchange
+            // when the MPS sub-interval came out smaller than Qe.
+            self.a -= qe;
+            if self.a < 0x8000 {
+                if self.a < qe {
+                    self.c += self.a;
+                    self.a = qe;
+                }
+                ctx.idx = entry.nmps;
+                self.renorm_e();
+            }
+        } else {
+            // Code_LPS (Figure D.3): A = A - Qe; without conditional
+            // exchange the LPS takes the upper sub-interval (C += A,
+            // A = Qe); with exchange (A < Qe) the LPS keeps the lower,
+            // now-smaller MPS sub-interval.
+            self.a -= qe;
+            if self.a >= qe {
+                self.c += self.a;
+                self.a = qe;
+            }
+            if entry.switch == 1 {
+                ctx.mps ^= 1;
+            }
+            ctx.idx = entry.nlps;
+            self.renorm_e();
+        }
+    }
+
+    /// Renorm_e (Figure D.7): shift A and C left until A >= X'8000',
+    /// emitting a byte via Byte_out every 8 shifts.
+    fn renorm_e(&mut self) {
+        loop {
+            self.a <<= 1;
+            self.c <<= 1;
+            self.ct -= 1;
+            if self.ct == 0 {
+                self.byte_out();
+                self.ct = 8;
+            }
+            if self.a >= 0x8000 {
+                break;
+            }
+        }
+    }
+
+    /// Byte_out (Figure D.8) with Output_stacked_zeros (D.9),
+    /// Output_stacked_X'FF's (D.10) and Stuff_0 (D.11).
+    fn byte_out(&mut self) {
+        let t = self.c >> 19;
+        if t > 0xFF {
+            // Carry-over: add the carry to the previous output byte, then
+            // stuff a zero if that made it X'FF' (Stuff_0), then convert
+            // any stacked X'FF' bytes to zeros (the carry rippled through
+            // them) before emitting the new byte.
+            if let Some(last) = self.out.last_mut() {
+                *last = last.wrapping_add(1);
+                if *last == 0xFF {
+                    self.out.push(0);
+                }
+            }
+            for _ in 0..self.st {
+                self.out.push(0);
+            }
+            self.st = 0;
+            self.out.push((t & 0xFF) as u8);
+        } else if t == 0xFF {
+            // Withhold X'FF' bytes until the carry is resolved (ST += 1).
+            self.st += 1;
+        } else {
+            // Carry resolved: flush stacked X'FF's, each followed by a
+            // stuffed zero, then the fresh byte.
+            for _ in 0..self.st {
+                self.out.push(0xFF);
+                self.out.push(0);
+            }
+            self.st = 0;
+            self.out.push(t as u8);
+        }
+        self.c &= 0x7FFFF;
+    }
+
+    /// Flush (Figure D.13): Clear_final_bits (Figure D.14), two aligned
+    /// Byte_outs, then Discard_final_zeros (Figure D.15). Returns the
+    /// completed entropy-coded segment (the caller appends the following
+    /// marker; the decoder pads with zero bits at the marker per §D.1.8).
+    pub fn finish(mut self) -> Vec<u8> {
+        // Clear_final_bits: zero as many low-order C bits as possible
+        // without leaving the final interval [C, C + A).
+        let mut t = self.c.wrapping_add(self.a - 1) & 0xFFFF_0000;
+        if t < self.c {
+            t += 0x8000;
+        }
+        self.c = t;
+        // Align + emit the last two bytes.
+        self.c <<= self.ct as u32;
+        self.byte_out();
+        self.c <<= 8;
+        self.byte_out();
+        // Any X'FF' bytes still stacked can no longer receive a carry —
+        // they are real data bytes and each needs its stuffed zero.
+        for _ in 0..self.st {
+            self.out.push(0xFF);
+            self.out.push(0);
+        }
+        self.st = 0;
+        // Discard_final_zeros: trailing zero bytes not preceded by X'FF'
+        // may be dropped; a zero following X'FF' is a stuffed zero and
+        // shall be kept.
+        while self.out.last() == Some(&0) {
+            self.out.pop();
+        }
+        if self.out.last() == Some(&0xFF) {
+            self.out.push(0);
+        }
+        self.out
+    }
+}
+
+impl Default for ArithEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Statistics layout (T.81 F.1.4.4). Each component / scan owns one DC area
 // and one AC area (both shared across blocks of the component).
 // ---------------------------------------------------------------------------
@@ -543,6 +717,96 @@ impl AcStats {
 }
 
 impl Default for AcStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lossless (SOF11) statistics area — 158 bins per T.81 §H.1.2.3.2:
+///   * 25 sets of four bins (S0 / SS / SP / SN) at bases 0, 4, ..., 96,
+///     selected by `L_Context(Da, Db)` over the 5 × 5 conditioning array
+///     of Figure H.2 (rows = difference-to-left class, columns =
+///     difference-above class, each ordered zero / +S / −S / +L / −L);
+///   * two 29-bin magnitude sets (X1..X15 then M2..M15, with
+///     `Mn = Xn + 14` per Table H.3) at base 100 when Db classifies as
+///     zero / small and base 129 when Db classifies as large
+///     (`X1_Context(Db)`, §H.1.2.3.2).
+///
+/// The L / U conditioning bounds default to (0, 1) per §H.1.2.3.3 and may
+/// be overridden by a DAC marker segment (Tc = 0 entry).
+#[derive(Clone, Debug)]
+pub struct LosslessStats {
+    pub bins: [Context; 158],
+    /// Conditioning lower bound L (DAC override; default 0).
+    pub l: u8,
+    /// Conditioning upper bound U (DAC override; default 1).
+    pub u: u8,
+}
+
+impl LosslessStats {
+    pub fn new() -> Self {
+        Self {
+            bins: [Context::default(); 158],
+            l: 0,
+            u: 1,
+        }
+    }
+
+    /// Re-initialise every bin (scan start and each restart interval, per
+    /// §H.1.2.3.4 / Annex D defaults).
+    pub fn reset(&mut self) {
+        for b in self.bins.iter_mut() {
+            *b = Context::default();
+        }
+    }
+
+    /// Classify a neighbouring difference into the five F.1.4.4.1.2
+    /// categories using the L / U bounds: 0 = zero, 1 = small positive,
+    /// 2 = small negative, 3 = large positive, 4 = large negative. The
+    /// lower (exclusive) bound for "small" is 0 when L = 0 and 2^(L−1)
+    /// otherwise; the upper (inclusive) bound is 2^U.
+    pub fn classify(&self, d: i32) -> usize {
+        let lower = if self.l == 0 {
+            0
+        } else {
+            1i32 << (self.l - 1) as i32
+        };
+        let upper = 1i32 << self.u as i32;
+        let abs = d.unsigned_abs() as i32;
+        if abs <= lower {
+            0
+        } else if abs <= upper {
+            if d > 0 {
+                1
+            } else {
+                2
+            }
+        } else if d > 0 {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// `L_Context(Da, Db)` — base S0 bin from the Figure H.2 array
+    /// (row stride 20 over the left-difference class, column stride 4
+    /// over the above-difference class).
+    fn s0(&self, da: i32, db: i32) -> usize {
+        20 * self.classify(da) + 4 * self.classify(db)
+    }
+
+    /// `X1_Context(Db)` — magnitude-set base: 100 when Db is zero /
+    /// small (either sign), 129 when Db is large (§H.1.2.3.2).
+    fn x1(&self, db: i32) -> usize {
+        if self.classify(db) <= 2 {
+            100
+        } else {
+            129
+        }
+    }
+}
+
+impl Default for LosslessStats {
     fn default() -> Self {
         Self::new()
     }
@@ -728,6 +992,107 @@ pub fn decode_ac(
     }
 }
 
+/// Decode one lossless prediction difference per the §H.1.2.3 statistical
+/// model (Table H.3 decision tree — same shape as the DC tree of Table F.4,
+/// conditioned on the differences `da` (sample to the left) and `db` (sample
+/// in the line above) instead of the previous-block DC difference). T.81
+/// §H.2.2 specifies the decoder mirrors the §H.1.2 coding model; the decoded
+/// signed difference is added modulo 2^16 to the prediction by the caller.
+pub fn decode_lossless_diff(
+    d: &mut ArithDecoder<'_>,
+    st: &mut LosslessStats,
+    da: i32,
+    db: i32,
+) -> Result<i32> {
+    let s0 = st.s0(da, db);
+    let zero = d.decode(&mut st.bins[s0]);
+    if zero == 0 {
+        return Ok(0);
+    }
+    // SS = S0 + 1 (sign), then SP = S0 + 2 / SN = S0 + 3 for the first
+    // magnitude decision, per Table H.3.
+    let sign = d.decode(&mut st.bins[s0 + 1]);
+    let sx_first = s0 + 2 + sign as usize;
+    let x1 = st.x1(db);
+    // The magnitude tree uses the DC layout (X2 = X1 + 1, Mn = Xn + 14).
+    let mag = decode_magnitude(d, &mut st.bins, sx_first, x1, true, false)?;
+    let v = mag + 1;
+    Ok(if sign != 0 { -v } else { v })
+}
+
+/// Encode one lossless prediction difference — the encoder-side mirror of
+/// [`decode_lossless_diff`] (T.81 §H.1.2.3, Table H.3). `v` must be the
+/// modulo-2^16 difference reduced to the representative range
+/// `-32768..=32767` (magnitude `Sz = |v| - 1` caps at 32767, the last
+/// `Sz < 2^15` decision of Table H.3).
+pub fn encode_lossless_diff(
+    e: &mut ArithEncoder,
+    st: &mut LosslessStats,
+    da: i32,
+    db: i32,
+    v: i32,
+) -> Result<()> {
+    let s0 = st.s0(da, db);
+    if v == 0 {
+        e.code_bit(&mut st.bins[s0], 0);
+        return Ok(());
+    }
+    e.code_bit(&mut st.bins[s0], 1);
+    let sign = u8::from(v < 0);
+    e.code_bit(&mut st.bins[s0 + 1], sign);
+    let sx_first = s0 + 2 + sign as usize;
+    let sz = v.unsigned_abs() - 1;
+    if sz > 32767 {
+        return Err(Error::invalid("arith lossless: |diff| > 32768"));
+    }
+    let x1 = st.x1(db);
+    encode_magnitude(e, &mut st.bins, sx_first, x1, sz);
+    Ok(())
+}
+
+/// Encoder-side mirror of [`decode_magnitude`] for the DC-shaped bin layout
+/// (X2 = X1 + 1, M-bins shadow X-bins at +14): the magnitude-category
+/// decision sequence of Figure F.8 (code_log2_Sz) followed by the magnitude
+/// bit pattern of Figure F.9 (code_Sz_bits).
+/// `sz` (= magnitude − 1) must be <= 32767, which the callers enforce.
+fn encode_magnitude(
+    e: &mut ArithEncoder,
+    bins: &mut [Context],
+    sx_first: usize,
+    x1: usize,
+    sz: u32,
+) {
+    // First decision: Sz >= 1?
+    if sz == 0 {
+        e.code_bit(&mut bins[sx_first], 0);
+        return;
+    }
+    e.code_bit(&mut bins[sx_first], 1);
+    // Second decision (X1): Sz >= 2?
+    if sz < 2 {
+        e.code_bit(&mut bins[x1], 0);
+        return;
+    }
+    e.code_bit(&mut bins[x1], 1);
+    // Category walk: at bin Xn, code 1 while Sz >= 2^n. Sz <= 32767
+    // guarantees termination at X15.
+    let mut m: u32 = 4;
+    let mut s = x1 + 1; // X2
+    while sz >= m {
+        e.code_bit(&mut bins[s], 1);
+        m <<= 1;
+        s += 1;
+    }
+    e.code_bit(&mut bins[s], 0);
+    // Magnitude bits below the implicit leading 1 (M-bin = X-bin + 14).
+    let m_bin = s + 14;
+    let mut bit = m >> 2;
+    while bit != 0 {
+        e.code_bit(&mut bins[m_bin], u8::from(sz & bit != 0));
+        bit >>= 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests against the K.4 example trace (T.81 Annex K).
 // ---------------------------------------------------------------------------
@@ -785,6 +1150,137 @@ mod tests {
         assert_eq!(QE_TABLE[0].nmps, 1);
         assert_eq!(QE_TABLE[0].switch, 1);
         assert_eq!(QE_TABLE.len(), 113);
+    }
+
+    /// Encoder counterpart of the K.4.1 test: coding the 256-bit test
+    /// sequence with a single context must reproduce the spec's listed
+    /// compressed data sequence (the entropy-coded segment portion, i.e.
+    /// everything before the appended EOI marker).
+    #[test]
+    fn k4_arith_roundtrip_encode() {
+        let mut e = ArithEncoder::new();
+        let mut ctx = Context::default();
+        for &byte in K4_PLAINTEXT.iter() {
+            for bit in (0..8).rev() {
+                e.code_bit(&mut ctx, (byte >> bit) & 1);
+            }
+        }
+        let out = e.finish();
+        assert_eq!(
+            out,
+            &K4_ENCODED[..29],
+            "K.4 arithmetic encode did not reproduce the spec's compressed sequence"
+        );
+    }
+
+    /// Self-consistency: a pseudorandom decision stream coded across
+    /// several independent contexts must decode back bit-exact.
+    #[test]
+    fn arith_encode_decode_roundtrip_multi_context() {
+        // xorshift32 — deterministic, no external dep.
+        let mut s = 0x1234_5678u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        const N: usize = 4096;
+        const NCTX: usize = 7;
+        let mut bits = Vec::with_capacity(N);
+        let mut ctx_ids = Vec::with_capacity(N);
+        for _ in 0..N {
+            let r = next();
+            // Skewed bit distribution so contexts adapt away from 50/50.
+            bits.push(u8::from((r & 0x7) == 0));
+            ctx_ids.push(((r >> 8) as usize) % NCTX);
+        }
+        let mut e = ArithEncoder::new();
+        let mut ectx = [Context::default(); NCTX];
+        for i in 0..N {
+            e.code_bit(&mut ectx[ctx_ids[i]], bits[i]);
+        }
+        let coded = e.finish();
+        let mut d = ArithDecoder::new(&coded);
+        let mut dctx = [Context::default(); NCTX];
+        for i in 0..N {
+            assert_eq!(
+                d.decode(&mut dctx[ctx_ids[i]]),
+                bits[i],
+                "decision {i} mismatched"
+            );
+        }
+    }
+
+    /// Lossless-diff layer: encode a difference stream with realistic
+    /// Da / Db conditioning and decode it back, across default and
+    /// DAC-overridden (L, U) bounds.
+    #[test]
+    fn lossless_diff_roundtrip() {
+        for (l, u) in [(0u8, 1u8), (2, 5), (0, 15)] {
+            let diffs: Vec<i32> = vec![
+                0, 1, -1, 2, -2, 3, 0, 0, 17, -300, 4095, -4096, 32767, -32768, 0, 5, 12345,
+                -12345, 1, 0, -1, 255, -256, 32767, -32768, 8, 0,
+            ];
+            let mut est = LosslessStats::new();
+            est.l = l;
+            est.u = u;
+            let mut e = ArithEncoder::new();
+            let mut da = 0i32;
+            // Db cycles over earlier diffs to exercise every context class.
+            for (i, &v) in diffs.iter().enumerate() {
+                let db = if i >= 5 { diffs[i - 5] } else { 0 };
+                encode_lossless_diff(&mut e, &mut est, da, db, v).unwrap();
+                da = v;
+            }
+            let coded = e.finish();
+            let mut dst = LosslessStats::new();
+            dst.l = l;
+            dst.u = u;
+            let mut d = ArithDecoder::new(&coded);
+            let mut da = 0i32;
+            for (i, &v) in diffs.iter().enumerate() {
+                let db = if i >= 5 { diffs[i - 5] } else { 0 };
+                let got = decode_lossless_diff(&mut d, &mut dst, da, db).unwrap();
+                assert_eq!(got, v, "diff {i} mismatched at L={l} U={u}");
+                da = v;
+            }
+        }
+    }
+
+    /// The Figure H.2 conditioning array bases and the X1_Context split.
+    #[test]
+    fn lossless_context_bases() {
+        let st = LosslessStats::new(); // L = 0, U = 1
+                                       // Default bounds: zero = {0}, small = |d| <= 2, large = |d| > 2.
+        assert_eq!(st.classify(0), 0);
+        assert_eq!(st.classify(1), 1);
+        assert_eq!(st.classify(2), 1);
+        assert_eq!(st.classify(-1), 2);
+        assert_eq!(st.classify(-2), 2);
+        assert_eq!(st.classify(3), 3);
+        assert_eq!(st.classify(-3), 4);
+        // Figure H.2 corners: (0,0) → 0, (0,−L) → 16, (−L,0) → 80,
+        // (−L,−L) → 96; X1_Context: small Db → 100, large Db → 129.
+        assert_eq!(st.s0(0, 0), 0);
+        assert_eq!(st.s0(0, -100), 16);
+        assert_eq!(st.s0(-100, 0), 80);
+        assert_eq!(st.s0(-100, -100), 96);
+        assert_eq!(st.x1(2), 100);
+        assert_eq!(st.x1(-2), 100);
+        assert_eq!(st.x1(3), 129);
+        assert_eq!(st.x1(-3), 129);
+        // L = 3 moves the small/zero boundary to 4 (= 2^(L−1), exclusive
+        // lower bound) and U = 5 the small/large boundary to 32 (= 2^U,
+        // inclusive upper bound).
+        let mut st = LosslessStats::new();
+        st.l = 3;
+        st.u = 5;
+        assert_eq!(st.classify(4), 0);
+        assert_eq!(st.classify(5), 1);
+        assert_eq!(st.classify(32), 1);
+        assert_eq!(st.classify(33), 3);
+        assert_eq!(st.classify(-33), 4);
     }
 
     #[test]

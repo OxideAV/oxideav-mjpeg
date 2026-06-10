@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lossless arithmetic JPEG (SOF11) decode** — the Annex H predictor
+  coding model with the modulo-2^16 prediction differences
+  entropy-coded by the Annex D Q-coder under the T.81 §H.1.2.3
+  two-dimensional statistical model. Each binary decision is
+  conditioned on the classifications of the differences coded for the
+  sample to the left (Da) and the sample in the line above (Db) via
+  the 5 × 5 `L_Context(Da, Db)` array of Figure H.2, with the
+  magnitude bins selected by `X1_Context(Db)` — 158 statistics bins
+  per scan component per §H.1.2.3.2 / Table H.3
+  (`jpeg::arith::LosslessStats`). The DAC marker's DC-conditioning
+  `(L, U)` bounds are honoured (defaults `(0, 1)` per §H.1.2.3.3;
+  small/zero boundary `2^(L−1)` exclusive, small/large boundary `2^U`
+  inclusive per F.1.4.4.1.2). Coverage matches the SOF3 Huffman path:
+  single-component grayscale and three-component RGB-class at every
+  precision `P ∈ 2..=16`, four-component CMYK-class at `P = 8`, all
+  Table H.1 predictors, point transform, and restart intervals
+  (statistics + conditioning + prediction re-initialised at each RSTn
+  per §H.1.2.3.4 / §H.2.1, with the coder re-initialised past the
+  marker). Prediction follows §H.1.2.1: origin `2^(P−Pt−1)` at
+  scan/interval start, the 1-D horizontal predictor across the first
+  line of the scan *and of each restart interval*, `Rb` at the start
+  of every other line. The precision-driven output shaping is shared
+  with SOF3 via the extracted `shape_lossless_frame` helper, so the
+  pixel-format policy is identical (`Gray8` / `Gray10Le` / `Gray12Le`
+  / `Gray16Le`, packed `Rgb24` / planar `Gbrp*Le` / packed `Rgb48Le`,
+  packed `Cmyk`).
+- **Q-coder arithmetic *encoder*** (`jpeg::arith::ArithEncoder`) per
+  T.81 Annex D §D.1: Initenc (Figure D.12), Code_MPS / Code_LPS with
+  conditional MPS/LPS exchange (Figures D.3 / D.4), Renorm_e
+  (Figure D.7), Byte_out with carry resolution, `0xFF` stacking and
+  `0xFF 0x00` stuffing (Figures D.8–D.11), and the Flush /
+  Clear_final_bits / Discard_final_zeros termination sequence
+  (Figures D.13–D.15) — validated byte-exactly against the Annex K.4.1
+  256-bit test sequence (the encoder reproduces the spec's listed
+  compressed stream, stuffed byte included), plus
+  `encode_lossless_diff` / `encode_magnitude` mirrors of the Table H.3
+  decision tree used by the SOF11 round-trip tests.
+- Eleven new tests: K.4.1 encode reproduction, multi-context
+  encode/decode self-consistency, lossless-diff round-trip across
+  default + DAC-overridden bounds, Figure H.2 context-base /
+  classification checks, and SOF11 decode round-trips (grayscale
+  `P = 8` across all seven predictors, grayscale `P = 16` with
+  pseudorandom samples through the deep end of the magnitude tree,
+  three-component RGB `P = 8`, line-aligned restart intervals,
+  DAC `(L = 2, U = 5)` conditioning, non-zero point transform) plus a
+  SOF10 still-rejected guard.
+
 - `IccProfileChunks` aggregated view of every APP2 `"ICC_PROFILE\0"`
   marker segment seen in the prefix (T.872 / Annex L of T.871; see
   `docs/image/jpeg/jpeg-fixtures-and-traces.md` §3.11) on

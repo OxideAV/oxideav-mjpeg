@@ -722,6 +722,46 @@ impl Default for AcStats {
     }
 }
 
+/// Statistics area for subsequent (refinement) successive-approximation
+/// scans of AC coefficients — T.81 §G.1.3.3.1 / Table G.2: a contiguous
+/// set of 189 bins, three per coefficient index `K ∈ 1..=63`:
+///   * `SE = 3 × (K − 1)` — the `K = EOB` (end-of-band) decision;
+///   * `S0 = SE + 1` — the `V = 0` decision;
+///   * `SC = S0 + 1` — the `LSB ZZ(K) = 1` correction-bit decision.
+///
+/// The sign of a coefficient with magnitude one (newly nonzero at this
+/// precision) uses the fixed 0x5A1D estimate, not a tracked bin. No
+/// magnitude tree exists in refinement scans, so there is no Kx
+/// conditioning either.
+#[derive(Clone, Debug)]
+pub struct AcRefineStats {
+    pub bins: [Context; 189],
+}
+
+impl AcRefineStats {
+    pub fn new() -> Self {
+        Self {
+            bins: [Context::default(); 189],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for b in self.bins.iter_mut() {
+            *b = Context::default();
+        }
+    }
+
+    pub fn restart_reset(&mut self) {
+        self.reset();
+    }
+}
+
+impl Default for AcRefineStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lossless (SOF11) statistics area — 158 bins per T.81 §H.1.2.3.2:
 ///   * 25 sets of four bins (S0 / SS / SP / SN) at bases 0, 4, ..., 96,
 ///     selected by `L_Context(Da, Db)` over the 5 × 5 conditioning array
@@ -816,10 +856,14 @@ impl Default for LosslessStats {
 // JPEG arithmetic block decode (DC + AC zigzag).
 // ---------------------------------------------------------------------------
 
-/// "Sign" bin shared across DC and AC: a fixed 50/50 estimator that always
-/// uses Qe = 0x5A1D, MPS = 0. Doesn't update on renormalisation. Implemented
-/// by decoding against a throwaway context that we reset before every call.
-fn decode_fixed_sign(d: &mut ArithDecoder<'_>) -> u8 {
+/// Fixed 50/50 estimator decision: always Qe = 0x5A1D, MPS = 0, never
+/// adapts on renormalisation. Implemented by decoding against a throwaway
+/// context that we reset before every call. T.81 uses this for the sign
+/// of DC differences / AC coefficients (Tables F.4 / F.5), the sign of
+/// newly-nonzero coefficients in AC refinement scans (§G.1.3.3), and the
+/// DC least-significant-bit decisions of successive-approximation
+/// refinement scans (§G.1.3.1).
+pub fn decode_fixed_bit(d: &mut ArithDecoder<'_>) -> u8 {
     let mut ctx = Context { idx: 0, mps: 0 };
     d.decode(&mut ctx)
 }
@@ -975,7 +1019,7 @@ pub fn decode_ac(
             }
         }
         // Sign uses the fixed 0x5A1D bin per Table F.5.
-        let sign = decode_fixed_sign(d);
+        let sign = decode_fixed_bit(d);
         // SP / SN both = S0 + 1 = SE + 2.
         let sx_first = 3 * (k - 1) + 2;
         let ac_low = (k as u8) <= ac.kx;
@@ -985,6 +1029,89 @@ pub fn decode_ac(
         let v = mag + 1;
         let signed = if sign != 0 { -v } else { v };
         coefs[ZIGZAG[k]] = signed;
+        if k == se {
+            return Ok(());
+        }
+        k += 1;
+    }
+}
+
+/// Decode one block's AC refinement (a subsequent successive-approximation
+/// scan) over the band `[ss..=se]` — the decoder mirror of T.81
+/// Figures G.10 / G.11 with the Table G.2 context indices:
+///
+///   * `EOBx`, the end-of-band index left by the previous scan of this
+///     component (§G.1.3.3), is recovered from the coefficient history —
+///     the index following the last nonzero coefficient in the band. The
+///     end-of-band decision is bypassed while `K < EOBx` and after coding
+///     a coefficient at `K = Se`.
+///   * A zero-history coefficient decodes a `V = 0` decision (`S0`);
+///     when it signals nonzero, a fixed-estimate sign follows and the
+///     coefficient becomes `±2^Al`.
+///   * A nonzero-history coefficient decodes one correction bit (`SC`)
+///     which, when set, grows the magnitude by `2^Al`.
+///
+/// Once the `K = EOB` decision signals end-of-band, the rest of the band
+/// is unchanged — unlike the Huffman refinement procedure there are no
+/// trailing correction bits, because the arithmetic EOB is defined as the
+/// position following the last nonzero coefficient at the *current*
+/// precision (§G.1.3.2 NOTE), which is never below `EOBx`.
+pub fn decode_ac_refine(
+    d: &mut ArithDecoder<'_>,
+    st: &mut AcRefineStats,
+    coefs: &mut [i32; 64],
+    ss: usize,
+    se: usize,
+    al: u8,
+) -> Result<()> {
+    use crate::jpeg::zigzag::ZIGZAG;
+    if ss == 0 || se > 63 || ss > se {
+        return Err(Error::invalid("arith AC refine: invalid band"));
+    }
+    let p1: i32 = 1 << al;
+    // EOBx: index following the last coefficient already nonzero from the
+    // prior scan(s) of this component, within the band.
+    let mut eobx = ss;
+    for k in ss..=se {
+        if coefs[ZIGZAG[k]] != 0 {
+            eobx = k + 1;
+        }
+    }
+    let mut k = ss;
+    loop {
+        if k >= eobx {
+            let se_bin = 3 * (k - 1);
+            if d.decode(&mut st.bins[se_bin]) != 0 {
+                // End-of-band: every remaining coefficient keeps its
+                // current value (all zero-history past EOBx).
+                return Ok(());
+            }
+        }
+        // Walk to the next coefficient coded in this scan: a correction
+        // bit for nonzero history, or a fresh ±1 at bit position Al.
+        loop {
+            let pos = ZIGZAG[k];
+            if coefs[pos] != 0 {
+                let t = d.decode(&mut st.bins[3 * (k - 1) + 2]);
+                if t != 0 {
+                    if coefs[pos] >= 0 {
+                        coefs[pos] += p1;
+                    } else {
+                        coefs[pos] -= p1;
+                    }
+                }
+                break;
+            }
+            if d.decode(&mut st.bins[3 * (k - 1) + 1]) != 0 {
+                let sign = decode_fixed_bit(d);
+                coefs[pos] = if sign != 0 { -p1 } else { p1 };
+                break;
+            }
+            k += 1;
+            if k > se {
+                return Err(Error::invalid("arith AC refine: run past Se"));
+            }
+        }
         if k == se {
             return Ok(());
         }
@@ -1055,7 +1182,9 @@ pub fn encode_lossless_diff(
 /// decision sequence of Figure F.8 (code_log2_Sz) followed by the magnitude
 /// bit pattern of Figure F.9 (code_Sz_bits).
 /// `sz` (= magnitude − 1) must be <= 32767, which the callers enforce.
-fn encode_magnitude(
+/// `pub(crate)` so the SOF10 round-trip test scaffolding in `decoder.rs`
+/// can drive the DC statistical model from the encode side.
+pub(crate) fn encode_magnitude(
     e: &mut ArithEncoder,
     bins: &mut [Context],
     sx_first: usize,

@@ -101,8 +101,8 @@ impl SofKind {
 
     /// True for the SOF variants the in-tree decoder is documented to
     /// accept (`lib.rs` module docstring: SOF0 / SOF1 / SOF2 / SOF3 /
-    /// SOF9). The "supported" line is data, not a promise; callers
-    /// that want to negotiate fallback can read it.
+    /// SOF9 / SOF10 / SOF11). The "supported" line is data, not a
+    /// promise; callers that want to negotiate fallback can read it.
     pub fn is_supported_by_decoder(self) -> bool {
         matches!(
             self,
@@ -111,6 +111,8 @@ impl SofKind {
                 | Self::Progressive
                 | Self::Lossless
                 | Self::ExtendedSequentialArith
+                | Self::ProgressiveArith
+                | Self::LosslessArith
         )
     }
 
@@ -1368,12 +1370,22 @@ mod tests {
     }
 
     #[test]
-    fn progressive_arith_kind_not_supported() {
+    fn progressive_arith_kind() {
         let buf = build_prefix(0xCA, 8, 16, 16, &[(1, 2, 2, 0)], &[]);
         let info = inspect_jpeg(&buf).expect("inspect SOF10");
         assert_eq!(info.sof_kind, SofKind::ProgressiveArith);
-        assert!(!info.sof_kind.is_supported_by_decoder());
+        assert!(info.sof_kind.is_supported_by_decoder());
         assert!(info.sof_kind.is_dct());
+        assert!(info.sof_kind.is_arithmetic());
+    }
+
+    #[test]
+    fn lossless_arith_kind() {
+        let buf = build_prefix(0xCB, 8, 16, 16, &[(1, 1, 1, 0)], &[]);
+        let info = inspect_jpeg(&buf).expect("inspect SOF11");
+        assert_eq!(info.sof_kind, SofKind::LosslessArith);
+        assert!(info.sof_kind.is_supported_by_decoder());
+        assert!(!info.sof_kind.is_dct());
         assert!(info.sof_kind.is_arithmetic());
     }
 

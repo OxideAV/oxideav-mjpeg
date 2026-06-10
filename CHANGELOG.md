@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Progressive arithmetic JPEG (SOF10) decode** — the SOF2 multi-scan
+  spectral-selection / successive-approximation structure with the
+  Annex D Q-coder as the entropy layer, per T.81 §G.1.3:
+  - DC first scans (`Ss = Se = 0`, `Ah = 0`) reuse the sequential
+    §F.1.4.1 DC statistical model on the point-transformed values
+    (DC point transform = arithmetic shift right); the decoded
+    difference accumulates into the per-component prediction and lands
+    left-shifted by `Al` (§G.1.3.1).
+  - DC refinement scans (`Ah > 0`) decode one binary decision per
+    block with the fixed 0.5 probability estimate (`Qe = 0x5A1D`,
+    `MPS = 0`, non-adapting) and OR the bit into the existing DC value
+    at bit position `Al`.
+  - AC first scans (`Ss > 0`, `Ah = 0`) run the §F.1.4 sequential AC
+    procedure with `Kmin = Ss` and the EOB decision meaning
+    end-of-*band* (§G.1.3.2); decoded values land left-shifted by
+    `Al`. The DAC marker's `Kx` conditioning is honoured (default 5).
+  - AC refinement scans (`Ah > 0`) follow the §G.1.3.3 coding model
+    (Figures G.10 / G.11) under the Table G.2 statistics layout — a
+    new 189-bin `jpeg::arith::AcRefineStats` area with `SE / S0 / SC`
+    bins per coefficient index, the end-of-band decision bypassed
+    while `K < EOBx` (recovered from the coefficient history), newly
+    nonzero coefficients signed by the fixed estimate, and correction
+    bits growing existing magnitudes by `2^Al`
+    (`jpeg::arith::decode_ac_refine`).
+  - Restart intervals re-initialise the coder, the statistics areas
+    and the DC predictions at every `RSTn`, in every scan kind.
+  - Same frame constraints and output shaping as the Huffman
+    progressive (SOF2) path: `P = 8` and `P = 12` (Annex G processes
+    4 and 8), 1- and 3-component plus 4-component CMYK / YCCK at
+    `P = 8` (Adobe APP14 transform flag honoured), shared coefficient
+    accumulator + EOI render.
+  - Round-trip tests drive every scan kind from an encoder-side
+    mirror of the §G.1.3 procedures (spectral selection only, full
+    progression, two successive-approximation levels, interleaved
+    4:2:0 DC, restart intervals, DAC `Kx` override, 12-bit, and
+    4-component CMYK), comparing the decoded pixels sample-exact
+    against a direct IDCT of the source coefficients.
+- `SofKind::is_supported_by_decoder` now reports `ProgressiveArith`
+  (SOF10) and `LosslessArith` (SOF11) as supported — the SOF11 decode
+  path landed previously but the inspector helper had not been
+  updated alongside it.
 - **Lossless arithmetic JPEG (SOF11) decode** — the Annex H predictor
   coding model with the modulo-2^16 prediction differences
   entropy-coded by the Annex D Q-coder under the T.81 §H.1.2.3

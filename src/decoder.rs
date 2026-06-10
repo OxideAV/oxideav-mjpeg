@@ -30,9 +30,10 @@ use crate::image::{
 pub use crate::registry::make_decoder;
 
 use crate::jpeg::arith::{
-    decode_ac as arith_decode_ac, decode_dc_diff as arith_decode_dc_diff,
-    decode_lossless_diff as arith_decode_lossless_diff, AcStats, ArithDecoder, DcStats,
-    LosslessStats,
+    decode_ac as arith_decode_ac, decode_ac_refine as arith_decode_ac_refine,
+    decode_dc_diff as arith_decode_dc_diff, decode_fixed_bit as arith_decode_fixed_bit,
+    decode_lossless_diff as arith_decode_lossless_diff, AcRefineStats, AcStats, ArithDecoder,
+    DcStats, LosslessStats,
 };
 use crate::jpeg::dct::idct8x8;
 use crate::jpeg::huffman::{parse_dht, HuffTable};
@@ -76,6 +77,10 @@ struct JpegState {
     /// Mutually exclusive with `progressive` / `lossless`. The scan
     /// dispatcher takes the arithmetic Q-coder path instead of Huffman.
     arithmetic: bool,
+    /// True when SOF10 (progressive, arithmetic-coded) was parsed. The
+    /// scan dispatcher takes the §G.1.3 progressive Q-coder path; the
+    /// coefficient accumulator + EOI render are shared with SOF2.
+    progressive_arith: bool,
     /// Per-destination DC arithmetic conditioning (L/U bounds + per-scan
     /// statistics). Indexed by Tb (0..3). Defaults are L=0, U=1.
     arith_dc: [Option<ArithDcConditioning>; 4],
@@ -111,6 +116,7 @@ impl JpegState {
             lossless_arith: false,
             adobe_transform: None,
             arithmetic: false,
+            progressive_arith: false,
             arith_dc: Default::default(),
             arith_ac: Default::default(),
         }
@@ -248,7 +254,11 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         };
         match marker {
             EOI => {
-                if state.progressive || state.seq_accum || state.arithmetic {
+                if state.progressive
+                    || state.seq_accum
+                    || state.arithmetic
+                    || state.progressive_arith
+                {
                     return render_from_coefs(&state, &coef_buf, pts);
                 }
                 return Err(Error::invalid("JPEG: EOI before SOS"));
@@ -385,10 +395,38 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 state.sof = Some(sof);
                 state.arithmetic = true;
             }
-            0xC5..=0xC7 | 0xCA | 0xCD..=0xCF => {
+            // SOF10 — progressive, arithmetic-coded (T.81 §G.1.3). The
+            // SOF2 multi-scan spectral-selection / successive-approximation
+            // structure with the Annex D Q-coder as the entropy layer.
+            // Same frame constraints as SOF2: P = 8 or P = 12 (Annex G
+            // processes 4 and 8), 4-component CMYK / YCCK at P = 8 only
+            // (no 12-bit CMYK `PixelFormat` variant in the workspace).
+            markers::SOF10 => {
+                if state.sof.is_some() {
+                    return Err(Error::invalid("JPEG: multiple SOF segments"));
+                }
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                if sof.precision != 8 && sof.precision != 12 {
+                    return Err(Error::unsupported(format!(
+                        "progressive arithmetic JPEG: precision {} (only 8 and 12 are supported)",
+                        sof.precision
+                    )));
+                }
+                if sof.components.len() == 4 && sof.precision != 8 {
+                    return Err(Error::unsupported(
+                        "progressive arithmetic JPEG: 4-component scans only at P = 8",
+                    ));
+                }
+                coef_buf = init_coef_buffers(&sof)?;
+                state.sof = Some(sof);
+                state.progressive_arith = true;
+            }
+            0xC5..=0xC7 | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "JPEG: hierarchical and SOF10/SOF13..15 arithmetic variants are not supported",
+                    "JPEG: hierarchical and SOF13..15 arithmetic variants are not supported",
                 ));
             }
             SOS => {
@@ -402,7 +440,10 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     }
                     return decode_lossless_scan(&state, &sos, scan, pts);
                 }
-                if state.arithmetic {
+                if state.progressive_arith {
+                    decode_progressive_arith_scan(&state, &sos, scan, &mut coef_buf)?;
+                    // Continue — more scans or EOI follow.
+                } else if state.arithmetic {
                     decode_arith_scan(&state, &sos, scan, &mut coef_buf)?;
                     // Continue — more scans or EOI follow.
                 } else if state.progressive {
@@ -1410,6 +1451,229 @@ fn locate_next_marker_after(scan: &[u8], from: usize) -> usize {
         i += 1;
     }
     scan.len()
+}
+
+// ---- Progressive arithmetic JPEG (SOF10) ---------------------------------
+//
+// T.81 Annex G pairs the SOF2 progressive scan structure (spectral
+// selection within successive approximation, §G.1.1) with the Annex D
+// Q-coder:
+//
+//   * DC first scans (Ss = Se = 0, Ah = 0) use the sequential DC
+//     statistical model of §F.1.4.1 on the point-transformed values; the
+//     decoded difference accumulates into the per-component prediction and
+//     lands left-shifted by Al (§G.1.3.1).
+//   * DC refinement scans (Ah > 0) code one binary decision per block with
+//     the fixed 0.5 probability estimate; the decoded bit is ORed into the
+//     existing DC value at bit position Al (§G.1.3.1).
+//   * AC first scans (Ss > 0, Ah = 0) are the §F.1.4 sequential AC
+//     procedure with Kmin = Ss and "EOB" meaning end-of-band rather than
+//     end-of-block (§G.1.3.2); decoded values land left-shifted by Al.
+//     Kx conditioning comes from the DAC marker (default 5).
+//   * AC refinement scans (Ah > 0) follow the §G.1.3.3 coding model
+//     (Figures G.10 / G.11, Table G.2) — see `arith::decode_ac_refine`.
+//
+// Statistics are re-initialised at scan start and at every restart marker;
+// the coefficient accumulator + EOI render path are shared with SOF2.
+
+fn decode_progressive_arith_scan(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+) -> Result<()> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+
+    // Same scan-header constraints as the Huffman progressive path.
+    if sos.ss > 63 || sos.se > 63 || sos.ss > sos.se {
+        return Err(Error::invalid("progressive arith: invalid Ss/Se"));
+    }
+    let is_dc_scan = sos.ss == 0;
+    if is_dc_scan && sos.se != 0 {
+        return Err(Error::invalid("progressive arith: DC scan must have Se=0"));
+    }
+    if !is_dc_scan && sos.components.len() != 1 {
+        return Err(Error::invalid(
+            "progressive arith: AC scans must be non-interleaved",
+        ));
+    }
+    if sos.ah > 13 || sos.al > 13 {
+        return Err(Error::invalid("progressive arith: Ah/Al out of range"));
+    }
+
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let mcus_x = width.div_ceil(8 * h_max);
+    let mcus_y = height.div_ceil(8 * v_max);
+
+    // Map SOS component id → SOF index.
+    let sos_map: Vec<usize> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            sof.components
+                .iter()
+                .position(|fc| fc.id == sc.id)
+                .ok_or_else(|| Error::invalid("progressive arith SOS: unknown component"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Per-SOS-component statistics areas, re-initialised at scan start and
+    // every restart. DC conditioning (L, U) and AC conditioning (Kx) come
+    // from the DAC destinations named by this scan's Tdj / Taj selectors.
+    // Refinement scans track their own bins (DC refinement none at all —
+    // the fixed estimate is stateless).
+    let mut dc_stats: Vec<DcStats> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            let mut s = DcStats::new();
+            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
+                s.l = cond.l;
+                s.u = cond.u;
+            }
+            s
+        })
+        .collect();
+    let mut ac_stats = AcStats::new();
+    if let Some(sc) = sos.components.first() {
+        if let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref() {
+            ac_stats.kx = cond.kx;
+        }
+    }
+    let mut ac_refine_stats = AcRefineStats::new();
+
+    let mut scan_pos = 0usize;
+    let mut decoder = ArithDecoder::new(scan);
+    let mut mcus_since_restart: u32 = 0;
+
+    // Scan-MCU grid: interleaved DC scans step the frame MCU grid; all
+    // other scans step the selected component's own block grid.
+    let interleaved = is_dc_scan && sos.components.len() > 1;
+    let (scan_mcus_x, scan_mcus_y) = if interleaved {
+        (mcus_x, mcus_y)
+    } else {
+        let c = sof.components[sos_map[0]];
+        (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+    };
+
+    for my in 0..scan_mcus_y {
+        for mx in 0..scan_mcus_x {
+            if state.restart_interval != 0
+                && mcus_since_restart != 0
+                && mcus_since_restart % state.restart_interval as u32 == 0
+            {
+                // Advance past the RSTn marker and re-Initdec there.
+                // Statistics + DC predictors reset per F.1.4.4.1.5.
+                scan_pos = locate_next_marker_after(scan, scan_pos);
+                if scan_pos >= scan.len() {
+                    return Err(Error::invalid(
+                        "progressive arith: missing restart marker mid-scan",
+                    ));
+                }
+                for s in dc_stats.iter_mut() {
+                    s.restart_reset();
+                }
+                ac_stats.restart_reset();
+                ac_refine_stats.restart_reset();
+                decoder = ArithDecoder::new(&scan[scan_pos..]);
+            }
+
+            if is_dc_scan {
+                if interleaved {
+                    for (sidx, &sof_idx) in sos_map.iter().enumerate() {
+                        let c = sof.components[sof_idx];
+                        let blocks_x = mcus_x * c.h_factor as usize;
+                        for by in 0..c.v_factor as usize {
+                            for bx in 0..c.h_factor as usize {
+                                let bidx_x = mx * c.h_factor as usize + bx;
+                                let bidx_y = my * c.v_factor as usize + by;
+                                let bi = bidx_y * blocks_x + bidx_x;
+                                prog_arith_decode_dc(
+                                    &mut decoder,
+                                    &mut dc_stats[sidx],
+                                    &mut coefs[sof_idx][bi],
+                                    sos.ah,
+                                    sos.al,
+                                )?;
+                            }
+                        }
+                    }
+                } else {
+                    let sof_idx = sos_map[0];
+                    let c = sof.components[sof_idx];
+                    let blocks_x = mcus_x * c.h_factor as usize;
+                    let bi = my * blocks_x + mx;
+                    prog_arith_decode_dc(
+                        &mut decoder,
+                        &mut dc_stats[0],
+                        &mut coefs[sof_idx][bi],
+                        sos.ah,
+                        sos.al,
+                    )?;
+                }
+            } else {
+                let sof_idx = sos_map[0];
+                let c = sof.components[sof_idx];
+                let blocks_x = mcus_x * c.h_factor as usize;
+                let bi = my * blocks_x + mx;
+                let ss = sos.ss as usize;
+                let se = sos.se as usize;
+                if sos.ah == 0 {
+                    // First scan of the band: sequential AC procedure with
+                    // Kmin = Ss; decoded values land shifted by Al.
+                    let mut tmp = [0i32; 64];
+                    arith_decode_ac(&mut decoder, &mut ac_stats, &mut tmp, ss, se)?;
+                    let block = &mut coefs[sof_idx][bi];
+                    for k in ss..=se {
+                        let pos = ZIGZAG[k];
+                        if tmp[pos] != 0 {
+                            block[pos] = tmp[pos] << sos.al;
+                        }
+                    }
+                } else {
+                    arith_decode_ac_refine(
+                        &mut decoder,
+                        &mut ac_refine_stats,
+                        &mut coefs[sof_idx][bi],
+                        ss,
+                        se,
+                        sos.al,
+                    )?;
+                }
+            }
+            mcus_since_restart += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Progressive arithmetic DC decode for one block (§G.1.3.1). `Ah == 0`
+/// decodes a §F.1.4.1 difference in the point-transformed domain and
+/// stores the accumulated prediction left-shifted by `Al`. `Ah > 0`
+/// decodes one fixed-estimate decision and ORs it into the existing DC
+/// value at bit position `Al`.
+fn prog_arith_decode_dc(
+    d: &mut ArithDecoder<'_>,
+    dc: &mut DcStats,
+    block: &mut [i32; 64],
+    ah: u8,
+    al: u8,
+) -> Result<()> {
+    if ah == 0 {
+        let diff = arith_decode_dc_diff(d, dc)?;
+        dc.pred = dc.pred.wrapping_add(diff);
+        block[0] = dc.pred << al;
+    } else {
+        let bit = arith_decode_fixed_bit(d) as i32;
+        block[0] |= bit << al;
+    }
+    Ok(())
 }
 
 // ---- Progressive JPEG (SOF2) --------------------------------------------
@@ -4069,13 +4333,14 @@ mod lossless_tests {
         }
     }
 
-    /// SOF10 (progressive, arithmetic) is still rejected — adding SOF11
-    /// must not have widened the accept matcher to its neighbour.
+    /// SOF13 (differential sequential, arithmetic) is still rejected —
+    /// adding SOF10 must not have widened the accept matcher into the
+    /// hierarchical-arithmetic neighbours.
     #[test]
-    fn sof10_progressive_arithmetic_still_rejected() {
+    fn sof13_differential_arithmetic_still_rejected() {
         let bytes = vec![
             0xFF, 0xD8, // SOI
-            0xFF, 0xCA, 0x00, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, // SOF10 stub
+            0xFF, 0xCD, 0x00, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, // SOF13 stub
             0xFF, 0xD9, // EOI
         ];
         let err = decode_jpeg(&bytes, None).expect_err("expected decode error");
@@ -4085,10 +4350,10 @@ mod lossless_tests {
         );
     }
 
-    /// Hierarchical (SOF5/6/7) and SOF10..15 arithmetic variants must
+    /// Hierarchical (SOF5/6/7) and SOF13..15 arithmetic variants must
     /// still be rejected with Unsupported — make sure we didn't widen
     /// the SOF accept matcher too far while adding SOF3 or SOF9.
-    /// SOF9 (extended sequential arithmetic) is now handled separately.
+    /// SOF9 / SOF10 / SOF11 (arithmetic) are now handled separately.
     #[test]
     fn hierarchical_arithmetic_still_rejected() {
         // Hand-construct a minimal stream with SOF5 (hierarchical). The
@@ -4108,6 +4373,711 @@ mod lossless_tests {
         let err = dec.receive_frame().expect_err("expected decode error");
         assert!(
             matches!(err, oxideav_core::Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sof10_tests {
+    use super::decode_jpeg;
+    use crate::jpeg::arith::{encode_magnitude, AcStats, ArithEncoder, Context, DcStats};
+    use crate::jpeg::dct::idct8x8;
+    use crate::jpeg::zigzag::ZIGZAG;
+
+    /// Append one length-prefixed marker segment (T.81 §B.1.1.4).
+    fn put_seg(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+        out.extend_from_slice(&[0xFF, marker]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    /// Code one decision with the fixed 0.5 estimate (Qe = 0x5A1D,
+    /// MPS = 0, never adapts) — encoder mirror of
+    /// `arith::decode_fixed_bit`.
+    fn code_fixed_bit(e: &mut ArithEncoder, bit: u8) {
+        let mut ctx = Context { idx: 0, mps: 0 };
+        e.code_bit(&mut ctx, bit);
+    }
+
+    /// Encoder-side §F.1.4.1 DC difference (mirror of
+    /// `arith::decode_dc_diff`).
+    fn encode_dc_diff(e: &mut ArithEncoder, dc: &mut DcStats, diff: i32) {
+        let s0 = dc.dc_context();
+        if diff == 0 {
+            e.code_bit(&mut dc.bins[s0], 0);
+            dc.prev_diff = 0;
+            return;
+        }
+        e.code_bit(&mut dc.bins[s0], 1);
+        let sign = u8::from(diff < 0);
+        e.code_bit(&mut dc.bins[s0 + 1], sign);
+        let sx = s0 + 2 + sign as usize;
+        // X1 base for DC is bin 20 (Table F.4); M-bins shadow X-bins at +14.
+        encode_magnitude(e, &mut dc.bins, sx, 20, diff.unsigned_abs() - 1);
+        dc.prev_diff = diff;
+    }
+
+    /// DC progressive coding for one block (§G.1.3.1). `full` is the
+    /// full-precision DC value; first scans code the point-transformed
+    /// difference, refinement scans code one fixed-estimate LSB.
+    fn encode_dc_unit(e: &mut ArithEncoder, dc: &mut DcStats, full: i32, ah: u8, al: u8) {
+        if ah == 0 {
+            let vt = full >> al; // DC point transform: arithmetic shift
+            let diff = vt - dc.pred;
+            encode_dc_diff(e, dc, diff);
+            dc.pred = vt;
+        } else {
+            code_fixed_bit(e, ((full >> al) & 1) as u8);
+        }
+    }
+
+    /// Encoder-side AC magnitude with the Table F.5 bin layout
+    /// (SP = SN = X1 = S0 + 1; X2.. at 189 / 217 by `K <= Kx`; M-bins
+    /// shadow X-bins at +14) — mirror of the AC arm of
+    /// `arith::decode_magnitude`.
+    fn encode_ac_mag(e: &mut ArithEncoder, bins: &mut [Context], k: usize, kx: u8, sz: u32) {
+        let s_first = 3 * (k - 1) + 2;
+        if sz == 0 {
+            e.code_bit(&mut bins[s_first], 0);
+            return;
+        }
+        e.code_bit(&mut bins[s_first], 1);
+        if sz < 2 {
+            // X1 coincides with the first-magnitude bin for AC.
+            e.code_bit(&mut bins[s_first], 0);
+            return;
+        }
+        e.code_bit(&mut bins[s_first], 1);
+        let mut m = 4u32;
+        let mut s = if (k as u8) <= kx { 189 } else { 217 };
+        while sz >= m {
+            e.code_bit(&mut bins[s], 1);
+            m <<= 1;
+            s += 1;
+        }
+        e.code_bit(&mut bins[s], 0);
+        let m_bin = s + 14;
+        let mut bit = m >> 2;
+        while bit != 0 {
+            e.code_bit(&mut bins[m_bin], u8::from(sz & bit != 0));
+            bit >>= 1;
+        }
+    }
+
+    /// First scan of a band for one block (§G.1.3.2 — the §F.1.4 AC
+    /// procedure with Kmin = Ss and EOB = end-of-band). `vals` holds the
+    /// point-transformed coefficients in zigzag-index order.
+    fn encode_ac_band(
+        e: &mut ArithEncoder,
+        ac: &mut AcStats,
+        vals: &[i32; 64],
+        ss: usize,
+        se: usize,
+    ) {
+        let mut eob = ss;
+        for k in ss..=se {
+            if vals[k] != 0 {
+                eob = k + 1;
+            }
+        }
+        let mut k = ss;
+        loop {
+            let se_bin = 3 * (k - 1);
+            if k >= eob {
+                e.code_bit(&mut ac.bins[se_bin], 1);
+                return;
+            }
+            e.code_bit(&mut ac.bins[se_bin], 0);
+            while vals[k] == 0 {
+                e.code_bit(&mut ac.bins[3 * (k - 1) + 1], 0);
+                k += 1;
+            }
+            e.code_bit(&mut ac.bins[3 * (k - 1) + 1], 1);
+            let v = vals[k];
+            code_fixed_bit(e, u8::from(v < 0));
+            encode_ac_mag(e, &mut ac.bins, k, ac.kx, v.unsigned_abs() - 1);
+            if k == se {
+                return;
+            }
+            k += 1;
+        }
+    }
+
+    /// Refinement scan of a band for one block (Figures G.10 / G.11,
+    /// Table G.2) — encoder mirror of `arith::decode_ac_refine`. `full`
+    /// holds the full-precision coefficients in zigzag-index order.
+    fn encode_ac_refine_band(
+        e: &mut ArithEncoder,
+        bins: &mut [Context; 189],
+        full: &[i32; 64],
+        ss: usize,
+        se: usize,
+        al: u8,
+    ) {
+        let shifted = |k: usize| (full[k].unsigned_abs() >> al) as i32;
+        let hist = |k: usize| (full[k].unsigned_abs() >> (al + 1)) as i32;
+        let mut eob = ss;
+        let mut eobx = ss;
+        for k in ss..=se {
+            if shifted(k) != 0 {
+                eob = k + 1;
+            }
+            if hist(k) != 0 {
+                eobx = k + 1;
+            }
+        }
+        let mut k = ss;
+        loop {
+            if k >= eobx {
+                let se_bin = 3 * (k - 1);
+                if k >= eob {
+                    e.code_bit(&mut bins[se_bin], 1);
+                    return;
+                }
+                e.code_bit(&mut bins[se_bin], 0);
+            }
+            loop {
+                if hist(k) != 0 {
+                    // Nonzero history → one correction bit (SC).
+                    let t = ((full[k].unsigned_abs() >> al) & 1) as u8;
+                    e.code_bit(&mut bins[3 * (k - 1) + 2], t);
+                    break;
+                }
+                if shifted(k) != 0 {
+                    // Newly nonzero at this precision: V = 0 decision then
+                    // the fixed-estimate sign.
+                    e.code_bit(&mut bins[3 * (k - 1) + 1], 1);
+                    code_fixed_bit(e, u8::from(full[k] < 0));
+                    break;
+                }
+                e.code_bit(&mut bins[3 * (k - 1) + 1], 0);
+                k += 1;
+            }
+            if k == se {
+                return;
+            }
+            k += 1;
+        }
+    }
+
+    /// One scan-header description: which SOF component indices it
+    /// covers, plus (Ss, Se, Ah, Al).
+    type ScanDesc = (Vec<usize>, u8, u8, u8, u8);
+
+    /// Build a complete SOF10 (progressive, arithmetic-coded) JPEG from
+    /// full-precision zigzag-order coefficient blocks — the encoder-side
+    /// mirror of `decode_progressive_arith_scan` per T.81 §G.1.3, used as
+    /// test scaffolding for round-trip verification. All quantiser values
+    /// are 1 so the decoded pixels are a pure IDCT of the coefficients.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sof10_jpeg(
+        width: usize,
+        height: usize,
+        precision: u8,
+        comps: &[(u8, u8)],
+        blocks: &[Vec<[i32; 64]>],
+        scans: &[ScanDesc],
+        restart_interval: u16,
+        kx_dac: Option<u8>,
+    ) -> Vec<u8> {
+        let nc = comps.len();
+        let mut out = vec![0xFF, 0xD8]; // SOI
+                                        // DQT: table 0, Pq = 0, all values 1 (identity dequantise).
+        let mut dqt = vec![0u8];
+        dqt.extend(std::iter::repeat(1u8).take(64));
+        put_seg(&mut out, 0xDB, &dqt);
+        if let Some(kx) = kx_dac {
+            // DAC entry: Tc = 1 (AC), Tb = 0, Cs = Kx (T.81 §B.2.4.3).
+            put_seg(&mut out, 0xCC, &[0x10, kx]);
+        }
+        if restart_interval != 0 {
+            put_seg(&mut out, 0xDD, &restart_interval.to_be_bytes());
+        }
+        let mut sof = vec![precision];
+        sof.extend_from_slice(&(height as u16).to_be_bytes());
+        sof.extend_from_slice(&(width as u16).to_be_bytes());
+        sof.push(nc as u8);
+        for (ci, (h, v)) in comps.iter().enumerate() {
+            sof.extend_from_slice(&[ci as u8 + 1, (h << 4) | v, 0]);
+        }
+        put_seg(&mut out, 0xCA, &sof); // SOF10
+
+        let h_max = comps.iter().map(|c| c.0).max().unwrap() as usize;
+        let v_max = comps.iter().map(|c| c.1).max().unwrap() as usize;
+        let mcus_x = width.div_ceil(8 * h_max);
+        let mcus_y = height.div_ceil(8 * v_max);
+        let kx = kx_dac.unwrap_or(5);
+
+        for (scomps, ss, se, ah, al) in scans {
+            let mut sos = vec![scomps.len() as u8];
+            for &ci in scomps {
+                sos.extend_from_slice(&[ci as u8 + 1, 0x00]);
+            }
+            sos.extend_from_slice(&[*ss, *se, (ah << 4) | al]);
+            put_seg(&mut out, 0xDA, &sos);
+
+            let is_dc = *ss == 0;
+            let interleaved = is_dc && scomps.len() > 1;
+            let (sm_x, sm_y) = if interleaved {
+                (mcus_x, mcus_y)
+            } else {
+                let (h, v) = comps[scomps[0]];
+                (mcus_x * h as usize, mcus_y * v as usize)
+            };
+
+            let mut dc_stats: Vec<DcStats> = (0..scomps.len()).map(|_| DcStats::new()).collect();
+            let mut ac = AcStats::new();
+            ac.kx = kx;
+            let mut refine_bins = [Context::default(); 189];
+            let mut enc = ArithEncoder::new();
+            let mut since_restart = 0u32;
+            let mut rst = 0u8;
+
+            for my in 0..sm_y {
+                for mx in 0..sm_x {
+                    if restart_interval != 0
+                        && since_restart != 0
+                        && since_restart % restart_interval as u32 == 0
+                    {
+                        out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                        out.extend_from_slice(&[0xFF, 0xD0 + rst]);
+                        rst = (rst + 1) % 8;
+                        for s in dc_stats.iter_mut() {
+                            *s = DcStats::new();
+                        }
+                        ac.reset();
+                        refine_bins = [Context::default(); 189];
+                    }
+                    if is_dc {
+                        for (sidx, &ci) in scomps.iter().enumerate() {
+                            let (h, v) = comps[ci];
+                            let blocks_x = mcus_x * h as usize;
+                            if interleaved {
+                                for by in 0..v as usize {
+                                    for bx in 0..h as usize {
+                                        let bi = (my * v as usize + by) * blocks_x
+                                            + mx * h as usize
+                                            + bx;
+                                        encode_dc_unit(
+                                            &mut enc,
+                                            &mut dc_stats[sidx],
+                                            blocks[ci][bi][0],
+                                            *ah,
+                                            *al,
+                                        );
+                                    }
+                                }
+                            } else {
+                                let bi = my * blocks_x + mx;
+                                encode_dc_unit(
+                                    &mut enc,
+                                    &mut dc_stats[sidx],
+                                    blocks[ci][bi][0],
+                                    *ah,
+                                    *al,
+                                );
+                            }
+                        }
+                    } else {
+                        let ci = scomps[0];
+                        let (h, _) = comps[ci];
+                        let blocks_x = mcus_x * h as usize;
+                        let bi = my * blocks_x + mx;
+                        let vals = &blocks[ci][bi];
+                        if *ah == 0 {
+                            // Point transform: the AC transform divides the
+                            // magnitude (§G.1.2.1 / §G.1.3.2).
+                            let mut tv = [0i32; 64];
+                            for k in *ss as usize..=*se as usize {
+                                let m = (vals[k].unsigned_abs() >> al) as i32;
+                                tv[k] = if vals[k] < 0 { -m } else { m };
+                            }
+                            encode_ac_band(&mut enc, &mut ac, &tv, *ss as usize, *se as usize);
+                        } else {
+                            encode_ac_refine_band(
+                                &mut enc,
+                                &mut refine_bins,
+                                vals,
+                                *ss as usize,
+                                *se as usize,
+                                *al,
+                            );
+                        }
+                    }
+                    since_restart += 1;
+                }
+            }
+            out.extend_from_slice(&enc.finish());
+        }
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    /// xorshift32 — deterministic coefficient fixtures, no payload files.
+    struct Rng(u32);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// Generate `n` coefficient blocks (zigzag-index order): bounded DC
+    /// plus `ac_count` sparse AC values within ±`ac_amp`.
+    fn gen_blocks(
+        n: usize,
+        seed: u32,
+        dc_amp: i32,
+        ac_amp: i32,
+        ac_count: usize,
+    ) -> Vec<[i32; 64]> {
+        let mut rng = Rng(seed);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut b = [0i32; 64];
+            b[0] = (rng.next() % (2 * dc_amp as u32 + 1)) as i32 - dc_amp;
+            for _ in 0..ac_count {
+                let k = 1 + (rng.next() as usize) % 63;
+                let v = (rng.next() % (2 * ac_amp as u32 + 1)) as i32 - ac_amp;
+                b[k] = v;
+            }
+            out.push(b);
+        }
+        out
+    }
+
+    /// Reference render: identity dequantise + IDCT + level shift, exactly
+    /// as `render_from_coefs` does for an 8-bit component, cropped to
+    /// (w, h).
+    fn expected_plane_8(blocks: &[[i32; 64]], blocks_x: usize, w: usize, h: usize) -> Vec<u8> {
+        let bw = blocks_x * 8;
+        let blocks_y = blocks.len() / blocks_x;
+        let mut full = vec![0u8; bw * blocks_y * 8];
+        for (bi, vals) in blocks.iter().enumerate() {
+            let mut nat = [0.0f32; 64];
+            for k in 0..64 {
+                nat[ZIGZAG[k]] = vals[k] as f32;
+            }
+            idct8x8(&mut nat);
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            for j in 0..8 {
+                for i in 0..8 {
+                    let v = nat[j * 8 + i] + 128.0;
+                    let px = if v <= 0.0 {
+                        0
+                    } else if v >= 255.0 {
+                        255
+                    } else {
+                        v.round() as u8
+                    };
+                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
+                }
+            }
+        }
+        let mut out = vec![0u8; w * h];
+        for y in 0..h {
+            out[y * w..y * w + w].copy_from_slice(&full[y * bw..y * bw + w]);
+        }
+        out
+    }
+
+    /// 12-bit variant: level shift 2048, clamp 0..=4095.
+    fn expected_plane_12(blocks: &[[i32; 64]], blocks_x: usize, w: usize, h: usize) -> Vec<u16> {
+        let bw = blocks_x * 8;
+        let blocks_y = blocks.len() / blocks_x;
+        let mut full = vec![0u16; bw * blocks_y * 8];
+        for (bi, vals) in blocks.iter().enumerate() {
+            let mut nat = [0.0f32; 64];
+            for k in 0..64 {
+                nat[ZIGZAG[k]] = vals[k] as f32;
+            }
+            idct8x8(&mut nat);
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            for j in 0..8 {
+                for i in 0..8 {
+                    let v = nat[j * 8 + i] + 2048.0;
+                    let px = if v <= 0.0 {
+                        0
+                    } else if v >= 4095.0 {
+                        4095
+                    } else {
+                        v.round() as u16
+                    };
+                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
+                }
+            }
+        }
+        let mut out = vec![0u16; w * h];
+        for y in 0..h {
+            out[y * w..y * w + w].copy_from_slice(&full[y * bw..y * bw + w]);
+        }
+        out
+    }
+
+    fn assert_gray8_exact(jpeg: &[u8], blocks: &[[i32; 64]], blocks_x: usize, w: usize, h: usize) {
+        let v = decode_jpeg(jpeg, None).expect("decode SOF10");
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w);
+        let want = expected_plane_8(blocks, blocks_x, w, h);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    v.planes[0].data[y * w + x],
+                    want[y * w + x],
+                    "pixel mismatch at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Spectral selection only (Annex G process 2): DC scan + two AC band
+    /// scans, no successive approximation. Bit-exact coefficient recovery
+    /// means the decoded pixels equal a direct IDCT of the source blocks.
+    #[test]
+    fn sof10_gray8_spectral_selection_roundtrip() {
+        let (w, h) = (24usize, 16usize);
+        let blocks = gen_blocks(3 * 2, 0xC0FFEE11, 200, 60, 10);
+        let scans: Vec<ScanDesc> = vec![
+            (vec![0], 0, 0, 0, 0),
+            (vec![0], 1, 5, 0, 0),
+            (vec![0], 6, 63, 0, 0),
+        ];
+        let jpeg = encode_sof10_jpeg(
+            w,
+            h,
+            8,
+            &[(1, 1)],
+            std::slice::from_ref(&blocks),
+            &scans,
+            0,
+            None,
+        );
+        assert!(
+            jpeg.windows(2).any(|x| x == [0xFF, 0xCA]),
+            "SOF10 marker missing"
+        );
+        assert_gray8_exact(&jpeg, &blocks, 3, w, h);
+    }
+
+    /// Full progression (Annex G process 4): 1-bit point transform on
+    /// every first scan, then DC + AC refinement scans restore the LSBs.
+    #[test]
+    fn sof10_gray8_full_progression_roundtrip() {
+        let (w, h) = (24usize, 16usize);
+        let blocks = gen_blocks(3 * 2, 0xDEC0DE22, 180, 50, 12);
+        let scans: Vec<ScanDesc> = vec![
+            (vec![0], 0, 0, 0, 1),
+            (vec![0], 1, 5, 0, 1),
+            (vec![0], 6, 63, 0, 1),
+            (vec![0], 0, 0, 1, 0),
+            (vec![0], 1, 5, 1, 0),
+            (vec![0], 6, 63, 1, 0),
+        ];
+        let jpeg = encode_sof10_jpeg(
+            w,
+            h,
+            8,
+            &[(1, 1)],
+            std::slice::from_ref(&blocks),
+            &scans,
+            0,
+            None,
+        );
+        assert_gray8_exact(&jpeg, &blocks, 3, w, h);
+    }
+
+    /// Two successive-approximation levels (Al = 2 first scans, then two
+    /// refinement passes) — exercises EOBx growth across refinement scans.
+    #[test]
+    fn sof10_gray8_two_level_sa_roundtrip() {
+        let (w, h) = (16usize, 16usize);
+        let blocks = gen_blocks(2 * 2, 0x5EED3333, 120, 40, 14);
+        let scans: Vec<ScanDesc> = vec![
+            (vec![0], 0, 0, 0, 2),
+            (vec![0], 1, 63, 0, 2),
+            (vec![0], 0, 0, 2, 1),
+            (vec![0], 1, 63, 2, 1),
+            (vec![0], 0, 0, 1, 0),
+            (vec![0], 1, 63, 1, 0),
+        ];
+        let jpeg = encode_sof10_jpeg(
+            w,
+            h,
+            8,
+            &[(1, 1)],
+            std::slice::from_ref(&blocks),
+            &scans,
+            0,
+            None,
+        );
+        assert_gray8_exact(&jpeg, &blocks, 2, w, h);
+    }
+
+    /// 4:2:0 three-component: interleaved DC scan (4 luma + 1 Cb + 1 Cr
+    /// blocks per MCU) followed by per-component full-band AC scans.
+    /// Every output plane is compared sample-exact against the IDCT
+    /// reference at its own resolution.
+    #[test]
+    fn sof10_yuv420_interleaved_dc_roundtrip() {
+        let (w, h) = (32usize, 16usize);
+        // mcus 2x1: luma 4x2 blocks, chroma 2x1 blocks each.
+        let comps = [(2u8, 2u8), (1, 1), (1, 1)];
+        let blocks = vec![
+            gen_blocks(4 * 2, 0xAAAA0001, 150, 40, 8),
+            gen_blocks(2, 0xBBBB0002, 100, 30, 6),
+            gen_blocks(2, 0xCCCC0003, 100, 30, 6),
+        ];
+        let scans: Vec<ScanDesc> = vec![
+            (vec![0, 1, 2], 0, 0, 0, 0),
+            (vec![0], 1, 63, 0, 0),
+            (vec![1], 1, 63, 0, 0),
+            (vec![2], 1, 63, 0, 0),
+        ];
+        let jpeg = encode_sof10_jpeg(w, h, 8, &comps, &blocks, &scans, 0, None);
+        let v = decode_jpeg(&jpeg, None).expect("decode SOF10 4:2:0");
+        assert_eq!(v.planes.len(), 3);
+        let dims = [(w, h, 4usize), (w / 2, h / 2, 2), (w / 2, h / 2, 2)];
+        for ci in 0..3 {
+            let (cw, ch, bx) = dims[ci];
+            assert_eq!(v.planes[ci].stride, cw, "plane {ci} stride");
+            let want = expected_plane_8(&blocks[ci], bx, cw, ch);
+            assert_eq!(v.planes[ci].data, want, "plane {ci} samples");
+        }
+    }
+
+    /// Restart markers: stats + DC prediction + Q-coder re-initialise at
+    /// every RSTn within every scan, in lockstep with the encoder.
+    #[test]
+    fn sof10_restart_interval_roundtrip() {
+        let (w, h) = (32usize, 16usize);
+        let blocks = gen_blocks(4 * 2, 0x12345678, 160, 45, 9);
+        let scans: Vec<ScanDesc> = vec![
+            (vec![0], 0, 0, 0, 1),
+            (vec![0], 1, 63, 0, 1),
+            (vec![0], 0, 0, 1, 0),
+            (vec![0], 1, 63, 1, 0),
+        ];
+        let jpeg = encode_sof10_jpeg(
+            w,
+            h,
+            8,
+            &[(1, 1)],
+            std::slice::from_ref(&blocks),
+            &scans,
+            3,
+            None,
+        );
+        assert!(
+            jpeg.windows(2)
+                .any(|x| x[0] == 0xFF && (0xD0..=0xD7).contains(&x[1])),
+            "no RSTn marker found in the scan"
+        );
+        assert_gray8_exact(&jpeg, &blocks, 4, w, h);
+    }
+
+    /// DAC-overridden AC conditioning (Kx = 20): both sides must place the
+    /// X2.. magnitude bins on the same low/high side of the threshold or
+    /// the bin streams desynchronise.
+    #[test]
+    fn sof10_dac_kx_conditioning_roundtrip() {
+        let (w, h) = (16usize, 16usize);
+        let blocks = gen_blocks(2 * 2, 0x0BAD5EED, 140, 50, 16);
+        let scans: Vec<ScanDesc> = vec![(vec![0], 0, 0, 0, 0), (vec![0], 1, 63, 0, 0)];
+        let jpeg = encode_sof10_jpeg(
+            w,
+            h,
+            8,
+            &[(1, 1)],
+            std::slice::from_ref(&blocks),
+            &scans,
+            0,
+            Some(20),
+        );
+        assert_gray8_exact(&jpeg, &blocks, 2, w, h);
+    }
+
+    /// 12-bit grayscale full progression (Annex G process 8): wider
+    /// coefficients through the deeper end of the magnitude tree, output
+    /// as little-endian `u16` samples with the 2048 level shift.
+    #[test]
+    fn sof10_gray12_full_progression_roundtrip() {
+        let (w, h) = (16usize, 16usize);
+        let blocks = gen_blocks(2 * 2, 0x600DCAFE, 4000, 900, 10);
+        let scans: Vec<ScanDesc> = vec![
+            (vec![0], 0, 0, 0, 1),
+            (vec![0], 1, 63, 0, 1),
+            (vec![0], 0, 0, 1, 0),
+            (vec![0], 1, 63, 1, 0),
+        ];
+        let jpeg = encode_sof10_jpeg(
+            w,
+            h,
+            12,
+            &[(1, 1)],
+            std::slice::from_ref(&blocks),
+            &scans,
+            0,
+            None,
+        );
+        let v = decode_jpeg(&jpeg, None).expect("decode SOF10 12-bit");
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w * 2);
+        let want = expected_plane_12(&blocks, 2, w, h);
+        for i in 0..w * h {
+            let got = u16::from_le_bytes([v.planes[0].data[i * 2], v.planes[0].data[i * 2 + 1]]);
+            assert_eq!(got, want[i], "sample mismatch at {i}");
+        }
+    }
+
+    /// 4-component (CMYK-class, no APP14 → plain pass-through) progressive
+    /// arithmetic: interleaved DC + per-component AC scans, packed `Cmyk`
+    /// output compared sample-exact.
+    #[test]
+    fn sof10_cmyk_spectral_selection_roundtrip() {
+        let (w, h) = (16usize, 8usize);
+        let comps = [(1u8, 1u8); 4];
+        let blocks: Vec<Vec<[i32; 64]>> = (0..4)
+            .map(|ci| gen_blocks(2, 0x4444_0000 + ci as u32, 120, 35, 7))
+            .collect();
+        let mut scans: Vec<ScanDesc> = vec![(vec![0, 1, 2, 3], 0, 0, 0, 0)];
+        for ci in 0..4 {
+            scans.push((vec![ci], 1, 63, 0, 0));
+        }
+        let jpeg = encode_sof10_jpeg(w, h, 8, &comps, &blocks, &scans, 0, None);
+        let v = decode_jpeg(&jpeg, None).expect("decode SOF10 CMYK");
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w * 4);
+        let want: Vec<Vec<u8>> = blocks
+            .iter()
+            .map(|b| expected_plane_8(b, 2, w, h))
+            .collect();
+        for i in 0..w * h {
+            for ci in 0..4 {
+                assert_eq!(
+                    v.planes[0].data[i * 4 + ci],
+                    want[ci][i],
+                    "component {ci} mismatch at sample {i}"
+                );
+            }
+        }
+    }
+
+    /// SOF10 only accepts P = 8 / P = 12 — a 10-bit frame is rejected
+    /// with `Unsupported`, not a desynchronised decode.
+    #[test]
+    fn sof10_unsupported_precision_rejected() {
+        let (w, h) = (8usize, 8usize);
+        let blocks = gen_blocks(1, 1, 50, 10, 3);
+        let scans: Vec<ScanDesc> = vec![(vec![0], 0, 0, 0, 0)];
+        let jpeg = encode_sof10_jpeg(w, h, 10, &[(1, 1)], &[blocks], &scans, 0, None);
+        let err = decode_jpeg(&jpeg, None).expect_err("expected decode error");
+        assert!(
+            matches!(err, crate::error::MjpegError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
     }

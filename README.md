@@ -1,7 +1,8 @@
 # oxideav-mjpeg
 
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
-decodes baseline (SOF0), extended-sequential (SOF1), progressive (SOF2)
+decodes baseline (SOF0), extended-sequential (SOF1 Huffman + SOF9
+arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic)
 and lossless (SOF3 Huffman + SOF11 arithmetic) JPEGs (single-component
 grayscale at any precision `P ∈ 2..=16` plus three-component RGB-class
 at `P = 8`), encodes
@@ -520,6 +521,17 @@ Decoder:
   sequential 12-bit path below. 4-component CMYK / YCCK is supported
   at `P = 8` and produces the same packed `Cmyk` output the
   sequential path emits (Adobe APP14 transform flag honoured).
+- **SOF10** (progressive, arithmetic) — the SOF2 scan structure with
+  the Annex D Q-coder as the entropy layer per T.81 §G.1.3. DC first
+  scans reuse the §F.1.4.1 sequential model on the point-transformed
+  values; DC refinement bits use the fixed 0.5 estimate; AC first
+  scans run the §F.1.4 procedure per band (`Kmin = Ss`, EOB =
+  end-of-band, DAC `Kx` honoured); AC refinement scans follow the
+  §G.1.3.3 model (Figures G.10 / G.11, Table G.2 — 189 statistics
+  bins, end-of-band decision bypassed below the prior scan's EOBx).
+  Restart intervals re-seed coder + statistics + DC prediction.
+  `P = 8` and `P = 12`, 4-component CMYK / YCCK at `P = 8` — same
+  output shaping as SOF2 via the shared coefficient accumulator.
 - **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
   component) — transparently routed through the shared coefficient
   accumulator.
@@ -630,15 +642,16 @@ Encoder:
 
 Not supported (decoder returns `Error::Unsupported`):
 
-- Hierarchical (SOF5..SOF7, SOF13..SOF15) and progressive arithmetic
-  (SOF10). SOF9 (extended sequential, arithmetic) is supported at
-  `P=8` and SOF11 (lossless, arithmetic) at every Annex H precision —
-  see the decoder coverage list above.
-- 12-bit 4-component progressive (SOF2 `Nf = 4, P = 12`) — the
-  workspace `PixelFormat` enum has no 12-bit CMYK variant. `P = 8`
-  4-component CMYK / YCCK *is* supported on both the sequential
-  (SOF0 / SOF1) and the progressive (SOF2) scan decompositions, with
-  the Adobe APP14 transform flag honoured on both paths.
+- Hierarchical (SOF5..SOF7, SOF13..SOF15). The arithmetic-coded
+  non-hierarchical variants are all supported: SOF9 (extended
+  sequential) at `P=8`, SOF10 (progressive) at `P=8` / `P=12`, and
+  SOF11 (lossless) at every Annex H precision — see the decoder
+  coverage list above.
+- 12-bit 4-component progressive (SOF2 / SOF10 with `Nf = 4,
+  P = 12`) — the workspace `PixelFormat` enum has no 12-bit CMYK
+  variant. `P = 8` 4-component CMYK / YCCK *is* supported on the
+  sequential (SOF0 / SOF1) and progressive (SOF2 / SOF10) scan
+  decompositions, with the Adobe APP14 transform flag honoured.
 - 4-component lossless above `P = 8` (the workspace `PixelFormat`
   enum has no high-bit-depth CMYK variant — wider precisions are
   rejected with `Unsupported`). `P = 8` 4-component lossless *is*

@@ -59,16 +59,24 @@
 //! arithmetic entropy decoder from T.81 Annex D + F.2.4. The DAC marker
 //! (Define Arithmetic Conditioning) is parsed when present; if absent the
 //! decoder uses the spec defaults `(L=0, U=1)` for DC / lossless
-//! conditioning and `Kx=5` for AC. Lossless arithmetic (SOF11) is
-//! decoded via the same Q-coder under the two-dimensional statistical
-//! model of §H.1.2.3 (binary decisions conditioned on the left / above
-//! difference classifications through the Figure H.2 array), covering
-//! the full Annex H surface the SOF3 path handles: every precision,
-//! every predictor, point transform and restart intervals.
+//! conditioning and `Kx=5` for AC. Progressive arithmetic (SOF10) is
+//! decoded via the same Q-coder under the T.81 §G.1.3 procedures: DC
+//! first scans reuse the §F.1.4.1 model on the point-transformed
+//! values, DC refinement bits use the fixed 0.5 estimate, AC first
+//! scans run the §F.1.4 procedure per band (`Kmin = Ss`, EOB =
+//! end-of-band), and AC refinement scans follow the §G.1.3.3 model
+//! (Figures G.10 / G.11, Table G.2) — at `P = 8` and `P = 12` with
+//! the same output shaping as the Huffman progressive (SOF2) path,
+//! 4-component CMYK / YCCK included at `P = 8`. Lossless arithmetic
+//! (SOF11) is decoded via the same Q-coder under the two-dimensional
+//! statistical model of §H.1.2.3 (binary decisions conditioned on the
+//! left / above difference classifications through the Figure H.2
+//! array), covering the full Annex H surface the SOF3 path handles:
+//! every precision, every predictor, point transform and restart
+//! intervals.
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Hierarchical (SOF5..SOF7, SOF13..SOF15) JPEGs
-//! - SOF10 (progressive arithmetic)
 //! - 12-bit progressive 4-component JPEGs (the workspace `PixelFormat`
 //!   enum has no 12-bit CMYK variant; `P=8` 4-component CMYK / YCCK
 //!   *is* supported on both the sequential and progressive scan

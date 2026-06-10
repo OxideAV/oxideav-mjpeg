@@ -32,6 +32,9 @@ pub const SOF2: u8 = 0xC2;
 pub const SOF3: u8 = 0xC3;
 /// Extended sequential DCT, arithmetic-coded (T.81 §F.1.4).
 pub const SOF9: u8 = 0xC9;
+/// Progressive DCT, arithmetic-coded (T.81 §G.1.3 — the SOF2 scan
+/// structure entropy-coded by the Annex D Q-coder).
+pub const SOF10: u8 = 0xCA;
 /// Lossless sequential, arithmetic-coded (T.81 §H.1.2.3 two-dimensional
 /// statistical model over the Annex D Q-coder).
 pub const SOF11: u8 = 0xCB;

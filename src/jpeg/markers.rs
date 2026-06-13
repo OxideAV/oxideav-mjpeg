@@ -19,6 +19,11 @@ pub const DHT: u8 = 0xC4;
 pub const DAC: u8 = 0xCC;
 /// Define Restart Interval.
 pub const DRI: u8 = 0xDD;
+/// Define Number of Lines (T.81 §B.2.5). Carries the frame's `NL`
+/// (number of lines) when the SOF `Y` field was coded as 0; the segment
+/// appears immediately after the first scan's entropy-coded data and is
+/// mandatory in that case.
+pub const DNL: u8 = 0xDC;
 /// COMment segment.
 pub const COM: u8 = 0xFE;
 

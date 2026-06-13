@@ -39,7 +39,7 @@ use crate::jpeg::dct::idct8x8;
 use crate::jpeg::huffman::{parse_dht, HuffTable};
 use crate::jpeg::markers::{self, *};
 use crate::jpeg::parser::{
-    parse_dac, parse_dri, parse_sof, parse_sos, MarkerWalker, SofInfo, SosInfo,
+    parse_dac, parse_dnl, parse_dri, parse_sof, parse_sos, MarkerWalker, SofInfo, SosInfo,
 };
 use crate::jpeg::quant::{parse_dqt, QuantTable};
 use crate::jpeg::zigzag::ZIGZAG;
@@ -234,11 +234,140 @@ fn validate_sos(sos: &SosInfo) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a frame's number of lines when the SOF header coded `Y = 0`
+/// (T.81 §B.2.2 / §B.2.5).
+///
+/// When `Y = 0` the real line count is carried by a mandatory DNL
+/// segment that "shall immediately follow the first scan" (§B.2.5). This
+/// helper performs an independent forward walk over the marker stream —
+/// `data` is the post-SOI byte slice (the same slice the main
+/// [`decode_jpeg`] walker sees) — to recover `NL` without disturbing the
+/// primary decode loop's position. It:
+///
+///   * finds the SOFn segment and reads its `Y` field; if `Y != 0` there
+///     is nothing to resolve and it returns `Ok(None)`;
+///   * otherwise consumes segments up to and including the first SOS plus
+///     that scan's entropy-coded data, then reads the next marker, which
+///     must be DNL, and returns `Ok(Some(NL))`.
+///
+/// Returns `Err(Invalid)` when `Y = 0` but no well-formed DNL follows the
+/// first scan (the segment is mandatory in that case), matching the
+/// spec's "this marker segment is mandatory if the number of lines (Y)
+/// specified in the frame header has the value zero".
+fn resolve_dnl_height(data: &[u8]) -> Result<Option<u16>> {
+    let mut walker = MarkerWalker::new(data);
+    // Walk to the SOFn to read Y. Skip table / misc segments along the way.
+    loop {
+        let Some(marker) = walker.next_marker()? else {
+            // No SOF at all — let the main loop report the real error.
+            return Ok(None);
+        };
+        match marker {
+            markers::SOI => continue,
+            m if markers::is_rst(m) => continue,
+            markers::EOI => return Ok(None),
+            // Hierarchical / unsupported SOFs (SOF5..7, SOF13..15) are
+            // left entirely to the main loop, which rejects them with
+            // `Unsupported`. Resolving DNL for them would be pointless and
+            // could surface a spurious error ahead of that rejection.
+            0xC5..=0xC7 | 0xCD..=0xCF => return Ok(None),
+            m if markers::is_sof(m) => {
+                // This pre-pass never reports SOF errors itself — a
+                // malformed SOF (e.g. a truncated component list) is left
+                // for the main decode loop to classify with its canonical
+                // error. We only need a *parseable* SOF here to read `Y`;
+                // if it doesn't parse, there is nothing to resolve and we
+                // defer.
+                let Ok(p) = walker.read_segment_payload() else {
+                    return Ok(None);
+                };
+                let Ok(sof) = parse_sof(p) else {
+                    return Ok(None);
+                };
+                if sof.height != 0 {
+                    // Y is already known; no DNL resolution needed.
+                    return Ok(None);
+                }
+                break;
+            }
+            markers::SOS => {
+                // SOS before any SOF — malformed, but not our concern here.
+                return Ok(None);
+            }
+            _ => {
+                // Any other length-prefixed segment: skip it.
+                let _ = walker.read_segment_payload()?;
+            }
+        }
+    }
+    // Y = 0: advance to the first SOS, consume its scan data, then the
+    // DNL segment must follow (T.81 §B.2.5).
+    loop {
+        let Some(marker) = walker.next_marker()? else {
+            return Err(Error::invalid(
+                "JPEG: SOF Y = 0 but stream ended before the first scan",
+            ));
+        };
+        match marker {
+            markers::SOI => continue,
+            m if markers::is_rst(m) => continue,
+            markers::EOI => {
+                return Err(Error::invalid(
+                    "JPEG: SOF Y = 0 but no scan precedes EOI (DNL required)",
+                ));
+            }
+            markers::SOS => {
+                let _ = walker.read_segment_payload()?;
+                let _ = walker.read_scan_data()?;
+                break;
+            }
+            _ => {
+                let _ = walker.read_segment_payload()?;
+            }
+        }
+    }
+    // The marker immediately after the first scan must be DNL.
+    let Some(marker) = walker.next_marker()? else {
+        return Err(Error::invalid(
+            "JPEG: SOF Y = 0 but no DNL marker follows the first scan",
+        ));
+    };
+    if marker != markers::DNL {
+        return Err(Error::invalid(
+            "JPEG: SOF Y = 0 but the marker after the first scan is not DNL",
+        ));
+    }
+    let p = walker.read_segment_payload()?;
+    let nl = parse_dnl(p)?;
+    Ok(Some(nl))
+}
+
+/// Apply a DNL-recovered line count to a freshly-parsed SOF whose `Y`
+/// field was coded as 0 (T.81 §B.2.5). When `dnl_height` is `Some`, the
+/// SOF's height is replaced by `NL`; when it is `None` the SOF is left
+/// untouched. A `Some` patch is only meaningful for an SOF with
+/// `height == 0`, but applying it unconditionally to a `height == 0` SOF
+/// keeps the call-sites uniform.
+fn apply_dnl_height(sof: &mut SofInfo, dnl_height: Option<u16>) {
+    if sof.height == 0 {
+        if let Some(nl) = dnl_height {
+            sof.height = nl;
+        }
+    }
+}
+
 pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
     }
+
+    // T.81 §B.2.2: a frame header may code Y = 0, in which case the real
+    // line count is supplied by a mandatory DNL segment immediately after
+    // the first scan (§B.2.5). Resolve it up-front so every downstream
+    // scan decoder works against a concrete height; the per-SOF handlers
+    // below patch `sof.height` with the recovered value.
+    let dnl_height = resolve_dnl_height(&data[2..])?;
 
     let mut walker = MarkerWalker::new(&data[2..]);
     let mut state = JpegState::new();
@@ -305,7 +434,8 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     return Err(Error::invalid("JPEG: multiple SOF segments"));
                 }
                 let p = walker.read_segment_payload()?;
-                let sof = parse_sof(p)?;
+                let mut sof = parse_sof(p)?;
+                apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof)?;
                 state.sof = Some(sof);
             }
@@ -314,7 +444,8 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     return Err(Error::invalid("JPEG: multiple SOF segments"));
                 }
                 let p = walker.read_segment_payload()?;
-                let sof = parse_sof(p)?;
+                let mut sof = parse_sof(p)?;
+                apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof)?;
                 // T.81 §G.1.1 permits SOF2 at P = 8 or P = 12. The progressive
                 // scan path operates on i32 coefficient planes, so the
@@ -360,7 +491,8 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     return Err(Error::invalid("JPEG: multiple SOF segments"));
                 }
                 let p = walker.read_segment_payload()?;
-                let sof = parse_sof(p)?;
+                let mut sof = parse_sof(p)?;
+                apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof)?;
                 validate_lossless_sof(&sof)?;
                 state.sof = Some(sof);
@@ -378,7 +510,8 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     return Err(Error::invalid("JPEG: multiple SOF segments"));
                 }
                 let p = walker.read_segment_payload()?;
-                let sof = parse_sof(p)?;
+                let mut sof = parse_sof(p)?;
+                apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof)?;
                 if sof.precision != 8 {
                     return Err(Error::unsupported(format!(
@@ -406,7 +539,8 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                     return Err(Error::invalid("JPEG: multiple SOF segments"));
                 }
                 let p = walker.read_segment_payload()?;
-                let sof = parse_sof(p)?;
+                let mut sof = parse_sof(p)?;
+                apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof)?;
                 if sof.precision != 8 && sof.precision != 12 {
                     return Err(Error::unsupported(format!(
@@ -475,6 +609,14 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 }
             }
             COM => {
+                let _ = walker.read_segment_payload()?;
+            }
+            // DNL (T.81 §B.2.5): the number-of-lines value was already
+            // recovered up-front by `resolve_dnl_height` and patched into
+            // the SOF, so here the segment is consumed and discarded. We
+            // still skip its payload via the length field to keep the
+            // walker aligned for any trailing markers.
+            markers::DNL => {
                 let _ = walker.read_segment_payload()?;
             }
             // APP14 "Adobe" marker: `"Adobe"` magic + 5 bytes of metadata
@@ -5080,5 +5222,66 @@ mod sof10_tests {
             matches!(err, crate::error::MjpegError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dnl_unit_tests {
+    use super::resolve_dnl_height;
+    use crate::jpeg::markers;
+
+    /// Append one length-prefixed marker segment (T.81 §B.1.1.4).
+    fn put_seg(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+        out.extend_from_slice(&[0xFF, marker]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    /// Build a minimal single-component frame whose SOF codes the given
+    /// `y` value, optionally followed by a `DNL nl` segment after the
+    /// (empty placeholder) first scan. Returns the post-SOI byte slice
+    /// that `resolve_dnl_height` consumes.
+    fn build(y: u16, dnl: Option<u16>) -> Vec<u8> {
+        let mut out = Vec::new();
+        // SOF0: P=8, Y, X=16, Nf=1, one component 1x1 / Tq=0.
+        let mut sof = vec![8u8];
+        sof.extend_from_slice(&y.to_be_bytes());
+        sof.extend_from_slice(&16u16.to_be_bytes());
+        sof.push(1); // Nf
+        sof.extend_from_slice(&[1, 0x11, 0]);
+        put_seg(&mut out, markers::SOF0, &sof);
+        // SOS: Ns=1, Cs=1 Td/Ta=0, Ss=0 Se=63 Ah/Al=0.
+        put_seg(&mut out, markers::SOS, &[1, 1, 0, 0, 63, 0]);
+        // A token entropy byte so the scan is non-empty.
+        out.push(0x00);
+        if let Some(nl) = dnl {
+            put_seg(&mut out, markers::DNL, &nl.to_be_bytes());
+        }
+        out.extend_from_slice(&[0xFF, markers::EOI]);
+        out
+    }
+
+    #[test]
+    fn non_zero_y_needs_no_resolution() {
+        let data = build(16, None);
+        assert_eq!(resolve_dnl_height(&data).unwrap(), None);
+    }
+
+    #[test]
+    fn zero_y_with_dnl_resolves() {
+        let data = build(0, Some(123));
+        assert_eq!(resolve_dnl_height(&data).unwrap(), Some(123));
+    }
+
+    #[test]
+    fn zero_y_without_dnl_errors() {
+        let data = build(0, None);
+        assert!(resolve_dnl_height(&data).is_err());
+    }
+
+    #[test]
+    fn zero_y_zero_nl_errors() {
+        let data = build(0, Some(0));
+        assert!(resolve_dnl_height(&data).is_err());
     }
 }

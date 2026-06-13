@@ -591,6 +591,15 @@ Decoder:
   default; the decoder accepts either, so a caller-supplied APP-segment
   override that drops the APP14 still round-trips.
 - Restart markers (`RSTn`) + DRI.
+- **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
+  header codes the number of lines `Y = 0`, the real line count is
+  recovered from the mandatory DNL segment (`0xFFDC`) that immediately
+  follows the first scan, and the frame is decoded at that height. The
+  `Y = 0` case without a following DNL (the segment is mandatory there
+  per §B.2.5), and a malformed `NL = 0` DNL, are both rejected. Applies
+  to every scan-decomposition path (baseline fast path, the
+  sequential / progressive / arithmetic accumulator paths, and
+  lossless).
 - **RTP/JPEG (RFC 2435)** depacketization via `rtp::JpegDepacketizer` —
   reassembles fragmented RTP/JPEG payloads and reconstructs the absent
   frame/scan headers (from the Q field or an in-band quantization-table

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DNL (Define Number of Lines) decode support (T.81 §B.2.2 / §B.2.5)** —
+  JPEG frames may code the number of lines `Y = 0` in the SOF header, in
+  which case the real line count is supplied by a mandatory DNL segment
+  (`0xFFDC`) immediately after the first scan. The decoder now performs an
+  up-front marker-stream pre-pass (`resolve_dnl_height`) that, when it
+  sees `Y = 0`, walks to the first scan, reads `NL` from the following
+  DNL segment, and patches the frame height before any scan decoder runs —
+  so every path (baseline fast path, sequential / progressive / arithmetic
+  accumulators, lossless) decodes at the correct height with no per-path
+  changes. A `Y = 0` stream with no following DNL is rejected (the segment
+  is mandatory there), as is a malformed DNL carrying `NL = 0`
+  (Table B.10 constrains `NL ∈ 1..=65535`). New `parse_dnl` parser entry,
+  `markers::DNL` constant, and explicit DNL handling in the main marker
+  loop. Covered by `tests/dnl.rs` (YUV 4:4:4 / 4:2:2 / 4:2:0 round-trips,
+  a non-MCU-aligned height, plus the two negative cases) and four
+  `decoder::dnl_unit_tests` unit tests.
 - **Progressive arithmetic JPEG (SOF10) decode** — the SOF2 multi-scan
   spectral-selection / successive-approximation structure with the
   Annex D Q-coder as the entropy layer, per T.81 §G.1.3:

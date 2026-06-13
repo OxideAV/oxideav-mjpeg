@@ -161,6 +161,24 @@ pub fn parse_dri(payload: &[u8]) -> Result<u16> {
     Ok(u16::from_be_bytes([payload[0], payload[1]]))
 }
 
+/// DNL payload is a 16-bit big-endian `NL` (number of lines), T.81 §B.2.5.
+///
+/// The marker walker hands this function the bytes *after* the 2-byte
+/// length field, so the payload starts with the `NL` value itself
+/// (`Ld = 4`, leaving 2 payload bytes). T.81 Table B.10 constrains `NL`
+/// to `1..=65535`; `NL = 0` is rejected as malformed because a DNL
+/// segment exists precisely to *define* a non-zero line count.
+pub fn parse_dnl(payload: &[u8]) -> Result<u16> {
+    if payload.len() < 2 {
+        return Err(Error::invalid("DNL: too short"));
+    }
+    let nl = u16::from_be_bytes([payload[0], payload[1]]);
+    if nl == 0 {
+        return Err(Error::invalid("DNL: NL = 0"));
+    }
+    Ok(nl)
+}
+
 /// Walker over JPEG markers.
 ///
 /// SOI/EOI/RST* have no payload or length field. Every other marker from

@@ -13,6 +13,7 @@
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_mjpeg::encoder::{
+    encode_lossless_arith_jpeg_cmyk, encode_lossless_arith_jpeg_cmyk_with_opts,
     encode_lossless_arith_jpeg_grayscale, encode_lossless_arith_jpeg_grayscale_with_opts,
     encode_lossless_arith_jpeg_rgb, encode_lossless_arith_jpeg_rgb_with_opts,
     encode_lossless_jpeg_cmyk, encode_lossless_jpeg_cmyk_with_opts, encode_lossless_jpeg_grayscale,
@@ -1207,6 +1208,236 @@ fn lossless_cmyk_rejects_invalid_adobe_transform() {
     let strides = [w as usize, w as usize, w as usize, w as usize];
     for bad in [1u8, 3, 4, 255] {
         let err = encode_lossless_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            1,
+            Some(bad),
+        );
+        assert!(err.is_err(), "expected reject for adobe_transform={bad}");
+    }
+}
+
+// --- SOF11 four-component (CMYK-class) arithmetic-coded lossless ---
+
+/// Plain ("regular") CMYK arithmetic: every Annex H Table H.1 predictor
+/// 1..=7 must round-trip bit-exact through the SOF11 four-component path
+/// when no APP14 colour-transform is requested.
+#[test]
+fn lossless_arith_cmyk_no_app14_every_predictor_is_bit_exact() {
+    let w = 24u32;
+    let h = 16u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_arith_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            predictor,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        // SOF11 marker (FF CB) must be present; SOF3 (FF C3) must not.
+        assert!(
+            jpeg.windows(2).any(|x| x == [0xFF, 0xCB]),
+            "predictor={predictor}: SOF11 marker missing"
+        );
+        assert!(
+            !jpeg.windows(2).any(|x| x == [0xFF, 0xC3]),
+            "predictor={predictor}: unexpected SOF3 marker"
+        );
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(v.planes.len(), 1, "predictor={predictor}");
+        let stride = v.planes[0].stride;
+        assert_eq!(
+            stride,
+            (w as usize) * 4,
+            "predictor={predictor}: expected packed Cmyk stride"
+        );
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                for ci in 0..4 {
+                    let got = v.planes[0].data[j * stride + i * 4 + ci];
+                    let want = planes[ci][j * w as usize + i];
+                    assert_eq!(
+                        got, want,
+                        "predictor={predictor} plane {ci} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Adobe CMYK (APP14 transform = 0) arithmetic: the encoder pre-inverts on
+/// the wire and the decoder un-inverts on output, so the round-trip recovers
+/// the caller's original samples.
+#[test]
+fn lossless_arith_cmyk_adobe_transform_0_roundtrip_is_bit_exact() {
+    let w = 20u32;
+    let h = 14u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for predictor in [1u8, 4, 7] {
+        let jpeg = encode_lossless_arith_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            predictor,
+            Some(0),
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        let v = decode_to_frame(jpeg, w, h);
+        let stride = v.planes[0].stride;
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                for ci in 0..4 {
+                    let got = v.planes[0].data[j * stride + i * 4 + ci];
+                    let want = planes[ci][j * w as usize + i];
+                    assert_eq!(
+                        got, want,
+                        "predictor={predictor} adobe=0 plane {ci} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Restart-marker emission on the arithmetic four-component path: the
+/// encoder flushes the Q-coder + writes DRI + RSTn at the requested MCU
+/// cadence, re-seeding every component, and the decoder reconstructs the
+/// same samples.
+#[test]
+fn lossless_arith_cmyk_restart_interval_roundtrip_is_bit_exact() {
+    let w = 16u32;
+    let h = 16u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    let jpeg = encode_lossless_arith_jpeg_cmyk_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2], &planes[3]],
+        strides,
+        4,
+        None,
+        13, // restart every 13 pixels — does not divide width × height evenly
+        0,
+    )
+    .expect("encode with restart interval");
+    assert!(
+        jpeg.windows(2).any(|x| x == [0xFF, 0xDD]),
+        "DRI marker missing when restart_interval > 0"
+    );
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for ci in 0..4 {
+                let got = v.planes[0].data[j * stride + i * 4 + ci];
+                let want = planes[ci][j * w as usize + i];
+                assert_eq!(got, want, "restart roundtrip plane {ci} at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// Non-zero point transform on the arithmetic four-component path: Pt = 2
+/// keeps only the top 6 bits, so the round-trip equals each input byte with
+/// its low 2 bits cleared.
+#[test]
+fn lossless_arith_cmyk_point_transform_roundtrips_with_quantization() {
+    let w = 12u32;
+    let h = 8u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    let pt: u8 = 2;
+    let jpeg = encode_lossless_arith_jpeg_cmyk_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2], &planes[3]],
+        strides,
+        1,
+        None,
+        0,
+        pt,
+    )
+    .expect("encode with Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for ci in 0..4 {
+                let got = v.planes[0].data[j * stride + i * 4 + ci];
+                let want = (planes[ci][j * w as usize + i] >> pt) << pt;
+                assert_eq!(got, want, "Pt={pt} plane {ci} at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// Adobe YCCK (APP14 transform = 2) arithmetic: the encoder inverts only K
+/// before coding and the decoder runs YCbCr → CMYK on output. The K plane
+/// round-trips exactly (it is only inverted/un-inverted, no colour
+/// conversion); the C/M/Y output is the BT.601 reconstruction of the input
+/// Y/Cb/Cr, which the SOF11 marker + structural decode must produce without
+/// error.
+#[test]
+fn lossless_arith_cmyk_ycck_k_plane_roundtrips() {
+    let w = 16u32;
+    let h = 12u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize); // [Y, Cb, Cr, K]
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    let jpeg = encode_lossless_arith_jpeg_cmyk(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2], &planes[3]],
+        strides,
+        1,
+        Some(2),
+    )
+    .expect("encode YCCK");
+    assert!(
+        jpeg.windows(2).any(|x| x == [0xFF, 0xCB]),
+        "SOF11 marker missing"
+    );
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    // K (the 4th packed byte) is exactly preserved through invert→un-invert.
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let got_k = v.planes[0].data[j * stride + i * 4 + 3];
+            let want_k = planes[3][j * w as usize + i];
+            assert_eq!(got_k, want_k, "YCCK K-plane mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// The arithmetic four-component encoder rejects out-of-range predictors and
+/// invalid Adobe-transform flags, matching the Huffman SOF3 path.
+#[test]
+fn lossless_arith_cmyk_rejects_bad_params() {
+    let w = 4u32;
+    let h = 4u32;
+    let planes = mk_cmyk_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize, w as usize];
+    for bad in [0u8, 8, 9, 255] {
+        let err = encode_lossless_arith_jpeg_cmyk(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2], &planes[3]],
+            strides,
+            bad,
+            None,
+        );
+        assert!(err.is_err(), "expected reject for predictor={bad}");
+    }
+    for bad in [1u8, 3, 4, 255] {
+        let err = encode_lossless_arith_jpeg_cmyk(
             w,
             h,
             [&planes[0], &planes[1], &planes[2], &planes[3]],

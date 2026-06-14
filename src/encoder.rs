@@ -4142,6 +4142,281 @@ pub fn encode_lossless_arith_jpeg_rgb_with_opts(
     Ok(out)
 }
 
+/// Encode four planar 8-bit colour channels (C, M, Y, K — or any four
+/// independent monochrome planes) as a standalone **four-component lossless,
+/// arithmetic-coded** JPEG (SOF11, interleaved scan) byte stream — the
+/// Q-coder counterpart of [`encode_lossless_jpeg_cmyk`].
+///
+/// The spatial model is identical to the Huffman four-component path (the
+/// Annex H Table H.1 predictors `1..=7` applied independently per component
+/// over each component's own `Ra` / `Rb` / `Rc`), but every prediction
+/// difference is coded with the Q-coder arithmetic statistical model of
+/// §H.1.2.3 (Table H.3 — `L_Context(Da, Db)` / `X1_Context(Db)`
+/// conditioning over each component's neighbouring differences) rather than a
+/// Huffman magnitude category. Each component is modelled independently (T.81
+/// §H.1.2), so the encoder keeps one statistics area and one
+/// difference-history pair per component while sharing a single
+/// arithmetic-coded entropy segment — one residual per component is emitted
+/// per pixel position in scan-component order (component IDs 1, 2, 3, 4; each
+/// declared `H_i = V_i = 1`, so a lossless MCU is one pixel). No DAC segment
+/// is emitted, so the decoder applies the default conditioning bounds
+/// `(L, U) = (0, 1)` per §H.1.2.3.3.
+///
+/// * `planes` — four plane slices in scan order. The encoder is colour-
+///   agnostic: the caller decides what the four planes represent and the
+///   decoder hands them back in the same SOS scan order, then applies the
+///   APP14 colour transform (if any) on output.
+/// * `strides` — bytes per row per plane; must be at least `width`.
+/// * `predictor` — selector value `1..=7` from Table H.1, shared by every
+///   component (T.81 §B.2.3).
+/// * `adobe_transform` — Adobe APP14 colour-transform flag, identical to
+///   [`encode_lossless_jpeg_cmyk`]:
+///   * `None`     — no APP14 segment; samples passed through unchanged
+///     ("regular" CMYK on the decoder side).
+///   * `Some(0)`  — Adobe CMYK convention: every input byte is inverted
+///     before predictive coding; the decoder un-inverts on output.
+///   * `Some(2)`  — Adobe YCCK: the caller passes `[Y, Cb, Cr, K]` planes
+///     and the encoder inverts only the K plane before coding so the
+///     decoder's YCCK → CMYK un-inversion lands on the same K value.
+///
+/// Precision is fixed at 8 bits (the only depth the workspace `PixelFormat`
+/// enum's `Cmyk` variant covers). Point transform is fixed at `Pt = 0` and no
+/// restart markers are emitted. For non-zero point transform or
+/// restart-marker emission see
+/// [`encode_lossless_arith_jpeg_cmyk_with_opts`].
+pub fn encode_lossless_arith_jpeg_cmyk(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 4],
+    strides: [usize; 4],
+    predictor: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    encode_lossless_arith_jpeg_cmyk_with_opts(
+        width,
+        height,
+        planes,
+        strides,
+        predictor,
+        adobe_transform,
+        0,
+        0,
+    )
+}
+
+/// Like [`encode_lossless_arith_jpeg_cmyk`] but also accepts a
+/// `restart_interval` (in MCUs — a four-component lossless MCU is exactly one
+/// pixel position, T.81 §H.1.2 with `H_i = V_i = 1`) and a `point_transform`
+/// (`Pt`, the SOS `Al` field's low nibble). Both default-to-zero options
+/// reproduce the historical zero-restart, zero-`Pt` output.
+///
+/// * `point_transform` — `0..=7`, strictly less than the fixed precision 8.
+///   With `Pt > 0` every (post-Adobe-inversion) input sample is
+///   right-shifted by `Pt` before predictive coding; the decoder left-shifts
+///   the reconstructed sample back by the same `Pt` on output.
+/// * `restart_interval` — MCUs (= pixel positions) between successive `RSTn`
+///   markers (`0` disables restart emission). On each boundary the encoder
+///   flushes the arithmetic segment, writes a fresh `RST0..=RST7` marker
+///   (cycling modulo 8 per §F.1.1.5.2), and re-initialises **every**
+///   component's statistical model, its neighbour-difference history, and its
+///   predictor to the scan-origin default `2^(8 − Pt − 1)` (§H.1.1 /
+///   §H.1.2.3.4 — each interval restarts with the same defaults as the image
+///   start, independently per component).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_arith_jpeg_cmyk_with_opts(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 4],
+    strides: [usize; 4],
+    predictor: u8,
+    adobe_transform: Option<u8>,
+    restart_interval: u16,
+    point_transform: u8,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless-arith CMYK encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= 8 {
+        return Err(Error::invalid(format!(
+            "lossless-arith CMYK encoder: point_transform {point_transform} must be < precision 8"
+        )));
+    }
+    match adobe_transform {
+        None | Some(0) | Some(2) => {}
+        Some(other) => {
+            return Err(Error::invalid(format!(
+                "lossless-arith CMYK encoder: adobe_transform = {other} (only None / Some(0) / Some(2) are supported)"
+            )));
+        }
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid(
+            "lossless-arith CMYK encoder: zero-size image",
+        ));
+    }
+    for c in 0..4 {
+        if strides[c] < w {
+            return Err(Error::invalid(
+                "lossless-arith CMYK encoder: stride smaller than width",
+            ));
+        }
+        if planes[c].len() < strides[c] * h {
+            return Err(Error::invalid(
+                "lossless-arith CMYK encoder: plane shorter than stride*h",
+            ));
+        }
+    }
+
+    // Apply the on-the-wire transform implied by `adobe_transform` so the
+    // residuals coded below match what the matching decoder expects. The
+    // decoder will re-invert (and YCCK→CMYK convert) on output (mirrors the
+    // SOF3 four-component encoder's inversion policy).
+    let invert_all = matches!(adobe_transform, Some(0));
+    let invert_k_only = matches!(adobe_transform, Some(2));
+    let pt = point_transform as u32;
+
+    // Decode each plane into a flat u32 buffer once, applying the Adobe
+    // inversion and the point transform up-front so all downstream values
+    // live in the `8 − Pt` range (matching the decoder's `sample_bits`).
+    let mut src: [Vec<u32>; 4] = [
+        vec![0u32; w * h],
+        vec![0u32; w * h],
+        vec![0u32; w * h],
+        vec![0u32; w * h],
+    ];
+    for c in 0..4 {
+        let invert_this = invert_all || (invert_k_only && c == 3);
+        for y in 0..h {
+            for x in 0..w {
+                let v = planes[c][y * strides[c] + x] as u32;
+                let v = if invert_this { 255 - v } else { v };
+                src[c][y * w + x] = v >> pt;
+            }
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 4 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    if let Some(tx) = adobe_transform {
+        write_adobe_app14(&mut out, tx);
+    }
+    write_sof11_lossless_multi(&mut out, w as u16, h as u16, 8, 4);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless_multi(&mut out, predictor, 4, point_transform);
+
+    // Default prediction for each component's first sample at scan start and
+    // after each restart interval (§H.1.2.1). Working precision is `8 − Pt`.
+    let sample_bits = 8u32 - pt;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    // Per-component conditioning history feeding `L_Context(Da, Db)` /
+    // `X1_Context(Db)`: `prev_diff[c][x]` is the reduced difference one row
+    // up, `cur_diff[c][x]` one column left in the current row (§H.1.2.3.2).
+    let mut prev_diff: [Vec<i32>; 4] = [vec![0i32; w], vec![0i32; w], vec![0i32; w], vec![0i32; w]];
+    let mut cur_diff: [Vec<i32>; 4] = [vec![0i32; w], vec![0i32; w], vec![0i32; w], vec![0i32; w]];
+    let mut stats: [LosslessStats; 4] = [
+        LosslessStats::new(),
+        LosslessStats::new(),
+        LosslessStats::new(),
+        LosslessStats::new(),
+    ];
+    let mut enc = ArithEncoder::new();
+
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: u32 = 0;
+    let total_mcus: u64 = w as u64 * h as u64;
+    let mut mcu_index: u64 = 0;
+    let mut reset_pred = true;
+    let mut first_line_y = 0usize;
+
+    for y in 0..h {
+        for x in 0..w {
+            // Emit RSTn before the boundary MCU (never after the last MCU —
+            // the decoder expects EOI there per §F.1.1.5.2).
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                mcus_since_restart = 0;
+                for s in stats.iter_mut() {
+                    s.reset();
+                }
+                for r in prev_diff.iter_mut() {
+                    r.fill(0);
+                }
+                for r in cur_diff.iter_mut() {
+                    r.fill(0);
+                }
+                reset_pred = true;
+                first_line_y = y;
+            }
+
+            // Interleaved-MCU order with Hi=Vi=1 across all components: at
+            // each (y, x) position, emit one residual per component in
+            // scan-header (component-id) order.
+            for c in 0..4 {
+                let plane = &src[c];
+                let actual = plane[y * w + x];
+                let pred: u32 = if reset_pred {
+                    origin
+                } else if y == first_line_y {
+                    // First line of the interval uses Ra regardless of selector.
+                    plane[y * w + x - 1]
+                } else if x == 0 {
+                    // Start of a non-first line uses Rb.
+                    plane[(y - 1) * w + x]
+                } else {
+                    let ra = plane[y * w + x - 1];
+                    let rb = plane[(y - 1) * w + x];
+                    let rc = plane[(y - 1) * w + x - 1];
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                        // §H.1 footnote: divide-by-2 is an arithmetic shift.
+                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                        7 => (ra.wrapping_add(rb)) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
+                // Modulo-2^16 difference (§H.1.2.1) reduced to the canonical
+                // -32768..=32767 representative (the ±32768 alias becomes the
+                // last `Sz` decision of Table H.3 inside `encode_lossless_diff`).
+                let dm = (actual.wrapping_sub(pred) & 0xFFFF) as i32;
+                let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
+                let da = if x == 0 { 0 } else { cur_diff[c][x - 1] };
+                let db = prev_diff[c][x];
+                encode_lossless_diff(&mut enc, &mut stats[c], da, db, dm)?;
+                cur_diff[c][x] = dm;
+            }
+
+            reset_pred = false;
+            mcu_index += 1;
+            mcus_since_restart += 1;
+        }
+        std::mem::swap(&mut prev_diff, &mut cur_diff);
+    }
+
+    out.extend_from_slice(&enc.finish());
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Encode three planar 8-bit colour channels as a standalone **multi-component
 /// lossless** JPEG (SOF3, three-component interleaved scan) byte stream.
 ///

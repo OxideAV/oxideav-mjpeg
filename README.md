@@ -263,6 +263,26 @@ other `P` → packed `Rgb48Le`), every predictor, the half-modulus
 `Di = 32768` case, non-zero `Pt`, and per-interval restart re-seeding of
 all three components.
 
+The four-component (CMYK-class) counterpart
+`encode_lossless_arith_jpeg_cmyk(width, height, [c0, c1, c2, c3], strides,
+predictor, adobe_transform)` (plus its `_with_opts(..., restart_interval,
+point_transform)` companion) emits a `SOF11 (Nf = 4, every component
+H = V = 1)` interleaved scan at `P = 8` — the Q-coder counterpart of
+`encode_lossless_jpeg_cmyk`. Each component is modelled independently per
+§H.1.2 (its own statistics area + `L_Context(Da, Db)` / `X1_Context(Db)`
+difference history), and one residual per component is emitted per pixel
+position in scan order into a single arithmetic-coded segment. The
+`adobe_transform` flag matches the Huffman CMYK helpers: `None` writes no
+APP14 (plain "regular" CMYK), `Some(0)` selects Adobe CMYK and inverts
+every sample on the wire before predictive coding, `Some(2)` selects Adobe
+YCCK (interpret the packed input as `[Y, Cb, Cr, K]` and invert only K
+before coding). Decode shape is the same packed `PixelFormat::Cmyk` the
+SOF3 four-component path produces (4 bytes/pixel). Bit-exact for every
+predictor, the half-modulus `Di = 32768` case, non-zero `Pt`, and
+per-interval restart re-seeding of all four components on the no-APP14 /
+Adobe-CMYK paths (YCCK is a lossy interop convention by construction —
+BT.601 YCbCr → RGB → CMY clamps; the K plane round-trips exactly).
+
 ### Lossless (SOF3) RGB / three-component encode
 
 For three-component (R, G, B / or any three independent monochrome
@@ -692,7 +712,8 @@ Encoder:
   every component's predictor to `2^(P − Pt − 1)` per T.81 §H.1.2.1.
 - **SOF11** (lossless, arithmetic-coded) — single-component grayscale
   and three-component interleaved (RGB-class) at any precision
-  `P ∈ 2..=16`, with every Annex H Table H.1 predictor `1..=7`. The
+  `P ∈ 2..=16`, plus four-component interleaved (CMYK-class) at `P = 8`,
+  with every Annex H Table H.1 predictor `1..=7`. The
   Q-coder counterpart of the SOF3 path: the modulo-2^16 prediction
   differences are entropy-coded by the Annex D arithmetic coder under
   the §H.1.2.3 two-dimensional statistical model (each component
@@ -700,7 +721,11 @@ Encoder:
   `(L, U) = (0, 1)`). Bit-exact for every predictor, the half-modulus
   `Di = 32768` case, non-zero point transform, and per-interval restart
   re-seeding via `encode_lossless_arith_jpeg_grayscale_with_opts` /
-  `encode_lossless_arith_jpeg_rgb_with_opts`.
+  `encode_lossless_arith_jpeg_rgb_with_opts` /
+  `encode_lossless_arith_jpeg_cmyk_with_opts`. The four-component path
+  honours the Adobe APP14 colour-transform flag identically to the
+  Huffman SOF3 CMYK encoder (no-APP14 / Adobe-CMYK round-trips are
+  bit-exact; YCCK is a lossy interop convention).
 - 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths, plus single-
   component `Gray8` and packed `Rgb24` on the baseline SOF0 path;
   `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless

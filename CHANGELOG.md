@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lossless arithmetic (SOF11) four-component (CMYK-class) encode (T.81
+  Annex H + §H.1.2.3)** — `encoder::encode_lossless_arith_jpeg_cmyk(width,
+  height, planes, strides, predictor, adobe_transform)` and its
+  `_with_opts(..., restart_interval, point_transform)` companion emit a
+  standalone four-component interleaved SOF11 (lossless, arithmetic-coded)
+  JPEG at `P = 8`. This is the Q-coder counterpart of the existing Huffman
+  `encode_lossless_jpeg_cmyk` and the four-component extension of
+  `encode_lossless_arith_jpeg_rgb`: each component is modelled independently
+  (§H.1.2) with its own `LosslessStats` area and `L_Context(Da, Db)` /
+  `X1_Context(Db)` difference history (§H.1.2.3.2), while a single
+  arithmetic-coded segment carries one residual per component per pixel
+  position in scan-component order (each component declared `H_i = V_i = 1`).
+  The Adobe APP14 colour-transform flag is honoured identically to the
+  Huffman CMYK helper — `None` (no APP14, plain CMYK), `Some(0)` (Adobe
+  CMYK, samples inverted on the wire), `Some(2)` (Adobe YCCK, K inverted) —
+  with the segment emitted before SOF11 so the decoder's existing
+  four-component un-inversion / YCCK → CMYK path applies on output. Output
+  decodes to packed `PixelFormat::Cmyk` (4 bytes/pixel), bit-exact on the
+  no-APP14 / Adobe-CMYK paths for every predictor, the half-modulus
+  `Di = 32768` case (§H.1.2.2), non-zero point transforms, and
+  restart-interval emission (each `RSTn` boundary flushes the Q-coder,
+  cycles `RST0..=RST7` modulo 8, and re-seeds every component's statistical
+  model + difference history + predictor to `2^(P − Pt − 1)`, §H.1.1 /
+  §H.1.2.3.4). The matching SOF11 four-component decode path already
+  existed. Covered by six new round-trips in `tests/lossless_roundtrip.rs`.
+
 - **Lossless arithmetic (SOF11) three-component encode (T.81 Annex H +
   §H.1.2.3)** — `encoder::encode_lossless_arith_jpeg_rgb(width, height,
   planes, strides, precision, predictor)` and its

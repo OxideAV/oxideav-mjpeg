@@ -14,6 +14,7 @@
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_mjpeg::encoder::{
     encode_lossless_arith_jpeg_grayscale, encode_lossless_arith_jpeg_grayscale_with_opts,
+    encode_lossless_arith_jpeg_rgb, encode_lossless_arith_jpeg_rgb_with_opts,
     encode_lossless_jpeg_cmyk, encode_lossless_jpeg_cmyk_with_opts, encode_lossless_jpeg_grayscale,
     encode_lossless_jpeg_grayscale_with_opts, encode_lossless_jpeg_rgb,
     encode_lossless_jpeg_rgb_with_opts,
@@ -1380,4 +1381,261 @@ fn lossless_arith_rejects_invalid_params() {
         encode_lossless_arith_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 1, 0, 8)
             .is_err()
     );
+}
+
+// ---- Lossless arithmetic (SOF11) three-component roundtrips --------------
+
+/// Every Annex H Table H.1 predictor must round-trip bit-exact through the
+/// SOF11 three-component arithmetic lossless encoder + decoder at 8-bit
+/// precision (decode lands on packed `Rgb24`). The three input planes are
+/// decorrelated so per-component statistics / history cross-talk would show
+/// up as a mismatch.
+#[test]
+fn lossless_arith_rgb_8bit_every_predictor_is_bit_exact() {
+    let w = 24u32;
+    let h = 16u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_arith_jpeg_rgb(
+            w,
+            h,
+            [&planes[0], &planes[1], &planes[2]],
+            strides,
+            8,
+            predictor,
+        )
+        .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        // SOF11 marker (0xFF 0xCB) must be present, SOF3 (0xFF 0xC3) must not.
+        assert!(
+            jpeg.windows(2).any(|x| x == [0xFF, 0xCB]),
+            "predictor={predictor}: SOF11 marker missing"
+        );
+        assert!(
+            !jpeg.windows(2).any(|x| x == [0xFF, 0xC3]),
+            "predictor={predictor}: unexpected SOF3 marker"
+        );
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(
+            v.planes.len(),
+            1,
+            "predictor={predictor}: expected packed Rgb24"
+        );
+        let stride = v.planes[0].stride;
+        assert_eq!(stride, (w as usize) * 3, "predictor={predictor}");
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let got_r = v.planes[0].data[j * stride + i * 3];
+                let got_g = v.planes[0].data[j * stride + i * 3 + 1];
+                let got_b = v.planes[0].data[j * stride + i * 3 + 2];
+                assert_eq!(
+                    got_r,
+                    planes[0][j * w as usize + i],
+                    "predictor={predictor} R mismatch at ({i},{j})"
+                );
+                assert_eq!(
+                    got_g,
+                    planes[1][j * w as usize + i],
+                    "predictor={predictor} G mismatch at ({i},{j})"
+                );
+                assert_eq!(
+                    got_b,
+                    planes[2][j * w as usize + i],
+                    "predictor={predictor} B mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+}
+
+/// P = 10 three-component arithmetic lossless decodes to planar `Gbrp10Le`
+/// (three 16-bit-storage planes, caller plane-order preserved). Exercises
+/// the wide-precision magnitude ladder on the Q-coder path.
+#[test]
+fn lossless_arith_rgb_10bit_predictor_4_planar_gbrp10() {
+    let w = 12u32;
+    let h = 8u32;
+    let precision = 10u8;
+    let planes = mk_rgb_wide(w as usize, h as usize, precision);
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    let jpeg = encode_lossless_arith_jpeg_rgb(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        precision,
+        4,
+    )
+    .expect("encode 10-bit 3-component arith");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 3, "expected 3 Gbrp10Le planes");
+    for ci in 0..3 {
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let want = read_le_u16(&planes[ci], (w as usize) * 2, i, j);
+                let got = read_le_u16(&v.planes[ci].data, v.planes[ci].stride, i, j);
+                assert_eq!(got, want, "comp={ci} mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// P = 16 three-component arithmetic lossless decodes to packed `Rgb48Le`.
+/// Exercises the half-modulus `Di = 32768` case (§H.1.2.2) per component.
+#[test]
+fn lossless_arith_rgb_16bit_packed_rgb48() {
+    let w = 10u32;
+    let h = 6u32;
+    let precision = 16u8;
+    let mut planes: [Vec<u8>; 3] = [
+        vec![0u8; (w * h * 2) as usize],
+        vec![0u8; (w * h * 2) as usize],
+        vec![0u8; (w * h * 2) as usize],
+    ];
+    for c in 0..3 {
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                // Alternate 0 / 0x8000 per component (offset by c) to force
+                // the |Di| = 32768 boundary through every plane.
+                let v: u16 = if (i + j + c) % 2 == 0 { 0 } else { 0x8000 };
+                let p = (j * w as usize + i) * 2;
+                planes[c][p] = (v & 0xFF) as u8;
+                planes[c][p + 1] = (v >> 8) as u8;
+            }
+        }
+    }
+    let strides = [(w as usize) * 2, (w as usize) * 2, (w as usize) * 2];
+    let jpeg = encode_lossless_arith_jpeg_rgb(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        precision,
+        1,
+    )
+    .expect("encode 16-bit 3-component arith");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 1, "expected packed Rgb48Le");
+    let stride = v.planes[0].stride;
+    assert_eq!(stride, (w as usize) * 6);
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for c in 0..3 {
+                let want = read_le_u16(&planes[c], (w as usize) * 2, i, j);
+                let lo = v.planes[0].data[j * stride + i * 6 + c * 2] as u16;
+                let hi = v.planes[0].data[j * stride + i * 6 + c * 2 + 1] as u16;
+                let got = lo | (hi << 8);
+                assert_eq!(got, want, "comp={c} mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// Restart-interval emission on the arithmetic three-component path: every
+/// interval flushes the Q-coder, writes an `RSTn`, and re-seeds all three
+/// components' model + history + predictor. The stream must stay bit-exact
+/// and carry at least one `RSTn`.
+#[test]
+fn lossless_arith_rgb_8bit_restart_interval_is_bit_exact() {
+    let w = 20u32;
+    let h = 12u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    // 7 MCUs per interval → boundaries fall mid-row, exercising the
+    // per-interval first-line / origin re-seed logic for all components.
+    let jpeg = encode_lossless_arith_jpeg_rgb_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        8,
+        2,
+        7,
+        0,
+    )
+    .expect("encode arith RGB lossless with restarts");
+    assert!(
+        (0xD0u8..=0xD7).any(|rst| jpeg.windows(2).any(|x| x == [0xFF, rst])),
+        "expected at least one RSTn marker"
+    );
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            assert_eq!(
+                v.planes[0].data[j * stride + i * 3],
+                planes[0][j * w as usize + i],
+                "R restart mismatch at ({i},{j})"
+            );
+            assert_eq!(
+                v.planes[0].data[j * stride + i * 3 + 1],
+                planes[1][j * w as usize + i],
+                "G restart mismatch at ({i},{j})"
+            );
+            assert_eq!(
+                v.planes[0].data[j * stride + i * 3 + 2],
+                planes[2][j * w as usize + i],
+                "B restart mismatch at ({i},{j})"
+            );
+        }
+    }
+}
+
+/// Non-zero point transform on the three-component arithmetic path: the low
+/// `Pt` bits are discarded on both sides, so each reconstructed sample
+/// equals `(input >> Pt) << Pt`.
+#[test]
+fn lossless_arith_rgb_8bit_point_transform_truncates_low_bits() {
+    let w = 16u32;
+    let h = 10u32;
+    let pt = 2u8;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let strides = [w as usize, w as usize, w as usize];
+    let jpeg = encode_lossless_arith_jpeg_rgb_with_opts(
+        w,
+        h,
+        [&planes[0], &planes[1], &planes[2]],
+        strides,
+        8,
+        1,
+        0,
+        pt,
+    )
+    .expect("encode arith RGB lossless with Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            for c in 0..3 {
+                let got = v.planes[0].data[j * stride + i * 3 + c];
+                let want = (planes[c][j * w as usize + i] >> pt) << pt;
+                assert_eq!(got, want, "comp={c} Pt mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// Input-validation: out-of-range precision / predictor / Pt and an
+/// oversized sample are all rejected up front.
+#[test]
+fn lossless_arith_rgb_rejects_invalid_params() {
+    let w = 8u32;
+    let h = 8u32;
+    let planes = mk_rgb_8bit(w as usize, h as usize);
+    let p: [&[u8]; 3] = [&planes[0], &planes[1], &planes[2]];
+    let s = [w as usize, w as usize, w as usize];
+    // precision out of range
+    assert!(encode_lossless_arith_jpeg_rgb(w, h, p, s, 17, 1).is_err());
+    assert!(encode_lossless_arith_jpeg_rgb(w, h, p, s, 1, 1).is_err());
+    // predictor out of range
+    assert!(encode_lossless_arith_jpeg_rgb(w, h, p, s, 8, 0).is_err());
+    assert!(encode_lossless_arith_jpeg_rgb(w, h, p, s, 8, 8).is_err());
+    // Pt >= precision
+    assert!(encode_lossless_arith_jpeg_rgb_with_opts(w, h, p, s, 8, 1, 0, 8).is_err());
+    // oversized sample for the declared precision
+    let mut r = vec![0u8; (w * h) as usize];
+    r[0] = 200; // > 2^4 - 1
+    let g = vec![0u8; (w * h) as usize];
+    let b = vec![0u8; (w * h) as usize];
+    assert!(encode_lossless_arith_jpeg_rgb(w, h, [&r, &g, &b], s, 4, 1).is_err());
 }

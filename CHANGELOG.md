@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lossless arithmetic (SOF11) three-component encode (T.81 Annex H +
+  §H.1.2.3)** — `encoder::encode_lossless_arith_jpeg_rgb(width, height,
+  planes, strides, precision, predictor)` and its
+  `_with_opts(..., restart_interval, point_transform)` companion emit a
+  standalone three-component interleaved SOF11 (lossless, arithmetic-coded)
+  JPEG. This is the Q-coder counterpart of the existing Huffman
+  `encode_lossless_jpeg_rgb` and the multi-component extension of the
+  single-component `encode_lossless_arith_jpeg_grayscale`: each component is
+  modelled independently (§H.1.2) with its own `LosslessStats` area and its
+  own `L_Context(Da, Db)` / `X1_Context(Db)` difference history (§H.1.2.3.2),
+  while a single arithmetic-coded entropy segment carries one residual per
+  component per pixel position in scan-component order (each component
+  declared `H_i = V_i = 1`, so a lossless MCU is one pixel). The Annex H
+  Table H.1 predictors `1..=7` are applied per component over that
+  component's own `Ra` / `Rb` / `Rc`; no DAC segment is emitted so the
+  decoder uses the default conditioning bounds `(L, U) = (0, 1)`
+  (§H.1.2.3.3). Output is bit-exact for every precision `P ∈ 2..=16`
+  (decode maps `P = 8` → packed `Rgb24`, `P ∈ {10, 12, 14}` → planar
+  `Gbrp*Le`, every other `P` → packed `Rgb48Le`), every predictor, the
+  half-modulus `Di = 32768` case (§H.1.2.2), non-zero point transforms, and
+  restart-interval emission (each `RSTn` boundary flushes the Q-coder,
+  byte-aligns, cycles `RST0..=RST7` modulo 8, and re-seeds every component's
+  statistical model + difference history + predictor to the scan-origin
+  default `2^(P − Pt − 1)`, §H.1.1 / §H.1.2.3.4). The matching SOF11
+  multi-component decode path already existed. Covered by six new
+  round-trips in `tests/lossless_roundtrip.rs`.
+
 - **Lossless arithmetic (SOF11) grayscale encode (T.81 Annex H + §H.1.2.3)** —
   `encoder::encode_lossless_arith_jpeg_grayscale(width, height, samples,
   stride, precision, predictor)` and its

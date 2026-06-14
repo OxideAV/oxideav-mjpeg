@@ -248,6 +248,21 @@ non-zero point transform `Pt` (the low `Pt` bits are discarded on both
 sides). The decoder has supported SOF11 since round 0.1.x, so these
 encode entry points round-trip end-to-end (`tests/lossless_roundtrip.rs`).
 
+The three-component (RGB-class) counterpart
+`encode_lossless_arith_jpeg_rgb(width, height, [c0, c1, c2], strides,
+precision, predictor)` (plus its `_with_opts(..., restart_interval,
+point_transform)` companion) emits a `SOF11 (Nf = 3, every component
+H = V = 1)` interleaved scan — the Q-coder counterpart of
+`encode_lossless_jpeg_rgb`. Each component is modelled independently per
+§H.1.2 (its own statistics area + `L_Context(Da, Db)` /
+`X1_Context(Db)` difference history), and one residual per component is
+emitted per pixel position in scan order into a single arithmetic-coded
+segment. Bit-exact for every precision `P ∈ 2..=16` (decode shape:
+`P = 8` → packed `Rgb24`, `P ∈ {10, 12, 14}` → planar `Gbrp*Le`, every
+other `P` → packed `Rgb48Le`), every predictor, the half-modulus
+`Di = 32768` case, non-zero `Pt`, and per-interval restart re-seeding of
+all three components.
+
 ### Lossless (SOF3) RGB / three-component encode
 
 For three-component (R, G, B / or any three independent monochrome
@@ -675,6 +690,17 @@ Encoder:
   `encode_lossless_jpeg_rgb_with_opts` /
   `encode_lossless_jpeg_cmyk_with_opts`. Restart boundaries re-seed
   every component's predictor to `2^(P − Pt − 1)` per T.81 §H.1.2.1.
+- **SOF11** (lossless, arithmetic-coded) — single-component grayscale
+  and three-component interleaved (RGB-class) at any precision
+  `P ∈ 2..=16`, with every Annex H Table H.1 predictor `1..=7`. The
+  Q-coder counterpart of the SOF3 path: the modulo-2^16 prediction
+  differences are entropy-coded by the Annex D arithmetic coder under
+  the §H.1.2.3 two-dimensional statistical model (each component
+  modelled independently, no DAC segment → default conditioning
+  `(L, U) = (0, 1)`). Bit-exact for every predictor, the half-modulus
+  `Di = 32768` case, non-zero point transform, and per-interval restart
+  re-seeding via `encode_lossless_arith_jpeg_grayscale_with_opts` /
+  `encode_lossless_arith_jpeg_rgb_with_opts`.
 - 4:4:4 / 4:2:2 / 4:2:0 YUV input on the lossy paths, plus single-
   component `Gray8` and packed `Rgb24` on the baseline SOF0 path;
   `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` input on the lossless

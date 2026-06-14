@@ -3607,6 +3607,26 @@ fn write_sof11_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u
     write_length_prefix(out, markers::SOF11, &payload);
 }
 
+/// Write a SOF11 segment for an `nf`-component lossless, arithmetic-coded
+/// frame with every component declared `H_i = V_i = 1` (the interleaved
+/// layout for multi-component lossless per T.81 §H.1.2). Component
+/// identifiers start at 1 and increment by 1. This is the arithmetic-coder
+/// counterpart of [`write_sof_lossless_multi`] (which writes SOF3).
+fn write_sof11_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precision: u8, nf: u8) {
+    debug_assert!((1..=4).contains(&nf));
+    let mut payload = Vec::with_capacity(8 + 3 * nf as usize);
+    payload.push(precision);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(nf);
+    for ci in 1..=nf {
+        payload.push(ci); // component identifier
+        payload.push(0x11); // H=1 V=1
+        payload.push(0); // Tq (ignored for lossless)
+    }
+    write_length_prefix(out, markers::SOF11, &payload);
+}
+
 /// Encode a single-component grayscale image as a standalone **lossless,
 /// arithmetic-coded** JPEG (SOF11) byte stream — the entropy-coder
 /// counterpart of [`encode_lossless_jpeg_grayscale`].
@@ -3833,6 +3853,285 @@ pub fn encode_lossless_arith_jpeg_grayscale_with_opts(
             reset_pred = false;
             sample_index += 1;
             samples_since_restart += 1;
+        }
+        std::mem::swap(&mut prev_diff, &mut cur_diff);
+    }
+
+    out.extend_from_slice(&enc.finish());
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// Encode three planar colour channels as a standalone **multi-component
+/// lossless, arithmetic-coded** JPEG (SOF11, three-component interleaved
+/// scan) byte stream — the Q-coder counterpart of
+/// [`encode_lossless_jpeg_rgb`].
+///
+/// The spatial model is identical to the Huffman three-component path (the
+/// Annex H Table H.1 predictors `1..=7` applied independently per component
+/// over each component's own `Ra` / `Rb` / `Rc`), but every prediction
+/// difference is coded with the Q-coder arithmetic statistical model of
+/// §H.1.2.3 (Table H.3 — `L_Context(Da, Db)` / `X1_Context(Db)`
+/// conditioning over each component's neighbouring differences) rather than
+/// a Huffman magnitude category. Each component is modelled independently
+/// (T.81 §H.1.2: "each component in the scan is modeled independently"), so
+/// the encoder keeps one statistics area and one difference-history pair per
+/// component while sharing a single arithmetic-coded entropy segment — one
+/// residual per component is emitted per pixel position in scan-component
+/// order (each component declared `H_i = V_i = 1`, so a lossless MCU is one
+/// pixel). No DAC segment is emitted, so the decoder applies the default
+/// conditioning bounds `(L, U) = (0, 1)` per §H.1.2.3.3.
+///
+/// * `planes` — three plane slices in `[ch0, ch1, ch2]` order. The encoder
+///   is colour-agnostic: component IDs in the bitstream are 1, 2, 3 in that
+///   order and the decoder hands the planes back in the same scan order
+///   (see [`encode_lossless_jpeg_rgb`] for the per-precision decoder output
+///   shape: `P = 8` → packed `Rgb24`, `P ∈ {10, 12, 14}` → planar
+///   `Gbrp*Le`, every other `P` → packed `Rgb48Le`).
+/// * `strides` — bytes per row per plane (`width` for `P ≤ 8`,
+///   `width * 2` for the little-endian 16-bit wider precisions).
+/// * `precision` — input bits per sample, in `2..=16`.
+/// * `predictor` — selector value `1..=7` from Table H.1, shared by every
+///   component (T.81 §B.2.3: the scan-header predictor selector applies to
+///   the whole scan).
+///
+/// Output is bit-exact for every supported precision and predictor,
+/// including the half-modulus `Di = 32768` case (§H.1.2.2). Point transform
+/// is fixed at `Pt = 0` and no restart markers are emitted; for non-zero
+/// point transform or restart-marker emission see
+/// [`encode_lossless_arith_jpeg_rgb_with_opts`].
+pub fn encode_lossless_arith_jpeg_rgb(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    precision: u8,
+    predictor: u8,
+) -> Result<Vec<u8>> {
+    encode_lossless_arith_jpeg_rgb_with_opts(
+        width, height, planes, strides, precision, predictor, 0, 0,
+    )
+}
+
+/// Like [`encode_lossless_arith_jpeg_rgb`] but also accepts a
+/// `restart_interval` (in MCUs — and a 3-component lossless MCU is exactly
+/// one pixel position, T.81 §H.1.2 with `H_i = V_i = 1`) and a
+/// `point_transform` (`Pt`, the SOS `Al` field's low nibble). Both
+/// default-to-zero options reproduce the historical zero-restart, zero-`Pt`
+/// output.
+///
+/// * `point_transform` — `0..=15`, strictly less than `precision`. With
+///   `Pt > 0` every input sample is right-shifted by `Pt` before predictive
+///   coding; the decoder left-shifts the reconstructed sample back by the
+///   same `Pt` on output (the low `Pt` bits are lost).
+/// * `restart_interval` — MCUs (= pixel positions) between successive
+///   `RSTn` markers (`0` disables restart emission). On each boundary the
+///   encoder flushes the arithmetic segment, writes a fresh `RST0..=RST7`
+///   marker (cycling modulo 8 per §F.1.1.5.2), and re-initialises **every**
+///   component's statistical model, its neighbour-difference history, and
+///   its predictor to the scan-origin default `2^(precision − Pt − 1)`
+///   (§H.1.1 / §H.1.2.3.4 — each interval restarts with the same defaults
+///   as the image start, independently per component).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_arith_jpeg_rgb_with_opts(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    precision: u8,
+    predictor: u8,
+    restart_interval: u16,
+    point_transform: u8,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "lossless-arith RGB encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless-arith RGB encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= precision {
+        return Err(Error::invalid(format!(
+            "lossless-arith RGB encoder: point_transform {point_transform} must be < precision {precision}"
+        )));
+    }
+    if point_transform > 15 {
+        return Err(Error::invalid(format!(
+            "lossless-arith RGB encoder: point_transform {point_transform} > 15 (SOS Al is 4 bits)"
+        )));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid(
+            "lossless-arith RGB encoder: zero-size image",
+        ));
+    }
+    let bytes_per_sample = if precision <= 8 { 1 } else { 2 };
+    for c in 0..3 {
+        if strides[c] < w * bytes_per_sample {
+            return Err(Error::invalid(
+                "lossless-arith RGB encoder: stride smaller than width*bytes_per_sample",
+            ));
+        }
+        if planes[c].len() < strides[c] * h {
+            return Err(Error::invalid(
+                "lossless-arith RGB encoder: plane shorter than stride*h",
+            ));
+        }
+    }
+
+    // Decode each plane into a flat u32 buffer once and apply the point
+    // transform up-front so all downstream values live in the
+    // `precision - Pt` range (matching the decoder's `sample_bits`).
+    let pt = point_transform as u32;
+    let max_sample: u32 = (1u32 << precision) - 1;
+    let mut src: [Vec<u32>; 3] = [vec![0u32; w * h], vec![0u32; w * h], vec![0u32; w * h]];
+    if precision <= 8 {
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let v = planes[c][y * strides[c] + x] as u32;
+                    if v > max_sample {
+                        return Err(Error::invalid(format!(
+                            "lossless-arith RGB encoder: sample {v} in plane {c} exceeds precision-{precision} max {max_sample}"
+                        )));
+                    }
+                    src[c][y * w + x] = v >> pt;
+                }
+            }
+        }
+    } else {
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let lo = planes[c][y * strides[c] + x * 2] as u32;
+                    let hi = planes[c][y * strides[c] + x * 2 + 1] as u32;
+                    let v = lo | (hi << 8);
+                    if v > max_sample {
+                        return Err(Error::invalid(format!(
+                            "lossless-arith RGB encoder: sample {v} in plane {c} exceeds precision-{precision} max {max_sample}"
+                        )));
+                    }
+                    src[c][y * w + x] = v >> pt;
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 3 * 2 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_sof11_lossless_multi(&mut out, w as u16, h as u16, precision, 3);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+
+    // Default prediction for each component's first sample at scan start and
+    // after each restart interval (§H.1.2.1). The working precision is
+    // `precision − Pt`.
+    let sample_bits = precision as u32 - pt;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    // Per-component conditioning history feeding `L_Context(Da, Db)` /
+    // `X1_Context(Db)`: `prev_diff[c][x]` is the reduced difference one row
+    // up, `cur_diff[c][x]` one column left in the current row (§H.1.2.3.2).
+    let mut prev_diff: [Vec<i32>; 3] = [vec![0i32; w], vec![0i32; w], vec![0i32; w]];
+    let mut cur_diff: [Vec<i32>; 3] = [vec![0i32; w], vec![0i32; w], vec![0i32; w]];
+    let mut stats: [LosslessStats; 3] = [
+        LosslessStats::new(),
+        LosslessStats::new(),
+        LosslessStats::new(),
+    ];
+    let mut enc = ArithEncoder::new();
+
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: u32 = 0;
+    let total_mcus: u64 = w as u64 * h as u64;
+    let mut mcu_index: u64 = 0;
+    // `reset_pred` forces `origin` at scan start and at the first MCU of
+    // every restart interval; `first_line_y` tracks the row where the
+    // current interval began so the "first line uses Ra" rule (§H.1.2.1)
+    // applies per-interval, not just to image row 0.
+    let mut reset_pred = true;
+    let mut first_line_y = 0usize;
+
+    for y in 0..h {
+        for x in 0..w {
+            // Emit RSTn before the boundary MCU (never after the last MCU —
+            // the decoder expects EOI there per §F.1.1.5.2).
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                mcus_since_restart = 0;
+                for s in stats.iter_mut() {
+                    s.reset();
+                }
+                for r in prev_diff.iter_mut() {
+                    r.fill(0);
+                }
+                for r in cur_diff.iter_mut() {
+                    r.fill(0);
+                }
+                reset_pred = true;
+                first_line_y = y;
+            }
+
+            // Interleaved-MCU order with Hi=Vi=1 across all components: at
+            // each (y, x) position, emit one residual for component 0, then
+            // 1, then 2 (component IDs in scan-header order).
+            for c in 0..3 {
+                let plane = &src[c];
+                let actual = plane[y * w + x];
+                let pred: u32 = if reset_pred {
+                    origin
+                } else if y == first_line_y {
+                    // First line of the interval uses Ra regardless of selector.
+                    plane[y * w + x - 1]
+                } else if x == 0 {
+                    // Start of a non-first line uses Rb.
+                    plane[(y - 1) * w + x]
+                } else {
+                    let ra = plane[y * w + x - 1];
+                    let rb = plane[(y - 1) * w + x];
+                    let rc = plane[(y - 1) * w + x - 1];
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                        // §H.1 footnote: divide-by-2 is an arithmetic shift.
+                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                        7 => (ra.wrapping_add(rb)) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
+                // Modulo-2^16 difference (§H.1.2.1) reduced to the canonical
+                // -32768..=32767 representative (the ±32768 alias becomes the
+                // last `Sz` decision of Table H.3 inside `encode_lossless_diff`).
+                let dm = (actual.wrapping_sub(pred) & 0xFFFF) as i32;
+                let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
+                let da = if x == 0 { 0 } else { cur_diff[c][x - 1] };
+                let db = prev_diff[c][x];
+                encode_lossless_diff(&mut enc, &mut stats[c], da, db, dm)?;
+                cur_diff[c][x] = dm;
+            }
+
+            reset_pred = false;
+            mcu_index += 1;
+            mcus_since_restart += 1;
         }
         std::mem::swap(&mut prev_diff, &mut cur_diff);
     }

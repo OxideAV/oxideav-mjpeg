@@ -13,6 +13,7 @@
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_mjpeg::encoder::{
+    encode_lossless_arith_jpeg_grayscale, encode_lossless_arith_jpeg_grayscale_with_opts,
     encode_lossless_jpeg_cmyk, encode_lossless_jpeg_cmyk_with_opts, encode_lossless_jpeg_grayscale,
     encode_lossless_jpeg_grayscale_with_opts, encode_lossless_jpeg_rgb,
     encode_lossless_jpeg_rgb_with_opts,
@@ -1214,4 +1215,169 @@ fn lossless_cmyk_rejects_invalid_adobe_transform() {
         );
         assert!(err.is_err(), "expected reject for adobe_transform={bad}");
     }
+}
+
+// ---- Lossless arithmetic (SOF11) grayscale roundtrips --------------------
+
+/// Every Annex H Table H.1 predictor must round-trip bit-exact through the
+/// SOF11 arithmetic lossless encoder + decoder at 8-bit precision.
+#[test]
+fn lossless_arith_8bit_every_predictor_is_bit_exact() {
+    let w = 24u32;
+    let h = 16u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    for predictor in 1u8..=7 {
+        let jpeg = encode_lossless_arith_jpeg_grayscale(w, h, &samples, w as usize, 8, predictor)
+            .unwrap_or_else(|e| panic!("encode predictor={predictor}: {e:?}"));
+        // SOF11 marker (0xFF 0xCB) must be present, and SOF3 must NOT.
+        assert!(
+            jpeg.windows(2).any(|x| x == [0xFF, 0xCB]),
+            "predictor={predictor}: SOF11 marker missing"
+        );
+        assert!(
+            !jpeg.windows(2).any(|x| x == [0xFF, 0xC3]),
+            "predictor={predictor}: unexpected SOF3 marker"
+        );
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(v.planes.len(), 1, "predictor={predictor}");
+        let stride = v.planes[0].stride;
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let got = v.planes[0].data[j * stride + i];
+                let want = samples[j * w as usize + i];
+                assert_eq!(got, want, "predictor={predictor} mismatch at ({i},{j})");
+            }
+        }
+    }
+}
+
+/// 12-bit precision through the arithmetic magnitude ladder.
+#[test]
+fn lossless_arith_12bit_predictor_1_is_bit_exact() {
+    let w = 16u32;
+    let h = 12u32;
+    let precision = 12u8;
+    let bytes = mk_samples_wide(w as usize, h as usize, precision);
+    let jpeg = encode_lossless_arith_jpeg_grayscale(w, h, &bytes, (w as usize) * 2, precision, 1)
+        .expect("encode 12-bit arith lossless");
+    let v = decode_to_frame(jpeg, w, h);
+    assert_eq!(v.planes.len(), 1);
+    let stride = v.planes[0].stride;
+    assert_eq!(
+        stride,
+        (w as usize) * 2,
+        "expected 16-bit-per-sample stride"
+    );
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let lo_in = bytes[(j * w as usize + i) * 2] as u16;
+            let hi_in = bytes[(j * w as usize + i) * 2 + 1] as u16;
+            let want = lo_in | (hi_in << 8);
+            let lo = v.planes[0].data[j * stride + i * 2] as u16;
+            let hi = v.planes[0].data[j * stride + i * 2 + 1] as u16;
+            let got = lo | (hi << 8);
+            assert_eq!(got, want, "12-bit arith mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// 16-bit precision exercises the `Sz`-capped half-modulus `Di = 32768`
+/// case (Annex H.1.2.2) on the arithmetic path.
+#[test]
+fn lossless_arith_16bit_predictor_4_is_bit_exact() {
+    let w = 16u32;
+    let h = 8u32;
+    let precision = 16u8;
+    let mut bytes = vec![0u8; (w * h * 2) as usize];
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let v: u16 = if (i + j) % 2 == 0 { 0 } else { 0x8000 };
+            bytes[(j * w as usize + i) * 2] = (v & 0xFF) as u8;
+            bytes[(j * w as usize + i) * 2 + 1] = (v >> 8) as u8;
+        }
+    }
+    let jpeg = encode_lossless_arith_jpeg_grayscale(w, h, &bytes, (w as usize) * 2, precision, 4)
+        .expect("encode 16-bit arith lossless");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let lo_in = bytes[(j * w as usize + i) * 2] as u16;
+            let hi_in = bytes[(j * w as usize + i) * 2 + 1] as u16;
+            let want = lo_in | (hi_in << 8);
+            let lo = v.planes[0].data[j * stride + i * 2] as u16;
+            let hi = v.planes[0].data[j * stride + i * 2 + 1] as u16;
+            let got = lo | (hi << 8);
+            assert_eq!(got, want, "16-bit arith mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// Restart-interval emission on the arithmetic path: every interval flushes
+/// the Q-coder, writes an `RSTn`, and re-seeds the model + predictor. The
+/// stream must still be bit-exact and must carry at least one `RSTn`.
+#[test]
+fn lossless_arith_8bit_restart_interval_is_bit_exact() {
+    let w = 20u32;
+    let h = 12u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    // 7 samples per interval → boundaries fall mid-row, exercising the
+    // per-interval first-line / origin re-seed logic.
+    let jpeg =
+        encode_lossless_arith_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 2, 7, 0)
+            .expect("encode arith lossless with restarts");
+    assert!(
+        (0xD0u8..=0xD7).any(|rst| jpeg.windows(2).any(|x| x == [0xFF, rst])),
+        "expected at least one RSTn marker"
+    );
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let got = v.planes[0].data[j * stride + i];
+            let want = samples[j * w as usize + i];
+            assert_eq!(got, want, "restart mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// Non-zero point transform: the low `Pt` bits are discarded on both sides,
+/// so the reconstructed sample equals `(input >> Pt) << Pt`.
+#[test]
+fn lossless_arith_8bit_point_transform_truncates_low_bits() {
+    let w = 16u32;
+    let h = 10u32;
+    let pt = 2u8;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    let jpeg =
+        encode_lossless_arith_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 1, 0, pt)
+            .expect("encode arith lossless with Pt");
+    let v = decode_to_frame(jpeg, w, h);
+    let stride = v.planes[0].stride;
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let got = v.planes[0].data[j * stride + i];
+            let want = (samples[j * w as usize + i] >> pt) << pt;
+            assert_eq!(got, want, "Pt mismatch at ({i},{j})");
+        }
+    }
+}
+
+/// Input-validation: out-of-range precision / predictor / Pt are rejected.
+#[test]
+fn lossless_arith_rejects_invalid_params() {
+    let w = 8u32;
+    let h = 8u32;
+    let samples = mk_samples_8bit(w as usize, h as usize);
+    // precision out of range
+    assert!(encode_lossless_arith_jpeg_grayscale(w, h, &samples, w as usize, 17, 1).is_err());
+    assert!(encode_lossless_arith_jpeg_grayscale(w, h, &samples, w as usize, 1, 1).is_err());
+    // predictor out of range
+    assert!(encode_lossless_arith_jpeg_grayscale(w, h, &samples, w as usize, 8, 0).is_err());
+    assert!(encode_lossless_arith_jpeg_grayscale(w, h, &samples, w as usize, 8, 8).is_err());
+    // Pt >= precision
+    assert!(
+        encode_lossless_arith_jpeg_grayscale_with_opts(w, h, &samples, w as usize, 8, 1, 0, 8)
+            .is_err()
+    );
 }

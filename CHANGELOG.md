@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lossless arithmetic (SOF11) grayscale encode (T.81 Annex H + §H.1.2.3)** —
+  `encoder::encode_lossless_arith_jpeg_grayscale(width, height, samples,
+  stride, precision, predictor)` and its
+  `_with_opts(..., restart_interval, point_transform)` companion emit a
+  standalone single-component SOF11 (lossless, arithmetic-coded) JPEG.
+  The spatial model reuses the Annex H Table H.1 predictors `1..=7` over
+  `Ra` / `Rb` / `Rc`, but each prediction difference is coded with the
+  Q-coder arithmetic statistical model of §H.1.2.3 (Table H.3 —
+  `L_Context(Da, Db)` / `X1_Context(Db)` conditioning over neighbouring
+  differences) rather than a Huffman magnitude category. No DAC segment
+  is emitted, so the decoder applies the default conditioning bounds
+  `(L, U) = (0, 1)` per §H.1.2.3.3. Output is bit-exact for every
+  precision `P ∈ 2..=16`, every predictor, the half-modulus
+  `Di = 32768` case (§H.1.2.2), non-zero point transforms, and
+  restart-interval emission (each `RSTn` boundary flushes the Q-coder,
+  byte-aligns, cycles `RST0..=RST7` modulo 8, and re-seeds the
+  statistical model + difference history + predictor to the scan-origin
+  default `2^(P − Pt − 1)`, §H.1.1 / §H.1.2.3.4). This is the
+  encoder-side counterpart to the existing SOF11 decode path and the
+  first arithmetic-coded entry point on the encoder side. Covered by
+  six new round-trips in `tests/lossless_roundtrip.rs`.
+
 - **DNL (Define Number of Lines) decode support (T.81 §B.2.2 / §B.2.5)** —
   JPEG frames may code the number of lines `Y = 0` in the SOF header, in
   which case the real line count is supplied by a mandatory DNL segment

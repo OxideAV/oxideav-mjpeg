@@ -215,6 +215,39 @@ enc.send_frame(&frame)?;
 Without `set_lossless(true)` the trait-API encoder rejects grayscale
 input rather than silently downgrading the bitstream.
 
+### Lossless arithmetic (SOF11) grayscale encode
+
+For single-component grayscale input the lossless **arithmetic-coded**
+counterpart of the SOF3 path is exposed directly:
+
+```rust
+use oxideav_mjpeg::encoder::encode_lossless_arith_jpeg_grayscale;
+
+// precision ∈ 2..=16, predictor ∈ 1..=7 (Annex H Table H.1).
+let jpeg = encode_lossless_arith_jpeg_grayscale(width, height, &samples, stride, 8, 1)?;
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+The spatial model is identical to the Huffman lossless path (Annex H
+predictors `1..=7` over `Ra` / `Rb` / `Rc`), but each prediction
+difference is coded with the Q-coder arithmetic statistical model of
+T.81 §H.1.2.3 (Table H.3) — the `L_Context(Da, Db)` / `X1_Context(Db)`
+conditioning over neighbouring differences — instead of a Huffman
+magnitude category. The bitstream is `SOI / JFIF APP0 / SOF11 (Nf = 1,
+H = V = 1) / [DRI] / SOS (Ss = predictor, Al = Pt) / arith scan / EOI`;
+no DAC segment is emitted, so the SOF11 decoder applies the default
+conditioning bounds `(L, U) = (0, 1)` per §H.1.2.3.3. Output is
+bit-exact for every precision `P ∈ 2..=16`, every predictor, and the
+half-modulus `Di = 32768` corner case (§H.1.2.2). The
+`encode_lossless_arith_jpeg_grayscale_with_opts(..., restart_interval,
+point_transform)` variant adds DRI + `RSTn` emission (each interval
+flushes the Q-coder, byte-aligns, writes `RST0..=RST7` cycling modulo 8,
+and re-seeds the statistical model + difference history + predictor to
+the scan-origin default `2^(P − Pt − 1)`, §H.1.1 / §H.1.2.3.4) and a
+non-zero point transform `Pt` (the low `Pt` bits are discarded on both
+sides). The decoder has supported SOF11 since round 0.1.x, so these
+encode entry points round-trip end-to-end (`tests/lossless_roundtrip.rs`).
+
 ### Lossless (SOF3) RGB / three-component encode
 
 For three-component (R, G, B / or any three independent monochrome

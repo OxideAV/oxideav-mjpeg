@@ -3589,6 +3589,260 @@ pub(crate) fn encode_lossless_grayscale_jpeg_8bit(
     encode_lossless_jpeg_grayscale(width, height, samples, stride, 8, 1)
 }
 
+// ---- Lossless arithmetic JPEG encoder (SOF11, single-component) ----------
+
+/// Write an SOF11 segment for a single-component arithmetic lossless frame.
+/// The payload shape is identical to SOF3 (precision / Y / X / Nf /
+/// per-component id+sampling+Tq) per T.81 §B.2.2 — only the marker code
+/// (`0xCB` vs `0xC3`) distinguishes the lossless arithmetic class.
+fn write_sof11_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u8) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(precision);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf — single grayscale component
+    payload.push(1); // component id
+    payload.push(0x11); // H=1 V=1
+    payload.push(0); // Tq (ignored for lossless)
+    write_length_prefix(out, markers::SOF11, &payload);
+}
+
+/// Encode a single-component grayscale image as a standalone **lossless,
+/// arithmetic-coded** JPEG (SOF11) byte stream — the entropy-coder
+/// counterpart of [`encode_lossless_jpeg_grayscale`].
+///
+/// The spatial model is identical to the Huffman lossless path (T.81
+/// Annex H predictors over `Ra` / `Rb` / `Rc`), but the prediction
+/// differences are coded with the Q-coder arithmetic statistical model of
+/// §H.1.2.3 (Table H.3) instead of a Huffman magnitude category. No DAC
+/// segment is emitted, so the decoder applies the default conditioning
+/// bounds `(L, U) = (0, 1)` per §H.1.2.3.3.
+///
+/// * `samples` — row-major luminance samples; row `y` starts at byte
+///   `y * stride`. For 8-bit precision this carries one byte per sample;
+///   for `precision > 8` it must contain little-endian 16-bit samples
+///   (two bytes per sample) and `stride` is therefore in bytes.
+/// * `precision` — input bits per sample, in `2..=16`.
+/// * `predictor` — selector value `1..=7` from T.81 Table H.1.
+///
+/// Output is bit-exact: the SOF11 decoder recovers every input sample
+/// verbatim, including the half-modulus `Di = 32768` case (§H.1.2.2).
+/// Point transform is fixed at `Pt = 0` and no restart markers are
+/// emitted. For non-zero point transform or restart-marker emission see
+/// [`encode_lossless_arith_jpeg_grayscale_with_opts`].
+pub fn encode_lossless_arith_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    precision: u8,
+    predictor: u8,
+) -> Result<Vec<u8>> {
+    encode_lossless_arith_jpeg_grayscale_with_opts(
+        width, height, samples, stride, precision, predictor, 0, 0,
+    )
+}
+
+/// Like [`encode_lossless_arith_jpeg_grayscale`] but also accepts a
+/// non-zero point transform `point_transform` (`Pt` — the SOS `Al` field)
+/// and a `restart_interval` measured in samples (a lossless MCU is one
+/// residual per §H.1.2). Both default-to-zero options reproduce the
+/// historical zero-restart, zero-`Pt` output.
+///
+/// * `point_transform` — `0..=15`, strictly less than `precision`. With
+///   `Pt > 0` every input sample is right-shifted by `Pt` before
+///   predictive coding; the decoder left-shifts the reconstructed sample
+///   back by the same `Pt` on output (the low `Pt` bits are lost).
+/// * `restart_interval` — samples between successive `RSTn` markers (`0`
+///   disables restart emission). On each boundary the encoder flushes the
+///   arithmetic segment, writes a fresh `RST0..=RST7` marker (cycling
+///   modulo 8 per §F.1.1.5.2), and re-initialises the statistical model,
+///   the neighbour-difference history, and the predictor to the
+///   scan-origin default `2^(precision − Pt − 1)` (§H.1.1 / §H.1.2.3.4).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_arith_jpeg_grayscale_with_opts(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    precision: u8,
+    predictor: u8,
+    restart_interval: u16,
+    point_transform: u8,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "lossless-arith encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless-arith encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= precision {
+        return Err(Error::invalid(format!(
+            "lossless-arith encoder: point_transform {point_transform} must be < precision {precision}"
+        )));
+    }
+    if point_transform > 15 {
+        return Err(Error::invalid(format!(
+            "lossless-arith encoder: point_transform {point_transform} > 15 (SOS Al is 4 bits)"
+        )));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("lossless-arith encoder: zero-size image"));
+    }
+    let bytes_per_sample = if precision <= 8 { 1 } else { 2 };
+    if stride < w * bytes_per_sample {
+        return Err(Error::invalid(
+            "lossless-arith encoder: stride smaller than width*bytes_per_sample",
+        ));
+    }
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "lossless-arith encoder: samples shorter than stride*h",
+        ));
+    }
+
+    // Decode samples into a flat u16 buffer once and apply the point
+    // transform up-front so every subsequent value lives in the
+    // `precision - Pt` range (matching the decoder's `sample_bits`).
+    let pt = point_transform as u32;
+    let max_sample: u32 = (1u32 << precision) - 1;
+    let mut src = vec![0u32; w * h];
+    if precision <= 8 {
+        for y in 0..h {
+            for x in 0..w {
+                let v = samples[y * stride + x] as u32;
+                if v > max_sample {
+                    return Err(Error::invalid(format!(
+                        "lossless-arith encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+                    )));
+                }
+                src[y * w + x] = v >> pt;
+            }
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                let lo = samples[y * stride + x * 2] as u32;
+                let hi = samples[y * stride + x * 2 + 1] as u32;
+                let v = lo | (hi << 8);
+                if v > max_sample {
+                    return Err(Error::invalid(format!(
+                        "lossless-arith encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+                    )));
+                }
+                src[y * w + x] = v >> pt;
+            }
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 2 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_sof11_lossless(&mut out, w as u16, h as u16, precision);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless(&mut out, predictor, point_transform);
+
+    // Default prediction for the first sample of the scan and after each
+    // restart interval (§H.1.2.1). The working precision is `precision − Pt`.
+    let sample_bits = precision as u32 - pt;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    // Neighbour-difference history feeding `L_Context(Da, Db)` /
+    // `X1_Context(Db)`: `prev_diff[x]` is the reduced difference one row up,
+    // `cur_diff[x]` one column left in the current row (§H.1.2.3.2).
+    let mut prev_diff = vec![0i32; w];
+    let mut cur_diff = vec![0i32; w];
+    let mut stats = LosslessStats::new();
+    let mut enc = ArithEncoder::new();
+
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut samples_since_restart: u32 = 0;
+    let total_samples: u64 = w as u64 * h as u64;
+    let mut sample_index: u64 = 0;
+    // `reset_pred` forces `origin` at scan start and at the first sample of
+    // every restart interval; `first_line_y` tracks the row where the
+    // current interval began so the "first line uses Ra" rule (§H.1.2.1)
+    // applies per-interval, not just to image row 0.
+    let mut reset_pred = true;
+    let mut first_line_y = 0usize;
+
+    for y in 0..h {
+        for x in 0..w {
+            // Emit RSTn before the boundary sample (never after the last
+            // sample — the decoder expects EOI there per §F.1.1.5.2).
+            if ri != 0 && samples_since_restart == ri && sample_index < total_samples {
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                samples_since_restart = 0;
+                stats.reset();
+                prev_diff.fill(0);
+                cur_diff.fill(0);
+                reset_pred = true;
+                first_line_y = y;
+            }
+
+            let actual = src[y * w + x];
+            let pred: u32 = if reset_pred {
+                origin
+            } else if y == first_line_y {
+                // First line of the interval uses Ra regardless of selector.
+                src[y * w + x - 1]
+            } else if x == 0 {
+                // Start of a non-first line uses Rb.
+                src[(y - 1) * w + x]
+            } else {
+                let ra = src[y * w + x - 1];
+                let rb = src[(y - 1) * w + x];
+                let rc = src[(y - 1) * w + x - 1];
+                match predictor {
+                    1 => ra,
+                    2 => rb,
+                    3 => rc,
+                    4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                    // §H.1 footnote: divide-by-2 is an arithmetic shift.
+                    5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                    6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                    7 => (ra.wrapping_add(rb)) >> 1,
+                    _ => unreachable!(),
+                }
+            };
+            // Modulo-2^16 difference (§H.1.2.1) reduced to the canonical
+            // -32768..=32767 representative (the ±32768 alias becomes the
+            // last `Sz` decision of Table H.3 inside `encode_lossless_diff`).
+            let dm = (actual.wrapping_sub(pred) & 0xFFFF) as i32;
+            let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
+            let da = if x == 0 { 0 } else { cur_diff[x - 1] };
+            let db = prev_diff[x];
+            encode_lossless_diff(&mut enc, &mut stats, da, db, dm)?;
+            cur_diff[x] = dm;
+
+            reset_pred = false;
+            sample_index += 1;
+            samples_since_restart += 1;
+        }
+        std::mem::swap(&mut prev_diff, &mut cur_diff);
+    }
+
+    out.extend_from_slice(&enc.finish());
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Encode three planar 8-bit colour channels as a standalone **multi-component
 /// lossless** JPEG (SOF3, three-component interleaved scan) byte stream.
 ///

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **JFIF extension APP0 (JFXX) inspector view (T.871 §10.2-10.5)** — the
+  decode-free inspector now surfaces the JFIF *extension* APP0 segment
+  (identifier `"JFXX\0"`) that conformant writers use to carry a
+  thumbnail (the JFIF APP0's own inline thumbnail is rarely populated —
+  most files emit a JFXX segment instead). A new `JfxxApp0` typed view
+  on `JpegInfo::jfxx` reports the thumbnail-storage variant via a
+  `JfxxThumbnail` enum exhaustive over the three `extension_code` bytes
+  T.871 §10.2 defines: `JpegEncoded { jpeg_len }` (`0x10`, §10.3 — an
+  embedded baseline JPEG, length reported without recursion),
+  `PaletteRgb { width, height }` (`0x11`, §10.4 — a 768-byte palette +
+  one-byte indices), and `Rgb24 { width, height }` (`0x13`, §10.5 —
+  packed 24-bit RGB, same layout as the §10.1 inline thumbnail).
+  `JfxxThumbnail::extension_code()` recovers the literal byte for
+  re-serialisation. A top-level `parse_jfxx_app0(payload) ->
+  Result<JfxxApp0>` validator is exported for callers that already hold
+  the APP0 payload bytes; it enforces the structural invariants
+  (identifier `"JFXX\0"`, defined `extension_code`, non-zero thumbnail
+  dimensions for `0x11`/`0x13`, declared body fits the payload) and
+  never copies the thumbnail body. `inspect_jpeg` populates the view
+  automatically when a JFXX extension APP0 follows the JFIF APP0; the
+  extension segment carries no colour-convention signal so it does not
+  influence `color_hint` (independent of `jfif`, which keeps reporting
+  the leading JFIF segment). Standalone surface — no `registry` feature,
+  no `oxideav-core` dep. Eleven new tests cover the three storage
+  variants, the short-payload / bad-identifier / reserved-code /
+  zero-dimension / body-overflow rejection paths, the JFIF+JFXX
+  dual-APP0 inspector aggregation, and the no-JFXX baseline.
+
 - **Lossless arithmetic (SOF11) four-component (CMYK-class) encode (T.81
   Annex H + §H.1.2.3)** — `encoder::encode_lossless_arith_jpeg_cmyk(width,
   height, planes, strides, predictor, adobe_transform)` and its

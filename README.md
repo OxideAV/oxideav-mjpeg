@@ -530,7 +530,16 @@ view (`version_major`/`_minor`, `units: JfifUnits` ∈
 `thumbnail_width`/`_height`, plus `has_thumbnail()`,
 `thumbnail_payload_len()`, `h_density_dpi()` / `v_density_dpi()`
 unit-normalised accessors and `pixel_aspect_ratio()` for the
-units-= 0 case). When an APP14 Adobe segment is present and
+units-= 0 case). When a JFIF *extension* APP0 segment (identifier
+`"JFXX\0"`, T.871 §10.2) follows the JFIF APP0 — the segment most
+writers use to carry the thumbnail — an optional `JfxxApp0` typed
+view on `JpegInfo::jfxx` reports the thumbnail-storage variant via a
+`JfxxThumbnail` enum exhaustive over the three defined
+`extension_code` bytes: `JpegEncoded { jpeg_len }` (`0x10`, §10.3 —
+embedded baseline JPEG), `PaletteRgb { width, height }` (`0x11`,
+§10.4 — 768-byte palette + indices), and `Rgb24 { width, height }`
+(`0x13`, §10.5 — packed 24-bit RGB). It carries no colour-convention
+signal, so it leaves `color_hint` untouched. When an APP14 Adobe segment is present and
 structurally valid per T.872 §6.5.3, an optional `AdobeApp14`
 typed view is also exposed (`dct_encode_version`, `flags_0`,
 `flags_1`, `transform: AdobeColorTransform` ∈ {`Unknown`,
@@ -551,6 +560,7 @@ path, DPI-aware thumbnail sizing, and corpus summarisation. The
 `is_arithmetic()` helpers so callers can negotiate without
 matching on every variant by hand. Standalone
 `parse_jfif_app0(payload) -> Result<JfifApp0>`,
+`parse_jfxx_app0(payload) -> Result<JfxxApp0>`,
 `parse_adobe_app14(payload) -> Result<AdobeApp14>`, and
 `parse_icc_profile_app2(payload) -> Result<IccProfileApp2Chunk<'_>>`
 validators are also re-exported for callers that already have the

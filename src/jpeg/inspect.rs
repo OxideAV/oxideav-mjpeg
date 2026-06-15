@@ -354,6 +354,91 @@ impl JfifApp0 {
     }
 }
 
+/// Thumbnail-storage variant of a JFIF extension APP0 segment
+/// (T.871 §10.2 `extension_code`).
+///
+/// The `extension_code` byte that follows the `"JFXX\0"` identifier
+/// selects one of three thumbnail storage formats. T.871 §10.2 defines
+/// exactly these three codes (`0x10`, `0x11`, `0x13`); every other byte
+/// is reserved and produces an `Err` from `parse_jfxx_app0`, matching
+/// the spec's enumerated "the following extensions are defined" wording.
+///
+/// The thumbnail pixel bytes themselves are **not** copied into the
+/// typed view — the inspector reports the geometry and the on-wire byte
+/// budget so a caller can locate the payload in the source buffer
+/// without the inspector allocating a second copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JfxxThumbnail {
+    /// `extension_code = 0x10` — the thumbnail is a complete baseline
+    /// JPEG (`SOI .. EOI`) embedded in `extension_data` (T.871 §10.3).
+    /// `jpeg_len` is the number of `extension_data` bytes carrying that
+    /// embedded stream (the whole payload tail after the 6-byte
+    /// identifier + code header).
+    JpegEncoded {
+        /// Length in bytes of the embedded baseline-JPEG `extension_data`.
+        jpeg_len: usize,
+    },
+    /// `extension_code = 0x11` — an uncompressed 8-bit-palette RGB
+    /// thumbnail (T.871 §10.4): a 768-byte (256 × RGB) palette followed
+    /// by `width × height` one-byte palette indices.
+    PaletteRgb {
+        /// `HthumbnailB` — horizontal thumbnail pixel count (non-zero
+        /// per §10.4).
+        width: u8,
+        /// `VthumbnailB` — vertical thumbnail pixel count (non-zero).
+        height: u8,
+    },
+    /// `extension_code = 0x13` — an uncompressed packed 24-bit RGB
+    /// thumbnail (T.871 §10.5): `width × height × 3` interleaved
+    /// `R, G, B` bytes. Same on-wire layout as the optional thumbnail
+    /// carried directly in the JFIF APP0 (§10.1).
+    Rgb24 {
+        /// `HthumbnailC` — horizontal thumbnail pixel count (non-zero
+        /// per §10.5).
+        width: u8,
+        /// `VthumbnailC` — vertical thumbnail pixel count (non-zero).
+        height: u8,
+    },
+}
+
+impl JfxxThumbnail {
+    /// The literal `extension_code` byte (T.871 §10.2) this variant
+    /// represents. Provided so a caller re-serialising a JFXX segment
+    /// from a typed view can recover the code without a side table.
+    pub fn extension_code(self) -> u8 {
+        match self {
+            Self::JpegEncoded { .. } => 0x10,
+            Self::PaletteRgb { .. } => 0x11,
+            Self::Rgb24 { .. } => 0x13,
+        }
+    }
+}
+
+/// Typed view of a JFIF extension APP0 marker segment (T.871 §10.2).
+///
+/// One or more JFIF extension APP0 segments may immediately follow the
+/// JFIF APP0 segment; each carries a thumbnail in one of the three
+/// formats T.871 §10.3-10.5 defines. The segment is identified by the
+/// zero-terminated `"JFXX\0"` string in its first five payload bytes,
+/// followed by a one-byte `extension_code`.
+///
+/// Parsed from the bytes that follow the APP0 marker's two-byte length
+/// field, **including** the `"JFXX\0"` identifier — i.e. the `payload`
+/// slice the inspector's marker walker hands to `parse_jfxx_app0`.
+/// Decode-only: the inspector never builds one from caller input.
+///
+/// The thumbnail pixel / JPEG bytes are not copied out; the typed view
+/// reports the storage variant and its geometry only. Callers that want
+/// the thumbnail itself can re-walk the source buffer with the offsets
+/// the variant implies (`palette + indices` for §10.4, `3 × w × h` RGB
+/// for §10.5, or the embedded baseline stream for §10.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JfxxApp0 {
+    /// The thumbnail-storage variant decoded from the `extension_code`
+    /// byte plus the geometry / length fields that follow it.
+    pub thumbnail: JfxxThumbnail,
+}
+
 /// Colour-transform byte from the Adobe APP14 segment (T.872 §6.5.3).
 ///
 /// The same three values that `ColorHint`'s `Adobe*` variants surface,
@@ -645,6 +730,19 @@ pub struct JpegInfo {
     /// a JFIF + Adobe stream reports both with the colour hint
     /// preferring Adobe (the existing inspector policy).
     pub jfif: Option<JfifApp0>,
+    /// Typed view of the first JFIF extension APP0 segment (T.871
+    /// §10.2-10.5) seen in the marker prefix, when one was present and
+    /// structurally well-formed. `None` for streams with no `"JFXX\0"`
+    /// extension segment, a truncated payload, a reserved
+    /// `extension_code`, or a thumbnail whose declared geometry
+    /// overflows its `extension_data`.
+    ///
+    /// Independent of `jfif`: a conformant writer that emits a thumbnail
+    /// via the extension mechanism (the common case — see the `jfif`
+    /// note) reports `jfif = Some(..)` with `has_thumbnail() == false`
+    /// *and* `jfxx = Some(..)`. The extension segment carries no
+    /// colour-convention signal, so it does not influence `color_hint`.
+    pub jfxx: Option<JfxxApp0>,
     /// Typed view of the Adobe APP14 segment (T.872 §6.5.3) when one
     /// was present in the marker prefix and structurally well-formed
     /// (identifier `"Adobe"`, payload ≥ 12 bytes, `transform ∈
@@ -679,6 +777,10 @@ impl JpegInfo {
 /// JFIF identifier from the start of an APP0 payload, T.871 §6.1.
 /// Five bytes: `"JFIF\0"`.
 const JFIF_MAGIC: &[u8; 5] = b"JFIF\0";
+
+/// JFIF extension identifier from the start of an extension APP0
+/// payload, T.871 §10.2. Five bytes: `"JFXX\0"`.
+const JFXX_MAGIC: &[u8; 5] = b"JFXX\0";
 
 /// Adobe identifier from the start of an APP14 payload, T.872 §6.5.3.
 /// Five bytes: `"Adobe"`. The 6th byte and onwards carry version /
@@ -779,6 +881,126 @@ pub fn parse_jfif_app0(payload: &[u8]) -> Result<JfifApp0> {
         thumbnail_width,
         thumbnail_height,
     })
+}
+
+/// Parse a JFIF extension APP0 payload (T.871 §10.2-10.5) into a typed
+/// view.
+///
+/// `payload` is the byte slice the marker walker hands to the inspector
+/// for the APP0 segment — the bytes after the marker's two-byte length
+/// field, starting with the `"JFXX\0"` identifier. The function returns
+/// `Ok(JfxxApp0)` when the segment is structurally valid per
+/// T.871 §10.2:
+///
+/// * Identifier equals `b"JFXX\0"`.
+/// * The `extension_code` byte (payload offset 5) is one of the three
+///   defined codes (`0x10` JPEG, `0x11` palette RGB, `0x13` packed RGB).
+/// * The `extension_data` that follows is large enough for the geometry
+///   the extension declares:
+///   - `0x10`: any (possibly empty) tail is accepted as the embedded
+///     baseline-JPEG body — the inspector does not recurse into it.
+///   - `0x11`: `width` / `height` are non-zero and the tail holds the
+///     768-byte palette plus `width × height` index bytes.
+///   - `0x13`: `width` / `height` are non-zero and the tail holds
+///     `3 × width × height` packed-RGB bytes.
+///
+/// Errors:
+/// * `Invalid` when the payload is shorter than the 6-byte
+///   identifier + `extension_code` header.
+/// * `Invalid` when the identifier doesn't match `"JFXX\0"` (the caller
+///   is expected to gate on the magic first, but the validator re-checks
+///   so direct calls aren't a footgun).
+/// * `Invalid` for a reserved `extension_code` byte.
+/// * `Invalid` when a `0x11` / `0x13` thumbnail declares a zero
+///   dimension (both spec sections require non-zero counts) or when its
+///   declared body overflows the remaining payload.
+///
+/// The thumbnail body is never copied; the typed view carries the
+/// geometry only and is `Copy`. The validator never allocates.
+pub fn parse_jfxx_app0(payload: &[u8]) -> Result<JfxxApp0> {
+    // T.871 §10.2 layout, byte offsets relative to the start of the
+    // APP0 payload (i.e. *after* the marker + length):
+    //
+    //   0..5    identifier "JFXX\0"
+    //   5       extension_code (0x10 | 0x11 | 0x13)
+    //   6..     extension_data (varies by code, see §10.3-10.5)
+    if payload.len() < 6 {
+        return Err(Error::invalid("parse_jfxx_app0: payload too short"));
+    }
+    if &payload[..5] != JFXX_MAGIC {
+        return Err(Error::invalid("parse_jfxx_app0: identifier != JFXX\\0"));
+    }
+
+    let data = &payload[6..];
+    let thumbnail = match payload[5] {
+        // §10.3 — embedded baseline JPEG. The whole tail is the
+        // SOI..EOI stream; the inspector does not validate or recurse
+        // into it (T.871 §10.3 forbids nested JFIF/JFXX markers there,
+        // but checking that would mean a second marker walk — out of
+        // scope for a prefix summary).
+        0x10 => JfxxThumbnail::JpegEncoded {
+            jpeg_len: data.len(),
+        },
+        // §10.4 — 8-bit palette RGB. extension_data layout:
+        //   0       HthumbnailB (non-zero)
+        //   1       VthumbnailB (non-zero)
+        //   2..770  768-byte palette (256 × RGB)
+        //   770..   width * height index bytes
+        0x11 => {
+            if data.len() < 2 {
+                return Err(Error::invalid(
+                    "parse_jfxx_app0: palette thumbnail missing dimensions",
+                ));
+            }
+            let width = data[0];
+            let height = data[1];
+            if width == 0 || height == 0 {
+                return Err(Error::invalid(
+                    "parse_jfxx_app0: palette thumbnail has zero dimension",
+                ));
+            }
+            // 2 dim bytes + 768 palette + (w * h) indices.
+            let need = 2usize + 768 + (width as usize) * (height as usize);
+            if data.len() < need {
+                return Err(Error::invalid(
+                    "parse_jfxx_app0: palette thumbnail overflows payload",
+                ));
+            }
+            JfxxThumbnail::PaletteRgb { width, height }
+        }
+        // §10.5 — packed 24-bit RGB. extension_data layout:
+        //   0       HthumbnailC (non-zero)
+        //   1       VthumbnailC (non-zero)
+        //   2..     3 * width * height packed R,G,B bytes
+        0x13 => {
+            if data.len() < 2 {
+                return Err(Error::invalid(
+                    "parse_jfxx_app0: rgb thumbnail missing dimensions",
+                ));
+            }
+            let width = data[0];
+            let height = data[1];
+            if width == 0 || height == 0 {
+                return Err(Error::invalid(
+                    "parse_jfxx_app0: rgb thumbnail has zero dimension",
+                ));
+            }
+            let need = 2usize + 3 * (width as usize) * (height as usize);
+            if data.len() < need {
+                return Err(Error::invalid(
+                    "parse_jfxx_app0: rgb thumbnail overflows payload",
+                ));
+            }
+            JfxxThumbnail::Rgb24 { width, height }
+        }
+        _ => {
+            return Err(Error::invalid(
+                "parse_jfxx_app0: reserved extension_code byte",
+            ));
+        }
+    };
+
+    Ok(JfxxApp0 { thumbnail })
 }
 
 /// Parse an Adobe APP14 payload (T.872 §6.5.3) into a typed view.
@@ -885,6 +1107,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut color_hint = ColorHint::Unspecified;
     let mut restart_interval: u16 = 0;
     let mut jfif: Option<JfifApp0> = None;
+    let mut jfxx: Option<JfxxApp0> = None;
     let mut adobe: Option<AdobeApp14> = None;
     let mut icc_total: Option<u8> = None;
     let mut icc_payload_len: usize = 0;
@@ -1000,6 +1223,20 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                 }
                 continue;
             }
+            if marker == markers::APP0 && payload.len() >= 5 && &payload[..5] == JFXX_MAGIC {
+                // JFIF extension APP0 (T.871 §10.2) — carries a thumbnail,
+                // not a colour-convention signal, so `color_hint` is left
+                // untouched. A structurally malformed JFXX segment is
+                // reported as `jfxx = None`. Only the first JFXX segment
+                // wins (a stream may legally carry several extension
+                // segments; the inspector summarises the first).
+                if jfxx.is_none() {
+                    if let Ok(parsed) = parse_jfxx_app0(payload) {
+                        jfxx = Some(parsed);
+                    }
+                }
+                continue;
+            }
             if marker == markers::APP14 && payload.len() >= 12 && &payload[..5] == ADOBE_MAGIC {
                 // APP14 layout: 5 bytes magic, 2 bytes version,
                 // 2 bytes flags0, 2 bytes flags1, 1 byte transform.
@@ -1064,6 +1301,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         color_hint,
         restart_interval,
         jfif,
+        jfxx,
         adobe,
         icc_profile,
     })
@@ -1606,6 +1844,154 @@ mod tests {
         assert_eq!(parsed.thumbnail_height, 2);
         assert_eq!(parsed.thumbnail_payload_len(), 12);
         assert_eq!(parsed.h_density_dpi(), Some(96));
+    }
+
+    #[test]
+    fn jfxx_jpeg_encoded_thumbnail() {
+        // §10.3 — extension_code 0x10, a tail standing in for an
+        // embedded baseline JPEG. The inspector reports its byte length
+        // without recursing into it.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFXX\0");
+        payload.push(0x10);
+        // Stand-in embedded stream (SOI..EOI shell, 4 bytes here).
+        payload.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xD9]);
+        let parsed = parse_jfxx_app0(&payload).expect("parse JFXX jpeg thumb");
+        assert_eq!(parsed.thumbnail, JfxxThumbnail::JpegEncoded { jpeg_len: 4 });
+        assert_eq!(parsed.thumbnail.extension_code(), 0x10);
+    }
+
+    #[test]
+    fn jfxx_palette_rgb_thumbnail() {
+        // §10.4 — extension_code 0x11: 2 dim bytes + 768 palette +
+        // (w * h) index bytes.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFXX\0");
+        payload.push(0x11);
+        payload.push(4); // HthumbnailB
+        payload.push(3); // VthumbnailB
+        payload.extend_from_slice(&[0u8; 768]); // palette
+        payload.extend_from_slice(&[0u8; 12]); // 4 * 3 indices
+        let parsed = parse_jfxx_app0(&payload).expect("parse JFXX palette thumb");
+        assert_eq!(
+            parsed.thumbnail,
+            JfxxThumbnail::PaletteRgb {
+                width: 4,
+                height: 3
+            }
+        );
+        assert_eq!(parsed.thumbnail.extension_code(), 0x11);
+    }
+
+    #[test]
+    fn jfxx_rgb24_thumbnail() {
+        // §10.5 — extension_code 0x13: 2 dim bytes + 3 * w * h RGB bytes.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFXX\0");
+        payload.push(0x13);
+        payload.push(2); // HthumbnailC
+        payload.push(2); // VthumbnailC
+        payload.extend_from_slice(&[0u8; 12]); // 2 * 2 * 3 RGB
+        let parsed = parse_jfxx_app0(&payload).expect("parse JFXX rgb thumb");
+        assert_eq!(
+            parsed.thumbnail,
+            JfxxThumbnail::Rgb24 {
+                width: 2,
+                height: 2
+            }
+        );
+        assert_eq!(parsed.thumbnail.extension_code(), 0x13);
+    }
+
+    #[test]
+    fn jfxx_rejects_short_payload() {
+        // Only the identifier, no extension_code byte.
+        assert!(parse_jfxx_app0(b"JFXX\0").is_err());
+    }
+
+    #[test]
+    fn jfxx_rejects_bad_identifier() {
+        // The JFIF APP0 magic is not the extension magic.
+        let payload = b"JFIF\0\x10";
+        assert!(parse_jfxx_app0(payload).is_err());
+    }
+
+    #[test]
+    fn jfxx_rejects_reserved_extension_code() {
+        // 0x12 is not one of the three defined codes (0x10/0x11/0x13).
+        let payload = b"JFXX\0\x12\x02\x02";
+        assert!(parse_jfxx_app0(payload).is_err());
+    }
+
+    #[test]
+    fn jfxx_rejects_zero_dimension() {
+        // §10.4 / §10.5 require non-zero pixel counts.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFXX\0");
+        payload.push(0x13);
+        payload.push(0); // zero width
+        payload.push(4);
+        assert!(parse_jfxx_app0(&payload).is_err());
+    }
+
+    #[test]
+    fn jfxx_rejects_thumbnail_overflowing_payload() {
+        // Declare a 2×2 packed-RGB thumbnail (needs 12 bytes) but only
+        // attach 5.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"JFXX\0");
+        payload.push(0x13);
+        payload.push(2);
+        payload.push(2);
+        payload.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert!(parse_jfxx_app0(&payload).is_err());
+    }
+
+    #[test]
+    fn inspect_jfif_plus_jfxx_dual_app0() {
+        // Conformant common case: a JFIF APP0 with no inline thumbnail
+        // immediately followed by a JFXX extension APP0 carrying one.
+        let jfif: Vec<u8> = b"JFIF\0\x01\x02\x01\x00\x48\x00\x48\x00\x00".to_vec();
+        let mut jfxx: Vec<u8> = Vec::new();
+        jfxx.extend_from_slice(b"JFXX\0");
+        jfxx.push(0x13);
+        jfxx.push(2);
+        jfxx.push(2);
+        jfxx.extend_from_slice(&[0u8; 12]);
+        let extras = [
+            (markers::APP0, jfif.as_slice()),
+            (markers::APP0, jfxx.as_slice()),
+        ];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 2, 2, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect JFIF+JFXX");
+        // Both typed views populate; the JFIF one carries no inline thumb.
+        let jfif_view = info.jfif.expect("jfif view");
+        assert!(!jfif_view.has_thumbnail());
+        let jfxx_view = info.jfxx.expect("jfxx view");
+        assert_eq!(
+            jfxx_view.thumbnail,
+            JfxxThumbnail::Rgb24 {
+                width: 2,
+                height: 2
+            }
+        );
+        // The extension segment carries no colour-convention signal —
+        // the hint comes from the JFIF APP0 only.
+        assert_eq!(info.color_hint, ColorHint::JfifYCbCr);
+    }
+
+    #[test]
+    fn inspect_no_jfxx_when_absent() {
+        let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &[]);
+        let info = inspect_jpeg(&buf).expect("inspect plain grayscale");
+        assert!(info.jfxx.is_none());
     }
 
     #[test]

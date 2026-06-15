@@ -245,8 +245,8 @@ flushes the Q-coder, byte-aligns, writes `RST0..=RST7` cycling modulo 8,
 and re-seeds the statistical model + difference history + predictor to
 the scan-origin default `2^(P − Pt − 1)`, §H.1.1 / §H.1.2.3.4) and a
 non-zero point transform `Pt` (the low `Pt` bits are discarded on both
-sides). The decoder has supported SOF11 since round 0.1.x, so these
-encode entry points round-trip end-to-end (`tests/lossless_roundtrip.rs`).
+sides). The SOF11 decoder consumes these encode outputs end-to-end
+(`tests/lossless_roundtrip.rs`).
 
 The three-component (RGB-class) counterpart
 `encode_lossless_arith_jpeg_rgb(width, height, [c0, c1, c2], strides,
@@ -350,9 +350,9 @@ predictor, adobe_transform)` directly:
 
 ### 4-component CMYK / YCCK encode
 
-The 4-component (CMYK / Adobe YCCK) decode paths landed in earlier
-rounds are now matched by a public encoder API. Both a baseline
-(SOF0) and a progressive (SOF2) variant accept the same packed
+The 4-component (CMYK / Adobe YCCK) decode paths are matched by a
+public encoder API. Both a baseline (SOF0) and a progressive (SOF2)
+variant accept the same packed
 `[C, M, Y, K]` interleaved buffer the decoder produces (4 bytes per
 pixel, `stride` bytes per row), so round-tripping a decoded CMYK
 frame back into a JPEG is a single call:
@@ -820,11 +820,11 @@ org-wide reusable fuzz workflow:
   crashes (debug build, no instrumentation; daily CI runs the
   release-instrumented binary).
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
-  oxideav-mjpeg encode → oxideav-mjpeg decode round-trip with ±2 LSB
-  YUV tolerance.
+  encode → decode round-trip with ±2 LSB YUV tolerance.
 - `libjpeg_encode_oxideav_decode` / `oxideav_encode_libjpeg_decode` —
-  cross-decode against system `libturbojpeg` (loaded via `libloading`
-  at runtime; no `*-sys` crate in the dep tree).
+  cross-decode against a system JPEG library used as a black-box
+  validator, loaded via `libloading` at runtime (no `*-sys` crate in
+  the dep tree).
 
 ## Fixture corpus
 
@@ -880,8 +880,8 @@ payload files, no `docs/` reads, no third-party library calls):
   predictor 4 (Ra + Rb − Rc), the most expensive 2-D Table H.1
   variant; A/B against `pred1` measures the predictor-loop cost.
 
-Headline numbers on the round-209 dev machine (Apple Silicon, release
-profile, criterion `--quick`): baseline 4:2:0 encode 256x256 q75 runs
+Headline numbers (Apple Silicon dev box, release profile, criterion
+`--quick`): baseline 4:2:0 encode 256x256 q75 runs
 ~185 µs / call (≈ 353 Melem/s); the matching decode runs ~248 µs /
 call (≈ 264 Melem/s). The 256x256 lossless grayscale encode runs
 ~370 µs / call independent of predictor choice (the magnitude /

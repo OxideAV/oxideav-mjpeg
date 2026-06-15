@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.7...v0.1.8) - 2026-06-15
+
+### Other
+
+- JFIF extension APP0 (JFXX) thumbnail view (T.871 §10.2-10.5)
+- SOF11 four-component (CMYK-class) lossless arithmetic encode
+- SOF11 three-component (RGB-class) lossless arithmetic encode (T.81 §H.1.2.3)
+- lossless arithmetic (SOF11) grayscale encode via T.81 §H.1.2.3
+- DNL (Define Number of Lines) support for SOF Y = 0 (T.81 §B.2.5)
+- progressive arithmetic JPEG (SOF10) via T.81 §G.1.3 scan procedures
+- lossless arithmetic JPEG (SOF11) via T.81 §H.1.2.3 statistical model
+- skip ICC-fixture inspect test when docs/ absent (CI fix)
+- typed APP2 ICC_PROFILE chunks view (T.872 / Annex L) on JpegInfo
+- typed Adobe APP14 view (T.872 §6.5.3) on JpegInfo
+- typed JFIF APP0 view (T.871 §10.1) on JpegInfo
+- drop release-plz.toml — use release-plz defaults across the workspace
+- progressive (SOF2) single-component grayscale encode
+- decode-free JPEG SOF discriminator + metadata inspector
+- baseline (SOF0) packed-Rgb24 lossy encode + decoder RGB tag
+- baseline (SOF0) single-component Gray8 lossy encode
+- four-component lossless (SOF3, P=8) round trip
+- restart-interval-aligned scan splitting for the packetizer
+- criterion harness for encode + decode hot paths
+- scrub decorative external-implementation attribution
+- add arith_decode cargo-fuzz target for SOF9 Q-coder surface
+- gate cmyk_roundtrip on the `registry` feature
+- promote 4-component CMYK / YCCK helpers to the public API
+
 ### Added
 
 - **JFIF extension APP0 (JFXX) inspector view (T.871 §10.2-10.5)** — the

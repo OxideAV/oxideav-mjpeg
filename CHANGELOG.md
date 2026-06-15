@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- typed COM (comment) segments view (T.81 §B.2.4.5) on JpegInfo
+
 ## [0.1.8](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.7...v0.1.8) - 2026-06-15
 
 ### Other

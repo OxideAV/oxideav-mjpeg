@@ -688,6 +688,59 @@ impl IccProfileChunks {
     }
 }
 
+/// Typed view of one COM (comment) marker segment (T.81 §B.2.4.5,
+/// Figure B.10 / Table B.8).
+///
+/// A COM segment is `COM | Lc | Cm_1 .. Cm_{Lc-2}`: a two-byte
+/// big-endian length `Lc ∈ [2, 65535]` followed by `Lc-2` comment
+/// bytes whose interpretation T.81 leaves entirely to the application.
+/// The inspector therefore makes no charset assumption — it copies the
+/// raw bytes verbatim and exposes them alongside two convenience
+/// projections (`as_str_lossy`, `is_ascii_text`) for the common case
+/// of a human-readable ASCII / UTF-8 annotation. A zero-length comment
+/// (`Lc = 2`, no comment bytes) is legal per the `2..=65535` range and
+/// is reported with an empty `bytes` vector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JpegComment {
+    /// The `Lc-2` comment bytes exactly as they appeared on the wire,
+    /// with no charset interpretation or trimming. Empty when the
+    /// segment carried only its length field (`Lc = 2`).
+    pub bytes: Vec<u8>,
+}
+
+impl JpegComment {
+    /// Number of comment bytes (`Lc - 2`). A convenience accessor; the
+    /// same value is `bytes.len()`.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// True when the segment carried no comment bytes (`Lc = 2`).
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Lossy UTF-8 projection of the comment bytes. Invalid sequences
+    /// are replaced with U+FFFD. Most real-world COM segments are plain
+    /// ASCII (encoder watermarks like `"Created with …"`), so this is
+    /// the convenient accessor for diagnostics; callers that need the
+    /// exact bytes read `bytes`.
+    pub fn as_str_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
+
+    /// True when every comment byte is a printable-or-whitespace ASCII
+    /// character (`0x09`, `0x0A`, `0x0D`, or `0x20..=0x7E`). Lets a
+    /// caller decide whether `as_str_lossy` is a faithful rendering
+    /// without an embedded replacement character. An empty comment is
+    /// reported as text (vacuously true).
+    pub fn is_ascii_text(&self) -> bool {
+        self.bytes
+            .iter()
+            .all(|&b| matches!(b, 0x09 | 0x0A | 0x0D | 0x20..=0x7E))
+    }
+}
+
 /// Result of a successful `inspect_jpeg` call.
 #[derive(Clone, Debug)]
 pub struct JpegInfo {
@@ -764,6 +817,14 @@ pub struct JpegInfo {
     /// not copied into `JpegInfo`; callers that need the assembled
     /// blob can re-walk the buffer with `parse_icc_profile_app2`.
     pub icc_profile: Option<IccProfileChunks>,
+    /// Every COM (comment) marker segment (T.81 §B.2.4.5) seen in the
+    /// marker prefix, in source order. Empty when the stream carried no
+    /// comments. Each entry holds the raw comment bytes verbatim (T.81
+    /// leaves their interpretation to the application); see
+    /// `JpegComment` for the convenience text projections. A stream may
+    /// legally carry several COM segments interspersed among the table
+    /// / frame markers — all of them are reported.
+    pub comments: Vec<JpegComment>,
 }
 
 impl JpegInfo {
@@ -1112,6 +1173,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut icc_total: Option<u8> = None;
     let mut icc_payload_len: usize = 0;
     let mut icc_chunks: Vec<(u8, usize)> = Vec::new();
+    let mut comments: Vec<JpegComment> = Vec::new();
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -1169,6 +1231,17 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
 
         if marker == markers::DRI {
             restart_interval = parse_dri(payload)?;
+            continue;
+        }
+
+        if marker == markers::COM {
+            // COM (T.81 §B.2.4.5): the marker walker already consumed
+            // the `Lc` length field, so `payload` is exactly the
+            // `Lc-2` comment bytes (empty when `Lc = 2`). Copy them
+            // verbatim — the interpretation is left to the application.
+            comments.push(JpegComment {
+                bytes: payload.to_vec(),
+            });
             continue;
         }
 
@@ -1275,9 +1348,9 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
             continue;
         }
 
-        // DHT / DQT / DAC / DNL / COM / reserved: skipped. The
-        // inspector does not care about Huffman / quant / arithmetic
-        // table contents; it only needs the SOF + DRI + APP hints to
+        // DHT / DQT / DAC / DNL / reserved: skipped. The inspector
+        // does not care about Huffman / quant / arithmetic table
+        // contents; it only needs the SOF + DRI + APP + COM hints to
         // produce its summary.
     }
 
@@ -1304,6 +1377,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         jfxx,
         adobe,
         icc_profile,
+        comments,
     })
 }
 
@@ -1625,6 +1699,101 @@ mod tests {
         assert!(info.sof_kind.is_supported_by_decoder());
         assert!(!info.sof_kind.is_dct());
         assert!(info.sof_kind.is_arithmetic());
+    }
+
+    #[test]
+    fn no_com_segment_reports_empty() {
+        let buf = build_prefix(0xC0, 8, 16, 16, &[(1, 1, 1, 0)], &[]);
+        let info = inspect_jpeg(&buf).expect("inspect no-COM");
+        assert!(info.comments.is_empty());
+    }
+
+    #[test]
+    fn single_ascii_com_segment() {
+        let text = b"Created with oxideav";
+        let extras = [(markers::COM, &text[..])];
+        let buf = build_prefix(0xC0, 8, 16, 16, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect single COM");
+        assert_eq!(info.comments.len(), 1);
+        let com = &info.comments[0];
+        assert_eq!(com.bytes, text);
+        assert_eq!(com.len(), text.len());
+        assert!(!com.is_empty());
+        assert!(com.is_ascii_text());
+        assert_eq!(com.as_str_lossy(), "Created with oxideav");
+    }
+
+    #[test]
+    fn zero_length_com_segment() {
+        // Lc = 2 (length field only, no comment bytes) is legal per the
+        // 2..=65535 range in Table B.8.
+        let extras = [(markers::COM, &[][..])];
+        let buf = build_prefix(0xC0, 8, 16, 16, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect empty COM");
+        assert_eq!(info.comments.len(), 1);
+        assert!(info.comments[0].is_empty());
+        assert_eq!(info.comments[0].len(), 0);
+        // An empty comment is vacuously text and renders to "".
+        assert!(info.comments[0].is_ascii_text());
+        assert_eq!(info.comments[0].as_str_lossy(), "");
+    }
+
+    #[test]
+    fn multiple_com_segments_in_source_order() {
+        let extras = [
+            (markers::COM, &b"first"[..]),
+            (markers::COM, &b"second"[..]),
+            (markers::COM, &b"third"[..]),
+        ];
+        let buf = build_prefix(0xC0, 8, 16, 16, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect multi COM");
+        assert_eq!(info.comments.len(), 3);
+        assert_eq!(info.comments[0].as_str_lossy(), "first");
+        assert_eq!(info.comments[1].as_str_lossy(), "second");
+        assert_eq!(info.comments[2].as_str_lossy(), "third");
+    }
+
+    #[test]
+    fn binary_com_segment_not_ascii_text() {
+        // Comment bytes whose interpretation T.81 leaves to the
+        // application: a non-printable payload is preserved verbatim
+        // and flagged as not-ascii-text.
+        let raw = [0x00u8, 0xFF, 0x80, 0x01];
+        let extras = [(markers::COM, &raw[..])];
+        let buf = build_prefix(0xC0, 8, 16, 16, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect binary COM");
+        assert_eq!(info.comments.len(), 1);
+        assert_eq!(info.comments[0].bytes, raw);
+        assert!(!info.comments[0].is_ascii_text());
+        // Lossy rendering substitutes U+FFFD for the invalid bytes.
+        assert!(info.comments[0].as_str_lossy().contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn com_after_sof_before_sos_reported() {
+        // COM is legal anywhere in the prefix, including between SOF
+        // and SOS. `build_prefix` puts extras before SOF, so craft a
+        // SOF→COM→SOS layout manually.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0xFF, markers::SOI]);
+        // SOF: P=8, Y=16, X=16, Nf=1, one component triple.
+        buf.extend_from_slice(&[0xFF, 0xC0]);
+        buf.extend_from_slice(&11u16.to_be_bytes());
+        buf.push(8);
+        buf.extend_from_slice(&16u16.to_be_bytes());
+        buf.extend_from_slice(&16u16.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&[1, 0x11, 0]);
+        // COM between SOF and SOS.
+        let text = b"post-frame note";
+        buf.extend_from_slice(&[0xFF, markers::COM]);
+        buf.extend_from_slice(&((text.len() + 2) as u16).to_be_bytes());
+        buf.extend_from_slice(text);
+        // SOS marker (inspector stops here).
+        buf.extend_from_slice(&[0xFF, markers::SOS]);
+        let info = inspect_jpeg(&buf).expect("inspect SOF→COM→SOS");
+        assert_eq!(info.comments.len(), 1);
+        assert_eq!(info.comments[0].as_str_lossy(), "post-frame note");
     }
 
     #[test]

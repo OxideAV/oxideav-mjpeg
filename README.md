@@ -551,7 +551,16 @@ T.871) appear, an `IccProfileChunks` summary on
 cumulative `total_payload_len`, the per-segment
 `(seq_no, payload_len)` ordering, and an `is_complete()`
 predicate that returns true when the sequence numbers cover
-`1..=total` exactly once. No entropy decoding, no DCT, no
+`1..=total` exactly once. Every COM (comment) marker segment
+(T.81 §B.2.4.5) seen in the prefix is collected — in source
+order — into `JpegInfo::comments` as a `Vec<JpegComment>`; each
+entry holds the `Lc-2` comment bytes verbatim (T.81 leaves their
+interpretation to the application), with `len()` / `is_empty()`
+accessors plus an `as_str_lossy()` UTF-8 projection and an
+`is_ascii_text()` predicate for the common human-readable
+annotation case (zero-length `Lc = 2` comments and COM segments
+appearing anywhere in the prefix, including between SOF and SOS,
+are all captured). No entropy decoding, no DCT, no
 allocation proportional to the scan body — O(prefix-length).
 Useful for pipeline triage (pick a target pixel format),
 fallback-decoder routing without spinning up the full decode

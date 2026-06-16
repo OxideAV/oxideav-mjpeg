@@ -18,7 +18,8 @@ use oxideav_mjpeg::encoder::{
     encode_lossless_arith_jpeg_rgb, encode_lossless_arith_jpeg_rgb_with_opts,
     encode_lossless_jpeg_cmyk, encode_lossless_jpeg_cmyk_with_opts, encode_lossless_jpeg_grayscale,
     encode_lossless_jpeg_grayscale_with_opts, encode_lossless_jpeg_rgb,
-    encode_lossless_jpeg_rgb_with_opts,
+    encode_lossless_jpeg_rgb_with_opts, encode_lossless_jpeg_yuv,
+    encode_lossless_jpeg_yuv_with_opts,
 };
 use oxideav_mjpeg::registry::make_decoder;
 
@@ -1869,4 +1870,167 @@ fn lossless_arith_rgb_rejects_invalid_params() {
     let g = vec![0u8; (w * h) as usize];
     let b = vec![0u8; (w * h) as usize];
     assert!(encode_lossless_arith_jpeg_rgb(w, h, [&r, &g, &b], s, 4, 1).is_err());
+}
+
+// ---- Subsampled three-component (YUV-class) lossless roundtrips ----------
+//
+// Exercises the T.81 A.2.3 interleaved-MCU lossless path: the luma
+// component is oversampled (2×1 / 2×2 / 4×1) relative to the two 1×1 chroma
+// components, mirroring the lossy 4:2:2 / 4:2:0 / 4:1:1 layouts. The
+// decoder reconstructs each component on its own padded grid, crops to the
+// true extent (A.2.4), and emits a planar Yuv*P frame.
+
+/// Build a deterministic textured 8-bit plane at `w × h`.
+fn mk_plane_8bit(w: usize, h: usize, seed: u32) -> Vec<u8> {
+    let mut p = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            p[j * w + i] =
+                ((i as u32 * 7 + j as u32 * 11 + seed * 13 + ((i ^ j) as u32 & 31)) & 0xFF) as u8;
+        }
+    }
+    p
+}
+
+/// (h_factor, v_factor) → expected (planes, chroma_w_div, chroma_h_div).
+fn chroma_dims(w: u32, h: u32, hf: u8, vf: u8) -> (u32, u32) {
+    (w.div_ceil(hf as u32), h.div_ceil(vf as u32))
+}
+
+#[test]
+fn lossless_yuv_subsampled_every_factor_and_predictor_is_bit_exact() {
+    // Odd width/height so the MCU-padding / cropping path is exercised.
+    let w = 17u32;
+    let h = 11u32;
+    // (1,1) is the all-1×1 RGB-class case (byte-identical to an RGB SOF3),
+    // which the decoder surfaces as packed Rgb24 — covered by the RGB
+    // roundtrip tests. Here we only exercise the genuinely subsampled
+    // (luma-oversampled) YUV-class layouts that emit planar Yuv*P.
+    for &(hf, vf) in &[(2u8, 1u8), (2, 2), (4, 1)] {
+        let (cw, ch) = chroma_dims(w, h, hf, vf);
+        let y = mk_plane_8bit(w as usize, h as usize, 1);
+        let cb = mk_plane_8bit(cw as usize, ch as usize, 2);
+        let cr = mk_plane_8bit(cw as usize, ch as usize, 3);
+        for predictor in 1u8..=7 {
+            let jpeg = encode_lossless_jpeg_yuv(
+                w,
+                h,
+                &y,
+                w as usize,
+                &cb,
+                cw as usize,
+                &cr,
+                cw as usize,
+                hf,
+                vf,
+                predictor,
+            )
+            .unwrap_or_else(|e| panic!("encode {hf}x{vf} pred={predictor}: {e:?}"));
+            // SOF3 marker present.
+            assert!(
+                jpeg.windows(2).any(|x| x == [0xFF, 0xC3]),
+                "{hf}x{vf} pred={predictor}: SOF3 missing"
+            );
+            let v = decode_to_frame(jpeg, w, h);
+            assert_eq!(v.planes.len(), 3, "{hf}x{vf} pred={predictor}: planes");
+
+            // Y plane: full resolution.
+            let ys = v.planes[0].stride;
+            for j in 0..h as usize {
+                for i in 0..w as usize {
+                    assert_eq!(
+                        v.planes[0].data[j * ys + i],
+                        y[j * w as usize + i],
+                        "{hf}x{vf} pred={predictor} Y at ({i},{j})"
+                    );
+                }
+            }
+            // Cb / Cr planes: subsampled resolution.
+            for (pi, src) in [(1usize, &cb), (2usize, &cr)] {
+                let s = v.planes[pi].stride;
+                for j in 0..ch as usize {
+                    for i in 0..cw as usize {
+                        assert_eq!(
+                            v.planes[pi].data[j * s + i],
+                            src[j * cw as usize + i],
+                            "{hf}x{vf} pred={predictor} C{pi} at ({i},{j})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_yuv_subsampled_with_restart_and_point_transform_is_bit_exact() {
+    let w = 20u32;
+    let h = 14u32;
+    let hf = 2u8;
+    let vf = 2u8; // 4:2:0
+    let (cw, ch) = chroma_dims(w, h, hf, vf);
+    // Point transform Pt=2: the low 2 bits of every sample are dropped on
+    // the wire, so the decoder reconstructs `(sample >> 2) << 2`.
+    let pt = 2u8;
+    let y = mk_plane_8bit(w as usize, h as usize, 5);
+    let cb = mk_plane_8bit(cw as usize, ch as usize, 6);
+    let cr = mk_plane_8bit(cw as usize, ch as usize, 7);
+    for ri in [0u16, 3, 7] {
+        let jpeg = encode_lossless_jpeg_yuv_with_opts(
+            w,
+            h,
+            &y,
+            w as usize,
+            &cb,
+            cw as usize,
+            &cr,
+            cw as usize,
+            hf,
+            vf,
+            4, // predictor 4
+            ri,
+            pt,
+        )
+        .unwrap_or_else(|e| panic!("encode ri={ri}: {e:?}"));
+        let v = decode_to_frame(jpeg, w, h);
+        assert_eq!(v.planes.len(), 3, "ri={ri}");
+        let ys = v.planes[0].stride;
+        for j in 0..h as usize {
+            for i in 0..w as usize {
+                let want = (y[j * w as usize + i] >> pt) << pt;
+                assert_eq!(v.planes[0].data[j * ys + i], want, "ri={ri} Y ({i},{j})");
+            }
+        }
+        for (pi, src) in [(1usize, &cb), (2usize, &cr)] {
+            let s = v.planes[pi].stride;
+            for j in 0..ch as usize {
+                for i in 0..cw as usize {
+                    let want = (src[j * cw as usize + i] >> pt) << pt;
+                    assert_eq!(
+                        v.planes[pi].data[j * s + i],
+                        want,
+                        "ri={ri} C{pi} ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lossless_yuv_rejects_unsupported_luma_factor() {
+    let w = 8u32;
+    let h = 8u32;
+    let y = vec![0u8; (w * h) as usize];
+    let cb = vec![0u8; (w * h) as usize];
+    let cr = vec![0u8; (w * h) as usize];
+    // 3×3 luma is not in the supported {1x1,2x1,2x2,4x1} set.
+    let err = encode_lossless_jpeg_yuv(
+        w, h, &y, w as usize, &cb, w as usize, &cr, w as usize, 3, 3, 1,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("3x3")
+            || format!("{err:?}").to_lowercase().contains("sampling")
+    );
 }

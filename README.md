@@ -7,10 +7,12 @@ and lossless (SOF3 Huffman + SOF11 arithmetic) JPEGs (single-component
 grayscale at any precision `P ∈ 2..=16` plus three-component RGB-class
 at `P = 8`), encodes
 baseline, progressive **and** lossless JPEG (the lossless path covers
-single-component grayscale at every precision `P ∈ 2..=16` and
-three-component interleaved RGB at every precision `P ∈ 2..=16`, with
-every Annex H Table H.1 predictor). YUV 4:4:4 / 4:2:2 / 4:2:0 and
-grayscale. Zero C dependencies.
+single-component grayscale at every precision `P ∈ 2..=16`,
+three-component interleaved RGB at every precision `P ∈ 2..=16`, and
+three-component **subsampled YUV-class** at `P = 8`
+(`Yuv444P`/`Yuv422P`/`Yuv420P`/`Yuv411P`), with every Annex H Table H.1
+predictor). YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. Zero C
+dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -769,9 +771,17 @@ Not supported (decoder returns `Error::Unsupported`):
   rejected with `Unsupported`). `P = 8` 4-component lossless *is*
   supported on both encode and decode with the Adobe APP14 transform
   flag honoured on output.
-- Lossless with non-unit sampling factors (the spec permits this
-  but no real-world corpus exercises it; rejected with
-  `Unsupported`).
+- Lossless (SOF3 Huffman) with **non-unit sampling factors** is now
+  decoded for the three-component YUV-class layout: the luma component
+  may be oversampled `1×1` / `2×1` / `2×2` / `4×1` with both chroma
+  components at `1×1`, decoding via the T.81 A.2.3 interleaved-MCU
+  ordering to a planar `Yuv444P` / `Yuv422P` / `Yuv420P` / `Yuv411P`
+  frame (each component cropped to its true extent per A.2.4). The
+  matching encoder is `encode_lossless_jpeg_yuv` /
+  `encode_lossless_jpeg_yuv_with_opts`. Still rejected with
+  `Unsupported`: subsampled chroma on the **arithmetic** (SOF11)
+  lossless path, four-component subsampling, and luma factors outside
+  the `{1×1, 2×1, 2×2, 4×1}` set.
 
 ## Fuzzing
 

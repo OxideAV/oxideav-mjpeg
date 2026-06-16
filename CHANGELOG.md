@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- SOF3 subsampled three-component (YUV-class) lossless encode + decode
+  (T.81 A.2.3 interleaved-MCU ordering) — luma 1×1/2×1/2×2/4×1, planar
+  Yuv444P/Yuv422P/Yuv420P/Yuv411P output
 - typed COM (comment) segments view (T.81 §B.2.4.5) on JpegInfo
 
 ## [0.1.8](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.7...v0.1.8) - 2026-06-15

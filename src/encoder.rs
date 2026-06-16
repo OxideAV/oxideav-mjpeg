@@ -4691,6 +4691,240 @@ pub fn encode_lossless_jpeg_rgb_with_opts(
     Ok(out)
 }
 
+/// Encode three planar **8-bit YUV-class** channels as a standalone
+/// **subsampled three-component lossless** JPEG (SOF3, interleaved scan)
+/// byte stream, with the luma component oversampled relative to the two
+/// chroma components.
+///
+/// This is the lossless counterpart of the lossy 4:2:2 / 4:2:0 / 4:1:1
+/// paths: the luma (first) component declares sampling factors
+/// `(h_factor, v_factor)` and both chroma components declare `1×1`, so a
+/// minimum coded unit carries `h_factor × v_factor` luma samples followed
+/// by one Cb and one Cr sample (T.81 A.2.3 interleaved data ordering, with
+/// the lossless data unit equal to one sample per E.1.1). Supported luma
+/// factors and the pixel format they round-trip to:
+///
+/// | `(h_factor, v_factor)` | chroma resolution        | decoder format |
+/// |------------------------|--------------------------|----------------|
+/// | `(1, 1)`               | full (= luma)            | `Yuv444P`      |
+/// | `(2, 1)`               | half width               | `Yuv422P`      |
+/// | `(2, 2)`               | half width, half height  | `Yuv420P`      |
+/// | `(4, 1)`               | quarter width            | `Yuv411P`      |
+///
+/// * `y_plane` / `y_stride` — full-resolution luma, `width × height`.
+/// * `cb_plane` / `cr_plane` (+ strides) — chroma at the subsampled
+///   resolution `ceil(width × h / h) × ceil(height × v / v)` i.e.
+///   `ceil(width / (h_max / 1)) × …`. Concretely: width is divided by
+///   `h_factor` (rounding up) and height by `v_factor` (rounding up).
+/// * `predictor` — Table H.1 selector `1..=7`, shared by every component.
+/// * `restart_interval` — `RSTn` cadence in **MCUs** (0 disables).
+/// * `point_transform` — `Pt`, `0..=15` and `< 8`.
+///
+/// Per A.2.4 each component is padded to a whole number of MCUs before
+/// predictive coding by replicating its right-most column / bottom row; the
+/// decoder crops the added samples back off on output. Bit-exact round-trip
+/// vs. `decode_lossless_scan` for every supported factor / predictor /
+/// restart / Pt combination.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_jpeg_yuv_with_opts(
+    width: u32,
+    height: u32,
+    y_plane: &[u8],
+    y_stride: usize,
+    cb_plane: &[u8],
+    cb_stride: usize,
+    cr_plane: &[u8],
+    cr_stride: usize,
+    h_factor: u8,
+    v_factor: u8,
+    predictor: u8,
+    restart_interval: u16,
+    point_transform: u8,
+) -> Result<Vec<u8>> {
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless YUV encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= 8 {
+        return Err(Error::invalid(format!(
+            "lossless YUV encoder: point_transform {point_transform} must be < precision 8"
+        )));
+    }
+    if !matches!((h_factor, v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
+        return Err(Error::unsupported(format!(
+            "lossless YUV encoder: unsupported luma sampling {h_factor}x{v_factor} (supported: 1x1, 2x1, 2x2, 4x1)"
+        )));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("lossless YUV encoder: zero-size image"));
+    }
+    let hf = h_factor as usize;
+    let vf = v_factor as usize;
+    let cw = w.div_ceil(hf); // chroma width
+    let ch = h.div_ceil(vf); // chroma height
+                             // Bounds: each supplied plane must hold its (sub)sampled extent.
+    if y_stride < w || y_plane.len() < y_stride * h {
+        return Err(Error::invalid("lossless YUV encoder: Y plane too small"));
+    }
+    if cb_stride < cw || cb_plane.len() < cb_stride * ch {
+        return Err(Error::invalid("lossless YUV encoder: Cb plane too small"));
+    }
+    if cr_stride < cw || cr_plane.len() < cr_stride * ch {
+        return Err(Error::invalid("lossless YUV encoder: Cr plane too small"));
+    }
+
+    let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 2 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_sof_lossless_yuv(&mut out, w as u16, h as u16, h_factor, v_factor);
+    write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+
+    let pt = point_transform as u32;
+
+    // MCU grid: ceil(width / h_max) × ceil(height / v_max) with
+    // h_max = h_factor, v_max = v_factor (luma carries the oversampling,
+    // chroma are 1×1). Each component is padded out to a whole number of
+    // MCUs by edge replication (A.2.4 NOTE).
+    let mcus_x = w.div_ceil(hf);
+    let mcus_y = h.div_ceil(vf);
+    let y_gw = mcus_x * hf; // padded luma grid width
+    let y_gh = mcus_y * vf;
+    let c_gw = mcus_x; // padded chroma grid (1×1) width
+    let c_gh = mcus_y;
+
+    // Build MCU-padded, point-transform-shifted component grids. Edge
+    // replication: a sample beyond the component's true extent takes the
+    // value of the nearest in-bounds sample (clamp the index).
+    let build_grid =
+        |plane: &[u8], stride: usize, src_w: usize, src_h: usize, gw: usize, gh: usize| {
+            let mut grid = vec![0u8; gw * gh];
+            for gy in 0..gh {
+                let sy = gy.min(src_h - 1);
+                for gx in 0..gw {
+                    let sx = gx.min(src_w - 1);
+                    grid[gy * gw + gx] = plane[sy * stride + sx] >> pt;
+                }
+            }
+            grid
+        };
+    let grids: [Vec<u8>; 3] = [
+        build_grid(y_plane, y_stride, w, h, y_gw, y_gh),
+        build_grid(cb_plane, cb_stride, cw, ch, c_gw, c_gh),
+        build_grid(cr_plane, cr_stride, cw, ch, c_gw, c_gh),
+    ];
+    let grid_w = [y_gw, c_gw, c_gw];
+    let comp_hf = [hf, 1, 1];
+    let comp_vf = [vf, 1, 1];
+
+    // Origin / restart bookkeeping (identical model to the RGB path; only
+    // the MCU sample layout differs).
+    let sample_bits = 8u32 - pt;
+    let origin: i32 = 1i32 << (sample_bits - 1);
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: u32 = 0;
+    let total_mcus: u64 = mcus_x as u64 * mcus_y as u64;
+    let mut mcu_index: u64 = 0;
+    let mut reset_pred = true;
+
+    let mut bw = BitWriter::new(&mut out);
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            // T.81 A.2.3: within an MCU emit component 0's H×V block (row
+            // major), then component 1's single sample, then component 2's.
+            for c in 0..3 {
+                let gw = grid_w[c];
+                let grid = &grids[c];
+                for sy in 0..comp_vf[c] {
+                    for sx in 0..comp_hf[c] {
+                        let gx = mx * comp_hf[c] + sx;
+                        let gy = my * comp_vf[c] + sy;
+                        let actual = grid[gy * gw + gx] as i32;
+                        let pred: i32 = if reset_pred {
+                            origin
+                        } else if gy == 0 {
+                            grid[gy * gw + gx - 1] as i32
+                        } else if gx == 0 {
+                            grid[(gy - 1) * gw + gx] as i32
+                        } else {
+                            let ra = grid[gy * gw + gx - 1] as i32;
+                            let rb = grid[(gy - 1) * gw + gx] as i32;
+                            let rc = grid[(gy - 1) * gw + gx - 1] as i32;
+                            match predictor {
+                                1 => ra,
+                                2 => rb,
+                                3 => rc,
+                                4 => ra + rb - rc,
+                                5 => ra + ((rb - rc) >> 1),
+                                6 => rb + ((ra - rc) >> 1),
+                                7 => (ra + rb) >> 1,
+                                _ => unreachable!(),
+                            }
+                        };
+                        let diff = actual - pred;
+                        let (s, bits) = category_lossless(diff);
+                        let hc = dc_huff.encode[s as usize];
+                        debug_assert!(hc.len != 0, "DC Huffman code for SSSS={s} must be present");
+                        bw.write_bits(hc.code as u32, hc.len as u32);
+                        if s != 0 && s != 16 {
+                            bw.write_bits(bits, s as u32);
+                        }
+                    }
+                }
+            }
+
+            reset_pred = false;
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                bw.flush_to_byte();
+                bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                mcus_since_restart = 0;
+                reset_pred = true;
+            }
+        }
+    }
+    bw.finish();
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// Convenience wrapper for [`encode_lossless_jpeg_yuv_with_opts`] with the
+/// default predictor 1 (Ra / left), no restart markers, and `Pt = 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_jpeg_yuv(
+    width: u32,
+    height: u32,
+    y_plane: &[u8],
+    y_stride: usize,
+    cb_plane: &[u8],
+    cb_stride: usize,
+    cr_plane: &[u8],
+    cr_stride: usize,
+    h_factor: u8,
+    v_factor: u8,
+    predictor: u8,
+) -> Result<Vec<u8>> {
+    encode_lossless_jpeg_yuv_with_opts(
+        width, height, y_plane, y_stride, cb_plane, cb_stride, cr_plane, cr_stride, h_factor,
+        v_factor, predictor, 0, 0,
+    )
+}
+
 /// Encode four planar 8-bit colour channels as a standalone **four-component
 /// lossless** JPEG (SOF3, four-component interleaved scan) byte stream.
 ///
@@ -4966,6 +5200,29 @@ fn write_sof_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precisio
         payload.push(0x11); // H=1 V=1
         payload.push(0); // Tq (ignored for lossless)
     }
+    write_length_prefix(out, markers::SOF3, &payload);
+}
+
+/// Write an SOF3 segment for a subsampled three-component (YUV-class)
+/// lossless frame: the luma component (id 1) declares `(h_factor,
+/// v_factor)`, both chroma components (ids 2, 3) declare `1×1`. Tq is 0 for
+/// every component (lossless ignores quantisation tables).
+fn write_sof_lossless_yuv(out: &mut Vec<u8>, width: u16, height: u16, h_factor: u8, v_factor: u8) {
+    debug_assert!((1..=4).contains(&h_factor) && (1..=4).contains(&v_factor));
+    let mut payload = Vec::with_capacity(8 + 3 * 3);
+    payload.push(8); // precision (YUV-class lossless is P = 8)
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // Nf
+    payload.push(1); // luma component id
+    payload.push((h_factor << 4) | (v_factor & 0x0F));
+    payload.push(0); // Tq
+    payload.push(2); // Cb id
+    payload.push(0x11); // 1×1
+    payload.push(0);
+    payload.push(3); // Cr id
+    payload.push(0x11); // 1×1
+    payload.push(0);
     write_length_prefix(out, markers::SOF3, &payload);
 }
 

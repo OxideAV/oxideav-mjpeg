@@ -195,13 +195,56 @@ fn validate_lossless_sof(sof: &SofInfo) -> Result<()> {
             sof.precision
         )));
     }
-    if sof.components.len() > 1 {
+    // Sampling-factor policy for the multi-component lossless processes:
+    //   * Four-component (CMYK-class) scans require `H_i = V_i = 1` on
+    //     every component. The packed `PixelFormat::Cmyk` output is one
+    //     byte-quadruple per pixel with no subsampled variant, so a
+    //     subsampled fourth component would have nowhere to land.
+    //   * Three-component (YUV-class) scans permit non-unit sampling on
+    //     the *first* (luma) component, with both chroma components held
+    //     at `H = V = 1` — exactly the convention the baseline/extended-
+    //     sequential decoders enforce (A.2.3 interleaved MCU ordering, luma
+    //     carries the oversampling). The supported luma factors are 1×1,
+    //     2×1, 2×2 and 4×1, mapping to `Yuv444P` / `Yuv422P` / `Yuv420P` /
+    //     `Yuv411P`. The all-1×1 RGB-class case keeps its packed `Rgb24`
+    //     (P=8) / `Gbrp*Le` / `Rgb48Le` output unchanged.
+    if sof.components.len() == 4 {
         for c in &sof.components {
             if c.h_factor != 1 || c.v_factor != 1 {
                 return Err(Error::unsupported(
-                    "lossless JPEG: multi-component scans require H_i = V_i = 1",
+                    "lossless JPEG: four-component scans require H_i = V_i = 1",
                 ));
             }
+        }
+    } else if sof.components.len() == 3 {
+        let cb = &sof.components[1];
+        let cr = &sof.components[2];
+        if cb.h_factor != cr.h_factor || cb.v_factor != cr.v_factor {
+            return Err(Error::unsupported(
+                "lossless JPEG: chroma components have different sampling factors",
+            ));
+        }
+        if cb.h_factor != 1 || cb.v_factor != 1 {
+            return Err(Error::unsupported(
+                "lossless JPEG: chroma components must declare H = V = 1 (luma carries oversampling)",
+            ));
+        }
+        let y = &sof.components[0];
+        if !matches!((y.h_factor, y.v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
+            return Err(Error::unsupported(format!(
+                "lossless JPEG: unsupported luma sampling {}x{} (supported: 1x1, 2x1, 2x2, 4x1)",
+                y.h_factor, y.v_factor
+            )));
+        }
+        // Subsampled (luma-oversampled) YUV-class output is planar
+        // `Yuv*P`, which the workspace `PixelFormat` enum only models at
+        // 8-bit precision. The all-1×1 RGB-class case keeps its existing
+        // P ∈ 2..=16 support (packed Rgb24 / planar Gbrp*Le / Rgb48Le).
+        if (y.h_factor != 1 || y.v_factor != 1) && sof.precision != 8 {
+            return Err(Error::unsupported(format!(
+                "lossless JPEG: subsampled three-component scans require precision 8, got {}",
+                sof.precision
+            )));
         }
     }
     Ok(())
@@ -2709,12 +2752,6 @@ fn decode_lossless_scan(
     let height = sof.height as usize;
     let nc = sos.components.len();
 
-    // Multi-component output: P = 8 → packed Rgb24, P ∈ {10, 12, 14} →
-    // planar `Gbrp{10,12,14}Le`, every other precision in 2..=16 →
-    // packed `Rgb48Le`. The decoder already validated `precision ∈
-    // 2..=16` at SOF3 parse time (see the `SOF3` arm in `decode_to_eoi`),
-    // so no upper-bound recheck is needed here.
-
     // Resolve one DC Huffman table per scan component (selectors are
     // independent per Annex H; the encoder may share the same table).
     let mut dc_tables: Vec<&HuffTable> = Vec::with_capacity(nc);
@@ -2725,99 +2762,223 @@ fn decode_lossless_scan(
         dc_tables.push(t);
     }
 
+    // Per-component sampling factors (T.81 A.2.3 / E.1.1: the lossless
+    // data unit is one sample, so a component with H_i × V_i contributes
+    // exactly that many samples per MCU). `validate_lossless_sof` has
+    // already constrained the legal combinations (single component, all-
+    // 1×1 multi-component, or 3-component YUV-class with luma oversampling
+    // and 1×1 chroma).
+    let h_factors: Vec<usize> = sof.components.iter().map(|c| c.h_factor as usize).collect();
+    let v_factors: Vec<usize> = sof.components.iter().map(|c| c.v_factor as usize).collect();
+    let h_max = *h_factors.iter().max().unwrap_or(&1);
+    let v_max = *v_factors.iter().max().unwrap_or(&1);
+    // The MCU-block (A.2.3) ordering only applies to interleaved scans
+    // (Ns > 1). For a single-component scan T.81 A.2.2 fixes the order as
+    // plain raster "regardless of the values of H1 and V1", so a
+    // grayscale component with non-unit factors still decodes left-to-
+    // right / top-to-bottom over the full image grid — never the block
+    // path below.
+    let subsampled = nc > 1 && (h_max != 1 || v_max != 1);
+
+    // Per-component sample-grid dimensions. For the all-1×1 cases this is
+    // exactly width × height; for a subsampled 3-component scan each
+    // component is `ceil(width × H_i / H_max) × ceil(height × V_i / V_max)`
+    // samples (the spec's "small rectangular arrays" partitioning). The
+    // grid is padded out to a whole number of MCUs (A.2.4: the encoder
+    // extends to a multiple of H_i / V_i, the decoder removes the added
+    // samples on output by cropping to the component's true extent).
+    let mcus_x = width.div_ceil(h_max);
+    let mcus_y = height.div_ceil(v_max);
+    // Padded per-component grid dimensions. In the non-subsampled (flat
+    // raster) path every component is decoded directly on the width ×
+    // height image grid (the all-1×1 multi-component cases have
+    // comp_w == width anyway, and a single-component grayscale with
+    // non-unit factors still rasters over the full image per A.2.2), so we
+    // collapse the grid to width × height there. Only the interleaved
+    // subsampled path uses the MCU-padded `ceil × factor` grids.
+    let (comp_w, comp_h): (Vec<usize>, Vec<usize>) = if subsampled {
+        (
+            h_factors.iter().map(|&h| mcus_x * h).collect(),
+            v_factors.iter().map(|&v| mcus_y * v).collect(),
+        )
+    } else {
+        (vec![width; nc], vec![height; nc])
+    };
+    // True (un-padded) per-component extent used to size the output planes.
+    let comp_true_w: Vec<usize> = h_factors
+        .iter()
+        .map(|&h| (width * h).div_ceil(h_max))
+        .collect();
+    let comp_true_h: Vec<usize> = v_factors
+        .iter()
+        .map(|&v| (height * v).div_ceil(v_max))
+        .collect();
+
     // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
     let sample_bits = precision - pt;
     let sample_max: u32 = 1u32 << sample_bits;
     let sample_mask: u32 = sample_max - 1;
     let origin: u32 = 1u32 << (sample_bits - 1);
 
-    // One sample buffer per component; each component is modeled
-    // independently per H.1.2.
-    let mut samples: Vec<Vec<u32>> = (0..nc).map(|_| vec![0u32; width * height]).collect();
+    // One padded sample grid per component; each component is modeled
+    // independently per H.1.2 using its own neighbour grid.
+    let mut samples: Vec<Vec<u32>> = (0..nc)
+        .map(|ci| vec![0u32; comp_w[ci] * comp_h[ci]])
+        .collect();
     let mut br = BitReader::new(scan);
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = RST0;
     let mut reset_pred = true; // true at image start and after each RSTn.
 
-    for y in 0..height {
-        for x in 0..width {
-            if state.restart_interval != 0
-                && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
-            {
-                br.bits = 0;
-                br.nbits = 0;
-                while br.saw_rst.is_none() {
-                    let prev = br.pos;
-                    match br.next_byte_with_stuff()? {
-                        Some(_) => {}
-                        None => {
-                            if prev == br.pos {
-                                break;
-                            }
+    // Decode one sample at component-grid position (cy, cx) for component
+    // `ci`. `decode_one` predicts from the component's own grid per Table
+    // H.1, honouring the first-line / first-column / restart fall-backs of
+    // H.1.2.1, then reads the modulo difference and stores the result.
+    // The closure borrows `samples` mutably through an index so the same
+    // body serves both the flat (all-1×1) and MCU-ordered paths.
+    macro_rules! decode_one {
+        ($ci:expr, $cx:expr, $cy:expr) => {{
+            let ci = $ci;
+            let cx = $cx;
+            let cy = $cy;
+            let cw = comp_w[ci];
+            let plane = &samples[ci];
+            let pred: u32 = if reset_pred {
+                origin
+            } else if cy == 0 {
+                plane[cy * cw + cx - 1]
+            } else if cx == 0 {
+                plane[(cy - 1) * cw + cx]
+            } else {
+                let ra = plane[cy * cw + cx - 1];
+                let rb = plane[(cy - 1) * cw + cx];
+                let rc = plane[(cy - 1) * cw + cx - 1];
+                match predictor {
+                    1 => ra,
+                    2 => rb,
+                    3 => rc,
+                    4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                    5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                    6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                    7 => (ra.wrapping_add(rb)) >> 1,
+                    _ => unreachable!(),
+                }
+            };
+            let s = decode_huff(&mut br, dc_tables[ci])? as u32;
+            if s > 16 {
+                // Annex H Table H.2: SSSS = magnitude in 0..16. A Huffman
+                // table that produces a value > 16 here is either corrupt
+                // or maliciously crafted; the existing extend / get_bits
+                // machinery has no defined behaviour for it.
+                return Err(Error::invalid("lossless: SSSS > 16"));
+            }
+            let residual: i32 = if s == 0 {
+                0
+            } else if s == 16 {
+                32_768
+            } else {
+                let bits = br.get_bits(s)? as i32;
+                extend(bits, s)
+            };
+            let sv = ((pred as i32).wrapping_add(residual) as u32) & sample_mask;
+            samples[ci][cy * cw + cx] = sv;
+        }};
+    }
+
+    // Consume an `RSTn` marker at a restart boundary and re-arm the
+    // predictor reset (H.1.2.1: the prediction value at the beginning of
+    // each restart interval is the origin again). Shared by both scan
+    // orderings.
+    macro_rules! consume_restart {
+        () => {{
+            br.bits = 0;
+            br.nbits = 0;
+            while br.saw_rst.is_none() {
+                let prev = br.pos;
+                match br.next_byte_with_stuff()? {
+                    Some(_) => {}
+                    None => {
+                        if prev == br.pos {
                             break;
+                        }
+                        break;
+                    }
+                }
+            }
+            if br.saw_rst.is_some() {
+                expected_rst = if expected_rst == RST7 {
+                    RST0
+                } else {
+                    expected_rst + 1
+                };
+                br.reset_at_restart();
+                reset_pred = true;
+            }
+        }};
+    }
+
+    if !subsampled {
+        // All-1×1 fast path (single component, RGB-class, or CMYK-class):
+        // one sample per component per pixel, scanned left-to-right /
+        // top-to-bottom. The component grid equals the image grid, so cx
+        // = x and cy = y. The restart interval counts MCUs (= pixels).
+        for y in 0..height {
+            for x in 0..width {
+                if state.restart_interval != 0
+                    && mcus_since_restart != 0
+                    && mcus_since_restart % state.restart_interval as u32 == 0
+                {
+                    consume_restart!();
+                }
+                for ci in 0..nc {
+                    decode_one!(ci, x, y);
+                }
+                reset_pred = false;
+                mcus_since_restart += 1;
+            }
+        }
+    } else {
+        // Subsampled 3-component (YUV-class) path. T.81 A.2.3: each MCU
+        // contributes H_i × V_i samples from component `i`, in left-to-
+        // right / top-to-bottom order within the MCU's H_i × V_i block,
+        // and the MCUs themselves walk left-to-right / top-to-bottom. The
+        // restart interval counts whole MCUs (H.1.1).
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                if state.restart_interval != 0
+                    && mcus_since_restart != 0
+                    && mcus_since_restart % state.restart_interval as u32 == 0
+                {
+                    consume_restart!();
+                }
+                for ci in 0..nc {
+                    let h = h_factors[ci];
+                    let v = v_factors[ci];
+                    for sy in 0..v {
+                        for sx in 0..h {
+                            let cx = mx * h + sx;
+                            let cy = my * v + sy;
+                            decode_one!(ci, cx, cy);
                         }
                     }
                 }
-                if br.saw_rst.is_some() {
-                    expected_rst = if expected_rst == RST7 {
-                        RST0
-                    } else {
-                        expected_rst + 1
-                    };
-                    br.reset_at_restart();
-                    reset_pred = true;
-                }
+                reset_pred = false;
+                mcus_since_restart += 1;
             }
-
-            for ci in 0..nc {
-                let plane = &samples[ci];
-                let pred: u32 = if reset_pred {
-                    origin
-                } else if y == 0 {
-                    plane[y * width + x - 1]
-                } else if x == 0 {
-                    plane[(y - 1) * width + x]
-                } else {
-                    let ra = plane[y * width + x - 1];
-                    let rb = plane[(y - 1) * width + x];
-                    let rc = plane[(y - 1) * width + x - 1];
-                    match predictor {
-                        1 => ra,
-                        2 => rb,
-                        3 => rc,
-                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
-                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
-                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
-                        7 => (ra.wrapping_add(rb)) >> 1,
-                        _ => unreachable!(),
-                    }
-                };
-
-                let s = decode_huff(&mut br, dc_tables[ci])? as u32;
-                if s > 16 {
-                    // Annex H Table H.2: SSSS = magnitude in 0..16. A
-                    // Huffman table that produces a value > 16 here is
-                    // either corrupt or maliciously crafted; the
-                    // existing extend / get_bits machinery has no
-                    // defined behaviour for it.
-                    return Err(Error::invalid("lossless: SSSS > 16"));
-                }
-                let residual: i32 = if s == 0 {
-                    0
-                } else if s == 16 {
-                    32_768
-                } else {
-                    let bits = br.get_bits(s)? as i32;
-                    extend(bits, s)
-                };
-
-                let sv = ((pred as i32).wrapping_add(residual) as u32) & sample_mask;
-                samples[ci][y * width + x] = sv;
-            }
-            reset_pred = false;
-            mcus_since_restart += 1;
         }
+    }
+
+    if subsampled {
+        return shape_lossless_yuv_frame(
+            &samples,
+            &comp_w,
+            &comp_true_w,
+            &comp_true_h,
+            width,
+            height,
+            pt,
+            pts,
+        );
     }
 
     shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
@@ -3001,6 +3162,52 @@ fn shape_lossless_frame(
     })
 }
 
+/// Shape a subsampled three-component (YUV-class) lossless decode into a
+/// planar `Yuv444P` / `Yuv422P` / `Yuv420P` / `Yuv411P` frame.
+///
+/// The scan decoder reconstructed each component onto its own MCU-padded
+/// sample grid (`comp_w[ci]` wide). Per T.81 A.2.4 the decoding process
+/// removes any samples the encoder added to round each component up to a
+/// whole number of MCUs, so here we crop component `ci` to its true extent
+/// `comp_true_w[ci] × comp_true_h[ci]` when copying into the output plane.
+/// Precision is fixed at `P = 8` for the YUV-class path (the only subsampled
+/// combination `validate_lossless_sof` admits), so each post-`<< pt` sample
+/// fits in a `u8`. Plane order is Y, Cb, Cr — the SOS scan order, matching
+/// the lossy decoder's planar layout.
+#[allow(clippy::too_many_arguments)]
+fn shape_lossless_yuv_frame(
+    samples: &[Vec<u32>],
+    comp_w: &[usize],
+    comp_true_w: &[usize],
+    comp_true_h: &[usize],
+    width: usize,
+    height: usize,
+    pt: u32,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let mut planes: Vec<VideoPlane> = Vec::with_capacity(3);
+    // Y plane is always full-resolution (width × height); the chroma
+    // planes carry their subsampled extent. We size each output plane to
+    // the component's true (un-padded) dimensions and copy row-by-row out
+    // of the wider padded grid.
+    for ci in 0..3 {
+        let cw = comp_w[ci];
+        let out_w = if ci == 0 { width } else { comp_true_w[ci] };
+        let out_h = if ci == 0 { height } else { comp_true_h[ci] };
+        let stride = out_w;
+        let mut data = vec![0u8; stride * out_h];
+        for y in 0..out_h {
+            let src_row = &samples[ci][y * cw..y * cw + out_w];
+            let dst_row = &mut data[y * stride..y * stride + out_w];
+            for (d, &s) in dst_row.iter_mut().zip(src_row) {
+                *d = (s << pt) as u8;
+            }
+        }
+        planes.push(VideoPlane { stride, data });
+    }
+    Ok(VideoFrame { pts, planes })
+}
+
 // ---- Lossless arithmetic JPEG (SOF11) -------------------------------------
 //
 // Same Annex H predictor-based coding model as SOF3, but the modulo-2^16
@@ -3036,6 +3243,19 @@ fn decode_lossless_arith_scan(
     if sos.components.len() != sof.components.len() {
         return Err(Error::unsupported(
             "lossless arith: non-interleaved multi-component scans are not supported",
+        ));
+    }
+    // The arithmetic (SOF11) lossless path models one sample per component
+    // per MCU; the A.2.3 subsampled-MCU ordering is only wired into the
+    // Huffman (SOF3) decoder. `validate_lossless_sof` now admits YUV-class
+    // subsampling, so reject it explicitly here rather than mis-decoding.
+    if sof
+        .components
+        .iter()
+        .any(|c| c.h_factor != 1 || c.v_factor != 1)
+    {
+        return Err(Error::unsupported(
+            "lossless arith: non-unit sampling factors are not supported",
         ));
     }
     let predictor = sos.ss;

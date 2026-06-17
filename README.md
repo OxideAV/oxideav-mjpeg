@@ -733,8 +733,10 @@ Encoder:
   every component's predictor to `2^(P − Pt − 1)` per T.81 §H.1.2.1.
 - **SOF11** (lossless, arithmetic-coded) — single-component grayscale
   and three-component interleaved (RGB-class) at any precision
-  `P ∈ 2..=16`, plus four-component interleaved (CMYK-class) at `P = 8`,
-  with every Annex H Table H.1 predictor `1..=7`. The
+  `P ∈ 2..=16`, three-component **subsampled YUV-class** at `P = 8`
+  (luma `1×1` / `2×1` / `2×2` / `4×1`, chroma `1×1` — the §A.2.3
+  interleaved-MCU layout), plus four-component interleaved (CMYK-class)
+  at `P = 8`, with every Annex H Table H.1 predictor `1..=7`. The
   Q-coder counterpart of the SOF3 path: the modulo-2^16 prediction
   differences are entropy-coded by the Annex D arithmetic coder under
   the §H.1.2.3 two-dimensional statistical model (each component
@@ -743,6 +745,7 @@ Encoder:
   `Di = 32768` case, non-zero point transform, and per-interval restart
   re-seeding via `encode_lossless_arith_jpeg_grayscale_with_opts` /
   `encode_lossless_arith_jpeg_rgb_with_opts` /
+  `encode_lossless_arith_jpeg_yuv_with_opts` /
   `encode_lossless_arith_jpeg_cmyk_with_opts`. The four-component path
   honours the Adobe APP14 colour-transform flag identically to the
   Huffman SOF3 CMYK encoder (no-APP14 / Adobe-CMYK round-trips are
@@ -771,17 +774,21 @@ Not supported (decoder returns `Error::Unsupported`):
   rejected with `Unsupported`). `P = 8` 4-component lossless *is*
   supported on both encode and decode with the Adobe APP14 transform
   flag honoured on output.
-- Lossless (SOF3 Huffman) with **non-unit sampling factors** is now
-  decoded for the three-component YUV-class layout: the luma component
-  may be oversampled `1×1` / `2×1` / `2×2` / `4×1` with both chroma
-  components at `1×1`, decoding via the T.81 A.2.3 interleaved-MCU
-  ordering to a planar `Yuv444P` / `Yuv422P` / `Yuv420P` / `Yuv411P`
-  frame (each component cropped to its true extent per A.2.4). The
-  matching encoder is `encode_lossless_jpeg_yuv` /
-  `encode_lossless_jpeg_yuv_with_opts`. Still rejected with
-  `Unsupported`: subsampled chroma on the **arithmetic** (SOF11)
-  lossless path, four-component subsampling, and luma factors outside
-  the `{1×1, 2×1, 2×2, 4×1}` set.
+- Lossless (SOF3 Huffman **and** SOF11 arithmetic) with **non-unit
+  sampling factors** is decoded for the three-component YUV-class
+  layout: the luma component may be oversampled `1×1` / `2×1` / `2×2` /
+  `4×1` with both chroma components at `1×1`, decoding via the T.81
+  A.2.3 interleaved-MCU ordering to a planar `Yuv444P` / `Yuv422P` /
+  `Yuv420P` / `Yuv411P` frame (each component cropped to its true extent
+  per A.2.4). The SOF11 path models each component independently under
+  the §H.1.2.3 two-dimensional statistical model over its own padded
+  grid, addressing the `L_Context(Da, Db)` conditioning neighbours by
+  absolute grid coordinate so the §A.2.3 walk's non-raster sample order
+  is handled correctly. The matching encoders are
+  `encode_lossless_jpeg_yuv` / `_with_opts` (SOF3) and
+  `encode_lossless_arith_jpeg_yuv` / `_with_opts` (SOF11). Still
+  rejected with `Unsupported`: four-component subsampling, and luma
+  factors outside the `{1×1, 2×1, 2×2, 4×1}` set.
 
 ## Fuzzing
 

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- SOF11 subsampled three-component (YUV-class) lossless **arithmetic**
+  encode + decode (T.81 A.2.3 interleaved-MCU ordering, §H.1.2.3
+  per-component statistical model over each component's own padded grid)
+  — luma 1×1/2×1/2×2/4×1, planar Yuv444P/Yuv422P/Yuv420P/Yuv411P output;
+  new `encoder::encode_lossless_arith_jpeg_yuv` / `_with_opts`
 - SOF3 subsampled three-component (YUV-class) lossless encode + decode
   (T.81 A.2.3 interleaved-MCU ordering) — luma 1×1/2×1/2×2/4×1, planar
   Yuv444P/Yuv422P/Yuv420P/Yuv411P output

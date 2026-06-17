@@ -3245,19 +3245,6 @@ fn decode_lossless_arith_scan(
             "lossless arith: non-interleaved multi-component scans are not supported",
         ));
     }
-    // The arithmetic (SOF11) lossless path models one sample per component
-    // per MCU; the A.2.3 subsampled-MCU ordering is only wired into the
-    // Huffman (SOF3) decoder. `validate_lossless_sof` now admits YUV-class
-    // subsampling, so reject it explicitly here rather than mis-decoding.
-    if sof
-        .components
-        .iter()
-        .any(|c| c.h_factor != 1 || c.v_factor != 1)
-    {
-        return Err(Error::unsupported(
-            "lossless arith: non-unit sampling factors are not supported",
-        ));
-    }
     let predictor = sos.ss;
     if !(1..=7).contains(&predictor) {
         return Err(Error::invalid(
@@ -3272,6 +3259,26 @@ fn decode_lossless_arith_scan(
     let width = sof.width as usize;
     let height = sof.height as usize;
     let nc = sos.components.len();
+
+    // Detect a subsampled YUV-class scan (luma oversampled, chroma 1×1). The
+    // A.2.3 interleaved-MCU ordering applies here; the flat per-pixel path
+    // below only handles all-1×1 components. `validate_lossless_sof` has
+    // already constrained the legal combinations.
+    let h_factors: Vec<usize> = sof.components.iter().map(|c| c.h_factor as usize).collect();
+    let v_factors: Vec<usize> = sof.components.iter().map(|c| c.v_factor as usize).collect();
+    let h_max = *h_factors.iter().max().unwrap_or(&1);
+    let v_max = *v_factors.iter().max().unwrap_or(&1);
+    if nc > 1 && (h_max != 1 || v_max != 1) {
+        if precision != 8 {
+            return Err(Error::unsupported(
+                "lossless arith: subsampled three-component scans require precision 8",
+            ));
+        }
+        return decode_lossless_arith_scan_subsampled(
+            state, sos, scan, pts, predictor, pt, width, height, &h_factors, &v_factors, h_max,
+            v_max,
+        );
+    }
 
     // One statistics area per scan component (§H.1.2.3.2), with the L / U
     // conditioning bounds taken from the DAC DC-conditioning entry the
@@ -3379,6 +3386,172 @@ fn decode_lossless_arith_scan(
     }
 
     shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
+}
+
+/// Decode a subsampled three-component (YUV-class) SOF11 lossless scan — the
+/// arithmetic-coded counterpart of the Huffman subsampled path in
+/// [`decode_lossless_scan`].
+///
+/// The luma component is oversampled (`1×1` / `2×1` / `2×2` / `4×1`) with both
+/// chroma components at `1×1`; the entropy data is walked in T.81 §A.2.3
+/// interleaved-MCU order (luma's `H_1 × V_1` block, then one Cb sample, then
+/// one Cr). Each component is modelled independently per §H.1.2 over its own
+/// MCU-padded sample grid (its own `Ra` / `Rb` / `Rc` predictor neighbours and
+/// its own statistics area), and the §H.1.2.3 `L_Context(Da, Db)` conditioning
+/// reads the differences from a full per-component **difference grid** indexed
+/// by absolute grid coordinate — because the §A.2.3 walk does not visit a
+/// component's samples in plain raster order, a sliding two-row window would
+/// mis-address the `Db` (above) neighbour. The grids are padded to a whole
+/// number of MCUs and cropped to each component's true extent on output
+/// (§A.2.4). Precision is fixed at `P = 8`.
+#[allow(clippy::too_many_arguments)]
+fn decode_lossless_arith_scan_subsampled(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    pts: Option<i64>,
+    predictor: u8,
+    pt: u32,
+    width: usize,
+    height: usize,
+    h_factors: &[usize],
+    v_factors: &[usize],
+    h_max: usize,
+    v_max: usize,
+) -> Result<VideoFrame> {
+    let nc = sos.components.len();
+
+    // One statistics area per scan component (§H.1.2.3.2); the DAC L / U
+    // conditioning bounds default to (0, 1) when no DAC segment is present.
+    let mut stats: Vec<LosslessStats> = sos
+        .components
+        .iter()
+        .map(|sc| {
+            let mut s = LosslessStats::new();
+            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
+                s.l = cond.l;
+                s.u = cond.u;
+            }
+            s
+        })
+        .collect();
+
+    let sample_bits = 8u32 - pt;
+    let sample_mask: u32 = (1u32 << sample_bits) - 1;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    // Per-component MCU-padded sample grids and their true (un-padded) extent.
+    let mcus_x = width.div_ceil(h_max);
+    let mcus_y = height.div_ceil(v_max);
+    let comp_w: Vec<usize> = h_factors.iter().map(|&hf| mcus_x * hf).collect();
+    let comp_h: Vec<usize> = v_factors.iter().map(|&vf| mcus_y * vf).collect();
+    let comp_true_w: Vec<usize> = h_factors
+        .iter()
+        .map(|&hf| (width * hf).div_ceil(h_max))
+        .collect();
+    let comp_true_h: Vec<usize> = v_factors
+        .iter()
+        .map(|&vf| (height * vf).div_ceil(v_max))
+        .collect();
+
+    let mut samples: Vec<Vec<u32>> = (0..nc)
+        .map(|ci| vec![0u32; comp_w[ci] * comp_h[ci]])
+        .collect();
+    // Full per-component difference grid for the §H.1.2.3 conditioning.
+    let mut diff_grid: Vec<Vec<i32>> = (0..nc)
+        .map(|ci| vec![0i32; comp_w[ci] * comp_h[ci]])
+        .collect();
+
+    let mut scan_pos = 0usize;
+    let mut decoder = ArithDecoder::new(scan);
+    let mut mcus_since_restart: u32 = 0;
+    let mut reset_pred = true; // true at scan start and after each RSTn
+    let mut first_row: Vec<usize> = vec![0usize; nc]; // first grid row of the current interval
+
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            if state.restart_interval != 0
+                && mcus_since_restart != 0
+                && mcus_since_restart % state.restart_interval as u32 == 0
+            {
+                scan_pos = locate_next_marker_after(scan, scan_pos);
+                if scan_pos >= scan.len() {
+                    return Err(Error::invalid(
+                        "lossless arith: missing restart marker mid-scan",
+                    ));
+                }
+                for s in stats.iter_mut() {
+                    s.reset();
+                }
+                for g in diff_grid.iter_mut() {
+                    g.fill(0);
+                }
+                decoder = ArithDecoder::new(&scan[scan_pos..]);
+                reset_pred = true;
+                for ci in 0..nc {
+                    first_row[ci] = my * v_factors[ci];
+                }
+            }
+
+            for ci in 0..nc {
+                let gw = comp_w[ci];
+                let hf = h_factors[ci];
+                let vf = v_factors[ci];
+                for sy in 0..vf {
+                    for sx in 0..hf {
+                        let gx = mx * hf + sx;
+                        let gy = my * vf + sy;
+                        let plane = &samples[ci];
+                        let pred: u32 = if reset_pred && gx == 0 && gy == first_row[ci] {
+                            origin
+                        } else if gy == first_row[ci] {
+                            // First grid line of the scan / interval uses Ra.
+                            plane[gy * gw + gx - 1]
+                        } else if gx == 0 {
+                            plane[(gy - 1) * gw + gx]
+                        } else {
+                            let ra = plane[gy * gw + gx - 1];
+                            let rb = plane[(gy - 1) * gw + gx];
+                            let rc = plane[(gy - 1) * gw + gx - 1];
+                            match predictor {
+                                1 => ra,
+                                2 => rb,
+                                3 => rc,
+                                4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                                5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                                6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                                7 => (ra.wrapping_add(rb)) >> 1,
+                                _ => unreachable!(),
+                            }
+                        };
+
+                        let dg = &diff_grid[ci];
+                        let da = if gx == 0 { 0 } else { dg[gy * gw + gx - 1] };
+                        let db = if gy == 0 { 0 } else { dg[(gy - 1) * gw + gx] };
+                        let diff =
+                            arith_decode_lossless_diff(&mut decoder, &mut stats[ci], da, db)?;
+                        diff_grid[ci][gy * gw + gx] = diff;
+
+                        let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
+                        samples[ci][gy * gw + gx] = sv;
+                    }
+                }
+            }
+            reset_pred = false;
+            mcus_since_restart += 1;
+        }
+    }
+
+    shape_lossless_yuv_frame(
+        &samples,
+        &comp_w,
+        &comp_true_w,
+        &comp_true_h,
+        width,
+        height,
+        pt,
+        pts,
+    )
 }
 
 #[cfg(all(test, feature = "registry"))]

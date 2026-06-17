@@ -3627,6 +3627,36 @@ fn write_sof11_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precis
     write_length_prefix(out, markers::SOF11, &payload);
 }
 
+/// Write a SOF11 segment for a three-component lossless, arithmetic-coded
+/// YUV-class frame: the luma component declares the oversampling factors
+/// `H_1 × V_1` and the two chroma components are `1 × 1`. This is the
+/// arithmetic-coder counterpart of [`write_sof_lossless_yuv`] (which writes
+/// SOF3) — precision is fixed at `P = 8` for the subsampled YUV-class path.
+fn write_sof11_lossless_yuv(
+    out: &mut Vec<u8>,
+    width: u16,
+    height: u16,
+    h_factor: u8,
+    v_factor: u8,
+) {
+    debug_assert!((1..=4).contains(&h_factor) && (1..=4).contains(&v_factor));
+    let mut payload = Vec::with_capacity(8 + 3 * 3);
+    payload.push(8); // precision (YUV-class lossless is P = 8)
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // Nf
+    payload.push(1); // luma component id
+    payload.push((h_factor << 4) | (v_factor & 0x0F));
+    payload.push(0); // Tq
+    payload.push(2); // Cb id
+    payload.push(0x11); // 1×1
+    payload.push(0);
+    payload.push(3); // Cr id
+    payload.push(0x11); // 1×1
+    payload.push(0);
+    write_length_prefix(out, markers::SOF11, &payload);
+}
+
 /// Encode a single-component grayscale image as a standalone **lossless,
 /// arithmetic-coded** JPEG (SOF11) byte stream — the entropy-coder
 /// counterpart of [`encode_lossless_jpeg_grayscale`].
@@ -4920,6 +4950,279 @@ pub fn encode_lossless_jpeg_yuv(
     predictor: u8,
 ) -> Result<Vec<u8>> {
     encode_lossless_jpeg_yuv_with_opts(
+        width, height, y_plane, y_stride, cb_plane, cb_stride, cr_plane, cr_stride, h_factor,
+        v_factor, predictor, 0, 0,
+    )
+}
+
+/// Encode three planar 8-bit YUV-class channels as a standalone
+/// **three-component lossless, arithmetic-coded** JPEG (SOF11, subsampled
+/// interleaved scan) byte stream — the Q-coder counterpart of
+/// [`encode_lossless_jpeg_yuv_with_opts`].
+///
+/// The luma component may be oversampled `1×1` / `2×1` / `2×2` / `4×1` with
+/// both chroma components at `1×1`; the scan walks the T.81 §A.2.3
+/// interleaved-MCU ordering (component 0's `H_1 × V_1` block, then component
+/// 1's single sample, then component 2's, per MCU). Each component is modelled
+/// independently per §H.1.2 over its **own** sample grid (its own `Ra` / `Rb` /
+/// `Rc` neighbours and its own `L_Context(Da, Db)` / `X1_Context(Db)`
+/// difference history), and every prediction difference is coded with the
+/// Q-coder statistical model of §H.1.2.3 (Table H.3). The per-component grids
+/// are padded out to a whole number of MCUs by edge replication (§A.2.4 NOTE);
+/// the decoder crops each component back to its true extent on output. No DAC
+/// segment is emitted, so the decoder applies the default conditioning bounds
+/// `(L, U) = (0, 1)` per §H.1.2.3.3.
+///
+/// Precision is fixed at 8 bits (the only depth the subsampled YUV-class path
+/// covers). The `_with_opts` form adds a `restart_interval` (in MCUs — one
+/// `H_1 × V_1` luma block plus two chroma samples) and a `point_transform`
+/// (`Pt`, the SOS `Al` field's low nibble): on each restart boundary the
+/// encoder flushes the arithmetic segment, writes a fresh `RST0..=RST7` marker
+/// (cycling modulo 8 per §F.1.1.5.2), and re-initialises every component's
+/// statistical model, difference history, and predictor to the scan-origin
+/// default `2^(8 − Pt − 1)` (§H.1.1 / §H.1.2.3.4). With `Pt > 0` every input
+/// sample is right-shifted by `Pt` before predictive coding.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_arith_jpeg_yuv_with_opts(
+    width: u32,
+    height: u32,
+    y_plane: &[u8],
+    y_stride: usize,
+    cb_plane: &[u8],
+    cb_stride: usize,
+    cr_plane: &[u8],
+    cr_stride: usize,
+    h_factor: u8,
+    v_factor: u8,
+    predictor: u8,
+    restart_interval: u16,
+    point_transform: u8,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "lossless-arith YUV encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    if point_transform >= 8 {
+        return Err(Error::invalid(format!(
+            "lossless-arith YUV encoder: point_transform {point_transform} must be < precision 8"
+        )));
+    }
+    if !matches!((h_factor, v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
+        return Err(Error::unsupported(format!(
+            "lossless-arith YUV encoder: unsupported luma sampling {h_factor}x{v_factor} (supported: 1x1, 2x1, 2x2, 4x1)"
+        )));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid(
+            "lossless-arith YUV encoder: zero-size image",
+        ));
+    }
+    let hf = h_factor as usize;
+    let vf = v_factor as usize;
+    let cw = w.div_ceil(hf); // chroma width
+    let ch = h.div_ceil(vf); // chroma height
+    if y_stride < w || y_plane.len() < y_stride * h {
+        return Err(Error::invalid(
+            "lossless-arith YUV encoder: Y plane too small",
+        ));
+    }
+    if cb_stride < cw || cb_plane.len() < cb_stride * ch {
+        return Err(Error::invalid(
+            "lossless-arith YUV encoder: Cb plane too small",
+        ));
+    }
+    if cr_stride < cw || cr_plane.len() < cr_stride * ch {
+        return Err(Error::invalid(
+            "lossless-arith YUV encoder: Cr plane too small",
+        ));
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + 3 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_sof11_lossless_yuv(&mut out, w as u16, h as u16, h_factor, v_factor);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+
+    let pt = point_transform as u32;
+
+    // MCU grid: ceil(width / h_max) × ceil(height / v_max) with
+    // h_max = h_factor, v_max = v_factor (luma carries the oversampling,
+    // chroma are 1×1). Each component is padded out to a whole number of MCUs
+    // by edge replication (§A.2.4 NOTE).
+    let mcus_x = w.div_ceil(hf);
+    let mcus_y = h.div_ceil(vf);
+    let y_gw = mcus_x * hf; // padded luma grid width
+    let y_gh = mcus_y * vf;
+    let c_gw = mcus_x; // padded chroma grid (1×1) width
+    let c_gh = mcus_y;
+
+    // Build MCU-padded, point-transform-shifted component grids. Edge
+    // replication: a sample beyond the component's true extent takes the value
+    // of the nearest in-bounds sample (clamp the index).
+    let build_grid =
+        |plane: &[u8], stride: usize, src_w: usize, src_h: usize, gw: usize, gh: usize| {
+            let mut grid = vec![0u32; gw * gh];
+            for gy in 0..gh {
+                let sy = gy.min(src_h - 1);
+                for gx in 0..gw {
+                    let sx = gx.min(src_w - 1);
+                    grid[gy * gw + gx] = (plane[sy * stride + sx] as u32) >> pt;
+                }
+            }
+            grid
+        };
+    let grids: [Vec<u32>; 3] = [
+        build_grid(y_plane, y_stride, w, h, y_gw, y_gh),
+        build_grid(cb_plane, cb_stride, cw, ch, c_gw, c_gh),
+        build_grid(cr_plane, cr_stride, cw, ch, c_gw, c_gh),
+    ];
+    let grid_w = [y_gw, c_gw, c_gw];
+    let comp_hf = [hf, 1, 1];
+    let comp_vf = [vf, 1, 1];
+
+    // Default prediction for each component's first sample at scan start and
+    // after each restart interval (§H.1.2.1). Working precision is `8 − Pt`.
+    let sample_bits = 8u32 - pt;
+    let origin: u32 = 1u32 << (sample_bits - 1);
+
+    // Per-component conditioning history as a full per-component difference
+    // grid (one entry per grid sample). The §A.2.3 MCU walk visits a
+    // component's samples out of plain raster order (a luma block spans `vf`
+    // rows per MCU and successive MCUs fill columns left-to-right), so the
+    // `Da` (left) / `Db` (above) conditioning neighbours are addressed by
+    // absolute grid coordinate — exactly as the predictor reads the sample
+    // grid — rather than by a sliding two-row window. Unwritten cells hold the
+    // §H.1.2.3.1 "zero outside the reconstructed region" default. Reset to all
+    // zero at scan start and at each restart (§H.1.2.3.4).
+    let mut diff_grid: [Vec<i32>; 3] = [
+        vec![0i32; grids[0].len()],
+        vec![0i32; grids[1].len()],
+        vec![0i32; grids[2].len()],
+    ];
+    let mut stats: [LosslessStats; 3] = [
+        LosslessStats::new(),
+        LosslessStats::new(),
+        LosslessStats::new(),
+    ];
+    let mut enc = ArithEncoder::new();
+
+    let ri = restart_interval as u32;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: u32 = 0;
+    let total_mcus: u64 = mcus_x as u64 * mcus_y as u64;
+    let mut mcu_index: u64 = 0;
+    // `reset_pred` forces `origin` at scan start and at the first MCU of every
+    // restart interval. The "first line uses Ra" rule (§H.1.2.1) is tracked
+    // per component via `first_row[c]` — the grid row index where the current
+    // interval began for that component.
+    let mut reset_pred = true;
+    let mut first_row: [usize; 3] = [0, 0, 0];
+
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            // Emit RSTn before the boundary MCU (never after the last MCU —
+            // the decoder expects EOI there per §F.1.1.5.2).
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                mcus_since_restart = 0;
+                for s in stats.iter_mut() {
+                    s.reset();
+                }
+                for g in diff_grid.iter_mut() {
+                    g.fill(0);
+                }
+                reset_pred = true;
+                first_row = [my * comp_vf[0], my, my];
+            }
+
+            // §A.2.3 interleaved-MCU order: component 0's H×V block (row
+            // major), then component 1's single sample, then component 2's.
+            for c in 0..3 {
+                let gw = grid_w[c];
+                let grid = &grids[c];
+                for sy in 0..comp_vf[c] {
+                    for sx in 0..comp_hf[c] {
+                        let gx = mx * comp_hf[c] + sx;
+                        let gy = my * comp_vf[c] + sy;
+                        let actual = grid[gy * gw + gx];
+                        let pred: u32 = if reset_pred && mx == 0 && sx == 0 && gy == first_row[c] {
+                            // Very first sample of the scan / interval.
+                            origin
+                        } else if gy == first_row[c] {
+                            // First grid line of the scan / interval uses Ra.
+                            grid[gy * gw + gx - 1]
+                        } else if gx == 0 {
+                            // Start of a non-first line uses Rb.
+                            grid[(gy - 1) * gw + gx]
+                        } else {
+                            let ra = grid[gy * gw + gx - 1];
+                            let rb = grid[(gy - 1) * gw + gx];
+                            let rc = grid[(gy - 1) * gw + gx - 1];
+                            match predictor {
+                                1 => ra,
+                                2 => rb,
+                                3 => rc,
+                                4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                                5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                                6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                                7 => (ra.wrapping_add(rb)) >> 1,
+                                _ => unreachable!(),
+                            }
+                        };
+                        // Modulo-2^16 difference (§H.1.2.1) reduced to the
+                        // canonical -32768..=32767 representative.
+                        let dm = (actual.wrapping_sub(pred) & 0xFFFF) as i32;
+                        let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
+                        let dg = &diff_grid[c];
+                        let da = if gx == 0 { 0 } else { dg[gy * gw + gx - 1] };
+                        let db = if gy == 0 { 0 } else { dg[(gy - 1) * gw + gx] };
+                        encode_lossless_diff(&mut enc, &mut stats[c], da, db, dm)?;
+                        diff_grid[c][gy * gw + gx] = dm;
+                    }
+                }
+            }
+
+            reset_pred = false;
+            mcu_index += 1;
+            mcus_since_restart += 1;
+        }
+    }
+
+    out.extend_from_slice(&enc.finish());
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// Convenience wrapper for [`encode_lossless_arith_jpeg_yuv_with_opts`] with
+/// the default predictor 1 (Ra / left), no restart markers, and `Pt = 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_lossless_arith_jpeg_yuv(
+    width: u32,
+    height: u32,
+    y_plane: &[u8],
+    y_stride: usize,
+    cb_plane: &[u8],
+    cb_stride: usize,
+    cr_plane: &[u8],
+    cr_stride: usize,
+    h_factor: u8,
+    v_factor: u8,
+    predictor: u8,
+) -> Result<Vec<u8>> {
+    encode_lossless_arith_jpeg_yuv_with_opts(
         width, height, y_plane, y_stride, cb_plane, cb_stride, cr_plane, cr_stride, h_factor,
         v_factor, predictor, 0, 0,
     )

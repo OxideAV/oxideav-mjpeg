@@ -45,6 +45,7 @@ use crate::error::{MjpegError as Error, Result};
 
 use super::markers;
 use super::parser::{parse_dri, parse_sof, MarkerWalker};
+use super::zigzag::ZIGZAG;
 
 /// Coarse classification of the SOF marker that opened the frame.
 ///
@@ -741,6 +742,113 @@ impl JpegComment {
     }
 }
 
+/// Typed view of one quantization table defined by a DQT marker
+/// segment (T.81 §B.2.4.1, Figure B.6 / Table B.4).
+///
+/// A DQT segment packs one or more tables; each table is a one-byte
+/// `Pq | Tq` selector (the high nibble `Pq` is the element precision —
+/// `0` ⇒ 8-bit, `1` ⇒ 16-bit; the low nibble `Tq` is the destination
+/// identifier in `0..=3`) followed by 64 quantizer elements `Qk` in
+/// the Figure A.6 zigzag order. The inspector unshuffles the elements
+/// into natural (row-major) `[row*8 + col]` order on the way in — the
+/// same convention the decoder's stored tables use — so two streams
+/// that quote the same table at different precisions compare equal in
+/// `values`.
+///
+/// This is pure prefix metadata: no entropy decode, no dequantization.
+/// Useful for re-encode fidelity (replay the exact source tables),
+/// corpus dedup / table-fingerprinting, and quality estimation against
+/// the Annex K base tables.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuantTableInfo {
+    /// Destination identifier `Tq` (low nibble of the `Pq | Tq` byte),
+    /// in `0..=3`. Components in the SOF reference a table by this id
+    /// via `InspectedComponent::quant_table`.
+    pub id: u8,
+    /// Element precision flag `Pq` (high nibble): `false` ⇒ 8-bit
+    /// elements (`Qk ∈ 0..=255`), `true` ⇒ 16-bit elements
+    /// (`Qk ∈ 0..=65535`). 16-bit tables are only legal for non-baseline
+    /// frames per T.81 §B.2.4.1, but the inspector reports the flag as
+    /// coded without cross-checking it against `sof_kind`.
+    pub sixteen_bit: bool,
+    /// The 64 quantizer elements in natural (row-major) order. The DC
+    /// quantizer is `values[0]`; element `[row*8 + col]` quantizes the
+    /// `(row, col)` DCT coefficient. Already un-zigzagged from the wire
+    /// order.
+    pub values: [u16; 64],
+}
+
+impl QuantTableInfo {
+    /// The DC quantizer element (`values[0]`). Convenience accessor for
+    /// the common quality-estimation entry point.
+    pub fn dc(&self) -> u16 {
+        self.values[0]
+    }
+
+    /// True when every element equals `1` — a "no quantization" table
+    /// (lossless-quality DCT, e.g. an `IJG Q=100`-style encode that
+    /// floors every divisor at 1). A quick triage predicate; callers
+    /// wanting the exact divisors read `values`.
+    pub fn is_all_ones(&self) -> bool {
+        self.values.iter().all(|&v| v == 1)
+    }
+}
+
+/// Parse a DQT marker segment payload (T.81 §B.2.4.1) into zero or more
+/// [`QuantTableInfo`] views, appending them to `out`.
+///
+/// `payload` is the byte slice the marker walker hands the inspector for
+/// the DQT segment — the bytes after the marker's two-byte `Lq` length
+/// field. A single segment may pack several tables back to back; each is
+/// a `Pq | Tq` selector byte followed by 64 elements (1 byte each for
+/// `Pq = 0`, 2 big-endian bytes each for `Pq = 1`).
+///
+/// Errors:
+/// * `Invalid` when a table's destination `Tq` exceeds `3`.
+/// * `Invalid` when a table's `Pq` nibble is neither `0` nor `1`.
+/// * `Invalid` when the payload is truncated mid-table.
+///
+/// A successful return guarantees the whole payload was consumed exactly
+/// (no trailing slack), matching the decoder's stricter DQT reader.
+pub fn parse_dqt_segment(payload: &[u8], out: &mut Vec<QuantTableInfo>) -> Result<()> {
+    let mut i = 0;
+    while i < payload.len() {
+        let pq_tq = payload[i];
+        let pq = pq_tq >> 4;
+        let tq = pq_tq & 0x0F;
+        if tq > 3 {
+            return Err(Error::invalid("DQT: table id > 3"));
+        }
+        if pq > 1 {
+            return Err(Error::invalid("DQT: precision nibble > 1"));
+        }
+        i += 1;
+        let n_bytes = if pq == 0 { 64 } else { 128 };
+        if i + n_bytes > payload.len() {
+            return Err(Error::invalid("DQT: truncated table"));
+        }
+        let mut nat = [0u16; 64];
+        if pq == 0 {
+            for k in 0..64 {
+                nat[ZIGZAG[k]] = payload[i + k] as u16;
+            }
+        } else {
+            for k in 0..64 {
+                let hi = payload[i + k * 2] as u16;
+                let lo = payload[i + k * 2 + 1] as u16;
+                nat[ZIGZAG[k]] = (hi << 8) | lo;
+            }
+        }
+        out.push(QuantTableInfo {
+            id: tq,
+            sixteen_bit: pq == 1,
+            values: nat,
+        });
+        i += n_bytes;
+    }
+    Ok(())
+}
+
 /// Result of a successful `inspect_jpeg` call.
 #[derive(Clone, Debug)]
 pub struct JpegInfo {
@@ -825,6 +933,20 @@ pub struct JpegInfo {
     /// legally carry several COM segments interspersed among the table
     /// / frame markers — all of them are reported.
     pub comments: Vec<JpegComment>,
+    /// Every quantization table defined by a DQT segment (T.81
+    /// §B.2.4.1) in the marker prefix, in the order the tables appear
+    /// on the wire (a single DQT segment may pack several). Empty for
+    /// streams with no DQT before SOS — including every lossless
+    /// (SOF3 / SOF11) frame, which carries no quantization at all.
+    ///
+    /// A later DQT may legally redefine a destination `Tq` an earlier
+    /// one already filled (T.81 §B.2.4.1 — "the quantization tables …
+    /// shall be defined prior to … the scan"); the inspector reports
+    /// *every* definition in source order rather than collapsing to the
+    /// last-wins view a decoder would apply, so a re-encoder can replay
+    /// the exact segment sequence. Read `quant_table_for(id)` for the
+    /// last-wins lookup that mirrors decode-time resolution.
+    pub quant_tables: Vec<QuantTableInfo>,
 }
 
 impl JpegInfo {
@@ -832,6 +954,16 @@ impl JpegInfo {
     /// same number is `components.len()`.
     pub fn num_components(&self) -> usize {
         self.components.len()
+    }
+
+    /// The quantization table a decoder would resolve for destination
+    /// `id` — the *last* DQT definition of that `Tq` in the prefix,
+    /// mirroring T.81 §B.2.4.1 redefinition semantics (a later DQT
+    /// overrides an earlier one for the same destination). Returns
+    /// `None` when no DQT in the prefix defined `id`. Use the raw
+    /// `quant_tables` vector when the full redefinition history matters.
+    pub fn quant_table_for(&self, id: u8) -> Option<&QuantTableInfo> {
+        self.quant_tables.iter().rev().find(|t| t.id == id)
     }
 }
 
@@ -1174,6 +1306,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
     let mut icc_payload_len: usize = 0;
     let mut icc_chunks: Vec<(u8, usize)> = Vec::new();
     let mut comments: Vec<JpegComment> = Vec::new();
+    let mut quant_tables: Vec<QuantTableInfo> = Vec::new();
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -1231,6 +1364,19 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
 
         if marker == markers::DRI {
             restart_interval = parse_dri(payload)?;
+            continue;
+        }
+
+        if marker == markers::DQT {
+            // DQT (T.81 §B.2.4.1): one or more quantization tables.
+            // Collect every definition in source order; redefinition
+            // semantics are exposed via `JpegInfo::quant_table_for`. A
+            // structurally malformed DQT (bad Tq / Pq nibble, truncated
+            // table) is a hard error here — unlike the tolerant APP
+            // parsers, a quant table the inspector cannot make sense of
+            // means the prefix is corrupt and any reported table would
+            // be misleading.
+            parse_dqt_segment(payload, &mut quant_tables)?;
             continue;
         }
 
@@ -1348,10 +1494,9 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
             continue;
         }
 
-        // DHT / DQT / DAC / DNL / reserved: skipped. The inspector
-        // does not care about Huffman / quant / arithmetic table
-        // contents; it only needs the SOF + DRI + APP + COM hints to
-        // produce its summary.
+        // DHT / DAC / DNL / reserved: skipped. The inspector does not
+        // surface Huffman / arithmetic-conditioning table contents; the
+        // DQT path above is the one table type it reports.
     }
 
     let sof_kind = sof_kind.ok_or_else(|| Error::invalid("inspect: SOS before SOF"))?;
@@ -1378,6 +1523,7 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
         adobe,
         icc_profile,
         comments,
+        quant_tables,
     })
 }
 
@@ -2633,5 +2779,179 @@ mod tests {
         assert_eq!(info.sof_kind, SofKind::Baseline);
         assert_eq!(info.width, 8);
         assert_eq!(info.height, 8);
+    }
+
+    // ---- DQT (quantization table) inspector ----
+
+    /// Build an 8-bit DQT payload for one table: `Pq|Tq` byte followed
+    /// by 64 elements in **zigzag** order (the wire order). `nat` is the
+    /// natural-order table the caller expects back out.
+    fn dqt8_payload(tq: u8, nat: &[u16; 64]) -> Vec<u8> {
+        let mut p = vec![tq & 0x0F]; // Pq = 0 (8-bit)
+        for k in 0..64 {
+            p.push(nat[ZIGZAG[k]] as u8);
+        }
+        p
+    }
+
+    #[test]
+    fn dqt_single_8bit_table_natural_order() {
+        // A recognisable natural-order table: value == natural index.
+        let mut nat = [0u16; 64];
+        for i in 0..64 {
+            nat[i] = i as u16;
+        }
+        let payload = dqt8_payload(0, &nat);
+        let extras = [(markers::DQT, &payload[..])];
+        let buf = build_prefix(0xC0, 8, 16, 16, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect single DQT");
+        assert_eq!(info.quant_tables.len(), 1);
+        let t = &info.quant_tables[0];
+        assert_eq!(t.id, 0);
+        assert!(!t.sixteen_bit);
+        // Un-zigzagged back to natural order.
+        assert_eq!(t.values, nat);
+        assert_eq!(t.dc(), 0);
+        assert!(!t.is_all_ones());
+        // Last-wins lookup resolves the same single definition.
+        assert_eq!(info.quant_table_for(0), Some(t));
+        assert_eq!(info.quant_table_for(1), None);
+    }
+
+    #[test]
+    fn dqt_all_ones_table_flagged() {
+        let nat = [1u16; 64];
+        let payload = dqt8_payload(2, &nat);
+        let extras = [(markers::DQT, &payload[..])];
+        let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 2)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect all-ones DQT");
+        assert_eq!(info.quant_tables.len(), 1);
+        assert_eq!(info.quant_tables[0].id, 2);
+        assert!(info.quant_tables[0].is_all_ones());
+        assert_eq!(info.quant_tables[0].dc(), 1);
+    }
+
+    #[test]
+    fn dqt_two_tables_one_segment() {
+        // One DQT segment packing a luma (Tq=0) and a chroma (Tq=1)
+        // table back to back — the multi-table-per-segment layout
+        // every JFIF writer uses.
+        let mut payload = dqt8_payload(0, &DEFAULT_LUMA_NAT());
+        payload.extend_from_slice(&dqt8_payload(1, &DEFAULT_CHROMA_NAT()));
+        let extras = [(markers::DQT, &payload[..])];
+        let buf = build_prefix(
+            0xC0,
+            8,
+            16,
+            16,
+            &[(1, 2, 2, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+            &extras,
+        );
+        let info = inspect_jpeg(&buf).expect("inspect packed DQT");
+        assert_eq!(info.quant_tables.len(), 2);
+        assert_eq!(info.quant_tables[0].id, 0);
+        assert_eq!(info.quant_tables[1].id, 1);
+        // Component 0 → table 0, components 1/2 → table 1.
+        assert_eq!(
+            info.quant_table_for(info.components[0].quant_table)
+                .unwrap()
+                .dc(),
+            DEFAULT_LUMA_NAT()[0]
+        );
+        assert_eq!(
+            info.quant_table_for(info.components[1].quant_table)
+                .unwrap(),
+            &info.quant_tables[1]
+        );
+    }
+
+    #[test]
+    fn dqt_16bit_table_round_trips() {
+        // Pq = 1 (16-bit): each element is two big-endian bytes.
+        let mut nat = [0u16; 64];
+        for i in 0..64 {
+            nat[i] = 256 + (i as u16) * 3; // values that overflow 8-bit
+        }
+        let mut payload = vec![0x10]; // Pq=1 (16-bit), Tq=0
+        for k in 0..64 {
+            payload.extend_from_slice(&nat[ZIGZAG[k]].to_be_bytes());
+        }
+        let extras = [(markers::DQT, &payload[..])];
+        let buf = build_prefix(0xC2, 12, 16, 16, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect 16-bit DQT");
+        assert_eq!(info.quant_tables.len(), 1);
+        assert!(info.quant_tables[0].sixteen_bit);
+        assert_eq!(info.quant_tables[0].values, nat);
+    }
+
+    #[test]
+    fn dqt_redefinition_last_wins_but_history_kept() {
+        // Two DQT segments redefining Tq = 0. `quant_tables` keeps both
+        // in source order; `quant_table_for` resolves the later one.
+        let first = dqt8_payload(0, &[7u16; 64]);
+        let second = dqt8_payload(0, &[9u16; 64]);
+        let extras = [(markers::DQT, &first[..]), (markers::DQT, &second[..])];
+        let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &extras);
+        let info = inspect_jpeg(&buf).expect("inspect redefined DQT");
+        assert_eq!(info.quant_tables.len(), 2);
+        assert_eq!(info.quant_tables[0].dc(), 7);
+        assert_eq!(info.quant_tables[1].dc(), 9);
+        // Decode-time resolution = last definition wins.
+        assert_eq!(info.quant_table_for(0).unwrap().dc(), 9);
+    }
+
+    #[test]
+    fn dqt_absent_on_lossless_frame() {
+        // A SOF3 (lossless) frame carries no quantization at all.
+        let buf = build_prefix(0xC3, 8, 16, 16, &[(1, 1, 1, 0)], &[]);
+        let info = inspect_jpeg(&buf).expect("inspect lossless");
+        assert!(info.quant_tables.is_empty());
+        assert_eq!(info.quant_table_for(0), None);
+    }
+
+    #[test]
+    fn dqt_rejects_bad_table_id() {
+        // Tq = 5 is out of the 0..=3 range.
+        let mut payload = vec![0x05];
+        payload.extend(std::iter::repeat(1u8).take(64));
+        let extras = [(markers::DQT, &payload[..])];
+        let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &extras);
+        assert!(inspect_jpeg(&buf).is_err());
+    }
+
+    #[test]
+    fn dqt_rejects_truncated_table() {
+        // Pq = 0 promises 64 bytes but only 10 follow.
+        let mut payload = vec![0x00];
+        payload.extend(std::iter::repeat(1u8).take(10));
+        let extras = [(markers::DQT, &payload[..])];
+        let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &extras);
+        assert!(inspect_jpeg(&buf).is_err());
+    }
+
+    #[test]
+    fn parse_dqt_segment_standalone() {
+        // The standalone validator works without an enclosing JPEG.
+        let payload = dqt8_payload(3, &[42u16; 64]);
+        let mut out = Vec::new();
+        parse_dqt_segment(&payload, &mut out).expect("standalone DQT");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, 3);
+        assert_eq!(out[0].dc(), 42);
+    }
+
+    // Small natural-order helpers for the packed-DQT test — recognisable
+    // distinct DC values so the per-component lookup is unambiguous.
+    #[allow(non_snake_case)]
+    fn DEFAULT_LUMA_NAT() -> [u16; 64] {
+        let mut t = [16u16; 64];
+        t[0] = 8;
+        t
+    }
+    #[allow(non_snake_case)]
+    fn DEFAULT_CHROMA_NAT() -> [u16; 64] {
+        let mut t = [24u16; 64];
+        t[0] = 17;
+        t
     }
 }

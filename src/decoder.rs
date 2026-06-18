@@ -169,11 +169,13 @@ fn validate_sof(sof: &SofInfo) -> Result<()> {
 /// Shared frame-header constraints for the lossless processes (SOF3
 /// Huffman and SOF11 arithmetic — T.81 Annex H):
 ///   * precision 2..=16 (§H.1.1);
-///   * single-component grayscale, three-component RGB-class and
-///     four-component CMYK-class interleaved frames. Components with
-///     non-unit sampling factors are rejected — Annex H pairs lossless
-///     with `data unit = one sample` (E.1.1), so non-1:1 sampling would
-///     not be a well-defined MCU;
+///   * single-component grayscale, three-component RGB-class /
+///     subsampled YUV-class, and four-component CMYK-class interleaved
+///     frames. Annex H pairs lossless with `data unit = one sample`
+///     (E.1.1), so subsampling is expressed as the §A.2.3 interleaved-MCU
+///     ordering: a three-component scan may oversample the luma component
+///     (`1×1` / `2×1` / `2×2` / `4×1`) with both chroma at `1×1`; every
+///     other component must be `1×1` (a four-component scan is all-1×1);
 ///   * the four-component path is `P = 8` only because the workspace
 ///     `PixelFormat` enum has no high-bit-depth CMYK variant.
 fn validate_lossless_sof(sof: &SofInfo) -> Result<()> {

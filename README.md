@@ -562,7 +562,22 @@ accessors plus an `as_str_lossy()` UTF-8 projection and an
 `is_ascii_text()` predicate for the common human-readable
 annotation case (zero-length `Lc = 2` comments and COM segments
 appearing anywhere in the prefix, including between SOF and SOS,
-are all captured). No entropy decoding, no DCT, no
+are all captured). Every DQT (Define Quantization Table, T.81
+§B.2.4.1) segment in the prefix is parsed into
+`JpegInfo::quant_tables` as a `Vec<QuantTableInfo>` — one entry
+per defined table in wire order (a single DQT segment may pack
+several). Each `QuantTableInfo` carries the destination `id`
+(`Tq ∈ 0..=3`), a `sixteen_bit` precision flag (`Pq`), and the
+64 quantizer elements un-zigzagged into natural (row-major)
+order, plus `dc()` (the `[0]` element) and `is_all_ones()`
+(no-quantization / lossless-quality DCT) helpers. A later DQT
+that redefines a destination is reported *in addition to* the
+earlier one (source-order history for faithful re-encode replay);
+`JpegInfo::quant_table_for(id)` does the last-wins lookup that
+mirrors decode-time resolution. Lossless (SOF3 / SOF11) frames
+carry no DQT, so `quant_tables` is empty there. The standalone
+`parse_dqt_segment(payload, &mut Vec<QuantTableInfo>)` validator
+is also re-exported. No entropy decoding, no DCT, no
 allocation proportional to the scan body — O(prefix-length).
 Useful for pipeline triage (pick a target pixel format),
 fallback-decoder routing without spinning up the full decode
@@ -572,10 +587,11 @@ path, DPI-aware thumbnail sizing, and corpus summarisation. The
 matching on every variant by hand. Standalone
 `parse_jfif_app0(payload) -> Result<JfifApp0>`,
 `parse_jfxx_app0(payload) -> Result<JfxxApp0>`,
-`parse_adobe_app14(payload) -> Result<AdobeApp14>`, and
-`parse_icc_profile_app2(payload) -> Result<IccProfileApp2Chunk<'_>>`
+`parse_adobe_app14(payload) -> Result<AdobeApp14>`,
+`parse_icc_profile_app2(payload) -> Result<IccProfileApp2Chunk<'_>>`,
+and `parse_dqt_segment(payload, &mut Vec<QuantTableInfo>)`
 validators are also re-exported for callers that already have the
-APP0 / APP14 / APP2 payload bytes in hand. Standalone surface —
+APP0 / APP14 / APP2 / DQT payload bytes in hand. Standalone surface —
 the inspector requires neither the `registry` feature nor an
 `oxideav-core` dep.
 

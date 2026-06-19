@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.8...v0.2.0) - 2026-06-19
+
+### Other
+
+- hierarchical-mode spatial lossless progression (T.81 Annex J)
+- typed DQT quantization-table view (T.81 §B.2.4.1) on JpegInfo
+- SOF11 subsampled YUV-class lossless arithmetic encode + decode
+- SOF3 subsampled YUV-class lossless encode + decode (T.81 A.2.3)
+- typed COM (comment) segments view (T.81 §B.2.4.5) on JpegInfo
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - hierarchical-mode (T.81 Annex J) **spatial lossless progression**

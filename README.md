@@ -5,7 +5,7 @@ decodes baseline (SOF0), extended-sequential (SOF1 Huffman + SOF9
 arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic),
 lossless (SOF3 Huffman + SOF11 arithmetic) and the **spatial
 hierarchical lossless progression** (T.81 Annex J — DHP + SOF3/SOF7
-+ EXP, single-component grayscale) JPEGs (single-component
++ EXP, 1 / 3 / 4 components) JPEGs (single-component
 grayscale at any precision `P ∈ 2..=16` plus three-component RGB-class
 at `P = 8`), encodes
 baseline, progressive **and** lossless JPEG (the lossless path covers
@@ -706,12 +706,16 @@ Decoder:
   bi-linearly upsampled per the `EXP` segment (§B.3.3 / §J.1.1.2) and
   whose decoded difference is added back modulo `2^P` (§J.2.1). The
   differential frames decode with the §J.2.3.2 model (difference
-  coded directly, predictor `Ss = 0`). Single-component (grayscale)
-  progressions at any precision `P ∈ 2..=16` reconstruct
-  bit-exactly; multi-component spatial progressions, the DCT
-  hierarchical path, and the arithmetic hierarchical variants
-  (SOF13..SOF15) still return `Unsupported` (see "Not supported"
-  below).
+  coded directly, predictor `Ss = 0`). Frames may be single-component
+  (grayscale, any precision `P ∈ 2..=16` → `Gray8` / `Gray*Le`),
+  three-component (RGB-class, `P ∈ 2..=16` → packed `Rgb24` /
+  planar `Gbrp*Le` / packed `Rgb48Le`), or four-component
+  (CMYK-class, `P = 8` → packed `Cmyk`, Adobe APP14 transform
+  honoured), all with every component at `H = V = 1`. Reconstruction
+  is bit-exact. The point transform is constrained to `Pt = 0` on
+  this path; subsampled frames, the DCT hierarchical path, and the
+  arithmetic hierarchical variants (SOF13..SOF15) still return
+  `Unsupported` (see "Not supported" below).
 - **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
   header codes the number of lines `Y = 0`, the real line count is
   recovered from the mandatory DNL segment (`0xFFDC`) that immediately
@@ -798,16 +802,20 @@ Not supported (decoder returns `Error::Unsupported`):
   Huffman) and each refinement frame is `SOF7` (differential
   lossless Huffman), with `EXP` (§B.3.3) ×2 bi-linear upsampling of
   the reference (§J.1.1.2) and modulo-2^P reconstruction (§J.2.1).
-  The current slice covers single-component (grayscale) progressions
-  at any precision `P ∈ 2..=16`; the differential frames apply the
-  §J.2.3.2 modification (the difference is decoded directly, without
-  spatial prediction, predictor `Ss = 0`). Still rejected with
-  `Unsupported`: multi-component spatial progressions, the **DCT**
-  hierarchical progression (SOF0..SOF2 / SOF9..SOF10 non-differential
-  frames + SOF5/SOF6 differential DCT frames — §K.7.2.1, which T.81
-  itself notes cannot be guaranteed lossless across differing IDCT
-  implementations), and the arithmetic hierarchical variants
-  (SOF13..SOF15). The non-hierarchical arithmetic variants are all
+  Frames may be single-component (grayscale, `P ∈ 2..=16`),
+  three-component (RGB-class, `P ∈ 2..=16`), or four-component
+  (CMYK-class, `P = 8` with the Adobe APP14 transform honoured), all
+  with every component at `H = V = 1`; the differential frames apply
+  the §J.2.3.2 modification (the difference is decoded directly,
+  without spatial prediction, predictor `Ss = 0`) and reconstruct
+  bit-exactly with the point transform constrained to `Pt = 0`. Still
+  rejected with `Unsupported`: subsampled (`H/V != 1`) hierarchical
+  frames, the **DCT** hierarchical progression (SOF0..SOF2 /
+  SOF9..SOF10 non-differential frames + SOF5/SOF6 differential DCT
+  frames — §K.7.2.1, which T.81 itself notes cannot be guaranteed
+  lossless across differing IDCT implementations), and the arithmetic
+  hierarchical variants (SOF13..SOF15). The non-hierarchical
+  arithmetic variants are all
   supported: SOF9 (extended sequential) at `P=8`, SOF10
   (progressive) at `P=8` / `P=12`, and SOF11 (lossless) at every
   Annex H precision — see the decoder coverage list above.

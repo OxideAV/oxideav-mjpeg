@@ -313,6 +313,163 @@ fn mk_image(w: usize, h: usize, seed: u32) -> Vec<u32> {
     v
 }
 
+// ---- Multi-component (interleaved, all-1×1) helpers --------------------
+
+/// Frame-header / DHP body for `nc` components, each id `1..=nc`, H=V=1,
+/// Tq=0.
+fn frame_body_nc(p: u8, w: u16, h: u16, nc: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.push(p);
+    v.extend_from_slice(&h.to_be_bytes());
+    v.extend_from_slice(&w.to_be_bytes());
+    v.push(nc);
+    for id in 1..=nc {
+        v.push(id);
+        v.push(0x11);
+        v.push(0);
+    }
+    v
+}
+
+/// SOS body for an `nc`-component interleaved lossless scan.
+fn sos_body_nc(predictor: u8, pt: u8, nc: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.push(nc);
+    for id in 1..=nc {
+        v.push(id);
+        v.push(0x00); // Td=0 Ta=0
+    }
+    v.push(predictor);
+    v.push(0x00); // Se
+    v.push(pt); // Ah=0 Al=pt
+    v
+}
+
+/// Encode an interleaved predictor-1 lossless scan for `nc` planes
+/// (`planes[c]` is component `c`'s w×h samples). One residual per component
+/// is emitted per pixel position in raster order (the all-1×1 interleaved
+/// MCU layout). Predictor 1 = Ra with the H.1.2.1 edge fall-backs, modelled
+/// per component.
+fn encode_pred1_scan_nc(planes: &[Vec<u32>], w: usize, h: usize, origin: u32) -> Vec<u8> {
+    let codes = canonical_codes();
+    let mut bw = BitWriter::new();
+    for y in 0..h {
+        for x in 0..w {
+            for plane in planes {
+                let pred: u32 = if x == 0 && y == 0 {
+                    origin
+                } else if y == 0 {
+                    plane[y * w + x - 1]
+                } else if x == 0 {
+                    plane[(y - 1) * w + x]
+                } else {
+                    plane[y * w + x - 1]
+                };
+                let diff = plane[y * w + x] as i32 - pred as i32;
+                let (ssss, bits) = category(diff);
+                let (len, code) = codes[&ssss];
+                bw.put(code, len);
+                if ssss > 0 {
+                    bw.put(bits, ssss);
+                }
+            }
+        }
+    }
+    bw.finish()
+}
+
+/// Encode an interleaved differential lossless scan for `nc` planes
+/// (§J.2.3.2: difference coded directly, no prediction).
+fn encode_diff_scan_nc(diffs: &[Vec<i32>], w: usize, h: usize) -> Vec<u8> {
+    let codes = canonical_codes();
+    let mut bw = BitWriter::new();
+    for i in 0..w * h {
+        for d in diffs {
+            let (ssss, bits) = category(d[i]);
+            let (len, code) = codes[&ssss];
+            bw.put(code, len);
+            if ssss > 0 {
+                bw.put(bits, ssss);
+            }
+        }
+    }
+    bw.finish()
+}
+
+/// Build a two-stage spatial-lossless hierarchical stream from `nc`
+/// full-resolution component planes. The decoder reconstructs each
+/// component bit-exactly. Component IDs 1, 2, 3 map to R, G, B on the
+/// `Rgb24` decode shape (P = 8); no Adobe APP14 is emitted.
+fn build_hierarchical_nc(full: &[Vec<u32>], w: usize, h: usize) -> Vec<u8> {
+    assert!(w % 2 == 0 && h % 2 == 0);
+    let nc = full.len();
+    let lw = w / 2;
+    let lh = h / 2;
+    let origin = 1u32 << 7;
+
+    // Low-res reference (decimation) + bilinear ×2 upsample per component.
+    let mut low = Vec::with_capacity(nc);
+    let mut up = Vec::with_capacity(nc);
+    for plane in full {
+        let mut l = vec![0u32; lw * lh];
+        for y in 0..lh {
+            for x in 0..lw {
+                l[y * lw + x] = plane[(2 * y) * w + (2 * x)];
+            }
+        }
+        let (u, uw, uh) = upsample2x(&l, lw, lh);
+        assert_eq!((uw, uh), (w, h));
+        low.push(l);
+        up.push(u);
+    }
+    // Per-component differential delta (signed, modulo 2^8).
+    let mut diffs = Vec::with_capacity(nc);
+    for c in 0..nc {
+        let d: Vec<i32> = (0..w * h)
+            .map(|i| {
+                let raw = (((full[c][i] as i32 - up[c][i] as i32) % 256) + 256) % 256;
+                if raw >= 128 {
+                    raw - 256
+                } else {
+                    raw
+                }
+            })
+            .collect();
+        diffs.push(d);
+    }
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(
+        &mut out,
+        0xDE,
+        &frame_body_nc(8, w as u16, h as u16, nc as u8),
+    ); // DHP
+    push_seg(&mut out, 0xC4, &dht_body());
+
+    // Stage 1: non-differential low-res frame (SOF3, interleaved).
+    push_seg(
+        &mut out,
+        0xC3,
+        &frame_body_nc(8, lw as u16, lh as u16, nc as u8),
+    );
+    push_seg(&mut out, 0xDA, &sos_body_nc(1, 0, nc as u8));
+    out.extend_from_slice(&encode_pred1_scan_nc(&low, lw, lh, origin));
+
+    // Stage 2: EXP (×2 both axes) + differential full-res frame (SOF7).
+    push_seg(&mut out, 0xDF, &[0x11]);
+    push_seg(
+        &mut out,
+        0xC7,
+        &frame_body_nc(8, w as u16, h as u16, nc as u8),
+    );
+    push_seg(&mut out, 0xDA, &sos_body_nc(0, 0, nc as u8));
+    out.extend_from_slice(&encode_diff_scan_nc(&diffs, w, h));
+
+    push_marker(&mut out, 0xD9); // EOI
+    out
+}
+
 #[test]
 fn spatial_hierarchical_two_stage_reconstructs_exactly() {
     let (w, h) = (16usize, 12usize);
@@ -373,5 +530,99 @@ fn non_differential_only_hierarchical_decodes() {
     let plane = &frame.planes[0];
     for i in 0..w * h {
         assert_eq!(plane.data[i] as u32, img[i], "pixel {i}");
+    }
+}
+
+#[test]
+fn spatial_hierarchical_three_component_rgb_reconstructs_exactly() {
+    // A 3-component (RGB-class) spatial progression at P = 8 decodes to a
+    // packed Rgb24 plane (3 bytes/pixel, components 1/2/3 → R/G/B).
+    let (w, h) = (12usize, 8usize);
+    let r = mk_image(w, h, 0xAA01);
+    let g = mk_image(w, h, 0xBB02);
+    let b = mk_image(w, h, 0xCC03);
+    let full = vec![r.clone(), g.clone(), b.clone()];
+    let jpeg = build_hierarchical_nc(&full, w, h);
+
+    assert!(jpeg.windows(2).any(|x| x == [0xFF, 0xDE]), "DHP missing");
+    assert!(jpeg.windows(2).any(|x| x == [0xFF, 0xC7]), "SOF7 missing");
+
+    let frame = decode(jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 1, "Rgb24 is a single packed plane");
+    let plane = &frame.planes[0];
+    assert_eq!(plane.stride, w * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let o = y * plane.stride + x * 3;
+            assert_eq!(plane.data[o] as u32, r[y * w + x], "R ({x},{y})");
+            assert_eq!(plane.data[o + 1] as u32, g[y * w + x], "G ({x},{y})");
+            assert_eq!(plane.data[o + 2] as u32, b[y * w + x], "B ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn spatial_hierarchical_horizontal_only_expansion() {
+    // EXP with Eh=1, Ev=0 expands only horizontally: the low-res reference
+    // is W/2 × H and the differential frame is W × H. Verifies the
+    // single-axis upsample path.
+    let (w, h) = (16usize, 8usize);
+    let full = mk_image(w, h, 0x5151);
+    assert!(w % 2 == 0);
+    let lw = w / 2;
+    let lh = h;
+    let origin = 1u32 << 7;
+
+    // Low-res = horizontal decimation; upsample only horizontally.
+    let mut low = vec![0u32; lw * lh];
+    for y in 0..lh {
+        for x in 0..lw {
+            low[y * lw + x] = full[y * w + 2 * x];
+        }
+    }
+    // Horizontal-only ×2 upsample (mirror the decoder's upsample_axis H).
+    let mut up = vec![0u32; w * lh];
+    for y in 0..lh {
+        for x in 0..lw {
+            let ra = low[y * lw + x];
+            let rb = if x + 1 < lw { low[y * lw + x + 1] } else { ra };
+            up[y * w + 2 * x] = ra;
+            up[y * w + 2 * x + 1] = (ra + rb) / 2;
+        }
+    }
+    let diff: Vec<i32> = (0..w * h)
+        .map(|i| {
+            let raw = (((full[i] as i32 - up[i] as i32) % 256) + 256) % 256;
+            if raw >= 128 {
+                raw - 256
+            } else {
+                raw
+            }
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8);
+    push_seg(&mut out, 0xDE, &frame_body(8, w as u16, h as u16));
+    push_seg(&mut out, 0xC4, &dht_body());
+    push_seg(&mut out, 0xC3, &frame_body(8, lw as u16, lh as u16));
+    push_seg(&mut out, 0xDA, &sos_body(1, 0));
+    out.extend_from_slice(&encode_pred1_scan(&low, lw, lh, origin));
+    push_seg(&mut out, 0xDF, &[0x10]); // EXP Eh=1 Ev=0
+    push_seg(&mut out, 0xC7, &frame_body(8, w as u16, h as u16));
+    push_seg(&mut out, 0xDA, &sos_body(0, 0));
+    out.extend_from_slice(&encode_diff_scan(&diff));
+    push_marker(&mut out, 0xD9);
+
+    let frame = decode(out, w as u32, h as u32);
+    let plane = &frame.planes[0];
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(
+                plane.data[y * plane.stride + x] as u32,
+                full[y * w + x],
+                "pixel ({x},{y})"
+            );
+        }
     }
 }

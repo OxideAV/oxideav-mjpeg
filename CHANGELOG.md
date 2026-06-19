@@ -17,11 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bi-linear reference upsampling (§J.1.1.2) and modulo-2^P
   reconstruction (§J.2.1). Differential frames decode with the
   §J.2.3.2 model (difference coded directly, predictor `Ss = 0`).
-  Single-component (grayscale) progressions at any precision
-  `P ∈ 2..=16` reconstruct bit-exactly. DCT / multi-component /
-  arithmetic hierarchical variants still return `Unsupported`.
-  `tests/hierarchical.rs` builds conformant two-stage streams by hand
-  and round-trips them bit-exactly.
+  Single-component (grayscale, `P ∈ 2..=16`), three-component
+  (RGB-class, `P ∈ 2..=16`) and four-component (CMYK-class, `P = 8`,
+  Adobe APP14 transform honoured) progressions — every component
+  `H = V = 1` — reconstruct bit-exactly with the point transform
+  constrained to `Pt = 0`. Subsampled / DCT / arithmetic hierarchical
+  variants still return `Unsupported`. `tests/hierarchical.rs` builds
+  conformant two-stage single- and multi-component streams by hand
+  (including horizontal-only `EXP` expansion) and round-trips them
+  bit-exactly.
 - SOF11 subsampled three-component (YUV-class) lossless **arithmetic**
   encode + decode (T.81 A.2.3 interleaved-MCU ordering, §H.1.2.3
   per-component statistical model over each component's own padded grid)

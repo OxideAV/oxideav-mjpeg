@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- hierarchical-mode (T.81 Annex J) **spatial lossless progression**
+  decode: a `DHP` marker (§B.3.2) before the first frame routes the
+  stream to a new hierarchical control loop; the non-differential
+  first frame is `SOF3` (lossless Huffman) and each refinement frame
+  is `SOF7` (differential lossless Huffman), with `EXP` (§B.3.3) ×2
+  bi-linear reference upsampling (§J.1.1.2) and modulo-2^P
+  reconstruction (§J.2.1). Differential frames decode with the
+  §J.2.3.2 model (difference coded directly, predictor `Ss = 0`).
+  Single-component (grayscale) progressions at any precision
+  `P ∈ 2..=16` reconstruct bit-exactly. DCT / multi-component /
+  arithmetic hierarchical variants still return `Unsupported`.
+  `tests/hierarchical.rs` builds conformant two-stage streams by hand
+  and round-trips them bit-exactly.
 - SOF11 subsampled three-component (YUV-class) lossless **arithmetic**
   encode + decode (T.81 A.2.3 interleaved-MCU ordering, §H.1.2.3
   per-component statistical model over each component's own padded grid)

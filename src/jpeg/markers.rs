@@ -27,6 +27,19 @@ pub const DNL: u8 = 0xDC;
 /// COMment segment.
 pub const COM: u8 = 0xFE;
 
+/// Define Hierarchical Progression (T.81 §B.3.2). Marks the start of a
+/// hierarchical-mode stream; the segment body has the same shape as a
+/// frame header (precision, X, Y, component list) but describes the
+/// *completed* image rather than a single frame, and carries no
+/// quantization-table selector (Tq is set to zero). Must precede the
+/// first SOF.
+pub const DHP: u8 = 0xDE;
+/// Expand Reference Components (T.81 §B.3.3). Precedes a differential
+/// frame whose reference components must be upsampled. Carries one byte
+/// packing `Eh` (high nibble) and `Ev` (low nibble): each is 1 when a
+/// ×2 expansion is required on that axis, 0 otherwise.
+pub const EXP: u8 = 0xDF;
+
 /// Baseline DCT sequential.
 pub const SOF0: u8 = 0xC0;
 /// Extended sequential DCT (same scan structure as SOF0 for 8-bit).
@@ -35,6 +48,11 @@ pub const SOF1: u8 = 0xC1;
 pub const SOF2: u8 = 0xC2;
 /// Lossless sequential, Huffman-coded (T.81 Annex H — predictor-based, no DCT).
 pub const SOF3: u8 = 0xC3;
+/// Differential lossless (sequential), Huffman-coded (T.81 Annex J). Used
+/// for the differential frames of a spatial hierarchical progression: the
+/// coding model is Annex H with the §J.2.3.2 modification (the difference
+/// is decoded directly, without spatial prediction).
+pub const SOF7: u8 = 0xC7;
 /// Extended sequential DCT, arithmetic-coded (T.81 §F.1.4).
 pub const SOF9: u8 = 0xC9;
 /// Progressive DCT, arithmetic-coded (T.81 §G.1.3 — the SOF2 scan

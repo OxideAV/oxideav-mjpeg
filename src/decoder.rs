@@ -602,6 +602,18 @@ pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
                 state.sof = Some(sof);
                 state.progressive_arith = true;
             }
+            // DHP (T.81 §B.3.2) — Define Hierarchical Progression. Its
+            // presence before the first SOF selects the hierarchical
+            // decoder (§J.2.1 "hierarchical?" decision point). Hand the
+            // remaining stream to the dedicated control loop, inheriting
+            // any table-specification segments already parsed into `state`.
+            markers::DHP => {
+                if state.sof.is_some() {
+                    return Err(Error::invalid("JPEG: DHP after first SOF"));
+                }
+                let dhp_payload = walker.read_segment_payload()?;
+                return decode_hierarchical(dhp_payload, &mut walker, state, pts);
+            }
             0xC5..=0xC7 | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
@@ -2715,12 +2727,76 @@ fn render_from_coefs_12bit(
 // in scan-header order. Point transform (Pt) is honoured. Restart markers
 // re-initialise every component's predictor to the image-origin value as
 // required by T.81.
+/// Per-component reconstructed sample planes from a (possibly subsampled)
+/// Huffman lossless scan, plus the geometry needed to shape them into a
+/// frame or feed them back as hierarchical reference components.
+///
+/// `samples[ci]` is the padded sample grid for component `ci`, `comp_w[ci]`
+/// wide. The values are the post-prediction, pre-`<< pt` reconstructed
+/// samples (range `0..2^(P-Pt)`). `subsampled` distinguishes the
+/// MCU-padded YUV-class grid from the flat width × height grids.
+struct LosslessPlanes {
+    samples: Vec<Vec<u32>>,
+    comp_w: Vec<usize>,
+    comp_true_w: Vec<usize>,
+    comp_true_h: Vec<usize>,
+    subsampled: bool,
+}
+
 fn decode_lossless_scan(
     state: &JpegState,
     sos: &SosInfo,
     scan: &[u8],
     pts: Option<i64>,
 ) -> Result<VideoFrame> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    let nc = sos.components.len();
+    let pt = sos.al as u32;
+    let precision = sof.precision as u32;
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let planes = decode_lossless_scan_planes(state, sos, scan, false)?;
+    if planes.subsampled {
+        return shape_lossless_yuv_frame(
+            &planes.samples,
+            &planes.comp_w,
+            &planes.comp_true_w,
+            &planes.comp_true_h,
+            width,
+            height,
+            pt,
+            pts,
+        );
+    }
+    shape_lossless_frame(
+        &planes.samples,
+        nc,
+        width,
+        height,
+        pt,
+        precision,
+        state,
+        pts,
+    )
+}
+
+/// Core of the Huffman lossless (SOF3) scan decoder: reconstruct the
+/// per-component sample planes without shaping them into a `VideoFrame`.
+/// Shared by the standalone lossless decode path and the hierarchical
+/// (Annex J) spatial progression. When `differential` is true the Annex J
+/// §J.2.3.2 modification applies — the difference is decoded directly
+/// without spatial prediction (the predictor selector Ss must be 0), so
+/// every reconstructed sample is the modulo-2^(P-Pt) two's-complement
+/// difference itself rather than `pred + diff`.
+fn decode_lossless_scan_planes(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    differential: bool,
+) -> Result<LosslessPlanes> {
     let sof = state
         .sof
         .as_ref()
@@ -2742,7 +2818,17 @@ fn decode_lossless_scan(
         ));
     }
     let predictor = sos.ss;
-    if !(1..=7).contains(&predictor) {
+    if differential {
+        // T.81 §J.1.3.2 / §J.2.3.2: in a differential lossless frame the
+        // difference is coded directly without prediction, and "the
+        // prediction selection parameter in the scan header shall be set
+        // to zero".
+        if predictor != 0 {
+            return Err(Error::invalid(
+                "differential lossless: predictor Ss must be 0",
+            ));
+        }
+    } else if !(1..=7).contains(&predictor) {
         return Err(Error::invalid("lossless: predictor Ss must be in 1..=7"));
     }
     let pt = sos.al as u32; // point transform
@@ -2845,7 +2931,16 @@ fn decode_lossless_scan(
             let cy = $cy;
             let cw = comp_w[ci];
             let plane = &samples[ci];
-            let pred: u32 = if reset_pred {
+            // T.81 §J.2.3.2: a differential lossless frame codes the
+            // difference directly — no spatial prediction — so the
+            // "prediction" contribution is fixed at zero and the
+            // reconstructed plane carries the raw modulo-2^(P-Pt) two's
+            // complement differences. The non-differential path predicts
+            // per Annex H Table H.1 with the H.1.2.1 edge / restart
+            // fall-backs.
+            let pred: u32 = if differential {
+                0
+            } else if reset_pred {
                 origin
             } else if cy == 0 {
                 plane[cy * cw + cx - 1]
@@ -2970,20 +3065,402 @@ fn decode_lossless_scan(
         }
     }
 
-    if subsampled {
-        return shape_lossless_yuv_frame(
-            &samples,
-            &comp_w,
-            &comp_true_w,
-            &comp_true_h,
-            width,
-            height,
-            pt,
-            pts,
-        );
-    }
+    Ok(LosslessPlanes {
+        samples,
+        comp_w,
+        comp_true_w,
+        comp_true_h,
+        subsampled,
+    })
+}
 
-    shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
+// ---- Hierarchical mode (T.81 Annex J) -------------------------------------
+//
+// A hierarchical-mode stream begins with a DHP marker segment declaring the
+// completed-image geometry, followed by a sequence of frames: one
+// non-differential frame per component group (the first, lowest-resolution
+// stage) and zero or more differential frames that refine resolution /
+// quality. Each differential frame codes the two's-complement difference
+// between its input components and the reconstructed reference components
+// from the preceding stage; an EXP segment ahead of the frame signals that
+// the reference is to be ×2 upsampled (J.1.1.2 bi-linear) before the
+// difference is added back modulo 2^16 (J.2.1).
+//
+// This implementation covers the **spatial (lossless) hierarchical
+// progression** of §K.7.2.2: the non-differential frame is SOF3 (lossless
+// Huffman) and every differential frame is SOF7 (differential lossless
+// Huffman). That is the progression with a "truly lossless final stage"
+// and — unlike the DCT hierarchical progression — does not depend on the
+// encoder and decoder sharing a bit-exact IDCT, so a conformant
+// round-trip is well defined. The current slice is restricted to
+// single-component (grayscale) frames; multi-component spatial
+// progressions and the DCT hierarchical path return `Unsupported`.
+
+/// One reconstructed reference component: a full-resolution sample plane
+/// plus its dimensions. Samples are stored at full precision (modulo
+/// 2^16), matching the reference-component model of §J.2.1.
+#[derive(Clone)]
+struct RefComponent {
+    width: usize,
+    height: usize,
+    samples: Vec<u32>,
+}
+
+/// ×2 bi-linear upsampling of a reference component per T.81 §J.1.1.2.
+///
+/// `Px = (Ra + Rb) / 2` with truncating division. The left column / top
+/// line of the upsampled image match the source; the right column / bottom
+/// line of the source are replicated to supply the missing right/bottom
+/// interpolation neighbours. Horizontal and vertical expansion are applied
+/// independently (the caller does horizontal first, then vertical, when
+/// both are signalled), so this helper expands a single axis.
+fn upsample_axis(rc: &RefComponent, horizontal: bool, modulus: u32) -> RefComponent {
+    if horizontal {
+        let out_w = rc.width * 2;
+        let out_h = rc.height;
+        let mut samples = vec![0u32; out_w * out_h];
+        for y in 0..out_h {
+            for x in 0..rc.width {
+                let ra = rc.samples[y * rc.width + x];
+                // Right edge replicates the boundary sample.
+                let rb = if x + 1 < rc.width {
+                    rc.samples[y * rc.width + x + 1]
+                } else {
+                    ra
+                };
+                // Even output column matches the source column; the odd
+                // column is the interpolated midpoint.
+                samples[y * out_w + 2 * x] = ra;
+                samples[y * out_w + 2 * x + 1] = ra.wrapping_add(rb) / 2 % modulus.max(1);
+            }
+        }
+        RefComponent {
+            width: out_w,
+            height: out_h,
+            samples,
+        }
+    } else {
+        let out_w = rc.width;
+        let out_h = rc.height * 2;
+        let mut samples = vec![0u32; out_w * out_h];
+        for y in 0..rc.height {
+            for x in 0..rc.width {
+                let ra = rc.samples[y * rc.width + x];
+                let rb = if y + 1 < rc.height {
+                    rc.samples[(y + 1) * rc.width + x]
+                } else {
+                    ra
+                };
+                samples[(2 * y) * out_w + x] = ra;
+                samples[(2 * y + 1) * out_w + x] = ra.wrapping_add(rb) / 2 % modulus.max(1);
+            }
+        }
+        RefComponent {
+            width: out_w,
+            height: out_h,
+            samples,
+        }
+    }
+}
+
+/// Hierarchical-mode (Annex J) decode control loop. Entered from
+/// `decode_jpeg` when a DHP marker is seen before the first SOF; `walker`
+/// is positioned immediately after the DHP segment payload, and `state`
+/// carries any table-specification segments parsed before the DHP.
+///
+/// Covers the spatial lossless progression only (SOF3 non-differential
+/// first frame + SOF7 differential frames). Anything else — a DCT-based
+/// non-differential frame, an arithmetic differential frame, or a
+/// multi-component frame — returns `Unsupported`.
+fn decode_hierarchical(
+    dhp_payload: &[u8],
+    walker: &mut MarkerWalker<'_>,
+    mut state: JpegState,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    // The DHP body is a frame header (§B.3.2): precision, Y, X, component
+    // list. It fixes the completed-image precision and component identities.
+    let dhp = parse_sof(dhp_payload)?;
+    if dhp.components.len() != 1 {
+        return Err(Error::unsupported(
+            "hierarchical JPEG: only single-component (grayscale) spatial progressions are supported",
+        ));
+    }
+    let precision = dhp.precision as u32;
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "hierarchical JPEG: precision {precision} out of range 2..=16"
+        )));
+    }
+    // Reference modulus: differential reconstruction is modulo 2^16 for the
+    // 16-bit lossless case (§J.1) and, more generally, the difference + the
+    // reference are kept within the sample range of the precision. We track
+    // it as 2^precision so an n-bit progression wraps consistently.
+    let ref_modulus: u32 = 1u32 << precision;
+
+    // Reset per-frame entropy-coding tables that must come fresh each frame;
+    // table-specification segments (DQT/DHT/DRI) parsed before the DHP are
+    // inherited by the first frame per §B.2.4 / §J.2.1.
+    let mut reference: Option<RefComponent> = None;
+    // Pending EXP expansion flags for the *next* frame (cleared after use).
+    let mut pending_exp: Option<(bool, bool)> = None;
+
+    loop {
+        let Some(marker) = walker.next_marker()? else {
+            return Err(Error::invalid(
+                "hierarchical JPEG: unexpected EOF before EOI",
+            ));
+        };
+        match marker {
+            EOI => {
+                let rc = reference
+                    .ok_or_else(|| Error::invalid("hierarchical JPEG: EOI before any frame"))?;
+                return shape_hierarchical_frame(&rc, precision, pts);
+            }
+            SOI => continue,
+            m if markers::is_rst(m) => continue,
+            DQT => {
+                let p = walker.read_segment_payload()?;
+                parse_dqt(p, &mut state.quant)?;
+            }
+            DHT => {
+                let p = walker.read_segment_payload()?;
+                parse_dht(p, &mut state.dc_huff, &mut state.ac_huff)?;
+            }
+            DRI => {
+                let p = walker.read_segment_payload()?;
+                state.restart_interval = parse_dri(p)?;
+            }
+            // EXP (§B.3.3): applies to the next (differential) frame only.
+            markers::EXP => {
+                let p = walker.read_segment_payload()?;
+                if p.len() != 1 {
+                    return Err(Error::invalid("hierarchical JPEG: EXP length != 1"));
+                }
+                let eh = (p[0] >> 4) & 0x0F;
+                let ev = p[0] & 0x0F;
+                if eh > 1 || ev > 1 {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: EXP Eh/Ev must be 0 or 1",
+                    ));
+                }
+                if pending_exp.is_some() {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: more than one EXP before a frame",
+                    ));
+                }
+                pending_exp = Some((eh == 1, ev == 1));
+            }
+            // Non-differential lossless frame (the first stage).
+            SOF3 => {
+                if reference.is_some() {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: a second non-differential frame is not supported",
+                    ));
+                }
+                if pending_exp.take().is_some() {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: EXP precedes a non-differential frame",
+                    ));
+                }
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                validate_lossless_sof(&sof)?;
+                if sof.components.len() != 1 {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: only single-component frames are supported",
+                    ));
+                }
+                if sof.precision as u32 != precision {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: frame precision differs from DHP",
+                    ));
+                }
+                state.sof = Some(sof.clone());
+                let rc = decode_hierarchical_frame(&state, walker, false)?;
+                reference = Some(rc);
+            }
+            // Differential lossless frame (a refinement stage).
+            SOF7 => {
+                let prev = reference.take().ok_or_else(|| {
+                    Error::invalid(
+                        "hierarchical JPEG: differential frame before a non-differential frame",
+                    )
+                })?;
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                validate_lossless_sof(&sof)?;
+                if sof.components.len() != 1 {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: only single-component frames are supported",
+                    ));
+                }
+                if sof.precision as u32 != precision {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: frame precision differs from DHP",
+                    ));
+                }
+                // Upsample the reference if an EXP segment preceded this
+                // frame. Horizontal expansion is applied first, then
+                // vertical (§J.1.1.2).
+                let mut upsampled = prev;
+                if let Some((eh, ev)) = pending_exp.take() {
+                    if eh {
+                        upsampled = upsample_axis(&upsampled, true, ref_modulus);
+                    }
+                    if ev {
+                        upsampled = upsample_axis(&upsampled, false, ref_modulus);
+                    }
+                }
+                state.sof = Some(sof.clone());
+                let diff = decode_hierarchical_frame(&state, walker, true)?;
+                // The differential frame's declared geometry must match the
+                // (possibly upsampled) reference — the difference is a
+                // per-sample two's-complement delta over the same grid.
+                if diff.width != upsampled.width || diff.height != upsampled.height {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: differential frame size != reference size",
+                    ));
+                }
+                // Reconstruct: add the difference modulo 2^precision (§J.2.1).
+                let mut samples = vec![0u32; diff.width * diff.height];
+                for i in 0..samples.len() {
+                    samples[i] = upsampled.samples[i].wrapping_add(diff.samples[i]) % ref_modulus;
+                }
+                reference = Some(RefComponent {
+                    width: diff.width,
+                    height: diff.height,
+                    samples,
+                });
+            }
+            // Any DCT-based or arithmetic SOF inside a hierarchical stream
+            // is outside the spatial-lossless slice this decoder covers.
+            m if markers::is_sof(m) => {
+                let _ = walker.read_segment_payload();
+                return Err(Error::unsupported(
+                    "hierarchical JPEG: only the spatial lossless progression (SOF3 + SOF7) is supported",
+                ));
+            }
+            COM => {
+                let _ = walker.read_segment_payload()?;
+            }
+            m if markers::is_app(m) => {
+                let _ = walker.read_segment_payload()?;
+            }
+            _ => {
+                let _ = walker.read_segment_payload();
+            }
+        }
+    }
+}
+
+/// Decode one hierarchical-mode lossless frame (single component) and
+/// return its reconstructed sample plane. Reads the frame's single SOS +
+/// entropy-coded scan from `walker`. `differential` selects the §J.2.3.2
+/// modification (difference coded directly, no spatial prediction).
+fn decode_hierarchical_frame(
+    state: &JpegState,
+    walker: &mut MarkerWalker<'_>,
+    differential: bool,
+) -> Result<RefComponent> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("hierarchical JPEG: missing SOF"))?;
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    // Locate the frame's SOS, consuming any table/misc segments that appear
+    // between the frame header and the scan header (§B.2 / §E.1: tables may
+    // precede a scan as well as a frame).
+    loop {
+        let Some(marker) = walker.next_marker()? else {
+            return Err(Error::invalid("hierarchical JPEG: EOF before SOS"));
+        };
+        match marker {
+            SOS => {
+                let p = walker.read_segment_payload()?;
+                let sos = parse_sos(p)?;
+                validate_sos(&sos)?;
+                let scan = walker.read_scan_data()?;
+                let planes = decode_lossless_scan_planes(state, &sos, scan, differential)?;
+                if planes.subsampled || planes.samples.len() != 1 {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: single-component frames only",
+                    ));
+                }
+                return Ok(RefComponent {
+                    width,
+                    height,
+                    samples: planes.samples.into_iter().next().unwrap(),
+                });
+            }
+            DQT => {
+                let _ = walker.read_segment_payload()?;
+            }
+            DHT => {
+                // A scan-local DHT would need to mutate `state`, but the
+                // hierarchical slice keeps tables frame-global; reject
+                // rather than silently ignore a table the scan needs.
+                return Err(Error::unsupported(
+                    "hierarchical JPEG: DHT between frame header and scan is not supported",
+                ));
+            }
+            DRI => {
+                let _ = walker.read_segment_payload()?;
+            }
+            COM => {
+                let _ = walker.read_segment_payload()?;
+            }
+            m if markers::is_app(m) => {
+                let _ = walker.read_segment_payload()?;
+            }
+            _ => {
+                return Err(Error::invalid(
+                    "hierarchical JPEG: unexpected marker before SOS",
+                ));
+            }
+        }
+    }
+}
+
+/// Shape a single reconstructed hierarchical-mode reference component into
+/// a grayscale `VideoFrame`, selecting the output `PixelFormat` by
+/// precision (the same policy the lossless grayscale path uses).
+fn shape_hierarchical_frame(
+    rc: &RefComponent,
+    precision: u32,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let out_format = match precision {
+        8 => PixelFormat::Gray8,
+        10 => PixelFormat::Gray10Le,
+        12 => PixelFormat::Gray12Le,
+        _ => PixelFormat::Gray16Le,
+    };
+    let n = rc.width * rc.height;
+    let plane = if out_format == PixelFormat::Gray8 {
+        let stride = rc.width;
+        let mut data = vec![0u8; stride * rc.height];
+        for i in 0..n {
+            data[i] = rc.samples[i] as u8;
+        }
+        VideoPlane { stride, data }
+    } else {
+        let stride = rc.width * 2;
+        let mut data = vec![0u8; stride * rc.height];
+        for i in 0..n {
+            let v = rc.samples[i] as u16;
+            data[i * 2] = (v & 0xFF) as u8;
+            data[i * 2 + 1] = (v >> 8) as u8;
+        }
+        VideoPlane { stride, data }
+    };
+    Ok(VideoFrame {
+        pts,
+        planes: vec![plane],
+    })
 }
 
 /// Shape the reconstructed per-component lossless sample planes into the

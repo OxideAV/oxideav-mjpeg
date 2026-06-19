@@ -2,8 +2,10 @@
 
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
 decodes baseline (SOF0), extended-sequential (SOF1 Huffman + SOF9
-arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic)
-and lossless (SOF3 Huffman + SOF11 arithmetic) JPEGs (single-component
+arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic),
+lossless (SOF3 Huffman + SOF11 arithmetic) and the **spatial
+hierarchical lossless progression** (T.81 Annex J — DHP + SOF3/SOF7
++ EXP, single-component grayscale) JPEGs (single-component
 grayscale at any precision `P ∈ 2..=16` plus three-component RGB-class
 at `P = 8`), encodes
 baseline, progressive **and** lossless JPEG (the lossless path covers
@@ -696,6 +698,20 @@ Decoder:
   default; the decoder accepts either, so a caller-supplied APP-segment
   override that drops the APP14 still round-trips.
 - Restart markers (`RSTn`) + DRI.
+- **Hierarchical spatial lossless progression (T.81 Annex J)** — a
+  `DHP` marker (§B.3.2) before the first frame routes the stream to
+  the hierarchical control loop (§J.2.1). The lowest-resolution stage
+  is a non-differential `SOF3` lossless frame; each higher-resolution
+  stage is a `SOF7` differential lossless frame whose reference is ×2
+  bi-linearly upsampled per the `EXP` segment (§B.3.3 / §J.1.1.2) and
+  whose decoded difference is added back modulo `2^P` (§J.2.1). The
+  differential frames decode with the §J.2.3.2 model (difference
+  coded directly, predictor `Ss = 0`). Single-component (grayscale)
+  progressions at any precision `P ∈ 2..=16` reconstruct
+  bit-exactly; multi-component spatial progressions, the DCT
+  hierarchical path, and the arithmetic hierarchical variants
+  (SOF13..SOF15) still return `Unsupported` (see "Not supported"
+  below).
 - **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
   header codes the number of lines `Y = 0`, the real line count is
   recovered from the mandatory DNL segment (`0xFFDC`) that immediately
@@ -775,11 +791,26 @@ Encoder:
 
 Not supported (decoder returns `Error::Unsupported`):
 
-- Hierarchical (SOF5..SOF7, SOF13..SOF15). The arithmetic-coded
-  non-hierarchical variants are all supported: SOF9 (extended
-  sequential) at `P=8`, SOF10 (progressive) at `P=8` / `P=12`, and
-  SOF11 (lossless) at every Annex H precision — see the decoder
-  coverage list above.
+- Hierarchical mode (T.81 Annex J) is **partially** supported. The
+  **spatial lossless progression** (§K.7.2.2) decodes: a `DHP`
+  marker (§B.3.2) before the first frame selects the hierarchical
+  path; the non-differential first frame is `SOF3` (lossless
+  Huffman) and each refinement frame is `SOF7` (differential
+  lossless Huffman), with `EXP` (§B.3.3) ×2 bi-linear upsampling of
+  the reference (§J.1.1.2) and modulo-2^P reconstruction (§J.2.1).
+  The current slice covers single-component (grayscale) progressions
+  at any precision `P ∈ 2..=16`; the differential frames apply the
+  §J.2.3.2 modification (the difference is decoded directly, without
+  spatial prediction, predictor `Ss = 0`). Still rejected with
+  `Unsupported`: multi-component spatial progressions, the **DCT**
+  hierarchical progression (SOF0..SOF2 / SOF9..SOF10 non-differential
+  frames + SOF5/SOF6 differential DCT frames — §K.7.2.1, which T.81
+  itself notes cannot be guaranteed lossless across differing IDCT
+  implementations), and the arithmetic hierarchical variants
+  (SOF13..SOF15). The non-hierarchical arithmetic variants are all
+  supported: SOF9 (extended sequential) at `P=8`, SOF10
+  (progressive) at `P=8` / `P=12`, and SOF11 (lossless) at every
+  Annex H precision — see the decoder coverage list above.
 - 12-bit 4-component progressive (SOF2 / SOF10 with `Nf = 4,
   P = 12`) — the workspace `PixelFormat` enum has no 12-bit CMYK
   variant. `P = 8` 4-component CMYK / YCCK *is* supported on the

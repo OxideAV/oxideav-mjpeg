@@ -728,15 +728,23 @@ Decoder:
   resulting signed difference is added to the ×2 EXP-upsampled
   reference modulo `2^16` (§J.2.1) and folded into the displayable
   `0..2^P` range. Frames are single-component (grayscale, `P = 8` /
-  `P = 12` → `Gray8` / `Gray12Le`) or three-component RGB-class
+  `P = 12` → `Gray8` / `Gray12Le`), three-component RGB-class
   (component IDs `R`/`G`/`B` or Adobe APP14 `transform = 0` → packed
-  `Rgb24`), all `H = V = 1`. The frame mode is fixed by the first
-  frame (T.81 §K.7.2 forbids mixing DCT and lossless non-differential
-  frames). Still `Unsupported`: 3-component YUV-class DCT progressions
-  (need a YCbCr → RGB conversion on the reference), 4-component DCT
-  progressions, the differential progressive (`SOF6`) frame, a
-  lossless differential frame terminating a DCT progression, and the
-  arithmetic hierarchical variants (SOF13..SOF15).
+  `Rgb24`, `P = 8` / `P = 12`), or three-component YUV-class
+  (component IDs other than `R`/`G`/`B`, no Adobe `transform = 0` →
+  planar `Yuv444P`, `P = 8`), all `H = V = 1`. Reconstruction is
+  colour-blind — every component accumulates in its own sample space
+  modulo `2^16` regardless of colour class, and the YCbCr / RGB
+  interpretation is deferred entirely to the display-time output
+  shaping (no in-loop colour conversion), so the YUV-class Y/Cb/Cr
+  planes pass through verbatim exactly as in the non-hierarchical
+  sequential path. The frame mode is fixed by the first frame
+  (T.81 §K.7.2 forbids mixing DCT and lossless non-differential
+  frames). Still `Unsupported`: `P = 12` 3-component YUV-class DCT
+  progressions (no high-bit-depth planar YCbCr `PixelFormat`),
+  4-component DCT progressions, the differential progressive (`SOF6`)
+  frame, a lossless differential frame terminating a DCT progression,
+  and the arithmetic hierarchical variants (SOF13..SOF15).
 - **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
   header codes the number of lines `Y = 0`, the real line count is
   recovered from the mandatory DNL segment (`0xFFDC`) that immediately
@@ -825,12 +833,12 @@ Not supported (decoder returns `Error::Unsupported`):
   `SOF7` differential frames (1/3/4-component, `P` up to 16, modulo-
   2^P reconstruction, §J.2.3.2 model). The **DCT** path covers `SOF0`
   / `SOF1` / `SOF2` non-differential + `SOF5` differential sequential
-  frames (1-component grayscale or 3-component RGB-class, `P = 8` /
-  `P = 12`, §J.2.3.1 model with the level-shift-free IDCT + direct DC,
+  frames (1-component grayscale or 3-component RGB-class at `P = 8` /
+  `P = 12`, plus 3-component YUV-class at `P = 8` → planar `Yuv444P`,
+  §J.2.3.1 model with the level-shift-free IDCT + direct DC,
   modulo-2^16 reconstruction). Still rejected with `Unsupported`:
-  subsampled (`H/V != 1`) hierarchical frames; 3-component YUV-class
-  and 4-component DCT progressions (a YCbCr → RGB conversion on the
-  reconstructed reference is not yet wired); the differential
+  subsampled (`H/V != 1`) hierarchical frames; `P = 12` 3-component
+  YUV-class and 4-component DCT progressions; the differential
   progressive (`SOF6`) frame; a lossless differential frame
   terminating a DCT progression; and the arithmetic hierarchical
   variants (SOF13..SOF15). The non-hierarchical arithmetic variants

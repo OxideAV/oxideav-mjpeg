@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- hierarchical-mode (T.81 Annex J) **DCT progression** decode now
+  covers **3-component YUV-class** frames (§K.7.2.1). A `DHP`-routed
+  DCT progression whose non-differential first frame is `SOF0` /
+  `SOF1` / `SOF2` with component IDs other than `R`/`G`/`B` (and no
+  Adobe APP14 `transform = 0`) is treated as YUV-class: every
+  component reconstructs in its own sample space modulo 2^16 (§J.2.1)
+  exactly as the RGB-class path does — colour interpretation is
+  deferred to display — and the completed image is shaped to planar
+  `Yuv444P` (every component `H = V = 1`, `P = 8`). Differential
+  `SOF5` refinement stages with `EXP` ×2 upsampling refine each
+  Y/Cb/Cr plane independently. Previously these returned
+  `Unsupported`. `P = 12` YUV-class progressions stay `Unsupported`
+  (no high-bit-depth planar YCbCr `PixelFormat`).
+  `tests/hierarchical_dct.rs` adds single-stage `SOF0` / `SOF2` and
+  two-stage differential `SOF5` YUV-class cases.
+
 - hierarchical-mode (T.81 Annex J) **spatial lossless progression**
   decode: a `DHP` marker (§B.3.2) before the first frame routes the
   stream to a new hierarchical control loop; the non-differential

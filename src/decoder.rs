@@ -3250,6 +3250,15 @@ fn decode_hierarchical(
     // reference-component reconstruction modulus is 2^16 for the DCT
     // progression and 2^precision for the lossless one.
     let mut dct_mode: Option<bool> = None;
+    // Colour class of a 3-component DCT progression, fixed by the
+    // non-differential first frame: `true` = YUV-class (component IDs not
+    // R/G/B and no Adobe `transform = 0`), `false` = RGB-class. Hierarchical
+    // reconstruction is colour-blind — every component accumulates modulo
+    // 2^16 in its native sample space (§J.2.1) regardless of colour class —
+    // so this flag only steers the EOI output shaping: YUV-class lands as
+    // planar `Yuv444P`, RGB-class as packed `Rgb24`. `None` for grayscale or
+    // lossless progressions, where shaping is precision-driven.
+    let mut dct_yuv_class: Option<bool> = None;
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -3261,7 +3270,13 @@ fn decode_hierarchical(
             EOI => {
                 let rc = reference
                     .ok_or_else(|| Error::invalid("hierarchical JPEG: EOI before any frame"))?;
-                return shape_hierarchical_frame(&rc, precision, &state, pts);
+                return shape_hierarchical_frame(
+                    &rc,
+                    precision,
+                    dct_yuv_class.unwrap_or(false),
+                    &state,
+                    pts,
+                );
             }
             SOI => continue,
             m if markers::is_rst(m) => continue,
@@ -3345,10 +3360,22 @@ fn decode_hierarchical(
                 let sof = parse_sof(p)?;
                 validate_sof(&sof)?;
                 check_hier_dct_frame(&sof, nc, precision)?;
-                if nc == 3 && !hier_dct_is_rgb_class(&sof, state.adobe_transform) {
-                    return Err(Error::unsupported(
-                        "hierarchical DCT JPEG: 3-component YUV-class progressions are not supported (RGB-class only)",
-                    ));
+                if nc == 3 {
+                    // Pin the 3-component colour class from the first frame.
+                    // RGB-class (component IDs R/G/B or Adobe `transform = 0`)
+                    // packs to `Rgb24`; everything else is treated as YUV-class
+                    // and lands as planar `Yuv444P`. The reconstruction loop is
+                    // identical for both — only EOI shaping differs.
+                    let is_yuv = !hier_dct_is_rgb_class(&sof, state.adobe_transform);
+                    if is_yuv && precision != 8 {
+                        // The planar `Yuv444P` output target is 8-bit; the
+                        // workspace `PixelFormat` enum has no high-bit-depth
+                        // planar YCbCr variant for the 12-bit DCT path.
+                        return Err(Error::unsupported(
+                            "hierarchical DCT JPEG: 3-component YUV-class progressions require P = 8",
+                        ));
+                    }
+                    dct_yuv_class = Some(is_yuv);
                 }
                 state.sof = Some(sof.clone());
                 let progressive = marker == SOF2;
@@ -3895,9 +3922,18 @@ fn decode_hierarchical_dct_frame(
 /// honoured). The point transform was constrained to zero when each scan
 /// was decoded, so the reconstructed samples already span the full
 /// `2^P` range and no `<< pt` is needed.
+///
+/// `yuv_class` only matters for a 3-component **DCT** progression: when set,
+/// the three reconstructed reference planes are interpreted as `P = 8`
+/// `Yuv444P` (planar Y/Cb/Cr) rather than packed `Rgb24`. Hierarchical
+/// reconstruction itself is colour-blind — every component accumulates in
+/// its own sample space modulo 2^16 (§J.2.1) — so the colour class is purely
+/// an output-shaping decision deferred to display, exactly as in the
+/// non-hierarchical sequential path.
 fn shape_hierarchical_frame(
     refs: &[RefComponent],
     precision: u32,
+    yuv_class: bool,
     state: &JpegState,
     pts: Option<i64>,
 ) -> Result<VideoFrame> {
@@ -3905,6 +3941,26 @@ fn shape_hierarchical_frame(
     let width = refs[0].width;
     let height = refs[0].height;
     let samples: Vec<Vec<u32>> = refs.iter().map(|rc| rc.samples.clone()).collect();
+    // 3-component YUV-class DCT progression → planar `Yuv444P` (`P = 8`,
+    // every component `H = V = 1`, so all three planes are full-resolution
+    // and line up one-sample-per-pixel). The Y/Cb/Cr planes pass through
+    // verbatim — colour interpretation is a display concern, matching the
+    // non-hierarchical 3-component non-RGB default.
+    if nc == 3 && yuv_class {
+        let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(3);
+        for plane in samples.iter() {
+            let stride = width;
+            let mut data = vec![0u8; stride * height];
+            for i in 0..width * height {
+                data[i] = plane[i] as u8;
+            }
+            out_planes.push(VideoPlane { stride, data });
+        }
+        return Ok(VideoFrame {
+            pts,
+            planes: out_planes,
+        });
+    }
     shape_lossless_frame(&samples, nc, width, height, 0, precision, state, pts)
 }
 

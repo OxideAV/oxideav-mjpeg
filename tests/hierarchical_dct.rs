@@ -20,7 +20,8 @@
 //!    image matches a known target. This proves the differential DCT frame
 //!    path + the modulo-2^16 §J.2.1 reconstruction.
 
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+use oxideav_core::frame::VideoPlane;
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame};
 use oxideav_mjpeg::registry::make_decoder;
 
 fn decode(jpeg: Vec<u8>, w: u32, h: u32) -> oxideav_core::VideoFrame {
@@ -137,6 +138,93 @@ fn single_stage_dct_hierarchical_rgb_matches_baseline() {
     assert_eq!(hier.planes.len(), 1);
     assert_eq!(hier.planes[0].stride, w * 3);
     assert_eq!(plain.planes[0].data, hier.planes[0].data);
+}
+
+/// Build a 4:4:4 YUV `VideoFrame` (three full-resolution planar Y/Cb/Cr
+/// planes) carrying a smooth gradient with a little structure on every
+/// component — exercised by the YUV-class hierarchical DCT path.
+fn make_yuv444_frame(w: usize, h: usize) -> VideoFrame {
+    let mut y = vec![0u8; w * h];
+    let mut cb = vec![0u8; w * h];
+    let mut cr = vec![0u8; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            let o = j * w + i;
+            y[o] = ((i * 9 + j * 5) & 0xFF) as u8;
+            cb[o] = (128 + (i as i32 - w as i32 / 2)).clamp(0, 255) as u8;
+            cr[o] = (128 + (j as i32 - h as i32 / 2)).clamp(0, 255) as u8;
+        }
+    }
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: w,
+                data: cb,
+            },
+            VideoPlane {
+                stride: w,
+                data: cr,
+            },
+        ],
+    }
+}
+
+#[test]
+fn single_stage_dct_hierarchical_yuv_matches_baseline() {
+    let (w, h) = (16usize, 16usize);
+    let frame = make_yuv444_frame(w, h);
+    // 4:4:4 baseline → component IDs 1/2/3 (YUV-class, every component
+    // H = V = 1), so the hierarchical DCT loop routes it to the new
+    // YUV-class shaping → planar Yuv444P.
+    let baseline =
+        oxideav_mjpeg::encoder::encode_jpeg(&frame, w as u32, h as u32, PixelFormat::Yuv444P, 85)
+            .unwrap();
+
+    let plain = decode(baseline.clone(), w as u32, h as u32);
+    let hier = decode(wrap_single_stage_dhp(&baseline), w as u32, h as u32);
+
+    // YUV-class → three planar Yuv444P planes, full resolution.
+    assert_eq!(hier.planes.len(), 3, "expected 3 planar Y/Cb/Cr planes");
+    assert_eq!(plain.planes.len(), 3);
+    for p in 0..3 {
+        assert_eq!(hier.planes[p].stride, w, "plane {p} stride");
+        assert_eq!(
+            plain.planes[p].data, hier.planes[p].data,
+            "plane {p} mismatch between baseline and hierarchical decode"
+        );
+    }
+}
+
+#[test]
+fn single_stage_progressive_dct_hierarchical_yuv_matches_baseline() {
+    // Non-differential first frame = SOF2 (progressive) YUV-class 4:4:4. The
+    // hierarchical control loop decodes the SOF2 frame as the sole stage via
+    // the spectral-selection accumulator, then shapes the YUV-class
+    // reference to planar Yuv444P. Proves the SOF2-first DCT progression
+    // routes through the new YUV-class shaping.
+    let (w, h) = (16usize, 16usize);
+    let frame = make_yuv444_frame(w, h);
+    let prog = oxideav_mjpeg::encoder::encode_jpeg_progressive(
+        &frame,
+        w as u32,
+        h as u32,
+        PixelFormat::Yuv444P,
+        85,
+    )
+    .unwrap();
+
+    let plain = decode(prog.clone(), w as u32, h as u32);
+    let hier = decode(wrap_single_stage_dhp(&prog), w as u32, h as u32);
+
+    assert_eq!(hier.planes.len(), 3);
+    for p in 0..3 {
+        assert_eq!(
+            plain.planes[p].data, hier.planes[p].data,
+            "plane {p} mismatch (SOF2 YUV hierarchical vs plain)"
+        );
+    }
 }
 
 // ---- Two-stage differential DCT progression (SOF0 + EXP + SOF5) ----------
@@ -284,6 +372,60 @@ fn sos_body() -> Vec<u8> {
     vec![1, 1, 0x00, 0, 63, 0x00]
 }
 
+/// SOFn / DHP body: P=8, Y, X, Nf=3, three components (ids 1/2/3, all
+/// H=V=1, Tq=0). Component IDs 1/2/3 (not R/G/B, no Adobe APP14) make this a
+/// YUV-class three-component frame.
+fn frame_body_3comp(w: u16, h: u16) -> Vec<u8> {
+    let mut v = vec![8, (h >> 8) as u8, h as u8, (w >> 8) as u8, w as u8, 3];
+    for id in 1u8..=3 {
+        v.extend_from_slice(&[id, 0x11, 0]);
+    }
+    v
+}
+
+/// SOS body: Ns=3, components 1/2/3 (Td=0/Ta=0 each), Ss=0, Se=63,
+/// Ah=0/Al=0 — an interleaved three-component scan.
+fn sos_body_3comp() -> Vec<u8> {
+    vec![3, 1, 0x00, 2, 0x00, 3, 0x00, 0, 63, 0x00]
+}
+
+/// Encode an interleaved three-component DCT scan of flat DC-only 8×8
+/// blocks, all components at H=V=1. `blocks[c]` is the raster-ordered list
+/// of flat block values for component `c`; every component must supply the
+/// same number of blocks (one per MCU). Within each MCU the three component
+/// blocks are emitted in order (§A.2.3). DC prediction is tracked
+/// independently per component.
+fn encode_flat_dct_scan_3comp(blocks: &[Vec<i32>; 3], differential: bool) -> Vec<u8> {
+    let dc_codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let ac_codes = canonical_codes(&AC_BITS, &AC_VALS);
+    let nmcu = blocks[0].len();
+    assert_eq!(blocks[1].len(), nmcu);
+    assert_eq!(blocks[2].len(), nmcu);
+    let mut bw = BitWriter::new();
+    let mut prev_dc = [0i32; 3];
+    let shift = if differential { 0 } else { 128 };
+    for mcu in 0..nmcu {
+        for c in 0..3 {
+            let dc_coef = 8 * (blocks[c][mcu] - shift);
+            let diff = if differential {
+                dc_coef
+            } else {
+                dc_coef - prev_dc[c]
+            };
+            prev_dc[c] = dc_coef;
+            let (ssss, bitsv) = category(diff);
+            let (len, code) = dc_codes[&ssss];
+            bw.put(code, len);
+            if ssss > 0 {
+                bw.put(bitsv, ssss);
+            }
+            let (l, cc) = ac_codes[&0x00];
+            bw.put(cc, l);
+        }
+    }
+    bw.finish()
+}
+
 /// Encode a single-component DCT scan of flat DC-only 8×8 blocks. Each block
 /// `b` carries constant value `vals[b]`; the stored DC coefficient is
 /// `8*vals[b]` (after the optional level shift), AC all zero (EOB only).
@@ -367,6 +509,69 @@ fn two_stage_differential_dct_hierarchical_grayscale() {
                 expect,
                 "pixel ({x},{y}) block ({bx},{by})"
             );
+        }
+    }
+}
+
+#[test]
+fn two_stage_differential_dct_hierarchical_yuv() {
+    // Three-component (YUV-class) two-stage DCT progression.
+    //
+    // Stage 1 (non-differential SOF0): one 8×8 flat block per component →
+    //   Y = 100, Cb = 120, Cr = 60. EXP ×2 both axes → flat 16×16 per
+    //   component.
+    // Stage 2 (differential SOF5): 16×16 = 2×2 blocks per component, each a
+    //   flat per-block correction. Final per-component pixel = base + d,
+    //   added modulo 2^16 then folded into 0..256 (§J.2.1).
+    //
+    // The output must be planar Yuv444P (3 full-resolution planes) carrying
+    // the reconstructed Y/Cb/Cr samples verbatim — no colour conversion.
+    let base = [100i32, 120, 60];
+    // Raster block order per component: [TL, TR, BL, BR].
+    let corr: [[i32; 4]; 3] = [[10, -5, 20, -30], [-8, 12, -4, 16], [5, -15, 25, -10]];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_3comp(16, 16)); // DHP (16×16, Nf=3)
+    push_seg(&mut out, 0xDB, &dqt_body()); // DQT (all 1s, table 0)
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS)); // DC DHT
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS)); // AC DHT
+
+    // Stage 1: non-differential SOF0, low-res 8×8, one block per component.
+    push_seg(&mut out, 0xC0, &frame_body_3comp(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body_3comp());
+    let stage1: [Vec<i32>; 3] = [vec![base[0]], vec![base[1]], vec![base[2]]];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp(&stage1, false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential SOF5, full-res 16×16 (2×2 blocks per component).
+    push_seg(&mut out, 0xC5, &frame_body_3comp(16, 16));
+    push_seg(&mut out, 0xDA, &sos_body_3comp());
+    let stage2: [Vec<i32>; 3] = [corr[0].to_vec(), corr[1].to_vec(), corr[2].to_vec()];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp(&stage2, true));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 3, "expected planar Yuv444P (3 planes)");
+    for c in 0..3 {
+        let stride = frame.planes[c].stride;
+        assert_eq!(stride, 16, "plane {c} stride");
+        let data = &frame.planes[c].data;
+        let block_corr = |bx: usize, by: usize| corr[c][by * 2 + bx];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let bx = x / 8;
+                let by = y / 8;
+                let expect = (base[c] + block_corr(bx, by)).clamp(0, 255) as u8;
+                assert_eq!(
+                    data[y * stride + x],
+                    expect,
+                    "plane {c} pixel ({x},{y}) block ({bx},{by})"
+                );
+            }
         }
     }
 }

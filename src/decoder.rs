@@ -3607,9 +3607,9 @@ fn check_hier_dct_frame(sof: &SofInfo, nc: usize, precision: u32) -> Result<()> 
 
 /// True when a hierarchical DCT 3-component frame is RGB-class — component
 /// IDs `R`/`G`/`B` (`82`/`71`/`66`) or an Adobe APP14 `transform = 0`. The
-/// EOI shaping packs three-component DCT references straight to RGB, so a
-/// YUV-class stream (which would need a YCbCr → RGB conversion that this
-/// slice does not yet perform) is rejected up front.
+/// EOI shaping packs an RGB-class reference straight to `Rgb24`; a
+/// YUV-class reference (anything else) lands as planar `Yuv444P`. Both
+/// reconstruct identically — only the output shaping differs.
 fn hier_dct_is_rgb_class(sof: &SofInfo, adobe_transform: Option<u8>) -> bool {
     if sof.components.len() != 3 {
         return false;

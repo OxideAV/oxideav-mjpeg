@@ -180,6 +180,29 @@ fn single_stage_dct_hierarchical_cmyk_matches_baseline() {
     );
 }
 
+#[test]
+fn single_stage_dct_hierarchical_ycck_matches_baseline() {
+    // 4-component YCCK baseline (Adobe APP14 transform = 2). The
+    // hierarchical DCT loop reconstructs the four planes identically to the
+    // plain decode and the EOI shaping applies the same YCbCr → RGB → CMY
+    // conversion, so the two outputs must be byte-identical.
+    let (w, h) = (16usize, 16usize);
+    let packed = make_packed_cmyk(w, h);
+    let baseline =
+        oxideav_mjpeg::encoder::encode_jpeg_cmyk(w as u32, h as u32, &packed, w * 4, 90, Some(2))
+            .unwrap();
+
+    let plain = decode(baseline.clone(), w as u32, h as u32);
+    let hier = decode(wrap_single_stage_dhp(&baseline), w as u32, h as u32);
+
+    assert_eq!(hier.planes.len(), 1, "expected one packed Cmyk plane");
+    assert_eq!(hier.planes[0].stride, w * 4);
+    assert_eq!(
+        plain.planes[0].data, hier.planes[0].data,
+        "YCCK hierarchical decode must match the plain baseline decode"
+    );
+}
+
 /// Build a 4:4:4 YUV `VideoFrame` (three full-resolution planar Y/Cb/Cr
 /// planes) carrying a smooth gradient with a little structure on every
 /// component — exercised by the YUV-class hierarchical DCT path.

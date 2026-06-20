@@ -48,6 +48,16 @@ pub const SOF1: u8 = 0xC1;
 pub const SOF2: u8 = 0xC2;
 /// Lossless sequential, Huffman-coded (T.81 Annex H — predictor-based, no DCT).
 pub const SOF3: u8 = 0xC3;
+/// Differential sequential DCT frame, Huffman-coded (T.81 Annex J). Used for
+/// the differential frames of a *DCT* hierarchical progression (§K.7.2.1):
+/// the coding model is Annex F with the §J.2.3.1 modification — the IDCT is
+/// computed *without* the level shift and the DC coefficient is decoded
+/// directly, without inter-block prediction.
+pub const SOF5: u8 = 0xC5;
+/// Differential progressive DCT frame, Huffman-coded (T.81 Annex J). The
+/// progressive (SOF2) scan structure under the §J.2.3.1 differential coding
+/// model (no level shift on the IDCT, DC decoded directly).
+pub const SOF6: u8 = 0xC6;
 /// Differential lossless (sequential), Huffman-coded (T.81 Annex J). Used
 /// for the differential frames of a spatial hierarchical progression: the
 /// coding model is Annex H with the §J.2.3.2 modification (the difference

@@ -46,6 +46,7 @@ use crate::jpeg::zigzag::ZIGZAG;
 
 // ---- Decoding state ------------------------------------------------------
 
+#[derive(Clone)]
 struct JpegState {
     quant: [Option<QuantTable>; 4],
     dc_huff: [Option<HuffTable>; 4],
@@ -1287,6 +1288,23 @@ fn decode_sequential_scan_accum(
     scan: &[u8],
     coefs: &mut [Vec<[i32; 64]>],
 ) -> Result<()> {
+    decode_sequential_scan_accum_diff(state, sos, scan, coefs, false)
+}
+
+/// Sequential-scan coefficient accumulator with an optional differential
+/// (§J.2.3.1) DC model. When `differential` is true the DC coefficient of
+/// every block is decoded directly — the inter-block predictor is reset to
+/// zero before each block instead of carried — as required for the SOF5
+/// differential frames of a DCT hierarchical progression. The
+/// non-differential case (`differential = false`) is the ordinary
+/// baseline / extended-sequential / non-interleaved accumulator.
+fn decode_sequential_scan_accum_diff(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+    differential: bool,
+) -> Result<()> {
     let sof = state
         .sof
         .as_ref()
@@ -1398,6 +1416,12 @@ fn decode_sequential_scan_accum(
                             let bidx_x = mx * c.h_factor as usize + bx;
                             let bidx_y = my * c.v_factor as usize + by;
                             let bi = bidx_y * blocks_x + bidx_x;
+                            // §J.2.3.1: differential DCT frames decode the DC
+                            // coefficient directly, with no inter-block
+                            // prediction.
+                            if differential {
+                                prev_dc[sidx] = 0;
+                            }
                             decode_block(
                                 &mut br,
                                 dc_tables[sidx],
@@ -1414,6 +1438,9 @@ fn decode_sequential_scan_accum(
                 let c = sof.components[sof_idx];
                 let blocks_x = mcus_x * c.h_factor as usize;
                 let bi = my * blocks_x + mx;
+                if differential {
+                    prev_dc[0] = 0;
+                }
                 decode_block(
                     &mut br,
                     dc_tables[0],
@@ -3216,6 +3243,13 @@ fn decode_hierarchical(
     let mut reference: Option<Vec<RefComponent>> = None;
     // Pending EXP expansion flags for the *next* frame (cleared after use).
     let mut pending_exp: Option<(bool, bool)> = None;
+    // Frame-coding mode, fixed by the non-differential first frame: `Some(true)`
+    // for the DCT progression (§K.7.2.1 — non-differential SOF0/1/2 + differential
+    // SOF5), `Some(false)` for the spatial-lossless progression (SOF3 + SOF7).
+    // T.81 §K.7.2 forbids mixing the two within one image. The §J.2.1
+    // reference-component reconstruction modulus is 2^16 for the DCT
+    // progression and 2^precision for the lossless one.
+    let mut dct_mode: Option<bool> = None;
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -3281,6 +3315,7 @@ fn decode_hierarchical(
                         "hierarchical JPEG: EXP precedes a non-differential frame",
                     ));
                 }
+                dct_mode = Some(false);
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
                 validate_sof(&sof)?;
@@ -3289,8 +3324,117 @@ fn decode_hierarchical(
                 state.sof = Some(sof.clone());
                 reference = Some(decode_hierarchical_frame(&state, walker, false)?);
             }
+            // Non-differential DCT frame (the first stage of a §K.7.2.1 DCT
+            // progression). SOF0 = baseline, SOF1 = extended sequential,
+            // SOF2 = progressive — all Huffman-coded. The reconstructed
+            // image samples (level-shifted, clamped to 0..2^P) become the
+            // reference component planes.
+            SOF0 | SOF1 | SOF2 => {
+                if reference.is_some() {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: a second non-differential frame is not supported",
+                    ));
+                }
+                if pending_exp.take().is_some() {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: EXP precedes a non-differential frame",
+                    ));
+                }
+                dct_mode = Some(true);
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                check_hier_dct_frame(&sof, nc, precision)?;
+                if nc == 3 && !hier_dct_is_rgb_class(&sof, state.adobe_transform) {
+                    return Err(Error::unsupported(
+                        "hierarchical DCT JPEG: 3-component YUV-class progressions are not supported (RGB-class only)",
+                    ));
+                }
+                state.sof = Some(sof.clone());
+                let progressive = marker == SOF2;
+                reference = Some(decode_hierarchical_dct_frame(
+                    &state,
+                    walker,
+                    false,
+                    progressive,
+                )?);
+            }
+            // Differential DCT frame (a refinement stage). SOF5 = differential
+            // sequential, Huffman-coded (§J.2.3.1). The decoded IDCT output is
+            // the signed two's-complement difference (no level shift, DC
+            // decoded directly); it is added modulo 2^16 to the upsampled
+            // reference (§J.2.1).
+            SOF5 => {
+                if dct_mode != Some(true) {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: differential DCT frame without a DCT first frame",
+                    ));
+                }
+                let prev = reference.take().ok_or_else(|| {
+                    Error::invalid(
+                        "hierarchical JPEG: differential frame before a non-differential frame",
+                    )
+                })?;
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                check_hier_dct_frame(&sof, nc, precision)?;
+                // ×2 upsample the reference per any preceding EXP. The DCT
+                // progression reconstructs modulo 2^16 (§J.2.1), so the
+                // interpolation arithmetic uses that modulus too.
+                let mut upsampled = prev;
+                if let Some((eh, ev)) = pending_exp.take() {
+                    for rc in upsampled.iter_mut() {
+                        if eh {
+                            *rc = upsample_axis(rc, true, 1u32 << 16);
+                        }
+                        if ev {
+                            *rc = upsample_axis(rc, false, 1u32 << 16);
+                        }
+                    }
+                }
+                state.sof = Some(sof.clone());
+                let diff = decode_hierarchical_dct_frame(&state, walker, true, false)?;
+                if diff.len() != upsampled.len() {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: differential frame component count mismatch",
+                    ));
+                }
+                let mask = (1u32 << precision) - 1;
+                let mut next = Vec::with_capacity(diff.len());
+                for (u, d) in upsampled.iter().zip(diff.iter()) {
+                    if d.width != u.width || d.height != u.height {
+                        return Err(Error::invalid(
+                            "hierarchical JPEG: differential frame size != reference size",
+                        ));
+                    }
+                    let mut samples = vec![0u32; d.width * d.height];
+                    for i in 0..samples.len() {
+                        // Add modulo 2^16 (§J.2.1), then fold into the
+                        // displayable 0..2^P range — a conformant DCT
+                        // progression keeps the running reference within it.
+                        samples[i] = (u.samples[i].wrapping_add(d.samples[i]) & 0xFFFF) & mask;
+                    }
+                    next.push(RefComponent {
+                        width: d.width,
+                        height: d.height,
+                        samples,
+                    });
+                }
+                reference = Some(next);
+            }
             // Differential lossless frame (a refinement stage).
             SOF7 => {
+                if dct_mode == Some(true) {
+                    // A differential *lossless* frame may legally terminate a
+                    // DCT progression (T.81 §K.7.2: "the final differential
+                    // frame for each component may use a differential lossless
+                    // process"); that mixed-final-frame case is not yet
+                    // covered by this decoder.
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: lossless differential frame terminating a DCT progression is not supported",
+                    ));
+                }
                 let prev = reference.take().ok_or_else(|| {
                     Error::invalid(
                         "hierarchical JPEG: differential frame before a non-differential frame",
@@ -3343,12 +3487,13 @@ fn decode_hierarchical(
                 }
                 reference = Some(next);
             }
-            // Any DCT-based or arithmetic SOF inside a hierarchical stream
-            // is outside the spatial-lossless slice this decoder covers.
+            // Any remaining SOF (the arithmetic hierarchical variants
+            // SOF13..SOF15, or the differential progressive DCT SOF6) is
+            // outside the slice this decoder covers.
             m if markers::is_sof(m) => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "hierarchical JPEG: only the spatial lossless progression (SOF3 + SOF7) is supported",
+                    "hierarchical JPEG: only the spatial lossless (SOF3 + SOF7) and DCT (SOF0/1/2 + SOF5) progressions are supported",
                 ));
             }
             COM => {
@@ -3389,6 +3534,60 @@ fn check_hier_frame(sof: &SofInfo, nc: usize, precision: u32) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Per-frame constraint check for a hierarchical-mode **DCT** frame
+/// (§K.7.2.1). The component count and precision must match the DHP, every
+/// component must be `H = V = 1` (the spatial progression refines resolution
+/// via EXP upsampling, not via in-frame subsampling), and the completed
+/// image must be either single-component (grayscale) or three-component
+/// RGB-class (component IDs `R`/`G`/`B`, or an Adobe APP14 `transform = 0`
+/// signalling no colour transform). YUV-class three-component and
+/// four-component DCT progressions, which need a colour-space conversion on
+/// the reconstructed reference, are not yet covered and return
+/// `Unsupported`.
+fn check_hier_dct_frame(sof: &SofInfo, nc: usize, precision: u32) -> Result<()> {
+    if sof.components.len() != nc {
+        return Err(Error::invalid(
+            "hierarchical DCT JPEG: frame component count differs from DHP",
+        ));
+    }
+    if sof.precision as u32 != precision {
+        return Err(Error::invalid(
+            "hierarchical DCT JPEG: frame precision differs from DHP",
+        ));
+    }
+    if sof
+        .components
+        .iter()
+        .any(|c| c.h_factor != 1 || c.v_factor != 1)
+    {
+        return Err(Error::unsupported(
+            "hierarchical DCT JPEG: subsampled (H/V != 1) frames are not supported",
+        ));
+    }
+    if !matches!(nc, 1 | 3) {
+        return Err(Error::unsupported(
+            "hierarchical DCT JPEG: only 1-component (grayscale) and 3-component RGB-class progressions are supported",
+        ));
+    }
+    Ok(())
+}
+
+/// True when a hierarchical DCT 3-component frame is RGB-class — component
+/// IDs `R`/`G`/`B` (`82`/`71`/`66`) or an Adobe APP14 `transform = 0`. The
+/// EOI shaping packs three-component DCT references straight to RGB, so a
+/// YUV-class stream (which would need a YCbCr → RGB conversion that this
+/// slice does not yet perform) is rejected up front.
+fn hier_dct_is_rgb_class(sof: &SofInfo, adobe_transform: Option<u8>) -> bool {
+    if sof.components.len() != 3 {
+        return false;
+    }
+    if adobe_transform == Some(0) {
+        return true;
+    }
+    let ids: Vec<u8> = sof.components.iter().map(|c| c.id).collect();
+    ids == [b'R', b'G', b'B']
 }
 
 /// Decode one hierarchical-mode lossless frame and return its reconstructed
@@ -3474,6 +3673,216 @@ fn decode_hierarchical_frame(
             }
         }
     }
+}
+
+/// Decode one hierarchical-mode **DCT** frame and return its reconstructed
+/// per-component sample planes (T.81 §K.7.2.1 — the DCT hierarchical
+/// progression). Reads the frame's scan(s) + entropy-coded data from
+/// `walker`, accumulating DCT coefficients into per-component blocks, then
+/// dequantises + runs the IDCT to produce one `RefComponent` per component
+/// cropped to the frame's true `width × height`.
+///
+/// `differential` selects the §J.2.3.1 modification used for SOF5 / SOF6
+/// frames: the IDCT is computed **without** the level shift, and the DC
+/// coefficient is decoded directly (no inter-block prediction). The
+/// returned samples are then the signed two's-complement *difference*,
+/// stored modulo `2^16` exactly as the §J.2.1 reference model requires; the
+/// caller adds them to the upsampled reference. For a non-differential
+/// frame (SOF0 / SOF1 / SOF2) the level shift is applied and samples are
+/// clamped into `0..2^P`, producing a directly-displayable reference plane.
+///
+/// `progressive` routes the scan loop through the spectral-selection /
+/// successive-approximation accumulator (`decode_progressive_scan`) for
+/// SOF2 / SOF6; sequential frames (SOF0 / SOF1 / SOF5) use
+/// `decode_sequential_scan_accum`. Table-specification segments (DQT / DHT
+/// / DRI) that appear between the frame header and its scans mutate a local
+/// copy of `state` so they apply to this frame only. The walker is left
+/// positioned just *before* the next frame-boundary marker (another SOFn,
+/// EXP, DHP or EOI), which this function never consumes.
+fn decode_hierarchical_dct_frame(
+    state: &JpegState,
+    walker: &mut MarkerWalker<'_>,
+    differential: bool,
+    progressive: bool,
+) -> Result<Vec<RefComponent>> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("hierarchical DCT: missing SOF"))?;
+    // The DCT hierarchical slice covers P = 8 / P = 12 (the precisions the
+    // baseline / extended-sequential / progressive DCT scan decoders and the
+    // IDCT render paths handle).
+    let precision = sof.precision as u32;
+    if precision != 8 && precision != 12 {
+        return Err(Error::unsupported(
+            "hierarchical DCT frame: only P = 8 and P = 12 are supported",
+        ));
+    }
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    if h_max == 0 || v_max == 0 {
+        return Err(Error::invalid(
+            "hierarchical DCT frame: sampling factor = 0",
+        ));
+    }
+    let mcus_x = width.div_ceil(8 * h_max);
+    let mcus_y = height.div_ceil(8 * v_max);
+
+    // Per-frame table copy: DQT/DHT/DRI between the frame header and its
+    // scans apply to this frame only (the shared `state` keeps the
+    // frame-global tables from before the DHP).
+    let mut fstate = state.clone();
+    let mut coefs = init_coef_buffers(sof)?;
+
+    // Consume the frame's scans until the next frame-boundary marker.
+    loop {
+        let save = walker.pos;
+        let Some(marker) = walker.next_marker()? else {
+            return Err(Error::invalid(
+                "hierarchical DCT frame: EOF before frame end",
+            ));
+        };
+        match marker {
+            SOS => {
+                let p = walker.read_segment_payload()?;
+                let sos = parse_sos(p)?;
+                validate_sos(&sos)?;
+                let scan = walker.read_scan_data()?;
+                if progressive {
+                    decode_progressive_scan(&fstate, &sos, scan, &mut coefs)?;
+                } else {
+                    // A sequential differential frame decodes its DC
+                    // directly (no inter-block prediction). The shared
+                    // accumulator resets the predictor per SOS but carries
+                    // it across blocks; the differential variant zeroes it
+                    // per block instead.
+                    decode_sequential_scan_accum_diff(
+                        &fstate,
+                        &sos,
+                        scan,
+                        &mut coefs,
+                        differential,
+                    )?;
+                }
+            }
+            DQT => {
+                let p = walker.read_segment_payload()?;
+                parse_dqt(p, &mut fstate.quant)?;
+            }
+            DHT => {
+                let p = walker.read_segment_payload()?;
+                parse_dht(p, &mut fstate.dc_huff, &mut fstate.ac_huff)?;
+            }
+            DRI => {
+                let p = walker.read_segment_payload()?;
+                fstate.restart_interval = parse_dri(p)?;
+            }
+            COM => {
+                let _ = walker.read_segment_payload()?;
+            }
+            m if markers::is_app(m) => {
+                let _ = walker.read_segment_payload()?;
+            }
+            m if markers::is_rst(m) => {
+                // A bare RST between scans (no length field) — skip it.
+            }
+            // A frame-boundary marker: rewind so the hierarchical loop sees
+            // it and don't consume it here.
+            EOI | DHP | markers::EXP => {
+                walker.pos = save;
+                break;
+            }
+            m if markers::is_sof(m) => {
+                walker.pos = save;
+                break;
+            }
+            _ => {
+                // Unknown length-prefixed segment between scans: skip its
+                // payload to stay aligned.
+                let _ = walker.read_segment_payload();
+            }
+        }
+    }
+
+    // Dequantise + IDCT each component into its own reconstructed plane,
+    // cropped to the frame's true extent. The plane modulus is 2^16 so the
+    // differential difference wraps exactly as the §J.2.1 reference model
+    // requires; non-differential samples are clamped into 0..2^P first.
+    let quant_tables: Vec<&QuantTable> = sof
+        .components
+        .iter()
+        .map(|c| {
+            fstate.quant[c.qt_id as usize]
+                .as_ref()
+                .ok_or_else(|| Error::invalid("hierarchical DCT frame: quant table missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let level_shift = if differential {
+        0.0f32
+    } else {
+        // T.81 §A.3.1: level shift = 2^(P-1).
+        (1u32 << (precision - 1)) as f32
+    };
+    let max_val = ((1u32 << precision) - 1) as f32;
+
+    let mut planes = Vec::with_capacity(sof.components.len());
+    for (ci, c) in sof.components.iter().enumerate() {
+        let blocks_x = mcus_x * c.h_factor as usize;
+        let blocks_y = mcus_y * c.v_factor as usize;
+        let comp_w = blocks_x * 8;
+        let comp_h = blocks_y * 8;
+        let qt = quant_tables[ci];
+        // Per-component true extent (T.81 §A.2.4): ceil(dim * factor / max).
+        let true_w = (width * c.h_factor as usize).div_ceil(h_max);
+        let true_h = (height * c.v_factor as usize).div_ceil(v_max);
+        let mut full = vec![0u32; comp_w * comp_h];
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let block = &coefs[ci][by * blocks_x + bx];
+                let mut fblock = [0.0f32; 64];
+                for k in 0..64 {
+                    fblock[k] = block[k] as f32 * qt.values[k] as f32;
+                }
+                idct8x8(&mut fblock);
+                let dst_x0 = bx * 8;
+                let dst_y0 = by * 8;
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let v = fblock[j * 8 + i] + level_shift;
+                        let s: u32 = if differential {
+                            // Signed difference, modulo 2^16 (two's complement).
+                            (v.round() as i32 as u32) & 0xFFFF
+                        } else {
+                            // Clamp to the displayable range 0..2^P.
+                            if v <= 0.0 {
+                                0
+                            } else if v >= max_val {
+                                max_val as u32
+                            } else {
+                                v.round() as u32
+                            }
+                        };
+                        full[(dst_y0 + j) * comp_w + dst_x0 + i] = s;
+                    }
+                }
+            }
+        }
+        // Crop to the component's true extent.
+        let mut samples = vec![0u32; true_w * true_h];
+        for y in 0..true_h {
+            samples[y * true_w..y * true_w + true_w]
+                .copy_from_slice(&full[y * comp_w..y * comp_w + true_w]);
+        }
+        planes.push(RefComponent {
+            width: true_w,
+            height: true_h,
+            samples,
+        });
+    }
+    Ok(planes)
 }
 
 /// Shape the reconstructed hierarchical-mode reference components into the

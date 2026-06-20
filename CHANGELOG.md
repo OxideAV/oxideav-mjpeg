@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - hierarchical-mode (T.81 Annex J) **DCT progression** decode now
+  covers **4-component CMYK-class** frames (§K.7.2.1) at `P = 8`. A
+  `DHP`-routed DCT progression with four components (`SOF0` / `SOF1` /
+  `SOF2` non-differential + `SOF5` differential, every component
+  `H = V = 1`) reconstructs each plane modulo 2^16 (§J.2.1) and shapes
+  the completed image to packed `Cmyk`, honouring the Adobe APP14
+  colour-transform flag identically to the non-hierarchical and
+  hierarchical-lossless four-component paths (`transform = 0`
+  un-inverts Adobe-CMYK, `transform = 2` YCCK decodes YCbCr → RGB).
+  Previously these returned `Unsupported`; `P = 12` four-component
+  progressions stay `Unsupported` (no high-bit-depth CMYK
+  `PixelFormat`). `tests/hierarchical_dct.rs` adds single-stage and
+  two-stage differential CMYK cases.
+- hierarchical-mode (T.81 Annex J) **DCT progression** decode now
   covers **3-component YUV-class** frames (§K.7.2.1). A `DHP`-routed
   DCT progression whose non-differential first frame is `SOF0` /
   `SOF1` / `SOF2` with component IDs other than `R`/`G`/`B` (and no

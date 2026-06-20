@@ -3567,12 +3567,11 @@ fn check_hier_frame(sof: &SofInfo, nc: usize, precision: u32) -> Result<()> {
 /// (§K.7.2.1). The component count and precision must match the DHP, every
 /// component must be `H = V = 1` (the spatial progression refines resolution
 /// via EXP upsampling, not via in-frame subsampling), and the completed
-/// image must be either single-component (grayscale) or three-component
-/// RGB-class (component IDs `R`/`G`/`B`, or an Adobe APP14 `transform = 0`
-/// signalling no colour transform). YUV-class three-component and
-/// four-component DCT progressions, which need a colour-space conversion on
-/// the reconstructed reference, are not yet covered and return
-/// `Unsupported`.
+/// image must be single-component (grayscale), three-component (RGB-class →
+/// `Rgb24` / YUV-class → `Yuv444P`) or four-component (CMYK-class →
+/// `Cmyk`, `P = 8` only). The colour interpretation is deferred to EOI
+/// shaping — every component reconstructs modulo `2^16` regardless — so no
+/// colour-space conversion happens inside the reconstruction loop.
 fn check_hier_dct_frame(sof: &SofInfo, nc: usize, precision: u32) -> Result<()> {
     if sof.components.len() != nc {
         return Err(Error::invalid(
@@ -3593,9 +3592,14 @@ fn check_hier_dct_frame(sof: &SofInfo, nc: usize, precision: u32) -> Result<()> 
             "hierarchical DCT JPEG: subsampled (H/V != 1) frames are not supported",
         ));
     }
-    if !matches!(nc, 1 | 3) {
+    if !matches!(nc, 1 | 3 | 4) {
         return Err(Error::unsupported(
-            "hierarchical DCT JPEG: only 1-component (grayscale) and 3-component RGB-class progressions are supported",
+            "hierarchical DCT JPEG: only 1-, 3- and 4-component progressions are supported",
+        ));
+    }
+    if nc == 4 && precision != 8 {
+        return Err(Error::unsupported(
+            "hierarchical DCT JPEG: 4-component (CMYK-class) progressions require P = 8",
         ));
     }
     Ok(())

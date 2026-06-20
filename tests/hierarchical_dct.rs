@@ -140,6 +140,46 @@ fn single_stage_dct_hierarchical_rgb_matches_baseline() {
     assert_eq!(plain.planes[0].data, hier.planes[0].data);
 }
 
+/// Build a packed `[C, M, Y, K]` gradient buffer (`stride = width * 4`).
+fn make_packed_cmyk(w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    for j in 0..h {
+        for i in 0..w {
+            let o = (j * w + i) * 4;
+            out[o] = (i * 255 / w.max(1)).min(255) as u8;
+            out[o + 1] = (j * 255 / h.max(1)).min(255) as u8;
+            out[o + 2] = ((i + j) * 255 / (w + h).max(1)).min(255) as u8;
+            out[o + 3] = (((i ^ j) * 7) & 0xFF) as u8 / 2;
+        }
+    }
+    out
+}
+
+#[test]
+fn single_stage_dct_hierarchical_cmyk_matches_baseline() {
+    // 4-component (CMYK-class) baseline → component IDs 1/2/3/4, every
+    // component H = V = 1, Adobe APP14 transform = 0 (plain CMYK). The
+    // hierarchical DCT loop decodes it as the sole non-differential stage
+    // and shapes the four reconstructed reference planes to packed Cmyk
+    // (honouring the Adobe transform), matching the plain baseline decode.
+    let (w, h) = (16usize, 16usize);
+    let packed = make_packed_cmyk(w, h);
+    let baseline =
+        oxideav_mjpeg::encoder::encode_jpeg_cmyk(w as u32, h as u32, &packed, w * 4, 90, Some(0))
+            .unwrap();
+
+    let plain = decode(baseline.clone(), w as u32, h as u32);
+    let hier = decode(wrap_single_stage_dhp(&baseline), w as u32, h as u32);
+
+    // CMYK-class → single packed Cmyk plane (4 bytes/pixel).
+    assert_eq!(hier.planes.len(), 1, "expected one packed Cmyk plane");
+    assert_eq!(hier.planes[0].stride, w * 4);
+    assert_eq!(
+        plain.planes[0].data, hier.planes[0].data,
+        "CMYK hierarchical decode must match the plain baseline decode"
+    );
+}
+
 /// Build a 4:4:4 YUV `VideoFrame` (three full-resolution planar Y/Cb/Cr
 /// planes) carrying a smooth gradient with a little structure on every
 /// component — exercised by the YUV-class hierarchical DCT path.
@@ -426,6 +466,64 @@ fn encode_flat_dct_scan_3comp(blocks: &[Vec<i32>; 3], differential: bool) -> Vec
     bw.finish()
 }
 
+/// SOFn / DHP body: P=8, Y, X, Nf=4, four components (ids 1/2/3/4, all
+/// H=V=1, Tq=0) — a CMYK-class four-component frame.
+fn frame_body_4comp(w: u16, h: u16) -> Vec<u8> {
+    let mut v = vec![8, (h >> 8) as u8, h as u8, (w >> 8) as u8, w as u8, 4];
+    for id in 1u8..=4 {
+        v.extend_from_slice(&[id, 0x11, 0]);
+    }
+    v
+}
+
+/// SOS body: Ns=4, components 1/2/3/4 (Td=0/Ta=0 each), Ss=0, Se=63,
+/// Ah=0/Al=0 — an interleaved four-component scan.
+fn sos_body_4comp() -> Vec<u8> {
+    vec![4, 1, 0x00, 2, 0x00, 3, 0x00, 4, 0x00, 0, 63, 0x00]
+}
+
+/// Adobe APP14 segment body declaring colour `transform` (0 = CMYK).
+fn adobe_app14_body(transform: u8) -> Vec<u8> {
+    // "Adobe" + version(2) + flags0(2) + flags1(2) + transform(1).
+    vec![
+        b'A', b'd', b'o', b'b', b'e', 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, transform,
+    ]
+}
+
+/// Encode an interleaved four-component DCT scan of flat DC-only 8×8
+/// blocks, all components at H=V=1. Mirrors `encode_flat_dct_scan_3comp`.
+fn encode_flat_dct_scan_4comp(blocks: &[Vec<i32>; 4], differential: bool) -> Vec<u8> {
+    let dc_codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let ac_codes = canonical_codes(&AC_BITS, &AC_VALS);
+    let nmcu = blocks[0].len();
+    for b in blocks.iter() {
+        assert_eq!(b.len(), nmcu);
+    }
+    let mut bw = BitWriter::new();
+    let mut prev_dc = [0i32; 4];
+    let shift = if differential { 0 } else { 128 };
+    for mcu in 0..nmcu {
+        for c in 0..4 {
+            let dc_coef = 8 * (blocks[c][mcu] - shift);
+            let diff = if differential {
+                dc_coef
+            } else {
+                dc_coef - prev_dc[c]
+            };
+            prev_dc[c] = dc_coef;
+            let (ssss, bitsv) = category(diff);
+            let (len, code) = dc_codes[&ssss];
+            bw.put(code, len);
+            if ssss > 0 {
+                bw.put(bitsv, ssss);
+            }
+            let (l, cc) = ac_codes[&0x00];
+            bw.put(cc, l);
+        }
+    }
+    bw.finish()
+}
+
 /// Encode a single-component DCT scan of flat DC-only 8×8 blocks. Each block
 /// `b` carries constant value `vals[b]`; the stored DC coefficient is
 /// `8*vals[b]` (after the optional level shift), AC all zero (EOB only).
@@ -570,6 +668,75 @@ fn two_stage_differential_dct_hierarchical_yuv() {
                     data[y * stride + x],
                     expect,
                     "plane {c} pixel ({x},{y}) block ({bx},{by})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn two_stage_differential_dct_hierarchical_cmyk() {
+    // Four-component (CMYK-class, Adobe transform = 0) two-stage DCT
+    // progression. Each component accumulates modulo 2^16 (§J.2.1) exactly
+    // like the 1/3-component cases; the EOI shaping packs the four planes
+    // into packed Cmyk and un-inverts the Adobe-CMYK convention
+    // (output = 255 − reconstructed sample).
+    let base = [80i32, 140, 40, 200];
+    // Raster block order per component: [TL, TR, BL, BR].
+    let corr: [[i32; 4]; 4] = [
+        [10, -5, 20, -30],
+        [-8, 12, -4, 16],
+        [5, -15, 25, -10],
+        [-12, 6, -18, 9],
+    ];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_4comp(16, 16)); // DHP (16×16, Nf=4)
+    push_seg(&mut out, 0xEE, &adobe_app14_body(0)); // APP14 Adobe transform=0
+    push_seg(&mut out, 0xDB, &dqt_body()); // DQT (all 1s)
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS)); // DC DHT
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS)); // AC DHT
+
+    // Stage 1: non-differential SOF0, low-res 8×8, one block per component.
+    push_seg(&mut out, 0xC0, &frame_body_4comp(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body_4comp());
+    let stage1: [Vec<i32>; 4] = [vec![base[0]], vec![base[1]], vec![base[2]], vec![base[3]]];
+    out.extend_from_slice(&encode_flat_dct_scan_4comp(&stage1, false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential SOF5, full-res 16×16 (2×2 blocks per component).
+    push_seg(&mut out, 0xC5, &frame_body_4comp(16, 16));
+    push_seg(&mut out, 0xDA, &sos_body_4comp());
+    let stage2: [Vec<i32>; 4] = [
+        corr[0].to_vec(),
+        corr[1].to_vec(),
+        corr[2].to_vec(),
+        corr[3].to_vec(),
+    ];
+    out.extend_from_slice(&encode_flat_dct_scan_4comp(&stage2, true));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 1, "expected one packed Cmyk plane");
+    let stride = frame.planes[0].stride;
+    assert_eq!(stride, 16 * 4);
+    let data = &frame.planes[0].data;
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let bx = x / 8;
+            let by = y / 8;
+            for c in 0..4 {
+                let recon = (base[c] + corr[c][by * 2 + bx]).clamp(0, 255);
+                // Adobe transform = 0 → output = 255 − reconstructed sample.
+                let expect = (255 - recon) as u8;
+                assert_eq!(
+                    data[y * stride + x * 4 + c],
+                    expect,
+                    "CMYK channel {c} pixel ({x},{y}) block ({bx},{by})"
                 );
             }
         }

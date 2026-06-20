@@ -138,3 +138,235 @@ fn single_stage_dct_hierarchical_rgb_matches_baseline() {
     assert_eq!(hier.planes[0].stride, w * 3);
     assert_eq!(plain.planes[0].data, hier.planes[0].data);
 }
+
+// ---- Two-stage differential DCT progression (SOF0 + EXP + SOF5) ----------
+//
+// The frames here use flat (DC-only) 8×8 blocks so the DCT round-trip is
+// exact: a constant `c` image has DCT coefficient `8*c` (level-shifted)
+// with all AC = 0, and the IDCT of a DC-only block `C` is the constant
+// `C/8`. With a quant table of all 1s the stored coefficient is the DC
+// value directly. This lets us hand-assemble a verifiable differential
+// progression without an FDCT.
+
+/// MSB-first bit writer with §B.1.1.5 0xFF byte stuffing.
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u32,
+    nbits: u32,
+}
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            acc: 0,
+            nbits: 0,
+        }
+    }
+    fn put(&mut self, code: u32, len: u8) {
+        for i in (0..len).rev() {
+            let bit = (code >> i) & 1;
+            self.acc = (self.acc << 1) | bit;
+            self.nbits += 1;
+            if self.nbits == 8 {
+                let b = (self.acc & 0xFF) as u8;
+                self.out.push(b);
+                if b == 0xFF {
+                    self.out.push(0x00);
+                }
+                self.acc = 0;
+                self.nbits = 0;
+            }
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            let pad = 8 - self.nbits;
+            self.acc = (self.acc << pad) | ((1 << pad) - 1);
+            let b = (self.acc & 0xFF) as u8;
+            self.out.push(b);
+            if b == 0xFF {
+                self.out.push(0x00);
+            }
+        }
+        self.out
+    }
+}
+
+/// Magnitude category (SSSS) + the `ssss`-bit magnitude code for a signed
+/// value (T.81 §F.1.2.1 Table F.1 / the Annex J extension for SSSS up to 15).
+fn category(v: i32) -> (u8, u32) {
+    if v == 0 {
+        return (0, 0);
+    }
+    let m = v.unsigned_abs();
+    let mut ssss = 0u8;
+    let mut t = m;
+    while t > 0 {
+        ssss += 1;
+        t >>= 1;
+    }
+    let bits = if v > 0 {
+        v as u32
+    } else {
+        (v + ((1 << ssss) - 1)) as u32
+    };
+    (ssss, bits)
+}
+
+// DC Huffman table covering categories 0..=15 (one code of each length
+// 1..=16 is impossible; use the canonical 16-symbol layout: SSSS i gets a
+// code of length i+1 for i in 0..=15 → BITS has one symbol at each length
+// 1..16). Kraft sum = sum 2^-(i+1) for i 0..15 < 1, valid prefix code.
+const DC_BITS: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+const DC_VALS: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+// AC Huffman table with a single symbol: 0x00 (EOB), code length 1.
+const AC_BITS: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+const AC_VALS: [u8; 1] = [0x00];
+
+fn canonical_codes(bits: &[u8; 16], vals: &[u8]) -> std::collections::HashMap<u8, (u8, u32)> {
+    let mut map = std::collections::HashMap::new();
+    let mut code: u32 = 0;
+    let mut k = 0usize;
+    for len in 1..=16u8 {
+        for _ in 0..bits[(len - 1) as usize] {
+            map.insert(vals[k], (len, code));
+            code += 1;
+            k += 1;
+        }
+        code <<= 1;
+    }
+    map
+}
+
+fn push_marker(out: &mut Vec<u8>, m: u8) {
+    out.push(0xFF);
+    out.push(m);
+}
+fn push_seg(out: &mut Vec<u8>, marker: u8, body: &[u8]) {
+    push_marker(out, marker);
+    let len = (body.len() + 2) as u16;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+/// SOFn / DHP body: P=8, Y, X, Nf=1, component (id=1, H=V=1, Tq=0).
+fn frame_body(w: u16, h: u16) -> Vec<u8> {
+    vec![
+        8,
+        (h >> 8) as u8,
+        h as u8,
+        (w >> 8) as u8,
+        w as u8,
+        1,
+        1,
+        0x11,
+        0,
+    ]
+}
+
+/// DQT body: 8-bit precision, table 0, all 64 entries = 1.
+fn dqt_body() -> Vec<u8> {
+    let mut v = vec![0x00]; // Pq=0, Tq=0
+    v.extend_from_slice(&[1u8; 64]);
+    v
+}
+
+/// DHT body for a (class, id) table.
+fn dht_body(tc: u8, th: u8, bits: &[u8; 16], vals: &[u8]) -> Vec<u8> {
+    let mut v = vec![(tc << 4) | th];
+    v.extend_from_slice(bits);
+    v.extend_from_slice(vals);
+    v
+}
+
+/// SOS body: Ns=1, component(id=1, Td=0/Ta=0), Ss=0, Se=63, Ah=0/Al=0.
+fn sos_body() -> Vec<u8> {
+    vec![1, 1, 0x00, 0, 63, 0x00]
+}
+
+/// Encode a single-component DCT scan of flat DC-only 8×8 blocks. Each block
+/// `b` carries constant value `vals[b]`; the stored DC coefficient is
+/// `8*vals[b]` (after the optional level shift), AC all zero (EOB only).
+/// `differential` selects the §J.2.3.1 model: no level shift, DC coded
+/// directly (no inter-block prediction).
+fn encode_flat_dct_scan(blocks: &[i32], differential: bool) -> Vec<u8> {
+    let dc_codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let ac_codes = canonical_codes(&AC_BITS, &AC_VALS);
+    let mut bw = BitWriter::new();
+    let mut prev_dc = 0i32;
+    for &b in blocks {
+        // DC coefficient = 8 * (value - level_shift_offset). For
+        // non-differential P=8 the level shift is 128; for differential it
+        // is 0.
+        let shift = if differential { 0 } else { 128 };
+        let dc_coef = 8 * (b - shift);
+        let diff = if differential {
+            dc_coef // coded directly
+        } else {
+            dc_coef - prev_dc
+        };
+        prev_dc = dc_coef;
+        let (ssss, bitsv) = category(diff);
+        let (len, code) = dc_codes[&ssss];
+        bw.put(code, len);
+        if ssss > 0 {
+            bw.put(bitsv, ssss);
+        }
+        // AC: single EOB.
+        let (l, c) = ac_codes[&0x00];
+        bw.put(c, l);
+    }
+    bw.finish()
+}
+
+#[test]
+fn two_stage_differential_dct_hierarchical_grayscale() {
+    // Stage 1 (non-differential SOF0): 8×8 flat block, value 100.
+    // → upsample ×2 both axes → flat 16×16 = 100.
+    // Stage 2 (differential SOF5): 16×16 = four 8×8 blocks, each a flat
+    // correction d. Final block pixels = 100 + d.
+    let base: i32 = 100;
+    let corrections: [i32; 4] = [10, -5, 20, -30];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body(16, 16)); // DHP (completed image 16×16)
+    push_seg(&mut out, 0xDB, &dqt_body()); // DQT (all 1s)
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS)); // DC DHT
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS)); // AC DHT
+
+    // Stage 1: non-differential SOF0, low-res 8×8.
+    push_seg(&mut out, 0xC0, &frame_body(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body());
+    out.extend_from_slice(&encode_flat_dct_scan(&[base], false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential SOF5, full-res 16×16 (2×2 blocks).
+    push_seg(&mut out, 0xC5, &frame_body(16, 16));
+    push_seg(&mut out, 0xDA, &sos_body());
+    out.extend_from_slice(&encode_flat_dct_scan(&corrections, true));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 1);
+    let stride = frame.planes[0].stride;
+    let data = &frame.planes[0].data;
+    // Block layout: block index = (by, bx) covers rows by*8.. cols bx*8.. .
+    // corrections array is raster block order: [TL, TR, BL, BR].
+    let block_corr = |bx: usize, by: usize| corrections[by * 2 + bx];
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let bx = x / 8;
+            let by = y / 8;
+            let expect = (base + block_corr(bx, by)).clamp(0, 255) as u8;
+            assert_eq!(
+                data[y * stride + x],
+                expect,
+                "pixel ({x},{y}) block ({bx},{by})"
+            );
+        }
+    }
+}

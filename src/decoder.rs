@@ -845,11 +845,105 @@ impl<'a> BitReader<'a> {
         self.nbits = 0;
         self.saw_rst = None;
     }
+
+    /// Look at the next `n` bits (MSB-first) without consuming them.
+    ///
+    /// Unlike `fill`, this is **non-destructive with respect to marker
+    /// state**: it only pulls *plain* entropy bytes into the buffer and
+    /// stops the moment the next byte would be a marker (a non-stuffed
+    /// `0xFF xx`), padding the remaining low-order bits with zero and
+    /// leaving `pos` / `saw_rst` exactly as they were. That matters on the
+    /// last symbol before a restart marker: the bit-by-bit `get_bits(1)`
+    /// walk only ever consumes the marker once it genuinely runs out of
+    /// real bits *for the current symbol*, never speculatively. An eager
+    /// `FAST_BITS`-wide peek must mirror that — it must not consume the
+    /// `RSTn` (and reset DC prediction / desync the AC run that follows)
+    /// just because it looked one byte too far ahead. The peeked high bits
+    /// that correspond to real buffered data are still exact, so the fast
+    /// table resolves the same symbol; the slow path then re-reads the same
+    /// bytes destructively when (and only when) a code actually needs them.
+    /// `n` must be ≤ 24 (same window cap as `get_bits`).
+    #[inline]
+    fn peek_bits(&mut self, n: u32) -> Result<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 24 {
+            return Err(Error::invalid("BitReader: peek_bits(n > 24)"));
+        }
+        while self.nbits < n {
+            // Only consume a *plain* byte (or a stuffed 0xFF00 → 0xFF). A
+            // run-collapsed marker leaves `pos` untouched and pads.
+            if self.pos >= self.buf.len() {
+                break;
+            }
+            let b = self.buf[self.pos];
+            if b == 0xFF {
+                // Peek past any 0xFF fill run to classify the marker without
+                // committing to it.
+                let mut p = self.pos + 1;
+                while p < self.buf.len() && self.buf[p] == 0xFF {
+                    p += 1;
+                }
+                if p >= self.buf.len() {
+                    break;
+                }
+                if self.buf[p] == 0x00 {
+                    // Stuffed zero → literal 0xFF byte. Safe to commit.
+                    self.bits |= 0xFFu32 << (24 - self.nbits);
+                    self.nbits += 8;
+                    self.pos = p + 1;
+                    continue;
+                }
+                // Real marker (RSTn or otherwise): do not consume it here.
+                break;
+            }
+            self.bits |= (b as u32) << (24 - self.nbits);
+            self.nbits += 8;
+            self.pos += 1;
+        }
+        Ok(self.bits >> (32 - n))
+    }
+
+    /// Drop the next `n` bits that a prior `peek_bits` already validated as
+    /// available. `n` must be ≤ `self.nbits`.
+    #[inline]
+    fn consume(&mut self, n: u32) {
+        self.bits <<= n;
+        self.nbits -= n;
+    }
 }
 
-/// Read a Huffman symbol using a linear walk up the `min_code` table (fine
-/// for a textbook implementation — no fast path).
+/// Read a Huffman symbol. Fast path: peek `FAST_BITS` bits and resolve any
+/// code of length ≤ `FAST_BITS` in a single table load, then consume exactly
+/// that many bits. Slow path (codes longer than `FAST_BITS`, or scan-end
+/// padding the fast table can't classify): the canonical length walk up the
+/// `min_code`/`max_code` tables. Both paths observe the identical
+/// zero-padded bitstream at scan end, so the decoded symbol is bit-identical
+/// to the pure length-walk decoder this replaced.
+#[inline]
 fn decode_huff(br: &mut BitReader<'_>, t: &HuffTable) -> Result<u8> {
+    let peek = br.peek_bits(crate::jpeg::huffman::FAST_BITS)?;
+    let entry = t.fast[peek as usize];
+    if entry != 0 {
+        let len = (entry >> 8) as u32;
+        // Only commit the fast result when the matched code is fully backed
+        // by real (non-padded) buffered bits. If `peek_bits` stopped short
+        // at a marker and padded, a code that reaches into the padding must
+        // go through the slow path, which consumes the marker correctly when
+        // (and only when) it truly runs out of bits.
+        if len <= br.nbits {
+            br.consume(len);
+            return Ok(entry as u8);
+        }
+    }
+    decode_huff_slow(br, t)
+}
+
+/// Canonical length-walk Huffman decode for codes longer than `FAST_BITS`
+/// (and for the scan-end padding case the fast table leaves unresolved).
+#[cold]
+fn decode_huff_slow(br: &mut BitReader<'_>, t: &HuffTable) -> Result<u8> {
     let mut code: i32 = 0;
     for l in 0..16 {
         let bit = br.get_bits(1)? as i32;

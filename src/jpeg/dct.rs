@@ -31,16 +31,60 @@ fn cos_table() -> &'static [[f32; 8]; 8] {
 }
 
 /// Inverse DCT of an 8×8 block (natural order, already dequantised). In-place.
+///
+/// Two short-circuits keep the output **bit-identical** to the full
+/// two-pass matrix multiply while skipping arithmetic that provably
+/// contributes nothing:
+///
+/// * **DC-only.** When every AC coefficient is zero, the full transform
+///   collapses to a constant block. The row pass leaves only `tmp[0][x] =
+///   t[0][x] * dc` non-zero, and the column pass yields `out[m][x] =
+///   t[0][m] * tmp[0][x]`. Because `cos(0) = 1` exactly, every `t[0][·]`
+///   is the *same* f32 (`t[0][0]`), so `t[0][0] * (t[0][0] * dc)` reproduces
+///   the two-pass multiply order exactly — same operations, same rounding.
+/// * **Per-row AC-zero skip in the row pass.** A row whose 8 inputs are all
+///   zero produces 8 zero outputs; a row whose only non-zero input is its DC
+///   (`block[y*8]`) produces `tmp[y][n] = t[0][n] * dc` — again the literal
+///   single-term form of the inner sum (the other 7 terms are `t[k][n] * 0.0
+///   = 0.0`, and adding `0.0` to a running f32 sum is the identity, so the
+///   accumulated result is bit-identical to the full loop).
 pub fn idct8x8(block: &mut [f32; 64]) {
     let t = cos_table();
+
+    // DC-only fast path: scan the 63 AC slots; bail to constant fill if all
+    // are zero. The constant equals the two-pass result exactly (see above).
+    if block[1..].iter().all(|&c| c == 0.0) {
+        let dc = block[0];
+        let v = t[0][0] * (t[0][0] * dc);
+        block.fill(v);
+        return;
+    }
+
     let mut tmp = [0.0f32; 64];
 
     // Row-wise 1-D inverse: for each row y, tmp[y][n] = Σk t[k][n] * block[y][k]
     for y in 0..8 {
+        let row = &block[y * 8..y * 8 + 8];
+        // Adding `t[k][n] * 0.0` (= 0.0) to a running f32 sum is the exact
+        // identity, so dropping all-zero AC terms — or an entirely zero row —
+        // leaves every `tmp[y][n]` bit-identical to the full inner loop.
+        if row[1..].iter().all(|&c| c == 0.0) {
+            let dc = row[0];
+            if dc == 0.0 {
+                for n in 0..8 {
+                    tmp[y * 8 + n] = 0.0;
+                }
+            } else {
+                for n in 0..8 {
+                    tmp[y * 8 + n] = t[0][n] * dc;
+                }
+            }
+            continue;
+        }
         for n in 0..8 {
             let mut s = 0.0f32;
             for k in 0..8 {
-                s += t[k][n] * block[y * 8 + k];
+                s += t[k][n] * row[k];
             }
             tmp[y * 8 + n] = s;
         }

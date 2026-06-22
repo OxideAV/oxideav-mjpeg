@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Baseline decode hot path ~1.5× faster** (`baseline_decode/yuv420_256x256_q75`
+  Criterion bench: ≈255 µs → ≈170 µs, −33%) with **bit-identical output**
+  (full suite green, zero test edits). Two changes:
+  - **Huffman fast-lookup table.** `HuffTable::build` now also fills a
+    `512`-entry (`FAST_BITS = 9`) table mapping each `9`-bit prefix to
+    `(length, symbol)` for every canonical code of length ≤ 9, built from
+    the same Annex C length walk that fills the encode table. The decode
+    hot path peeks 9 bits and resolves short codes in one load instead of a
+    16-iteration bit-by-bit walk; codes longer than 9 bits fall back to the
+    canonical `min_code`/`max_code` length walk. The peek is
+    marker-non-destructive — it never speculatively consumes a restart
+    marker — and only commits a fast hit when the matched code is fully
+    backed by real (non-padded) buffered bits, so restart-interval streams
+    decode identically.
+  - **IDCT short-circuits (exact-rounding).** `idct8x8` adds a DC-only fast
+    path (all-AC-zero block → constant fill computed in the same multiply
+    order as the two-pass transform) and a per-row all-zero / DC-only skip
+    in the row pass. Both rest on `cos(0) = 1` making every `t[0][·]` the
+    same f32 and on `x + 0.0` being the exact f32 identity, so the f32
+    formulation and its rounding are preserved byte-for-byte.
+
 ### Other
 
 - hierarchical-mode (T.81 Annex J) **DCT progression** decode now

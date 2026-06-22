@@ -20,6 +20,14 @@ pub struct HuffCode {
     pub len: u8,
 }
 
+/// Number of leading bits the Huffman fast-lookup table is indexed by.
+/// Codes no longer than this are resolved in a single array load on the
+/// decode hot path; longer codes fall back to the canonical length walk.
+/// 9 covers every code in the Annex K typical tables (max DC length 9,
+/// max AC length 16 but the overwhelming majority of AC symbols are
+/// ≤ 9 bits) while keeping the table at 512 entries (1 KiB).
+pub const FAST_BITS: u32 = 9;
+
 /// Decode table for a Huffman segment.
 #[derive(Clone, Debug)]
 pub struct HuffTable {
@@ -35,6 +43,13 @@ pub struct HuffTable {
     pub max_code: [i32; 17],
     /// Per-symbol encode info, populated only when built.
     pub encode: Vec<HuffCode>,
+    /// Fast-lookup table indexed by the next `FAST_BITS` bits (MSB-first).
+    /// Each entry packs `(length << 8) | symbol` when a code of length
+    /// `≤ FAST_BITS` matches that prefix, or `0` when none does (length 0
+    /// is impossible for a real code, so it doubles as the "miss" sentinel
+    /// that routes the decoder to the canonical slow path). Built so that
+    /// decoded symbols are bit-identical to the length-walk path.
+    pub fast: Vec<u16>,
 }
 
 impl HuffTable {
@@ -73,18 +88,33 @@ impl HuffTable {
             code <<= 1;
         }
 
-        // Build encode table. `encode[sym]` = (code, length).
+        // Build encode table. `encode[sym]` = (code, length). The same
+        // canonical walk fills the fast-lookup table: for every code whose
+        // length is `≤ FAST_BITS`, every `FAST_BITS`-bit index sharing that
+        // code as its high-order prefix maps to `(len << 8) | symbol`.
         let mut encode = vec![HuffCode::default(); 256];
+        let mut fast = vec![0u16; 1usize << FAST_BITS];
         let mut sidx = 0usize;
         let mut c: u32 = 0;
         for l in 0..16 {
             let n = bits[l] as usize;
+            let len = (l as u32) + 1;
             for _ in 0..n {
                 let sym = values[sidx] as usize;
                 encode[sym] = HuffCode {
                     code: c as u16,
-                    len: (l as u8) + 1,
+                    len: len as u8,
                 };
+                if len <= FAST_BITS {
+                    // Left-justify the code into the FAST_BITS window and
+                    // fill every index whose top `len` bits equal it.
+                    let shift = FAST_BITS - len;
+                    let base = (c << shift) as usize;
+                    let entry = ((len as u16) << 8) | (values[sidx] as u16);
+                    for slot in base..base + (1usize << shift) {
+                        fast[slot] = entry;
+                    }
+                }
                 sidx += 1;
                 c += 1;
             }
@@ -97,6 +127,7 @@ impl HuffTable {
             values: values.to_vec(),
             max_code,
             encode,
+            fast,
         })
     }
 }

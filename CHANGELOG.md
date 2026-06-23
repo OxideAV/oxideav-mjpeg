@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hierarchical DCT progression: 12-bit 3-component YUV-class frames**
+  (T.81 §K.7.2.1). The `DHP` control loop now decodes a 3-component
+  YUV-class DCT progression at `P = 12` to planar `Yuv444P12Le` (16-bit
+  little-endian per sample, high 4 bits zero), mirroring the
+  non-hierarchical 12-bit YUV shaping. All hierarchical DCT frames are
+  `H = V = 1`, so the YUV-class output is always full-resolution 4:4:4.
+  Both an extended-sequential (SOF1) and a progressive (SOF2) first
+  frame are covered. Previously this case returned `Unsupported`; the
+  workspace `PixelFormat::Yuv444P12Le` variant already existed, so the
+  gate was a stale wiring restriction, not a missing format.
+
 ### Performance
 
 - **Baseline decode hot path ~1.5× faster** (`baseline_decode/yuv420_256x256_q75`

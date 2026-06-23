@@ -732,7 +732,8 @@ Decoder:
   (component IDs `R`/`G`/`B` or Adobe APP14 `transform = 0` → packed
   `Rgb24`, `P = 8` / `P = 12`), three-component YUV-class
   (component IDs other than `R`/`G`/`B`, no Adobe `transform = 0` →
-  planar `Yuv444P`, `P = 8`), or four-component CMYK-class
+  planar `Yuv444P` at `P = 8`, planar `Yuv444P12Le` at `P = 12`), or
+  four-component CMYK-class
   (→ packed `Cmyk`, Adobe APP14 transform honoured, `P = 8`), all
   `H = V = 1`. Reconstruction is colour-blind — every component
   accumulates in its own sample space modulo `2^16` regardless of
@@ -742,8 +743,8 @@ Decoder:
   exactly as in the non-hierarchical sequential path. The frame mode
   is fixed by the first frame (T.81 §K.7.2 forbids mixing DCT and
   lossless non-differential frames). Still `Unsupported`: `P = 12`
-  3-component YUV-class and 4-component DCT progressions (no
-  high-bit-depth planar YCbCr / CMYK `PixelFormat`), the differential
+  4-component DCT progressions (no high-bit-depth packed CMYK
+  `PixelFormat`), the differential
   progressive (`SOF6`) frame, a lossless differential frame
   terminating a DCT progression, and the arithmetic hierarchical
   variants (SOF13..SOF15).
@@ -836,12 +837,13 @@ Not supported (decoder returns `Error::Unsupported`):
   2^P reconstruction, §J.2.3.2 model). The **DCT** path covers `SOF0`
   / `SOF1` / `SOF2` non-differential + `SOF5` differential sequential
   frames (1-component grayscale or 3-component RGB-class at `P = 8` /
-  `P = 12`, 3-component YUV-class at `P = 8` → planar `Yuv444P`, and
+  `P = 12`, 3-component YUV-class at `P = 8` → planar `Yuv444P` and at
+  `P = 12` → planar `Yuv444P12Le`, and
   4-component CMYK-class at `P = 8` → packed `Cmyk` with the Adobe
   APP14 transform honoured, §J.2.3.1 model with the level-shift-free
   IDCT + direct DC, modulo-2^16 reconstruction). Still rejected with
   `Unsupported`: subsampled (`H/V != 1`) hierarchical frames; `P = 12`
-  3-component YUV-class and 4-component DCT progressions; the
+  4-component DCT progressions; the
   differential progressive (`SOF6`) frame; a lossless differential
   frame
   terminating a DCT progression; and the arithmetic hierarchical

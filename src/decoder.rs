@@ -3461,12 +3461,14 @@ fn decode_hierarchical(
                     // and lands as planar `Yuv444P`. The reconstruction loop is
                     // identical for both — only EOI shaping differs.
                     let is_yuv = !hier_dct_is_rgb_class(&sof, state.adobe_transform);
-                    if is_yuv && precision != 8 {
-                        // The planar `Yuv444P` output target is 8-bit; the
-                        // workspace `PixelFormat` enum has no high-bit-depth
-                        // planar YCbCr variant for the 12-bit DCT path.
+                    if is_yuv && !matches!(precision, 8 | 12) {
+                        // The planar YCbCr output targets are 8-bit
+                        // (`Yuv444P`) and 12-bit (`Yuv444P12Le`); the
+                        // workspace `PixelFormat` enum has no other
+                        // high-bit-depth planar YCbCr variant for the DCT
+                        // path.
                         return Err(Error::unsupported(
-                            "hierarchical DCT JPEG: 3-component YUV-class progressions require P = 8",
+                            "hierarchical DCT JPEG: 3-component YUV-class progressions require P = 8 or P = 12",
                         ));
                     }
                     dct_yuv_class = Some(is_yuv);
@@ -4039,20 +4041,36 @@ fn shape_hierarchical_frame(
     let width = refs[0].width;
     let height = refs[0].height;
     let samples: Vec<Vec<u32>> = refs.iter().map(|rc| rc.samples.clone()).collect();
-    // 3-component YUV-class DCT progression → planar `Yuv444P` (`P = 8`,
-    // every component `H = V = 1`, so all three planes are full-resolution
-    // and line up one-sample-per-pixel). The Y/Cb/Cr planes pass through
-    // verbatim — colour interpretation is a display concern, matching the
-    // non-hierarchical 3-component non-RGB default.
+    // 3-component YUV-class DCT progression → planar `Yuv444P` (`P = 8`)
+    // or `Yuv444P12Le` (`P = 12`). Every component is `H = V = 1`, so all
+    // three planes are full-resolution and line up one-sample-per-pixel.
+    // The Y/Cb/Cr planes pass through verbatim — colour interpretation is a
+    // display concern, matching the non-hierarchical 3-component non-RGB
+    // default.
     if nc == 3 && yuv_class {
         let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(3);
-        for plane in samples.iter() {
-            let stride = width;
-            let mut data = vec![0u8; stride * height];
-            for i in 0..width * height {
-                data[i] = plane[i] as u8;
+        if precision == 12 {
+            // 16-bit little-endian per sample (high 4 bits zero), mirroring
+            // the non-hierarchical 12-bit YUV path's `Yuv444P12Le` shaping.
+            for plane in samples.iter() {
+                let stride = width * 2;
+                let mut data = vec![0u8; stride * height];
+                for i in 0..width * height {
+                    let v = (plane[i] & 0x0FFF) as u16;
+                    data[i * 2] = (v & 0xFF) as u8;
+                    data[i * 2 + 1] = (v >> 8) as u8;
+                }
+                out_planes.push(VideoPlane { stride, data });
             }
-            out_planes.push(VideoPlane { stride, data });
+        } else {
+            for plane in samples.iter() {
+                let stride = width;
+                let mut data = vec![0u8; stride * height];
+                for i in 0..width * height {
+                    data[i] = plane[i] as u8;
+                }
+                out_planes.push(VideoPlane { stride, data });
+            }
         }
         return Ok(VideoFrame {
             pts,
@@ -5595,6 +5613,159 @@ mod precision_12_tests {
     #[test]
     fn yuv420_12bit_progressive_roundtrip() {
         run_progressive_yuv_12bit_roundtrip(16, 16, 2, 2, PixelFormat::Yuv420P12Le);
+    }
+
+    // ---- Hierarchical DCT progression, 12-bit YUV-class -----------------
+    //
+    // T.81 §K.7.2.1 permits a hierarchical DCT progression whose first
+    // (non-differential) frame is SOF0/SOF1/SOF2. A single-stage
+    // progression (DHP + one non-differential frame, no EXP, no
+    // differential refinement) reconstructs to exactly the same samples as
+    // decoding that frame standalone. For a 3-component YUV-class frame at
+    // `P = 12` the hierarchical control loop now shapes the reference
+    // planes into `Yuv444P12Le` (16-bit LE per sample) instead of
+    // rejecting the precision. All hierarchical DCT frames are `H = V = 1`
+    // (resolution refinement is via EXP upsampling, not in-frame
+    // subsampling), so the YUV-class output is always full-resolution
+    // 4:4:4.
+
+    /// Locate the first SOF marker and return `(offset, segment_len)`.
+    fn find_sof_off(jpeg: &[u8]) -> usize {
+        let mut i = 2; // skip SOI
+        while i + 1 < jpeg.len() {
+            if jpeg[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let m = jpeg[i + 1];
+            if m == 0xFF {
+                i += 1;
+                continue;
+            }
+            if m == 0xD8 || m == 0xD9 || (0xD0..=0xD7).contains(&m) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+            let is_sof = matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+            if is_sof {
+                return i;
+            }
+            if m == 0xDA {
+                break;
+            }
+            i += 2 + len;
+        }
+        panic!("no SOF found");
+    }
+
+    /// Splice a DHP (§B.3.2) segment in front of the first SOF, turning a
+    /// plain DCT JPEG into a single-stage hierarchical DCT progression. The
+    /// DHP body shares the frame-header shape (P, Y, X, Nf, components), so
+    /// the SOF body is copied verbatim.
+    fn wrap_single_stage_dhp(jpeg: &[u8]) -> Vec<u8> {
+        let sof_off = find_sof_off(jpeg);
+        let seg_len = u16::from_be_bytes([jpeg[sof_off + 2], jpeg[sof_off + 3]]) as usize;
+        let body = &jpeg[sof_off + 4..sof_off + 2 + seg_len];
+        let mut dhp = Vec::new();
+        dhp.push(0xFF);
+        dhp.push(0xDE); // DHP
+        let dhp_len = (body.len() + 2) as u16;
+        dhp.extend_from_slice(&dhp_len.to_be_bytes());
+        dhp.extend_from_slice(body);
+
+        let mut out = Vec::with_capacity(jpeg.len() + dhp.len());
+        out.extend_from_slice(&jpeg[..sof_off]);
+        out.extend_from_slice(&dhp);
+        out.extend_from_slice(&jpeg[sof_off..]);
+        out
+    }
+
+    /// Decode `jpeg` and assert the resulting three 16-bit-LE planes match
+    /// the supplied `(y, cb, cr)` originals within the IDCT-roundtrip
+    /// tolerance (`assert_plane_close`).
+    fn assert_yuv444_12bit_decode(
+        jpeg: Vec<u8>,
+        w: u32,
+        h: u32,
+        y: &[u16],
+        cb: &[u16],
+        cr: &[u16],
+    ) {
+        let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+        dec_params.width = Some(w);
+        dec_params.height = Some(h);
+        let mut dec = make_decoder(&dec_params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), jpeg))
+            .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("decoder did not emit a video frame")
+        };
+        assert_eq!(v.planes.len(), 3, "expected three planes");
+        // 4:4:4 → every plane full-resolution, 16-bit LE storage.
+        assert_eq!(v.planes[0].stride, (w * 2) as usize, "Y stride");
+        assert_eq!(v.planes[1].stride, (w * 2) as usize, "Cb stride");
+        assert_eq!(v.planes[2].stride, (w * 2) as usize, "Cr stride");
+
+        let got_y = unpack_le_u16_plane(
+            &v.planes[0].data,
+            v.planes[0].stride,
+            w as usize,
+            h as usize,
+        );
+        let got_cb = unpack_le_u16_plane(
+            &v.planes[1].data,
+            v.planes[1].stride,
+            w as usize,
+            h as usize,
+        );
+        let got_cr = unpack_le_u16_plane(
+            &v.planes[2].data,
+            v.planes[2].stride,
+            w as usize,
+            h as usize,
+        );
+        assert_plane_close("Y", y, &got_y);
+        assert_plane_close("Cb", cb, &got_cb);
+        assert_plane_close("Cr", cr, &got_cr);
+    }
+
+    /// Single-stage hierarchical DCT progression whose first frame is a
+    /// SOF1 (extended-sequential) 12-bit YUV-class 4:4:4 frame. The DHP
+    /// control loop must decode it to `Yuv444P12Le` matching the standalone
+    /// decode.
+    #[test]
+    fn hierarchical_dct_yuv444_12bit_sof1() {
+        let (w, h) = (16u32, 16u32);
+        let (y, cb, cr, _c_w, _c_h) = build_yuv_12bit(w as usize, h as usize, 1, 1);
+        let plain =
+            encode_yuv_jpeg_12bit(w, h, &y, &cb, &cr, 1, 1, 90).expect("encode 12-bit yuv 4:4:4");
+        let hier = wrap_single_stage_dhp(&plain);
+        // The DHP marker must precede the SOF in the spliced stream.
+        assert!(
+            hier.windows(2).position(|x| x == [0xFF, 0xDE]).unwrap()
+                < hier.windows(2).position(|x| x == [0xFF, 0xC1]).unwrap(),
+            "DHP must precede SOF1"
+        );
+        assert_yuv444_12bit_decode(hier, w, h, &y, &cb, &cr);
+    }
+
+    /// Same single-stage progression but with a progressive (SOF2) first
+    /// frame at `P = 12`, exercising the progressive-scan accumulator on
+    /// the hierarchical YUV-class 12-bit path.
+    #[test]
+    fn hierarchical_dct_yuv444_12bit_sof2() {
+        let (w, h) = (16u32, 16u32);
+        let (y, cb, cr, _c_w, _c_h) = build_yuv_12bit(w as usize, h as usize, 1, 1);
+        let plain = encode_yuv_jpeg_progressive_12bit(w, h, &y, &cb, &cr, 1, 1, 90)
+            .expect("encode 12-bit progressive yuv 4:4:4");
+        let hier = wrap_single_stage_dhp(&plain);
+        assert!(
+            hier.windows(2).position(|x| x == [0xFF, 0xDE]).unwrap()
+                < hier.windows(2).position(|x| x == [0xFF, 0xC2]).unwrap(),
+            "DHP must precede SOF2"
+        );
+        assert_yuv444_12bit_decode(hier, w, h, &y, &cb, &cr);
     }
 }
 

@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace `PixelFormat::Yuv444P12Le` variant already existed, so the
   gate was a stale wiring restriction, not a missing format.
 
+### Tests
+
+- **Hierarchical DCT `P = 12` coverage.** New single-stage roundtrips for
+  the previously-untested 12-bit grayscale (`Gray12Le`) and RGB-class
+  (`Gbrp12Le`) hierarchical DCT progressions, plus a hand-built two-stage
+  (DHP + EXP ×2 + differential SOF5) 12-bit YUV-class progression that
+  exercises the §J.2.1 modulo-2^16 reconstruction at `P = 12`.
+
 ### Performance
 
 - **Baseline decode hot path ~1.5× faster** (`baseline_decode/yuv420_256x256_q75`

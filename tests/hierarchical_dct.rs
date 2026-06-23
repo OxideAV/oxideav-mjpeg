@@ -746,6 +746,144 @@ fn encode_flat_dct_scan_3comp_shift(
     bw.finish()
 }
 
+/// SOFn / DHP body at `P = 12`, Nf=1 (single grayscale component, id=1,
+/// H=V=1, Tq=0).
+fn frame_body_12bit(w: u16, h: u16) -> Vec<u8> {
+    vec![
+        12,
+        (h >> 8) as u8,
+        h as u8,
+        (w >> 8) as u8,
+        w as u8,
+        1,
+        1,
+        0x11,
+        0,
+    ]
+}
+
+/// SOFn / DHP body at `P = 12`, Nf=3, RGB-class (component IDs R/G/B so
+/// `hier_dct_is_rgb_class` returns true → planar `Gbrp12Le` output for the
+/// 12-bit RGB-class hierarchical DCT path), all H=V=1, Tq=0.
+fn frame_body_rgb_12bit(w: u16, h: u16) -> Vec<u8> {
+    let mut v = vec![12, (h >> 8) as u8, h as u8, (w >> 8) as u8, w as u8, 3];
+    for id in [b'R', b'G', b'B'] {
+        v.extend_from_slice(&[id, 0x11, 0]);
+    }
+    v
+}
+
+/// SOS body for the R/G/B-id three-component scan (Td=0/Ta=0 each), Ss=0,
+/// Se=63, Ah=0/Al=0.
+fn sos_body_rgb() -> Vec<u8> {
+    vec![3, b'R', 0x00, b'G', 0x00, b'B', 0x00, 0, 63, 0x00]
+}
+
+/// Flat-DC single-component DCT scan with an explicit non-differential
+/// level shift, so the `P = 12` grayscale path (shift 2048) reuses the
+/// builder.
+fn encode_flat_dct_scan_shift(blocks: &[i32], differential: bool, nondiff_shift: i32) -> Vec<u8> {
+    let dc_codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let ac_codes = canonical_codes(&AC_BITS, &AC_VALS);
+    let mut bw = BitWriter::new();
+    let mut prev_dc = 0i32;
+    let shift = if differential { 0 } else { nondiff_shift };
+    for &b in blocks {
+        let dc_coef = 8 * (b - shift);
+        let diff = if differential {
+            dc_coef
+        } else {
+            dc_coef - prev_dc
+        };
+        prev_dc = dc_coef;
+        let (ssss, bitsv) = category(diff);
+        let (len, code) = dc_codes[&ssss];
+        bw.put(code, len);
+        if ssss > 0 {
+            bw.put(bitsv, ssss);
+        }
+        let (l, c) = ac_codes[&0x00];
+        bw.put(c, l);
+    }
+    bw.finish()
+}
+
+#[test]
+fn single_stage_dct_hierarchical_grayscale_12bit() {
+    // Single-stage P=12 grayscale DCT progression: DHP + one
+    // non-differential SOF1 frame (full-res 16×16 = 2×2 blocks), no EXP. Each
+    // block carries a flat DC value; the decoder folds it into 0..4095 and
+    // shapes to a single 16-bit-LE `Gray12Le` plane.
+    let vals: [i32; 4] = [2000, 2100, 1900, 2048];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_12bit(16, 16)); // DHP
+    push_seg(&mut out, 0xDB, &dqt_body());
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS));
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS));
+    push_seg(&mut out, 0xC1, &frame_body_12bit(16, 16)); // SOF1 P=12
+    push_seg(&mut out, 0xDA, &sos_body());
+    out.extend_from_slice(&encode_flat_dct_scan_shift(&vals, false, 2048));
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 1, "expected one Gray12Le plane");
+    let stride = frame.planes[0].stride;
+    assert_eq!(stride, 32, "Gray12Le stride (16-bit LE × 16 px)");
+    let data = &frame.planes[0].data;
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let blk = (y / 8) * 2 + (x / 8);
+            let expect = vals[blk].clamp(0, 4095) as u16;
+            let got = u16::from_le_bytes([data[y * stride + x * 2], data[y * stride + x * 2 + 1]]);
+            assert_eq!(got, expect, "pixel ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn single_stage_dct_hierarchical_rgb_12bit() {
+    // Single-stage P=12 RGB-class DCT progression (component IDs R/G/B). The
+    // hierarchical loop shapes the three reconstructed reference planes to
+    // planar `Gbrp12Le` (3 planes, 16-bit LE per sample, samples in the low
+    // 12 bits). Plane `i` carries SOS scan-order component `i` (R, G, B),
+    // mirroring the non-hierarchical SOF3 three-component P=12 shaping.
+    let base = [2000i32, 2100, 1900];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_rgb_12bit(16, 16)); // DHP
+    push_seg(&mut out, 0xDB, &dqt_body());
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS));
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS));
+    push_seg(&mut out, 0xC1, &frame_body_rgb_12bit(16, 16)); // SOF1 P=12, R/G/B
+    push_seg(&mut out, 0xDA, &sos_body_rgb());
+    let blocks: [Vec<i32>; 3] = [vec![base[0]], vec![base[1]], vec![base[2]]];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp_shift(&blocks, false, 2048));
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    // RGB-class at P=12 → planar Gbrp12Le, three planes (stride width × 2).
+    assert_eq!(
+        frame.planes.len(),
+        3,
+        "expected three planar Gbrp12Le planes"
+    );
+    for c in 0..3 {
+        let stride = frame.planes[c].stride;
+        assert_eq!(stride, 16 * 2, "plane {c} stride (16-bit LE × 16 px)");
+        let data = &frame.planes[c].data;
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let got =
+                    u16::from_le_bytes([data[y * stride + x * 2], data[y * stride + x * 2 + 1]]);
+                assert_eq!(got, base[c] as u16, "plane {c} pixel ({x},{y})");
+            }
+        }
+    }
+}
+
 #[test]
 fn two_stage_differential_dct_hierarchical_yuv_12bit() {
     // Three-component (YUV-class) two-stage DCT progression at `P = 12`.

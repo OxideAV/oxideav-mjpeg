@@ -697,6 +697,120 @@ fn two_stage_differential_dct_hierarchical_yuv() {
     }
 }
 
+/// SOFn / DHP body at `P = 12`, Nf=3, three YUV-class components (ids
+/// 1/2/3, all H=V=1, Tq=0). Mirrors `frame_body_3comp` but with the
+/// precision byte set to 12.
+fn frame_body_3comp_12bit(w: u16, h: u16) -> Vec<u8> {
+    let mut v = vec![12, (h >> 8) as u8, h as u8, (w >> 8) as u8, w as u8, 3];
+    for id in 1u8..=3 {
+        v.extend_from_slice(&[id, 0x11, 0]);
+    }
+    v
+}
+
+/// Like `encode_flat_dct_scan_3comp` but with an explicit non-differential
+/// level shift (2^(P-1)), so the same flat-DC scan builder serves the
+/// `P = 12` path (shift = 2048) as well as the `P = 8` path (shift = 128).
+fn encode_flat_dct_scan_3comp_shift(
+    blocks: &[Vec<i32>; 3],
+    differential: bool,
+    nondiff_shift: i32,
+) -> Vec<u8> {
+    let dc_codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let ac_codes = canonical_codes(&AC_BITS, &AC_VALS);
+    let nmcu = blocks[0].len();
+    assert_eq!(blocks[1].len(), nmcu);
+    assert_eq!(blocks[2].len(), nmcu);
+    let mut bw = BitWriter::new();
+    let mut prev_dc = [0i32; 3];
+    let shift = if differential { 0 } else { nondiff_shift };
+    for mcu in 0..nmcu {
+        for c in 0..3 {
+            let dc_coef = 8 * (blocks[c][mcu] - shift);
+            let diff = if differential {
+                dc_coef
+            } else {
+                dc_coef - prev_dc[c]
+            };
+            prev_dc[c] = dc_coef;
+            let (ssss, bitsv) = category(diff);
+            let (len, code) = dc_codes[&ssss];
+            bw.put(code, len);
+            if ssss > 0 {
+                bw.put(bitsv, ssss);
+            }
+            let (l, cc) = ac_codes[&0x00];
+            bw.put(cc, l);
+        }
+    }
+    bw.finish()
+}
+
+#[test]
+fn two_stage_differential_dct_hierarchical_yuv_12bit() {
+    // Three-component (YUV-class) two-stage DCT progression at `P = 12`.
+    //
+    // Stage 1 (non-differential SOF1 extended-sequential): one 8×8 flat
+    //   block per component → Y = 2000, Cb = 2100, Cr = 1900. Level shift is
+    //   2^(P-1) = 2048. EXP ×2 both axes → flat 16×16 per component.
+    // Stage 2 (differential SOF5): 16×16 = 2×2 blocks per component, each a
+    //   flat per-block correction added modulo 2^16 (§J.2.1) then folded
+    //   into 0..2^12.
+    //
+    // Output must be planar `Yuv444P12Le` (3 full-resolution planes, 16-bit
+    // little-endian per sample) carrying the reconstructed Y/Cb/Cr samples
+    // verbatim — no colour conversion.
+    let base = [2000i32, 2100, 1900];
+    let corr: [[i32; 4]; 3] = [[10, -5, 20, -30], [-8, 12, -4, 16], [5, -15, 25, -10]];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_3comp_12bit(16, 16)); // DHP (16×16, Nf=3)
+    push_seg(&mut out, 0xDB, &dqt_body()); // DQT (all 1s, table 0)
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS)); // DC DHT
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS)); // AC DHT
+
+    // Stage 1: non-differential SOF1 (extended sequential), low-res 8×8.
+    push_seg(&mut out, 0xC1, &frame_body_3comp_12bit(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body_3comp());
+    let stage1: [Vec<i32>; 3] = [vec![base[0]], vec![base[1]], vec![base[2]]];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp_shift(&stage1, false, 2048));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential SOF5, full-res 16×16 (2×2 blocks per component).
+    push_seg(&mut out, 0xC5, &frame_body_3comp_12bit(16, 16));
+    push_seg(&mut out, 0xDA, &sos_body_3comp());
+    let stage2: [Vec<i32>; 3] = [corr[0].to_vec(), corr[1].to_vec(), corr[2].to_vec()];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp_shift(&stage2, true, 0));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(
+        frame.planes.len(),
+        3,
+        "expected planar Yuv444P12Le (3 planes)"
+    );
+    for c in 0..3 {
+        let stride = frame.planes[c].stride;
+        assert_eq!(stride, 32, "plane {c} stride (16-bit LE × 16 px)");
+        let data = &frame.planes[c].data;
+        let block_corr = |bx: usize, by: usize| corr[c][by * 2 + bx];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let bx = x / 8;
+                let by = y / 8;
+                let expect = (base[c] + block_corr(bx, by)).clamp(0, 4095) as u16;
+                let got =
+                    u16::from_le_bytes([data[y * stride + x * 2], data[y * stride + x * 2 + 1]]);
+                assert_eq!(got, expect, "plane {c} pixel ({x},{y}) block ({bx},{by})");
+            }
+        }
+    }
+}
+
 #[test]
 fn two_stage_differential_dct_hierarchical_cmyk() {
     // Four-component (CMYK-class, Adobe transform = 0) two-stage DCT

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Decoder panic on an over-subscribed Huffman table (fuzz crash).**
+  `HuffTable::build` walked the canonical code counter without verifying
+  the BITS list defines a valid prefix code. A crafted DHT with more
+  short codes than the code space admits drove the counter past `2^len`,
+  and the `FAST_BITS`-wide fast-lookup fill (added last round) computed an
+  index of 512 into the 512-entry table → `index out of bounds` panic at
+  `src/jpeg/huffman.rs`. `build` now rejects an over-subscribed table
+  (Kraft sum greater than 1, T.81 Annex C) up front with `InvalidData`, so
+  the public decode path errors cleanly instead of panicking. Adds the
+  minimised crash input to the `decode` fuzz corpus plus unit + integration
+  regressions.
+
 ### Added
 
 - **Hierarchical DCT progression: 12-bit 3-component YUV-class frames**

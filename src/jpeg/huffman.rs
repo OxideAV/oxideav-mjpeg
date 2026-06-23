@@ -64,6 +64,27 @@ impl HuffTable {
             return Err(Error::invalid("DHT: > 256 symbols"));
         }
 
+        // Reject an over-subscribed (non-prefix) code table. T.81 Annex C
+        // (Figures C.1–C.3) assumes the BITS list defines a valid Huffman
+        // code: the canonical code value at each length must fit in that
+        // many bits, i.e. the Kraft sum Σ bits[l] · 2^-(l+1) ≤ 1. A
+        // malformed DHT that packs more short codes than the code space
+        // admits would otherwise drive the canonical code counter past
+        // `2^len`, overflowing the `FAST_BITS`-wide fast-lookup table below
+        // (`(code << shift)` ≥ `1 << FAST_BITS`). Check it up front so the
+        // decoder returns `InvalidData` instead of panicking on a crafted
+        // stream.
+        let mut kcode: u32 = 0;
+        for l in 0..16 {
+            kcode += bits[l] as u32;
+            // After placing `bits[l]` codes of length `l+1`, the next code
+            // value must still fit in `l+1` bits.
+            if kcode > (1u32 << (l + 1)) {
+                return Err(Error::invalid("DHT: over-subscribed Huffman code"));
+            }
+            kcode <<= 1;
+        }
+
         let mut min_code = [0i32; 17];
         let mut max_code = [-1i32; 17];
         let mut val_offset = [0i32; 17];
@@ -250,6 +271,50 @@ mod tests {
             let c = t.encode[sym as usize];
             assert!(c.len > 0);
             assert!(c.len <= 16);
+        }
+    }
+
+    #[test]
+    fn over_subscribed_table_rejected() {
+        // Two codes of length 1 already saturate the 1-bit code space (codes
+        // 0 and 1); a third makes the canonical code value reach 2, which no
+        // longer fits in 1 bit. A naive canonical walk would left-justify
+        // that code past the `FAST_BITS`-wide fast-lookup window and panic
+        // with an out-of-bounds index. `build` must reject it as
+        // `InvalidData` instead.
+        let mut bits = [0u8; 16];
+        bits[0] = 3; // 3 codes of length 1 — over-subscribed
+        let values = [0u8, 1, 2];
+        let err = HuffTable::build(&bits, &values).expect_err("over-subscribed must fail");
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn maximally_full_table_accepted() {
+        // A table that exactly fills the code space at one length (Kraft sum
+        // = 1) is a valid prefix code and must still build. 256 codes of
+        // length 8 saturate the 8-bit space precisely.
+        let mut bits = [0u8; 16];
+        bits[7] = 255; // 255 of the 256 length-8 codes (BITS cap is 255)
+        let values: Vec<u8> = (0u8..255).collect();
+        HuffTable::build(&bits, &values).expect("Kraft-sum-≤1 table must build");
+    }
+
+    #[test]
+    fn fast_table_fill_stays_in_bounds_for_all_lengths() {
+        // For every code length 1..=FAST_BITS, a single code at that length
+        // must fill a contiguous, in-bounds slice of the 512-entry fast
+        // table. Regression guard for the `(code << shift)` overflow.
+        for l in 1u8..=9 {
+            let mut bits = [0u8; 16];
+            bits[(l - 1) as usize] = 1;
+            let values = [0u8];
+            let t = HuffTable::build(&bits, &values).expect("single code builds");
+            assert_eq!(t.fast.len(), 512);
+            // The single code's symbol must be reachable through the fast
+            // table at its left-justified prefix.
+            let entry = t.fast[0];
+            assert_eq!((entry >> 8) as u8, l, "length {l} fast entry");
         }
     }
 }

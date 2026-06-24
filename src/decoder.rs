@@ -3546,18 +3546,33 @@ fn decode_hierarchical(
                 }
                 reference = Some(next);
             }
-            // Differential lossless frame (a refinement stage).
+            // Differential lossless frame (a refinement stage). A SOF7 frame
+            // refines a spatial-lossless progression (the common case) and
+            // also legally *terminates* a DCT progression — T.81 §K.7.2: the
+            // final differential frame of a hierarchical sequence may use a
+            // differential lossless process even when the earlier frames were
+            // DCT-based. Both routes decode the difference with the §J.2.3.2
+            // lossless model (difference coded directly, predictor `Ss = 0`)
+            // and add it to the upsampled reference per §J.2.1; they differ
+            // only in the reconstruction modulus (`2^16` for the DCT
+            // progression — every DCT-progression reference plane already
+            // accumulates modulo `2^16` — vs `2^precision` for the lossless
+            // one) and in the final fold-down: a lossless-terminated DCT
+            // progression folds the running modulo-`2^16` value into the
+            // displayable `0..2^P` range, mirroring the SOF5 differential
+            // path's fold.
             SOF7 => {
-                if dct_mode == Some(true) {
-                    // A differential *lossless* frame may legally terminate a
-                    // DCT progression (T.81 §K.7.2: "the final differential
-                    // frame for each component may use a differential lossless
-                    // process"); that mixed-final-frame case is not yet
-                    // covered by this decoder.
-                    return Err(Error::unsupported(
-                        "hierarchical JPEG: lossless differential frame terminating a DCT progression is not supported",
-                    ));
-                }
+                let dct_terminate = dct_mode == Some(true);
+                // §J.2.1: differential components are added modulo 2^16. The
+                // spatial-lossless slice keeps everything within `2^precision`
+                // (P ≤ 16) for both the upsample interpolation and the
+                // add-back, which is equivalent there; a DCT progression's
+                // references live in the full `2^16` modulus.
+                let recon_modulus: u32 = if dct_terminate {
+                    1u32 << 16
+                } else {
+                    ref_modulus
+                };
                 let prev = reference.take().ok_or_else(|| {
                     Error::invalid(
                         "hierarchical JPEG: differential frame before a non-differential frame",
@@ -3575,10 +3590,10 @@ fn decode_hierarchical(
                 if let Some((eh, ev)) = pending_exp.take() {
                     for rc in upsampled.iter_mut() {
                         if eh {
-                            *rc = upsample_axis(rc, true, ref_modulus);
+                            *rc = upsample_axis(rc, true, recon_modulus);
                         }
                         if ev {
-                            *rc = upsample_axis(rc, false, ref_modulus);
+                            *rc = upsample_axis(rc, false, recon_modulus);
                         }
                     }
                 }
@@ -3590,7 +3605,11 @@ fn decode_hierarchical(
                     ));
                 }
                 // Reconstruct each component: add the difference modulo
-                // 2^precision (§J.2.1).
+                // `recon_modulus` (§J.2.1). When the SOF7 frame terminates a
+                // DCT progression the running value is modulo `2^16`, so fold
+                // it into the displayable `0..2^P` range — exactly the mask
+                // the SOF5 differential path applies.
+                let mask = (1u32 << precision) - 1;
                 let mut next = Vec::with_capacity(diff.len());
                 for (u, d) in upsampled.iter().zip(diff.iter()) {
                     if d.width != u.width || d.height != u.height {
@@ -3600,7 +3619,8 @@ fn decode_hierarchical(
                     }
                     let mut samples = vec![0u32; d.width * d.height];
                     for i in 0..samples.len() {
-                        samples[i] = u.samples[i].wrapping_add(d.samples[i]) % ref_modulus;
+                        let sum = u.samples[i].wrapping_add(d.samples[i]) % recon_modulus;
+                        samples[i] = if dct_terminate { sum & mask } else { sum };
                     }
                     next.push(RefComponent {
                         width: d.width,

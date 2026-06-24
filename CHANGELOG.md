@@ -23,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical DCT progression terminated by a differential lossless
+  (SOF7) frame** (T.81 §K.7.2). The final differential frame of a
+  hierarchical sequence may legally use a differential *lossless* process
+  even when the earlier frames were DCT-based; the decoder previously
+  returned `Unsupported` for that mixed terminating frame. The `SOF7`
+  handler now accepts a SOF7 frame closing a DCT progression: the
+  difference is decoded with the §J.2.3.2 lossless model (coded directly,
+  predictor `Ss = 0`), added to the ×2 EXP-upsampled reference modulo
+  `2^16` (§J.2.1 — every DCT-progression reference plane already
+  accumulates modulo `2^16`), and the running value folds into the
+  displayable `0..2^P` range, mirroring the SOF5 differential path's fold.
+  The colour class is fixed by the DCT first frame, so a YUV-class
+  progression still shapes to planar `Yuv444P`, an RGB-class one to packed
+  `Rgb24`, a grayscale one to `Gray8` / `Gray*Le`, and a four-component
+  one to packed `Cmyk` (Adobe APP14 transform honoured). Spatial-lossless
+  (SOF3 + SOF7) progressions are unaffected — they keep the `2^precision`
+  modulus. `tests/hierarchical_dct.rs` adds three hand-built two-stage
+  cases (grayscale, YUV-class, CMYK-class) that reconstruct bit-exactly.
+  Still `Unsupported`: the differential progressive (SOF6) frame and the
+  arithmetic hierarchical variants (SOF13..SOF15).
 - **Hierarchical DCT progression: 12-bit 3-component YUV-class frames**
   (T.81 §K.7.2.1). The `DHP` control loop now decodes a 3-component
   YUV-class DCT progression at `P = 12` to planar `Yuv444P12Le` (16-bit

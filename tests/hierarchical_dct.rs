@@ -697,6 +697,205 @@ fn two_stage_differential_dct_hierarchical_yuv() {
     }
 }
 
+// ---- DCT progression terminated by a differential *lossless* SOF7 frame --
+//
+// T.81 §K.7.2 permits the final differential frame of a hierarchical
+// sequence to use a differential *lossless* process even when the earlier
+// frames are DCT-based. The non-differential frame is a DCT-mode SOF0; the
+// reference plane it produces (level-shifted, clamped to 0..2^P) is ×2
+// EXP-upsampled and refined by a SOF7 frame whose scan codes the two's-
+// complement difference directly (§J.2.3.2, predictor Ss = 0). The §J.2.1
+// reconstruction adds the difference modulo 2^16, then the displayable
+// value folds into 0..2^P.
+
+/// Lossless SOS body for `nc` components: Ns, then (id, Td/Ta=0) per
+/// component, then Ss=predictor, Se=0, Ah=0/Al=pt.
+fn sos_body_lossless(predictor: u8, pt: u8, nc: u8) -> Vec<u8> {
+    let mut v = vec![nc];
+    for id in 1..=nc {
+        v.push(id);
+        v.push(0x00);
+    }
+    v.push(predictor);
+    v.push(0); // Se = 0 for lossless
+    v.push(pt); // Ah=0, Al=pt
+    v
+}
+
+/// Encode an interleaved differential lossless scan for `nc` planes
+/// (§J.2.3.2): every coded value IS the two's-complement difference, no
+/// prediction. One residual per component per pixel position, in
+/// scan-component order. Uses the DC Huffman table (`DC_BITS`/`DC_VALS`,
+/// SSSS 0..=15) — every difference here is small enough to land in that
+/// range.
+fn encode_diff_lossless_scan(diffs: &[Vec<i32>], w: usize, h: usize) -> Vec<u8> {
+    let codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let mut bw = BitWriter::new();
+    for i in 0..w * h {
+        for plane in diffs.iter() {
+            let (ssss, bits) = category(plane[i]);
+            let (len, code) = codes[&ssss];
+            bw.put(code, len);
+            if ssss > 0 {
+                bw.put(bits, ssss);
+            }
+        }
+    }
+    bw.finish()
+}
+
+#[test]
+fn two_stage_dct_terminated_by_lossless_grayscale() {
+    // Stage 1 (non-differential SOF0, DCT): 8×8 flat block, value 100 →
+    // EXP ×2 both axes → flat 16×16 reference = 100.
+    // Stage 2 (differential SOF7, lossless): each of the four 8×8 sub-blocks
+    // gets a per-pixel correction; final pixel = (100 + d) folded into
+    // 0..256.  Because the SOF7 codes the difference directly, the
+    // corrections need not be block-constant — give every pixel its own.
+    let base: i32 = 100;
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body(16, 16)); // DHP 16×16
+    push_seg(&mut out, 0xDB, &dqt_body()); // DQT (all 1s)
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS)); // DC DHT
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS)); // AC DHT
+
+    // Stage 1: non-differential DCT SOF0, low-res 8×8.
+    push_seg(&mut out, 0xC0, &frame_body(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body());
+    out.extend_from_slice(&encode_flat_dct_scan(&[base], false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Per-pixel corrections for the 16×16 differential lossless frame.
+    let corr: Vec<i32> = (0..16 * 16).map(|i| ((i * 7) % 41) - 20).collect();
+    push_seg(&mut out, 0xC7, &frame_body(16, 16)); // SOF7 differential lossless
+    push_seg(&mut out, 0xDA, &sos_body_lossless(0, 0, 1)); // predictor 0
+    out.extend_from_slice(&encode_diff_lossless_scan(
+        std::slice::from_ref(&corr),
+        16,
+        16,
+    ));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 1);
+    let stride = frame.planes[0].stride;
+    let data = &frame.planes[0].data;
+    for i in 0..16 * 16 {
+        let expect = ((base + corr[i]).rem_euclid(65536) & 0xFF) as u8;
+        let x = i % 16;
+        let y = i / 16;
+        assert_eq!(data[y * stride + x], expect, "pixel {i}");
+    }
+}
+
+#[test]
+fn two_stage_dct_terminated_by_lossless_yuv() {
+    // Three-component YUV-class DCT progression terminated by a differential
+    // lossless SOF7 frame. Output must stay planar Yuv444P (the colour class
+    // is fixed by the DCT first frame).
+    let base = [100i32, 120, 60];
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_3comp(16, 16)); // DHP 16×16, Nf=3
+    push_seg(&mut out, 0xDB, &dqt_body());
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS));
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS));
+
+    // Stage 1: non-differential DCT SOF0, low-res 8×8 (one block/component).
+    push_seg(&mut out, 0xC0, &frame_body_3comp(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body_3comp());
+    let stage1: [Vec<i32>; 3] = [vec![base[0]], vec![base[1]], vec![base[2]]];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp(&stage1, false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential lossless SOF7, full-res 16×16, per-pixel corr.
+    let corr: [Vec<i32>; 3] = [
+        (0..16 * 16).map(|i| ((i * 3) % 31) - 15).collect(),
+        (0..16 * 16).map(|i| ((i * 5) % 23) - 11).collect(),
+        (0..16 * 16).map(|i| ((i * 11) % 19) - 9).collect(),
+    ];
+    push_seg(&mut out, 0xC7, &frame_body_3comp(16, 16));
+    push_seg(&mut out, 0xDA, &sos_body_lossless(0, 0, 3));
+    out.extend_from_slice(&encode_diff_lossless_scan(&corr, 16, 16));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 3, "expected planar Yuv444P");
+    for c in 0..3 {
+        let stride = frame.planes[c].stride;
+        assert_eq!(stride, 16);
+        let data = &frame.planes[c].data;
+        for i in 0..16 * 16 {
+            let expect = ((base[c] + corr[c][i]).rem_euclid(65536) & 0xFF) as u8;
+            let x = i % 16;
+            let y = i / 16;
+            assert_eq!(data[y * stride + x], expect, "plane {c} pixel {i}");
+        }
+    }
+}
+
+#[test]
+fn two_stage_dct_terminated_by_lossless_cmyk() {
+    // Four-component CMYK-class DCT progression terminated by a differential
+    // lossless SOF7 frame (P = 8). No APP14 → plain "regular" CMYK pass-
+    // through, so the reconstructed samples map straight to the packed Cmyk
+    // output bytes.
+    let base = [80i32, 110, 140, 200];
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_4comp(16, 16)); // DHP 16×16, Nf=4
+    push_seg(&mut out, 0xDB, &dqt_body());
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS));
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS));
+
+    // Stage 1: non-differential DCT SOF0, low-res 8×8 (one block/component).
+    push_seg(&mut out, 0xC0, &frame_body_4comp(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body_4comp());
+    let stage1: [Vec<i32>; 4] = [vec![base[0]], vec![base[1]], vec![base[2]], vec![base[3]]];
+    out.extend_from_slice(&encode_flat_dct_scan_4comp(&stage1, false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential lossless SOF7, full-res 16×16, per-pixel corr.
+    let corr: [Vec<i32>; 4] = [
+        (0..16 * 16).map(|i| ((i * 3) % 31) - 15).collect(),
+        (0..16 * 16).map(|i| ((i * 5) % 23) - 11).collect(),
+        (0..16 * 16).map(|i| ((i * 7) % 19) - 9).collect(),
+        (0..16 * 16).map(|i| ((i * 13) % 17) - 8).collect(),
+    ];
+    push_seg(&mut out, 0xC7, &frame_body_4comp(16, 16));
+    push_seg(&mut out, 0xDA, &sos_body_lossless(0, 0, 4));
+    out.extend_from_slice(&encode_diff_lossless_scan(&corr, 16, 16));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 1, "expected packed Cmyk (1 plane)");
+    let stride = frame.planes[0].stride;
+    assert_eq!(stride, 16 * 4);
+    let data = &frame.planes[0].data;
+    for i in 0..16 * 16 {
+        let x = i % 16;
+        let y = i / 16;
+        for c in 0..4 {
+            let expect = ((base[c] + corr[c][i]).rem_euclid(65536) & 0xFF) as u8;
+            assert_eq!(
+                data[(y * stride) + x * 4 + c],
+                expect,
+                "cmyk pixel {i} comp {c}"
+            );
+        }
+    }
+}
+
 /// SOFn / DHP body at `P = 12`, Nf=3, three YUV-class components (ids
 /// 1/2/3, all H=V=1, Tq=0). Mirrors `frame_body_3comp` but with the
 /// precision byte set to 12.

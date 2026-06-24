@@ -742,11 +742,17 @@ Decoder:
   conversion), so the YUV-class Y/Cb/Cr planes pass through verbatim
   exactly as in the non-hierarchical sequential path. The frame mode
   is fixed by the first frame (T.81 §K.7.2 forbids mixing DCT and
-  lossless non-differential frames). Still `Unsupported`: `P = 12`
-  4-component DCT progressions (no high-bit-depth packed CMYK
+  lossless non-differential frames). A DCT progression may also be
+  **terminated by a differential lossless `SOF7` frame** (§K.7.2): the
+  `SOF7` difference decodes under the §J.2.3.2 lossless model (coded
+  directly, predictor `Ss = 0`), is added to the ×2 EXP-upsampled
+  reference modulo `2^16` (§J.2.1), and folds into the displayable
+  `0..2^P` range — 1 / 3 / 4 components, colour class inherited from the
+  DCT first frame (grayscale → `Gray8`/`Gray*Le`, RGB-class → `Rgb24`,
+  YUV-class → `Yuv444P`, CMYK-class → `Cmyk`). Still `Unsupported`:
+  `P = 12` 4-component DCT progressions (no high-bit-depth packed CMYK
   `PixelFormat`), the differential
-  progressive (`SOF6`) frame, a lossless differential frame
-  terminating a DCT progression, and the arithmetic hierarchical
+  progressive (`SOF6`) frame, and the arithmetic hierarchical
   variants (SOF13..SOF15).
 - **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
   header codes the number of lines `Y = 0`, the real line count is
@@ -841,12 +847,14 @@ Not supported (decoder returns `Error::Unsupported`):
   `P = 12` → planar `Yuv444P12Le`, and
   4-component CMYK-class at `P = 8` → packed `Cmyk` with the Adobe
   APP14 transform honoured, §J.2.3.1 model with the level-shift-free
-  IDCT + direct DC, modulo-2^16 reconstruction). Still rejected with
+  IDCT + direct DC, modulo-2^16 reconstruction). A DCT progression may
+  additionally be **terminated by a differential lossless `SOF7`
+  frame** (§K.7.2 — §J.2.3.2 model, add modulo `2^16`, fold to `0..2^P`;
+  1/3/4-component, colour class inherited from the DCT first frame).
+  Still rejected with
   `Unsupported`: subsampled (`H/V != 1`) hierarchical frames; `P = 12`
   4-component DCT progressions; the
-  differential progressive (`SOF6`) frame; a lossless differential
-  frame
-  terminating a DCT progression; and the arithmetic hierarchical
+  differential progressive (`SOF6`) frame; and the arithmetic hierarchical
   variants (SOF13..SOF15). The non-hierarchical arithmetic variants
   are all supported: SOF9 (extended sequential) at `P=8`, SOF10
   (progressive) at `P=8` / `P=12`, and SOF11 (lossless) at every

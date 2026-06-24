@@ -3373,6 +3373,12 @@ fn decode_hierarchical(
     // reference-component reconstruction modulus is 2^16 for the DCT
     // progression and 2^precision for the lossless one.
     let mut dct_mode: Option<bool> = None;
+    // Entropy coder of a lossless (spatial) progression, fixed by the
+    // non-differential first frame: `true` = arithmetic (SOF11 + SOF15),
+    // `false` = Huffman (SOF3 + SOF7). A differential lossless refinement
+    // frame must match its non-differential frame's coder. `None` until the
+    // first lossless frame; irrelevant for DCT progressions.
+    let mut arith_lossless = false;
     // Colour class of a 3-component DCT progression, fixed by the
     // non-differential first frame: `true` = YUV-class (component IDs not
     // R/G/B and no Adobe `transform = 0`), `false` = RGB-class. Hierarchical
@@ -3410,6 +3416,26 @@ fn decode_hierarchical(
             DHT => {
                 let p = walker.read_segment_payload()?;
                 parse_dht(p, &mut state.dc_huff, &mut state.ac_huff)?;
+            }
+            DAC => {
+                // Arithmetic conditioning (§B.2.4.3) — frame-global within the
+                // hierarchical sequence. The SOF11 / SOF15 arith lossless
+                // frames read the DC-conditioning `(L, U)` bounds from here;
+                // absent a DAC the §H.1.2.3.3 defaults `(0, 1)` apply.
+                let p = walker.read_segment_payload()?;
+                let entries = parse_dac(p)?;
+                for e in entries {
+                    if e.tc == 0 {
+                        let l = e.cs & 0x0F;
+                        let u = e.cs >> 4;
+                        if l > u || u > 15 {
+                            return Err(Error::invalid("DAC: invalid L/U bounds"));
+                        }
+                        state.arith_dc[e.tb as usize] = Some(ArithDcConditioning { l, u });
+                    } else {
+                        state.arith_ac[e.tb as usize] = Some(ArithAcConditioning { kx: e.cs });
+                    }
+                }
             }
             DRI => {
                 let p = walker.read_segment_payload()?;
@@ -3454,6 +3480,7 @@ fn decode_hierarchical(
                     ));
                 }
                 dct_mode = Some(false);
+                arith_lossless = false;
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
                 validate_sof(&sof)?;
@@ -3461,6 +3488,31 @@ fn decode_hierarchical(
                 check_hier_frame(&sof, nc, precision)?;
                 state.sof = Some(sof.clone());
                 reference = Some(decode_hierarchical_frame(&state, walker, false)?);
+            }
+            // Non-differential lossless **arithmetic** frame (SOF11) — the
+            // first stage of an arithmetic spatial-lossless progression. The
+            // Q-coder counterpart of the SOF3 stage: same §H.1.2 predictor
+            // reconstruction, Annex D entropy layer.
+            markers::SOF11 => {
+                if reference.is_some() {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: a second non-differential frame is not supported",
+                    ));
+                }
+                if pending_exp.take().is_some() {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: EXP precedes a non-differential frame",
+                    ));
+                }
+                dct_mode = Some(false);
+                arith_lossless = true;
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                validate_lossless_sof(&sof)?;
+                check_hier_frame(&sof, nc, precision)?;
+                state.sof = Some(sof.clone());
+                reference = Some(decode_hierarchical_arith_frame(&state, walker, false)?);
             }
             // Non-differential DCT frame (the first stage of a §K.7.2.1 DCT
             // progression). SOF0 = baseline, SOF1 = extended sequential,
@@ -3664,12 +3716,82 @@ fn decode_hierarchical(
                 }
                 reference = Some(next);
             }
-            // Any remaining SOF (the arithmetic hierarchical variants
-            // SOF13..SOF15) is outside the slice this decoder covers.
+            // Differential lossless **arithmetic** frame (SOF15) — the Q-coder
+            // counterpart of SOF7. Refines an arithmetic spatial-lossless
+            // progression (SOF11 first frame) and, like SOF7, may also
+            // *terminate* a DCT progression (§K.7.2). The difference decodes
+            // under the §J.2.3.2 lossless model (coded directly, predictor
+            // `Ss = 0`) and is added modulo `recon_modulus` (§J.2.1), with the
+            // DCT-terminate fold into `0..2^P` matching SOF7.
+            markers::SOF15 => {
+                let dct_terminate = dct_mode == Some(true);
+                if !dct_terminate && !arith_lossless {
+                    // A SOF15 refining a *Huffman* (SOF3) lossless progression
+                    // is a malformed mix of coders within one progression.
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: SOF15 (arith) refining a Huffman lossless progression",
+                    ));
+                }
+                let recon_modulus: u32 = if dct_terminate {
+                    1u32 << 16
+                } else {
+                    ref_modulus
+                };
+                let prev = reference.take().ok_or_else(|| {
+                    Error::invalid(
+                        "hierarchical JPEG: differential frame before a non-differential frame",
+                    )
+                })?;
+                let p = walker.read_segment_payload()?;
+                let sof = parse_sof(p)?;
+                validate_sof(&sof)?;
+                validate_lossless_sof(&sof)?;
+                check_hier_frame(&sof, nc, precision)?;
+                let mut upsampled = prev;
+                if let Some((eh, ev)) = pending_exp.take() {
+                    for rc in upsampled.iter_mut() {
+                        if eh {
+                            *rc = upsample_axis(rc, true, recon_modulus);
+                        }
+                        if ev {
+                            *rc = upsample_axis(rc, false, recon_modulus);
+                        }
+                    }
+                }
+                state.sof = Some(sof.clone());
+                let diff = decode_hierarchical_arith_frame(&state, walker, true)?;
+                if diff.len() != upsampled.len() {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: differential frame component count mismatch",
+                    ));
+                }
+                let mask = (1u32 << precision) - 1;
+                let mut next = Vec::with_capacity(diff.len());
+                for (u, d) in upsampled.iter().zip(diff.iter()) {
+                    if d.width != u.width || d.height != u.height {
+                        return Err(Error::invalid(
+                            "hierarchical JPEG: differential frame size != reference size",
+                        ));
+                    }
+                    let mut samples = vec![0u32; d.width * d.height];
+                    for i in 0..samples.len() {
+                        let sum = u.samples[i].wrapping_add(d.samples[i]) % recon_modulus;
+                        samples[i] = if dct_terminate { sum & mask } else { sum };
+                    }
+                    next.push(RefComponent {
+                        width: d.width,
+                        height: d.height,
+                        samples,
+                    });
+                }
+                reference = Some(next);
+            }
+            // Any remaining SOF (the arithmetic hierarchical DCT variants
+            // SOF13 / SOF14) is outside the slice this decoder covers.
             m if markers::is_sof(m) => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "hierarchical JPEG: only the spatial lossless (SOF3 + SOF7) and DCT (SOF0/1/2 + SOF5/6, SOF7-terminated) progressions are supported",
+                    "hierarchical JPEG: only the spatial lossless (SOF3/11 + SOF7/15) and DCT (SOF0/1/2 + SOF5/6, SOF7-terminated) progressions are supported",
                 ));
             }
             COM => {
@@ -3833,6 +3955,86 @@ fn decode_hierarchical_frame(
                 // A scan-local DHT would need to mutate `state`, but the
                 // hierarchical slice keeps tables frame-global; reject
                 // rather than silently ignore a table the scan needs.
+                return Err(Error::unsupported(
+                    "hierarchical JPEG: DHT between frame header and scan is not supported",
+                ));
+            }
+            DRI => {
+                let _ = walker.read_segment_payload()?;
+            }
+            COM => {
+                let _ = walker.read_segment_payload()?;
+            }
+            m if markers::is_app(m) => {
+                let _ = walker.read_segment_payload()?;
+            }
+            _ => {
+                return Err(Error::invalid(
+                    "hierarchical JPEG: unexpected marker before SOS",
+                ));
+            }
+        }
+    }
+}
+
+/// Decode one hierarchical-mode lossless **arithmetic** (SOF11 / SOF15)
+/// frame and return its reconstructed per-component sample planes — the
+/// Q-coder counterpart of [`decode_hierarchical_frame`]. Reads the frame's
+/// single SOS + arithmetic-coded scan from `walker`. `differential` selects
+/// the §J.2.3.2 modification (difference coded directly, no spatial
+/// prediction, `Ss = 0`). The DAC DC-conditioning bounds carried in `state`
+/// (default `(L, U) = (0, 1)` when no DAC segment is present) are honoured by
+/// `decode_lossless_arith_scan_planes`.
+fn decode_hierarchical_arith_frame(
+    state: &JpegState,
+    walker: &mut MarkerWalker<'_>,
+    differential: bool,
+) -> Result<Vec<RefComponent>> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("hierarchical JPEG: missing SOF"))?;
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    loop {
+        let Some(marker) = walker.next_marker()? else {
+            return Err(Error::invalid("hierarchical JPEG: EOF before SOS"));
+        };
+        match marker {
+            SOS => {
+                let p = walker.read_segment_payload()?;
+                let sos = parse_sos(p)?;
+                validate_sos(&sos)?;
+                if sos.al != 0 {
+                    return Err(Error::unsupported(
+                        "hierarchical JPEG: non-zero point transform is not supported",
+                    ));
+                }
+                let scan = walker.read_scan_data()?;
+                let samples = decode_lossless_arith_scan_planes(state, &sos, scan, differential)?;
+                // Every component shares the frame's width × height (all
+                // factors are 1×1, checked in `check_hier_frame`).
+                return Ok(samples
+                    .into_iter()
+                    .map(|samples| RefComponent {
+                        width,
+                        height,
+                        samples,
+                    })
+                    .collect());
+            }
+            DQT => {
+                let _ = walker.read_segment_payload()?;
+            }
+            DAC => {
+                // Scan-local DAC would need to mutate `state`; the hierarchical
+                // slice keeps conditioning frame-global (DAC parsed before the
+                // frame in the main loop). Reject rather than silently ignore.
+                return Err(Error::unsupported(
+                    "hierarchical JPEG: DAC between frame header and scan is not supported",
+                ));
+            }
+            DHT => {
                 return Err(Error::unsupported(
                     "hierarchical JPEG: DHT between frame header and scan is not supported",
                 ));
@@ -4389,13 +4591,85 @@ fn decode_lossless_arith_scan(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    let predictor = sos.ss;
+    let pt = sos.al as u32; // point transform
+    let precision = sof.precision as u32;
+    let width = sof.width as usize;
+    let height = sof.height as usize;
+    let nc = sos.components.len();
+
+    // Detect a subsampled YUV-class scan (luma oversampled, chroma 1×1). The
+    // A.2.3 interleaved-MCU ordering applies here; the flat per-pixel path
+    // only handles all-1×1 components. `validate_lossless_sof` has already
+    // constrained the legal combinations. (The subsampled path is never used
+    // by the hierarchical differential routes, which require H = V = 1.)
+    let h_factors: Vec<usize> = sof.components.iter().map(|c| c.h_factor as usize).collect();
+    let v_factors: Vec<usize> = sof.components.iter().map(|c| c.v_factor as usize).collect();
+    let h_max = *h_factors.iter().max().unwrap_or(&1);
+    let v_max = *v_factors.iter().max().unwrap_or(&1);
+    if nc > 1 && (h_max != 1 || v_max != 1) {
+        if sos.components.len() != sof.components.len() {
+            return Err(Error::unsupported(
+                "lossless arith: non-interleaved multi-component scans are not supported",
+            ));
+        }
+        if !(1..=7).contains(&predictor) {
+            return Err(Error::invalid(
+                "lossless arith: predictor Ss must be in 1..=7",
+            ));
+        }
+        if pt >= precision {
+            return Err(Error::invalid("lossless arith: Pt >= precision"));
+        }
+        if precision != 8 {
+            return Err(Error::unsupported(
+                "lossless arith: subsampled three-component scans require precision 8",
+            ));
+        }
+        return decode_lossless_arith_scan_subsampled(
+            state, sos, scan, pts, predictor, pt, width, height, &h_factors, &v_factors, h_max,
+            v_max,
+        );
+    }
+
+    let samples = decode_lossless_arith_scan_planes(state, sos, scan, false)?;
+    shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
+}
+
+/// Decode a flat (all-`H = V = 1`) lossless arithmetic scan into per-component
+/// sample planes. Shared by the standalone SOF11 decode path and the
+/// hierarchical (Annex J) arithmetic spatial progression. When `differential`
+/// is true the §J.2.3.2 modification applies: the decoded difference is the
+/// reconstructed sample value directly (no spatial prediction), so the
+/// scan-header predictor `Ss` only steers the entropy conditioning history,
+/// not the sample reconstruction. The two-dimensional `L_Context(Da, Db)`
+/// conditioning (§H.1.2.3) is identical in both cases — it always reads the
+/// differences coded for the left / above neighbours.
+fn decode_lossless_arith_scan_planes(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    differential: bool,
+) -> Result<Vec<Vec<u32>>> {
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
     if sos.components.len() != sof.components.len() {
         return Err(Error::unsupported(
             "lossless arith: non-interleaved multi-component scans are not supported",
         ));
     }
     let predictor = sos.ss;
-    if !(1..=7).contains(&predictor) {
+    // A differential lossless frame codes the difference directly (§J.2.3.2),
+    // so the §H.1.2.1 predictors do not apply; `Ss` must be 0 (T.81 §J.1.3.2).
+    if differential {
+        if predictor != 0 {
+            return Err(Error::invalid(
+                "differential lossless arith: predictor Ss must be 0",
+            ));
+        }
+    } else if !(1..=7).contains(&predictor) {
         return Err(Error::invalid(
             "lossless arith: predictor Ss must be in 1..=7",
         ));
@@ -4408,26 +4682,6 @@ fn decode_lossless_arith_scan(
     let width = sof.width as usize;
     let height = sof.height as usize;
     let nc = sos.components.len();
-
-    // Detect a subsampled YUV-class scan (luma oversampled, chroma 1×1). The
-    // A.2.3 interleaved-MCU ordering applies here; the flat per-pixel path
-    // below only handles all-1×1 components. `validate_lossless_sof` has
-    // already constrained the legal combinations.
-    let h_factors: Vec<usize> = sof.components.iter().map(|c| c.h_factor as usize).collect();
-    let v_factors: Vec<usize> = sof.components.iter().map(|c| c.v_factor as usize).collect();
-    let h_max = *h_factors.iter().max().unwrap_or(&1);
-    let v_max = *v_factors.iter().max().unwrap_or(&1);
-    if nc > 1 && (h_max != 1 || v_max != 1) {
-        if precision != 8 {
-            return Err(Error::unsupported(
-                "lossless arith: subsampled three-component scans require precision 8",
-            ));
-        }
-        return decode_lossless_arith_scan_subsampled(
-            state, sos, scan, pts, predictor, pt, width, height, &h_factors, &v_factors, h_max,
-            v_max,
-        );
-    }
 
     // One statistics area per scan component (§H.1.2.3.2), with the L / U
     // conditioning bounds taken from the DAC DC-conditioning entry the
@@ -4496,7 +4750,13 @@ fn decode_lossless_arith_scan(
 
             for ci in 0..nc {
                 let plane = &samples[ci];
-                let pred: u32 = if reset_pred {
+                // The spatial predictor only applies to a non-differential
+                // frame (§H.1.2.1). A differential frame (§J.2.3.2) codes the
+                // difference directly, so the reconstructed value IS the
+                // decoded difference (modulo the sample range) — no prediction.
+                let pred: u32 = if differential {
+                    0
+                } else if reset_pred {
                     origin
                 } else if y == first_line_y {
                     // First line of the scan / restart interval: 1-D
@@ -4534,7 +4794,7 @@ fn decode_lossless_arith_scan(
         std::mem::swap(&mut prev_diff, &mut cur_diff);
     }
 
-    shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
+    Ok(samples)
 }
 
 /// Decode a subsampled three-component (YUV-class) SOF11 lossless scan — the

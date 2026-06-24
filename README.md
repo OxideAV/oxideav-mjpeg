@@ -701,20 +701,25 @@ Decoder:
 - **Hierarchical spatial lossless progression (T.81 Annex J)** — a
   `DHP` marker (§B.3.2) before the first frame routes the stream to
   the hierarchical control loop (§J.2.1). The lowest-resolution stage
-  is a non-differential `SOF3` lossless frame; each higher-resolution
-  stage is a `SOF7` differential lossless frame whose reference is ×2
+  is a non-differential `SOF3` (Huffman) **or `SOF11` (arithmetic)**
+  lossless frame; each higher-resolution
+  stage is a matching `SOF7` (Huffman) **or `SOF15` (arithmetic)**
+  differential lossless frame whose reference is ×2
   bi-linearly upsampled per the `EXP` segment (§B.3.3 / §J.1.1.2) and
   whose decoded difference is added back modulo `2^P` (§J.2.1). The
   differential frames decode with the §J.2.3.2 model (difference
-  coded directly, predictor `Ss = 0`). Frames may be single-component
+  coded directly, predictor `Ss = 0`); the arithmetic frames use the
+  §H.1.2.3 two-dimensional Q-coder statistical model (DAC
+  DC-conditioning `(L, U)` honoured, default `(0, 1)`). Frames may be
+  single-component
   (grayscale, any precision `P ∈ 2..=16` → `Gray8` / `Gray*Le`),
   three-component (RGB-class, `P ∈ 2..=16` → packed `Rgb24` /
   planar `Gbrp*Le` / packed `Rgb48Le`), or four-component
   (CMYK-class, `P = 8` → packed `Cmyk`, Adobe APP14 transform
   honoured), all with every component at `H = V = 1`. Reconstruction
   is bit-exact. The point transform is constrained to `Pt = 0` on
-  this path; subsampled frames and the arithmetic hierarchical
-  variants (SOF13..SOF15) still return `Unsupported` (see "Not
+  this path; subsampled frames and the differential DCT arithmetic
+  variants (SOF13 / SOF14) still return `Unsupported` (see "Not
   supported" below).
 - **Hierarchical DCT progression (T.81 §K.7.2.1)** — the same `DHP` /
   `EXP` control loop also decodes a DCT progression: the
@@ -747,16 +752,17 @@ Decoder:
   exactly as in the non-hierarchical sequential path. The frame mode
   is fixed by the first frame (T.81 §K.7.2 forbids mixing DCT and
   lossless non-differential frames). A DCT progression may also be
-  **terminated by a differential lossless `SOF7` frame** (§K.7.2): the
-  `SOF7` difference decodes under the §J.2.3.2 lossless model (coded
+  **terminated by a differential lossless `SOF7` (Huffman) or `SOF15`
+  (arithmetic) frame** (§K.7.2): the
+  difference decodes under the §J.2.3.2 lossless model (coded
   directly, predictor `Ss = 0`), is added to the ×2 EXP-upsampled
   reference modulo `2^16` (§J.2.1), and folds into the displayable
   `0..2^P` range — 1 / 3 / 4 components, colour class inherited from the
   DCT first frame (grayscale → `Gray8`/`Gray*Le`, RGB-class → `Rgb24`,
   YUV-class → `Yuv444P`, CMYK-class → `Cmyk`). Still `Unsupported`:
   `P = 12` 4-component DCT progressions (no high-bit-depth packed CMYK
-  `PixelFormat`) and the arithmetic hierarchical
-  variants (SOF13..SOF15).
+  `PixelFormat`) and the differential DCT arithmetic
+  variants (SOF13 / SOF14).
 - **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
   header codes the number of lines `Y = 0`, the real line count is
   recovered from the mandatory DNL segment (`0xFFDC`) that immediately
@@ -841,9 +847,12 @@ Not supported (decoder returns `Error::Unsupported`):
   progression** (§K.7.2.1) decode through the same `DHP` (§B.3.2) /
   `EXP` (§B.3.3) control loop with ×2 bi-linear reference upsampling
   (§J.1.1.2) — see the decoder coverage list above for the full
-  description. The **lossless** path covers `SOF3` non-differential +
-  `SOF7` differential frames (1/3/4-component, `P` up to 16, modulo-
-  2^P reconstruction, §J.2.3.2 model). The **DCT** path covers `SOF0`
+  description. The **lossless** path covers `SOF3` (Huffman) / `SOF11`
+  (arithmetic) non-differential +
+  `SOF7` / `SOF15` differential frames (1/3/4-component, `P` up to 16,
+  modulo-2^P reconstruction, §J.2.3.2 model; the arithmetic frames use
+  the §H.1.2.3 Q-coder model with DAC `(L, U)` conditioning). The
+  **DCT** path covers `SOF0`
   / `SOF1` / `SOF2` non-differential + `SOF5` differential sequential
   **and `SOF6` differential progressive**
   frames (1-component grayscale or 3-component RGB-class at `P = 8` /
@@ -853,12 +862,13 @@ Not supported (decoder returns `Error::Unsupported`):
   APP14 transform honoured, §J.2.3.1 model with the level-shift-free
   IDCT + direct DC, modulo-2^16 reconstruction). A DCT progression may
   additionally be **terminated by a differential lossless `SOF7`
-  frame** (§K.7.2 — §J.2.3.2 model, add modulo `2^16`, fold to `0..2^P`;
+  (Huffman) or `SOF15` (arithmetic) frame** (§K.7.2 — §J.2.3.2 model,
+  add modulo `2^16`, fold to `0..2^P`;
   1/3/4-component, colour class inherited from the DCT first frame).
   Still rejected with
   `Unsupported`: subsampled (`H/V != 1`) hierarchical frames; `P = 12`
-  4-component DCT progressions; and the arithmetic hierarchical
-  variants (SOF13..SOF15). The non-hierarchical arithmetic variants
+  4-component DCT progressions; and the differential DCT arithmetic
+  variants (SOF13 / SOF14). The non-hierarchical arithmetic variants
   are all supported: SOF9 (extended sequential) at `P=8`, SOF10
   (progressive) at `P=8` / `P=12`, and SOF11 (lossless) at every
   Annex H precision — see the decoder coverage list above.

@@ -23,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical arithmetic spatial-lossless progression (SOF11 + SOF15)**
+  (T.81 Annex J / §H.1.2.3). The `DHP` control loop now decodes an
+  arithmetic spatial-lossless progression — the Q-coder counterpart of the
+  Huffman SOF3 + SOF7 path: a non-differential `SOF11` first frame seeds the
+  reference and one or more differential `SOF15` frames refine resolution via
+  `EXP` ×2 bi-linear upsampling, with the difference added modulo
+  `2^precision` (§J.2.1). The differential `SOF15` frame decodes under the
+  §J.2.3.2 model (difference coded directly, predictor `Ss = 0`); a `SOF15`
+  may also *terminate* a DCT progression (§K.7.2, modulo `2^16` + fold to
+  `0..2^P`, like `SOF7`). The flat (`H = V = 1`) arithmetic lossless decode
+  is refactored into a shared `decode_lossless_arith_scan_planes` with a
+  `differential` flag (the public SOF11 path is byte-identical). The hier
+  loop also now parses `DAC` so the §H.1.2.3.3 DC-conditioning `(L, U)`
+  bounds carry into the arithmetic frames (default `(0, 1)` absent a DAC).
+  1 / 3 / 4 components, `P ∈ 2..=16` (CMYK-class `P = 8`); `markers::SOF13`
+  / `SOF14` / `SOF15` constants added. New `tests/hierarchical_arith.rs`
+  hand-builds two-stage grayscale + RGB streams (Q-coder scan bytes produced
+  with the crate's own `jpeg::arith` encoder primitives) and round-trips them
+  bit-exactly. The differential DCT arithmetic variants (`SOF13` / `SOF14`)
+  remain `Unsupported`.
 - **Hierarchical DCT progression: differential progressive (SOF6) frame**
   (T.81 §K.7.2.1 / §J.2.3.1). A `SOF6` differential progressive frame
   refining a DCT progression now decodes: its scans route through the same

@@ -71,6 +71,18 @@ pub const SOF10: u8 = 0xCA;
 /// Lossless sequential, arithmetic-coded (T.81 §H.1.2.3 two-dimensional
 /// statistical model over the Annex D Q-coder).
 pub const SOF11: u8 = 0xCB;
+/// Differential sequential DCT frame, arithmetic-coded (T.81 Annex J). The
+/// arithmetic counterpart of SOF5 — Annex F entropy model with the §J.2.3.1
+/// differential modification.
+pub const SOF13: u8 = 0xCD;
+/// Differential progressive DCT frame, arithmetic-coded (T.81 Annex J). The
+/// arithmetic counterpart of SOF6.
+pub const SOF14: u8 = 0xCE;
+/// Differential lossless (sequential), arithmetic-coded (T.81 Annex J). The
+/// Q-coder counterpart of SOF7 — Annex H §H.1.2.3 statistical model with the
+/// §J.2.3.2 differential modification (the difference is decoded directly,
+/// without spatial prediction).
+pub const SOF15: u8 = 0xCF;
 
 /// Application-specific markers APP0..APP15 (0xE0..0xEF).
 pub const APP0: u8 = 0xE0;

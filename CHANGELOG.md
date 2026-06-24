@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical DCT progression: differential progressive (SOF6) frame**
+  (T.81 §K.7.2.1 / §J.2.3.1). A `SOF6` differential progressive frame
+  refining a DCT progression now decodes: its scans route through the same
+  spectral-selection / successive-approximation accumulator as the
+  non-hierarchical SOF2 path (`decode_progressive_scan_diff`), but the
+  first DC scan (`Ah = 0`) decodes the DC coefficient **directly** — no
+  inter-block prediction — per the §J.2.3.1 differential-frame
+  modification, while AC scans and DC refinement scans are unchanged. The
+  IDCT runs without the level shift and the signed difference is added to
+  the ×2 EXP-upsampled reference modulo `2^16` (§J.2.1), then folded into
+  `0..2^P`, identically to the SOF5 differential-sequential path. Covered
+  by two hand-built two-stage `tests/hierarchical_dct.rs` cases (grayscale
+  + YUV-class) plus a `prog_decode_dc` unit test asserting the differential
+  DC path ignores prediction. Previously SOF6 returned `Unsupported`. The
+  arithmetic hierarchical variants (SOF13..SOF15) remain `Unsupported`.
 - **Hierarchical DCT progression terminated by a differential lossless
   (SOF7) frame** (T.81 §K.7.2). The final differential frame of a
   hierarchical sequence may legally use a differential *lossless* process

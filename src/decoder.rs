@@ -2019,6 +2019,25 @@ fn decode_progressive_scan(
     scan: &[u8],
     coefs: &mut [Vec<[i32; 64]>],
 ) -> Result<()> {
+    decode_progressive_scan_diff(state, sos, scan, coefs, false)
+}
+
+/// Progressive-scan coefficient accumulator with an optional differential
+/// (§J.2.3.1) DC model. When `differential` is true the first DC scan
+/// (`Ah = 0`) decodes the DC coefficient **directly** — without the
+/// inter-block prediction the ordinary progressive DC scan uses — so the
+/// stored coefficient is the two's-complement difference value of the
+/// hierarchical-mode SOF6 differential progressive frame. AC scans and DC
+/// successive-approximation refinement scans are unaffected (the §J.2.3.1
+/// modification touches only the first DC pass). The non-differential case
+/// (`differential = false`) is the ordinary progressive scan.
+fn decode_progressive_scan_diff(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+    differential: bool,
+) -> Result<()> {
     let sof = state
         .sof
         .as_ref()
@@ -2165,6 +2184,7 @@ fn decode_progressive_scan(
                                     &mut coefs[sof_idx][bi],
                                     sos.ah,
                                     sos.al,
+                                    differential,
                                 )?;
                             }
                         }
@@ -2182,6 +2202,7 @@ fn decode_progressive_scan(
                         &mut coefs[sof_idx][bi],
                         sos.ah,
                         sos.al,
+                        differential,
                     )?;
                 }
             } else {
@@ -2229,6 +2250,7 @@ fn prog_decode_dc(
     block: &mut [i32; 64],
     ah: u8,
     al: u8,
+    differential: bool,
 ) -> Result<()> {
     if ah == 0 {
         let t = decode_huff(br, dc)? as u32;
@@ -2238,8 +2260,15 @@ fn prog_decode_dc(
             let bits = br.get_bits(t)? as i32;
             extend(bits, t)
         };
-        *prev_dc = prev_dc.wrapping_add(dc_diff);
-        block[0] = *prev_dc << al;
+        if differential {
+            // §J.2.3.1: a differential progressive (SOF6) frame decodes the
+            // DC coefficient directly — no inter-block prediction. The decoded
+            // value IS the coefficient (point-transform-shifted by Al).
+            block[0] = dc_diff << al;
+        } else {
+            *prev_dc = prev_dc.wrapping_add(dc_diff);
+            block[0] = *prev_dc << al;
+        }
     } else {
         // Successive-approximation DC refinement: read 1 bit, shift into the
         // existing DC at position `Al`.
@@ -3483,16 +3512,21 @@ fn decode_hierarchical(
                 )?);
             }
             // Differential DCT frame (a refinement stage). SOF5 = differential
-            // sequential, Huffman-coded (§J.2.3.1). The decoded IDCT output is
-            // the signed two's-complement difference (no level shift, DC
-            // decoded directly); it is added modulo 2^16 to the upsampled
-            // reference (§J.2.1).
-            SOF5 => {
+            // sequential, SOF6 = differential progressive — both Huffman-coded
+            // (§J.2.3.1). The decoded IDCT output is the signed two's-
+            // complement difference (no level shift, DC decoded directly); it
+            // is added modulo 2^16 to the upsampled reference (§J.2.1). SOF6
+            // routes its scans through the spectral-selection /
+            // successive-approximation accumulator (same decomposition as the
+            // non-hierarchical SOF2 progressive path) with the §J.2.3.1
+            // direct-DC modification.
+            SOF5 | SOF6 => {
                 if dct_mode != Some(true) {
                     return Err(Error::invalid(
                         "hierarchical JPEG: differential DCT frame without a DCT first frame",
                     ));
                 }
+                let prog = marker == SOF6;
                 let prev = reference.take().ok_or_else(|| {
                     Error::invalid(
                         "hierarchical JPEG: differential frame before a non-differential frame",
@@ -3517,7 +3551,7 @@ fn decode_hierarchical(
                     }
                 }
                 state.sof = Some(sof.clone());
-                let diff = decode_hierarchical_dct_frame(&state, walker, true, false)?;
+                let diff = decode_hierarchical_dct_frame(&state, walker, true, prog)?;
                 if diff.len() != upsampled.len() {
                     return Err(Error::invalid(
                         "hierarchical JPEG: differential frame component count mismatch",
@@ -3631,12 +3665,11 @@ fn decode_hierarchical(
                 reference = Some(next);
             }
             // Any remaining SOF (the arithmetic hierarchical variants
-            // SOF13..SOF15, or the differential progressive DCT SOF6) is
-            // outside the slice this decoder covers.
+            // SOF13..SOF15) is outside the slice this decoder covers.
             m if markers::is_sof(m) => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "hierarchical JPEG: only the spatial lossless (SOF3 + SOF7) and DCT (SOF0/1/2 + SOF5) progressions are supported",
+                    "hierarchical JPEG: only the spatial lossless (SOF3 + SOF7) and DCT (SOF0/1/2 + SOF5/6, SOF7-terminated) progressions are supported",
                 ));
             }
             COM => {
@@ -3898,7 +3931,7 @@ fn decode_hierarchical_dct_frame(
                 validate_sos(&sos)?;
                 let scan = walker.read_scan_data()?;
                 if progressive {
-                    decode_progressive_scan(&fstate, &sos, scan, &mut coefs)?;
+                    decode_progressive_scan_diff(&fstate, &sos, scan, &mut coefs, differential)?;
                 } else {
                     // A sequential differential frame decodes its DC
                     // directly (no inter-block prediction). The shared
@@ -4751,9 +4784,34 @@ mod prog_tests {
         let mut br = BitReader::new(&buf);
         let mut prev_dc = 0i32;
         let mut block = [0i32; 64];
-        prog_decode_dc(&mut br, &t, &mut prev_dc, &mut block, 0, 2).unwrap();
+        prog_decode_dc(&mut br, &t, &mut prev_dc, &mut block, 0, 2, false).unwrap();
         assert_eq!(prev_dc, 5);
         assert_eq!(block[0], 20);
+    }
+
+    /// Differential progressive (SOF6, §J.2.3.1): the DC-first pass decodes
+    /// the DC coefficient directly, without inter-block prediction. With a
+    /// pre-seeded `prev_dc`, the differential path must IGNORE it (store
+    /// `diff << Al`) where the non-differential path would add it.
+    #[test]
+    fn dc_first_pass_differential_ignores_prediction() {
+        let t = HuffTable::build(&STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS).unwrap();
+        // category=3 then value 5 (same buffer as the prediction test).
+        let code = t.encode[3];
+        let mut bw = ProgTestBitWriter::new();
+        bw.put(code.code as u32, code.len as u32);
+        bw.put(0b101, 3);
+        let buf = bw.finish();
+
+        let mut br = BitReader::new(&buf);
+        // Seed prev_dc with a non-zero value the differential path must not use.
+        let mut prev_dc = 99i32;
+        let mut block = [0i32; 64];
+        prog_decode_dc(&mut br, &t, &mut prev_dc, &mut block, 0, 0, true).unwrap();
+        // Direct decode: block[0] = 5 << 0 = 5, prev_dc untouched (no
+        // prediction accumulation).
+        assert_eq!(block[0], 5);
+        assert_eq!(prev_dc, 99);
     }
 
     /// DC refinement (Ah>0) just appends a single bit at position `Al`.
@@ -4769,7 +4827,7 @@ mod prog_tests {
         let mut prev_dc = 0i32;
         let mut block = [0i32; 64];
         block[0] = 0b1000;
-        prog_decode_dc(&mut br, &t, &mut prev_dc, &mut block, 1, 0).unwrap();
+        prog_decode_dc(&mut br, &t, &mut prev_dc, &mut block, 1, 0, false).unwrap();
         assert_eq!(block[0], 0b1001);
     }
 

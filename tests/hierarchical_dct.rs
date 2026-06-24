@@ -896,6 +896,174 @@ fn two_stage_dct_terminated_by_lossless_cmyk() {
     }
 }
 
+// ---- DCT progression with a differential *progressive* SOF6 frame --------
+//
+// A SOF6 differential progressive frame (§J.2.3.1) routes its scans through
+// the spectral-selection accumulator (like SOF2) but with two modifications:
+// the IDCT is computed without the level shift and the DC coefficient is
+// decoded directly (no inter-block prediction). The decoded signed
+// difference is added to the ×2 EXP-upsampled reference modulo 2^16 (§J.2.1).
+
+/// SOS body for a progressive DC-first scan over `nc` interleaved
+/// components: Ns, then (id, Td=0/Ta=0) per component, then Ss=0, Se=0,
+/// Ah=0/Al=0.
+fn sos_body_prog_dc(nc: u8) -> Vec<u8> {
+    let mut v = vec![nc];
+    for id in 1..=nc {
+        v.push(id);
+        v.push(0x00);
+    }
+    v.extend_from_slice(&[0, 0, 0x00]); // Ss=0 Se=0 Ah/Al=0
+    v
+}
+
+/// SOS body for a progressive AC scan on a single component `id`:
+/// Ns=1, (id, Td=0/Ta=0), Ss=1, Se=63, Ah=0/Al=0.
+fn sos_body_prog_ac(id: u8) -> Vec<u8> {
+    vec![1, id, 0x00, 1, 63, 0x00]
+}
+
+/// Encode an interleaved differential-progressive DC-first scan for `nc`
+/// components. Each component supplies one flat per-block DC *difference*
+/// value (the SOF6 §J.2.3.1 model codes the DC directly, no prediction). The
+/// stored DC coefficient is `8 * d` (a flat block has its DC = 8× the pixel
+/// value under the unit quant + IDCT scaling).  Component blocks within an
+/// MCU are emitted in scan order.
+fn encode_diff_prog_dc_scan(blocks: &[Vec<i32>], nmcu: usize) -> Vec<u8> {
+    let dc_codes = canonical_codes(&DC_BITS, &DC_VALS);
+    let mut bw = BitWriter::new();
+    for mcu in 0..nmcu {
+        for plane in blocks.iter() {
+            let dc_coef = 8 * plane[mcu];
+            let (ssss, bitsv) = category(dc_coef);
+            let (len, code) = dc_codes[&ssss];
+            bw.put(code, len);
+            if ssss > 0 {
+                bw.put(bitsv, ssss);
+            }
+        }
+    }
+    bw.finish()
+}
+
+/// Encode an all-EOB progressive AC scan covering `nblocks` blocks: emit one
+/// `0x00` (EOBn, r=0 → run covers exactly the current block) per block.
+fn encode_eob_ac_scan(nblocks: usize) -> Vec<u8> {
+    let ac_codes = canonical_codes(&AC_BITS, &AC_VALS);
+    let mut bw = BitWriter::new();
+    let (len, code) = ac_codes[&0x00];
+    for _ in 0..nblocks {
+        bw.put(code, len);
+    }
+    bw.finish()
+}
+
+#[test]
+fn two_stage_dct_differential_progressive_sof6_grayscale() {
+    // Stage 1 (non-differential SOF0): 8×8 flat block value 100 → EXP ×2 →
+    // flat 16×16 reference = 100.
+    // Stage 2 (differential SOF6): 16×16 = four 8×8 blocks, each a flat DC
+    // correction d, with the progressive DC-first + AC decomposition. Final
+    // block = (100 + d) folded into 0..256.
+    let base: i32 = 100;
+    let corrections: [i32; 4] = [10, -5, 20, -30];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body(16, 16)); // DHP 16×16
+    push_seg(&mut out, 0xDB, &dqt_body());
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS));
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS));
+
+    // Stage 1: non-differential DCT SOF0, low-res 8×8.
+    push_seg(&mut out, 0xC0, &frame_body(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body());
+    out.extend_from_slice(&encode_flat_dct_scan(&[base], false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential progressive SOF6, full-res 16×16 (2×2 blocks).
+    push_seg(&mut out, 0xC6, &frame_body(16, 16));
+    // DC-first scan (codes the four block DC differences directly).
+    push_seg(&mut out, 0xDA, &sos_body_prog_dc(1));
+    out.extend_from_slice(&encode_diff_prog_dc_scan(&[corrections.to_vec()], 4));
+    // AC scan (all blocks EOB → no AC coefficients).
+    push_seg(&mut out, 0xDA, &sos_body_prog_ac(1));
+    out.extend_from_slice(&encode_eob_ac_scan(4));
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 1);
+    let stride = frame.planes[0].stride;
+    let data = &frame.planes[0].data;
+    let block_corr = |bx: usize, by: usize| corrections[by * 2 + bx];
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let bx = x / 8;
+            let by = y / 8;
+            let expect = (base + block_corr(bx, by)).clamp(0, 255) as u8;
+            assert_eq!(data[y * stride + x], expect, "pixel ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn two_stage_dct_differential_progressive_sof6_yuv() {
+    // Three-component YUV-class DCT progression with a differential
+    // progressive SOF6 refinement frame. Output stays planar Yuv444P.
+    let base = [100i32, 120, 60];
+    let corr: [[i32; 4]; 3] = [[10, -5, 20, -30], [-8, 12, -4, 16], [5, -15, 25, -10]];
+
+    let mut out = Vec::new();
+    push_marker(&mut out, 0xD8); // SOI
+    push_seg(&mut out, 0xDE, &frame_body_3comp(16, 16)); // DHP 16×16, Nf=3
+    push_seg(&mut out, 0xDB, &dqt_body());
+    push_seg(&mut out, 0xC4, &dht_body(0, 0, &DC_BITS, &DC_VALS));
+    push_seg(&mut out, 0xC4, &dht_body(1, 0, &AC_BITS, &AC_VALS));
+
+    // Stage 1: non-differential DCT SOF0, low-res 8×8 (one block/component).
+    push_seg(&mut out, 0xC0, &frame_body_3comp(8, 8));
+    push_seg(&mut out, 0xDA, &sos_body_3comp());
+    let stage1: [Vec<i32>; 3] = [vec![base[0]], vec![base[1]], vec![base[2]]];
+    out.extend_from_slice(&encode_flat_dct_scan_3comp(&stage1, false));
+
+    // EXP ×2 both axes.
+    push_seg(&mut out, 0xDF, &[0x11]);
+
+    // Stage 2: differential progressive SOF6, full-res 16×16 (2×2/comp).
+    push_seg(&mut out, 0xC6, &frame_body_3comp(16, 16));
+    // Interleaved DC-first scan over all three components.
+    push_seg(&mut out, 0xDA, &sos_body_prog_dc(3));
+    let dc_blocks: Vec<Vec<i32>> = vec![corr[0].to_vec(), corr[1].to_vec(), corr[2].to_vec()];
+    out.extend_from_slice(&encode_diff_prog_dc_scan(&dc_blocks, 4));
+    // Per-component AC scans (all EOB).
+    for id in 1u8..=3 {
+        push_seg(&mut out, 0xDA, &sos_body_prog_ac(id));
+        out.extend_from_slice(&encode_eob_ac_scan(4));
+    }
+
+    push_marker(&mut out, 0xD9); // EOI
+
+    let frame = decode(out, 16, 16);
+    assert_eq!(frame.planes.len(), 3, "expected planar Yuv444P");
+    for c in 0..3 {
+        let stride = frame.planes[c].stride;
+        assert_eq!(stride, 16);
+        let data = &frame.planes[c].data;
+        let block_corr = |bx: usize, by: usize| corr[c][by * 2 + bx];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let bx = x / 8;
+                let by = y / 8;
+                let expect = (base[c] + block_corr(bx, by)).clamp(0, 255) as u8;
+                assert_eq!(data[y * stride + x], expect, "plane {c} pixel ({x},{y})");
+            }
+        }
+    }
+}
+
 /// SOFn / DHP body at `P = 12`, Nf=3, three YUV-class components (ids
 /// 1/2/3, all H=V=1, Tq=0). Mirrors `frame_body_3comp` but with the
 /// precision byte set to 12.

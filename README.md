@@ -722,9 +722,13 @@ Decoder:
   sequential) or `SOF2` (progressive) — its reconstructed image
   samples (dequant + IDCT + §A.3.1 level shift, clamped to `0..2^P`)
   seed the reference component planes. Each higher-resolution stage is
-  a `SOF5` differential sequential DCT frame decoded under the
+  a `SOF5` differential sequential **or `SOF6` differential progressive**
+  DCT frame decoded under the
   §J.2.3.1 model (IDCT computed *without* the level shift, DC
-  coefficient decoded directly with no inter-block prediction); the
+  coefficient decoded directly with no inter-block prediction — the
+  `SOF6` path applies that direct-DC rule to the first DC scan of the
+  same spectral-selection / successive-approximation decomposition the
+  non-hierarchical `SOF2` path uses); the
   resulting signed difference is added to the ×2 EXP-upsampled
   reference modulo `2^16` (§J.2.1) and folded into the displayable
   `0..2^P` range. Frames are single-component (grayscale, `P = 8` /
@@ -751,8 +755,7 @@ Decoder:
   DCT first frame (grayscale → `Gray8`/`Gray*Le`, RGB-class → `Rgb24`,
   YUV-class → `Yuv444P`, CMYK-class → `Cmyk`). Still `Unsupported`:
   `P = 12` 4-component DCT progressions (no high-bit-depth packed CMYK
-  `PixelFormat`), the differential
-  progressive (`SOF6`) frame, and the arithmetic hierarchical
+  `PixelFormat`) and the arithmetic hierarchical
   variants (SOF13..SOF15).
 - **DNL (Define Number of Lines, T.81 §B.2.5)** — when the SOF frame
   header codes the number of lines `Y = 0`, the real line count is
@@ -842,6 +845,7 @@ Not supported (decoder returns `Error::Unsupported`):
   `SOF7` differential frames (1/3/4-component, `P` up to 16, modulo-
   2^P reconstruction, §J.2.3.2 model). The **DCT** path covers `SOF0`
   / `SOF1` / `SOF2` non-differential + `SOF5` differential sequential
+  **and `SOF6` differential progressive**
   frames (1-component grayscale or 3-component RGB-class at `P = 8` /
   `P = 12`, 3-component YUV-class at `P = 8` → planar `Yuv444P` and at
   `P = 12` → planar `Yuv444P12Le`, and
@@ -853,8 +857,7 @@ Not supported (decoder returns `Error::Unsupported`):
   1/3/4-component, colour class inherited from the DCT first frame).
   Still rejected with
   `Unsupported`: subsampled (`H/V != 1`) hierarchical frames; `P = 12`
-  4-component DCT progressions; the
-  differential progressive (`SOF6`) frame; and the arithmetic hierarchical
+  4-component DCT progressions; and the arithmetic hierarchical
   variants (SOF13..SOF15). The non-hierarchical arithmetic variants
   are all supported: SOF9 (extended sequential) at `P=8`, SOF10
   (progressive) at `P=8` / `P=12`, and SOF11 (lossless) at every

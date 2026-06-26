@@ -30,9 +30,10 @@ use oxideav_core::{
 use crate::container;
 use crate::decoder::decode_jpeg;
 use crate::encoder::{
-    encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts,
-    encode_jpeg_progressive, encode_jpeg_progressive_grayscale, encode_jpeg_rgb24_with_opts,
-    encode_jpeg_with_opts, encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
+    encode_arith_jpeg_grayscale, encode_arith_jpeg_rgb24, encode_arith_jpeg_yuv, encode_jpeg_cmyk,
+    encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts, encode_jpeg_progressive,
+    encode_jpeg_progressive_grayscale, encode_jpeg_rgb24_with_opts, encode_jpeg_with_opts,
+    encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
@@ -260,6 +261,11 @@ pub struct MjpegEncoder {
     /// When true, take the lossless (SOF3) path for single-component
     /// grayscale input. Ignored for any non-grayscale `pix`.
     lossless: bool,
+    /// When true, emit a sequential arithmetic-coded DCT frame (SOF9)
+    /// instead of the Huffman baseline (SOF0). Honoured for `Gray8`,
+    /// `Yuv*P` and `Rgb24` input; ignored on the lossless and progressive
+    /// paths (which take precedence) and for CMYK / high-bit-depth input.
+    arithmetic: bool,
     /// Lossless predictor selector (T.81 Table H.1, 1..=7). Only
     /// consulted on the lossless path. Defaults to 1 (Ra / left).
     lossless_predictor: u8,
@@ -354,6 +360,7 @@ impl MjpegEncoder {
             // default; flip `set_lossless(true)` to switch to the
             // bit-exact SOF3 path instead.
             lossless: false,
+            arithmetic: false,
             lossless_predictor: 1,
             cmyk_adobe_transform: None,
             time_base: params
@@ -416,6 +423,23 @@ impl MjpegEncoder {
     /// True when lossless (SOF3) emission is enabled.
     pub fn lossless(&self) -> bool {
         self.lossless
+    }
+
+    /// Enable or disable sequential arithmetic-coded DCT (SOF9) emission.
+    /// Honoured for `Gray8`, `Yuv420P` / `Yuv422P` / `Yuv444P` and `Rgb24`
+    /// input. The lossless and progressive flags take precedence — when
+    /// either is set the arithmetic flag is ignored — and CMYK /
+    /// high-bit-depth grayscale input always uses its existing path. The
+    /// SOF9 output is the Q-coder counterpart of the baseline SOF0 path:
+    /// same forward DCT + quantiser, so it decodes to identical pixels.
+    /// `set_restart_interval` is honoured on this path.
+    pub fn set_arithmetic(&mut self, on: bool) {
+        self.arithmetic = on;
+    }
+
+    /// True when sequential arithmetic-coded DCT (SOF9) emission is enabled.
+    pub fn arithmetic(&self) -> bool {
+        self.arithmetic
     }
 
     /// Set the lossless predictor selector (T.81 Table H.1, 1..=7).
@@ -546,6 +570,15 @@ impl Encoder for MjpegEncoder {
                                 plane.stride,
                                 self.quality,
                             )?
+                        } else if self.arithmetic {
+                            encode_arith_jpeg_grayscale(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                                self.restart_interval,
+                            )?
                         } else {
                             encode_jpeg_grayscale_with_opts(
                                 self.width,
@@ -591,14 +624,25 @@ impl Encoder for MjpegEncoder {
                                 "MJPEG encoder: RGB24 plane stride must be at least width * 3",
                             ));
                         }
-                        encode_jpeg_rgb24_with_opts(
-                            self.width,
-                            self.height,
-                            &plane.data,
-                            plane.stride,
-                            self.quality,
-                            self.restart_interval,
-                        )?
+                        if self.arithmetic && !self.lossless {
+                            encode_arith_jpeg_rgb24(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                                self.restart_interval,
+                            )?
+                        } else {
+                            encode_jpeg_rgb24_with_opts(
+                                self.width,
+                                self.height,
+                                &plane.data,
+                                plane.stride,
+                                self.quality,
+                                self.restart_interval,
+                            )?
+                        }
                     }
                     // 4-component CMYK / YCCK input takes the dedicated
                     // CMYK encode path. The single packed plane is laid
@@ -638,10 +682,20 @@ impl Encoder for MjpegEncoder {
                             )?
                         }
                     }
-                    // YUV inputs take the baseline / progressive DCT path.
+                    // YUV inputs take the baseline / progressive / arithmetic
+                    // DCT path.
                     _ => {
                         if self.progressive {
                             encode_jpeg_progressive(v, self.width, self.height, pix, self.quality)?
+                        } else if self.arithmetic {
+                            encode_arith_jpeg_yuv(
+                                v,
+                                self.width,
+                                self.height,
+                                pix,
+                                self.quality,
+                                self.restart_interval,
+                            )?
                         } else {
                             encode_jpeg_with_opts(
                                 v,

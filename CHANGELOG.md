@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`MjpegEncoder::set_arithmetic(bool)` trait-API toggle.** The
+  registry/`Encoder`-trait encoder now exposes the SOF9 arithmetic DCT path:
+  `set_arithmetic(true)` routes `Gray8`, `Yuv420P/422P/444P` and `Rgb24`
+  input through the new `encode_arith_jpeg_*` functions (restart interval
+  honoured). The lossless and progressive flags take precedence — when
+  either is set the arithmetic flag is ignored — and CMYK / high-bit-depth
+  grayscale keep their existing paths. New trait-API tests confirm SOF9 vs
+  SOF0 pixel identity and the progressive-wins precedence.
+
 - **Sequential arithmetic DCT encoder (SOF9), packed RGB24.**
   `encoder::encode_arith_jpeg_rgb24` emits a standalone SOF9 RGB JPEG (three
   `'R'/'G'/'B'` components, Adobe APP14 `transform = 0`, no colour

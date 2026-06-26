@@ -1304,3 +1304,81 @@ fn arith_sof9_rgb24_matches_baseline_pixels() {
         assert_eq!(a, b, "RGB24 plane {ci} mismatch (SOF9 vs SOF0)");
     }
 }
+
+/// The trait-level `MjpegEncoder::set_arithmetic(true)` routes YUV input
+/// through the SOF9 path and decodes identically to the baseline trait
+/// encoder at the same quality.
+#[test]
+fn trait_set_arithmetic_yuv_matches_baseline() {
+    use oxideav_mjpeg::encoder::MjpegEncoder;
+
+    let pix = PixelFormat::Yuv420P;
+    let (w, h) = (32u32, 24u32);
+    let frame = make_gradient_frame(w, h, pix);
+
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(pix);
+    params.frame_rate = Some(Rational::new(30, 1));
+
+    // Arithmetic (SOF9).
+    let mut enc_a = MjpegEncoder::from_params(&params).expect("enc");
+    enc_a.set_arithmetic(true);
+    assert!(enc_a.arithmetic());
+    enc_a
+        .send_frame(&Frame::Video(frame.clone()))
+        .expect("send");
+    let pkt_a = enc_a.receive_packet().expect("recv");
+    assert!(
+        pkt_a.data.windows(2).any(|x| x == [0xFF, 0xC9]),
+        "trait arith path must emit SOF9"
+    );
+
+    // Baseline (SOF0).
+    let mut enc_b = MjpegEncoder::from_params(&params).expect("enc");
+    enc_b
+        .send_frame(&Frame::Video(frame.clone()))
+        .expect("send");
+    let pkt_b = enc_b.receive_packet().expect("recv");
+    assert!(
+        pkt_b.data.windows(2).any(|x| x == [0xFF, 0xC0]),
+        "baseline path must emit SOF0"
+    );
+
+    let va = decode_planes(pkt_a.data, w, h);
+    let vb = decode_planes(pkt_b.data, w, h);
+    for (ci, (a, b)) in va.iter().zip(vb.iter()).enumerate() {
+        assert_eq!(a, b, "plane {ci}: trait SOF9 vs SOF0 mismatch");
+    }
+}
+
+/// `set_progressive(true)` takes precedence over `set_arithmetic(true)`:
+/// the progressive (SOF2) path wins, no SOF9 is emitted.
+#[test]
+fn trait_progressive_takes_precedence_over_arithmetic() {
+    use oxideav_mjpeg::encoder::MjpegEncoder;
+
+    let pix = PixelFormat::Yuv444P;
+    let (w, h) = (16u32, 16u32);
+    let frame = make_gradient_frame(w, h, pix);
+
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(pix);
+
+    let mut enc = MjpegEncoder::from_params(&params).expect("enc");
+    enc.set_arithmetic(true);
+    enc.set_progressive(true);
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("recv");
+    assert!(
+        pkt.data.windows(2).any(|x| x == [0xFF, 0xC2]),
+        "progressive must win: expected SOF2"
+    );
+    assert!(
+        !pkt.data.windows(2).any(|x| x == [0xFF, 0xC9]),
+        "SOF9 must NOT be emitted when progressive is on"
+    );
+}

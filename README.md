@@ -3,17 +3,26 @@
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
 decodes baseline (SOF0), extended-sequential (SOF1 Huffman + SOF9
 arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic),
-lossless (SOF3 Huffman + SOF11 arithmetic) and the **spatial
-hierarchical lossless progression** (T.81 Annex J — DHP + SOF3/SOF7
-+ EXP, 1 / 3 / 4 components) JPEGs (single-component
-grayscale at any precision `P ∈ 2..=16` plus three-component RGB-class
-at `P = 8`), encodes
-baseline, progressive **and** lossless JPEG (the lossless path covers
+lossless (SOF3 Huffman + SOF11 arithmetic) and the **full
+hierarchical mode** (T.81 Annex J — DHP-introduced progressions):
+the spatial-lossless progression (non-differential SOF3 / SOF11 +
+differential SOF7 / SOF15 + EXP, 1 / 3 / 4 components) **and** the
+DCT progression (non-differential SOF0 / SOF1 / SOF2 Huffman or
+SOF9 / SOF10 arithmetic + differential SOF5 / SOF6 Huffman or
+SOF13 / SOF14 arithmetic, optionally SOF7 / SOF15-terminated) —
+covering every defined SOFn decode family. Single-component
+grayscale decodes at any precision `P ∈ 2..=16` plus three-component
+RGB-/YUV-class at `P = 8` (DCT also `P = 12`). Encodes baseline,
+progressive, **sequential arithmetic DCT (SOF9)** and lossless JPEG.
+The SOF9 arithmetic encoder produces grayscale, YUV
+(`Yuv444P`/`Yuv422P`/`Yuv420P`) and packed RGB24, with optional
+restart-interval framing, and is reachable via the trait API
+(`MjpegEncoder::set_arithmetic(true)`). The lossless path covers
 single-component grayscale at every precision `P ∈ 2..=16`,
 three-component interleaved RGB at every precision `P ∈ 2..=16`, and
 three-component **subsampled YUV-class** at `P = 8`
 (`Yuv444P`/`Yuv422P`/`Yuv420P`/`Yuv411P`), with every Annex H Table H.1
-predictor). YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. Zero C
+predictor. YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. Zero C
 dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)

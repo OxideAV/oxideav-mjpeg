@@ -1271,3 +1271,36 @@ fn decode_planes(jpeg: Vec<u8>, w: u32, h: u32) -> Vec<Vec<u8>> {
     };
     v.planes.iter().map(|p| p.data.clone()).collect()
 }
+
+/// SOF9 (sequential arithmetic DCT) packed-RGB24 encode → decode must produce
+/// pixels byte-identical to the baseline SOF0 RGB24 path at the same quality.
+#[test]
+fn arith_sof9_rgb24_matches_baseline_pixels() {
+    use oxideav_mjpeg::encoder::{encode_arith_jpeg_rgb24, encode_jpeg_rgb24};
+
+    let (w, h) = (32u32, 24u32);
+    let stride = (w * 3) as usize;
+    let mut rgb = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let p = y * stride + x * 3;
+            rgb[p] = ((x * 7) % 256) as u8;
+            rgb[p + 1] = ((y * 9) % 256) as u8;
+            rgb[p + 2] = (((x + y) * 5) % 256) as u8;
+        }
+    }
+
+    let arith = encode_arith_jpeg_rgb24(w, h, &rgb, stride, 82, 0).expect("encode SOF9 RGB");
+    assert!(
+        arith.windows(2).any(|x| x == [0xFF, 0xC9]),
+        "SOF9 marker missing"
+    );
+    let base = encode_jpeg_rgb24(w, h, &rgb, stride, 82).expect("encode SOF0 RGB");
+
+    let va = decode_planes(arith, w, h);
+    let vb = decode_planes(base, w, h);
+    assert_eq!(va.len(), vb.len(), "plane count");
+    for (ci, (a, b)) in va.iter().zip(vb.iter()).enumerate() {
+        assert_eq!(a, b, "RGB24 plane {ci} mismatch (SOF9 vs SOF0)");
+    }
+}

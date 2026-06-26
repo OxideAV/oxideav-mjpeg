@@ -3987,6 +3987,128 @@ pub fn encode_arith_jpeg_yuv(
     Ok(out)
 }
 
+/// Write a SOF9 (extended sequential DCT, arithmetic) frame header for a
+/// packed-RGB24 frame: three components `'R'/'G'/'B'` (82/71/66), each
+/// `H = V = 1`, all binding quantiser table 0. Mirrors
+/// [`write_sof0_rgb24_8bit`] with the SOF9 marker.
+fn write_sof9_rgb24_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 9);
+    payload.push(8);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3);
+    payload.push(b'R');
+    payload.push(0x11);
+    payload.push(0);
+    payload.push(b'G');
+    payload.push(0x11);
+    payload.push(0);
+    payload.push(b'B');
+    payload.push(0x11);
+    payload.push(0);
+    write_length_prefix(out, markers::SOF9, &payload);
+}
+
+/// Encode a packed-RGB24 image as a standalone **sequential, arithmetic-coded
+/// DCT** JPEG (SOF9) — the Q-coder counterpart of [`encode_jpeg_rgb24`]. The
+/// three R/G/B channels are coded as components directly (no colour
+/// transform; Adobe APP14 `transform = 0` marks them as R/G/B), with the
+/// interleaved MCU layout, forward DCT and quantisation of the baseline
+/// path. Default arithmetic conditioning; optional restart-interval framing.
+/// Output round-trips bit-exact through the SOF9 decode path.
+pub fn encode_arith_jpeg_rgb24(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    restart_interval: u16,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("arith-DCT RGB24 encoder: zero-size image"));
+    }
+    let min_stride = w
+        .checked_mul(3)
+        .ok_or_else(|| Error::invalid("arith-DCT RGB24 encoder: width * 3 overflow"))?;
+    if stride < min_stride {
+        return Err(Error::invalid(
+            "arith-DCT RGB24 encoder: stride smaller than width * 3",
+        ));
+    }
+    if samples.len() < stride.saturating_mul(h) {
+        return Err(Error::invalid(
+            "arith-DCT RGB24 encoder: samples shorter than stride*h",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_adobe_app14(&mut out, 0); // transform = 0 → R/G/B
+    write_dqt(&mut out, 0, &luma_q);
+    write_sof9_rgb24_8bit(&mut out, w as u16, h as u16);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos_rgb24_8bit(&mut out);
+
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let total_mcus = mcus_x.saturating_mul(mcus_y);
+    let ri = restart_interval as usize;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: usize = 0;
+    let mut mcu_index: usize = 0;
+
+    let mut dc = [DcStats::new(), DcStats::new(), DcStats::new()];
+    let mut ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+    let mut enc = ArithEncoder::new();
+
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for ch in 0..3 {
+                let mut blk = [0.0f32; 64];
+                fill_block_packed_channel(&mut blk, samples, stride, w, h, mx * 8, my * 8, ch);
+                fdct8x8(&mut blk);
+                let mut zz = [0i32; 64];
+                for k in 0..64 {
+                    let v = blk[ZIGZAG[k]] / luma_q[ZIGZAG[k]] as f32;
+                    zz[k] = if v >= 0.0 {
+                        (v + 0.5) as i32
+                    } else {
+                        -((-v + 0.5) as i32)
+                    };
+                }
+                arith_encode_block(&mut enc, &mut dc[ch], &mut ac[ch], &zz);
+            }
+
+            mcu_index += 1;
+            mcus_since_restart += 1;
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                dc = [DcStats::new(), DcStats::new(), DcStats::new()];
+                ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+                mcus_since_restart = 0;
+            }
+        }
+    }
+    out.extend_from_slice(&enc.finish());
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Encode a single-component grayscale image as a standalone **lossless,
 /// arithmetic-coded** JPEG (SOF11) byte stream — the entropy-coder
 /// counterpart of [`encode_lossless_jpeg_grayscale`].

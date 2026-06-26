@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sequential arithmetic DCT encoder (SOF9), packed RGB24.**
+  `encoder::encode_arith_jpeg_rgb24` emits a standalone SOF9 RGB JPEG (three
+  `'R'/'G'/'B'` components, Adobe APP14 `transform = 0`, no colour
+  transform) — the Q-coder counterpart of `encode_jpeg_rgb24`. Optional
+  restart-interval framing. Round-trip test asserts byte-identical pixels
+  against the baseline SOF0 RGB path. This completes the SOF9 arithmetic DCT
+  encode trio (grayscale / YCbCr / RGB) matching the baseline encoders.
+
 - **Sequential arithmetic DCT encoder (SOF9), 3-component YCbCr.**
   `encoder::encode_arith_jpeg_yuv` emits a standalone SOF9 (sequential
   arithmetic DCT) YCbCr JPEG across 4:4:4 / 4:2:2 / 4:2:0 subsampling — the

@@ -1115,3 +1115,87 @@ fn roundtrip_grayscale_progressive_trait_api() {
         "PSNR = {psnr:.2} dB (expected ≥ 20 on noisy pattern)"
     );
 }
+
+/// SOF9 (sequential arithmetic DCT) grayscale encode → decode must produce
+/// pixels **byte-identical** to the baseline SOF0 path at the same quality:
+/// both use the same forward DCT + quantiser, and the Q-coder entropy stage
+/// is lossless, so the decoder recovers the same quantised coefficients and
+/// renders the same image. This is the strongest possible parity check.
+#[test]
+fn arith_sof9_grayscale_matches_baseline_pixels() {
+    use oxideav_mjpeg::encoder::{encode_arith_jpeg_grayscale, encode_jpeg_grayscale};
+
+    let (w, h) = (40u32, 24u32);
+    let stride = w as usize;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            // A non-flat gradient with some high-frequency wiggle so the AC
+            // band exercises a range of magnitudes (not just DC).
+            let v = (x * 5 + y * 3 + ((x ^ y) & 0x1F)) % 256;
+            samples[y * stride + x] = v as u8;
+        }
+    }
+
+    let arith = encode_arith_jpeg_grayscale(w, h, &samples, stride, 80, 0).expect("encode SOF9");
+    assert!(
+        arith.windows(2).any(|x| x == [0xFF, 0xC9]),
+        "SOF9 marker missing"
+    );
+    let base = encode_jpeg_grayscale(w, h, &samples, stride, 80).expect("encode SOF0");
+
+    let va = decode_to_gray(arith, w, h);
+    let vb = decode_to_gray(base, w, h);
+    assert_eq!(va, vb, "SOF9 and SOF0 decoded pixels must be identical");
+}
+
+/// SOF9 with a restart interval: the DRI + RSTn re-initialisation in the
+/// encoder must stay in lockstep with the decoder, again byte-identical to
+/// the restart-free SOF9 output (restart markers don't change the rendered
+/// image, only the entropy framing).
+#[test]
+fn arith_sof9_grayscale_restart_interval_roundtrip() {
+    use oxideav_mjpeg::encoder::encode_arith_jpeg_grayscale;
+
+    let (w, h) = (32u32, 24u32);
+    let stride = w as usize;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            samples[y * stride + x] = ((x * 7 + y * 11) % 256) as u8;
+        }
+    }
+
+    let no_rst = encode_arith_jpeg_grayscale(w, h, &samples, stride, 75, 0).expect("SOF9 no rst");
+    let with_rst = encode_arith_jpeg_grayscale(w, h, &samples, stride, 75, 2).expect("SOF9 rst=2");
+    assert!(
+        with_rst
+            .windows(2)
+            .any(|x| x[0] == 0xFF && (0xD0..=0xD7).contains(&x[1])),
+        "no RSTn marker emitted"
+    );
+
+    let a = decode_to_gray(no_rst, w, h);
+    let b = decode_to_gray(with_rst, w, h);
+    assert_eq!(a, b, "restart framing must not change the rendered image");
+}
+
+fn decode_to_gray(jpeg: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), jpeg))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    let stride = v.planes[0].stride;
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            out.push(v.planes[0].data[y * stride + x]);
+        }
+    }
+    out
+}

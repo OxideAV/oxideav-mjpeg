@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sequential arithmetic DCT encoder (SOF9), grayscale.**
+  `encoder::encode_arith_jpeg_grayscale` emits a standalone SOF9
+  (extended-sequential DCT, arithmetic-coded) grayscale JPEG — the Q-coder
+  counterpart of the baseline `encode_jpeg_grayscale`. Forward DCT and
+  quality-scaled quantisation are shared with the baseline path; the entropy
+  stage codes each block's DC difference (§F.1.4.1) and full AC band
+  (§F.1.4) through the binary Q-coder with default conditioning
+  (`(L,U)=(0,1)`, `Kx=5`, no DAC). Optional restart-interval framing emits
+  DRI + cycling `RST0..=RST7` with per-interval re-initialisation of the
+  coder, statistics and DC predictor (§F.2.4.4). The Q-coder DC-diff / AC
+  band / block encode procedures were promoted into `jpeg::arith` as
+  `pub(crate)` (`encode_dc_diff`, `encode_ac`, `encode_block`). New tests:
+  a module-level encode→decode block round-trip, and integration round-trips
+  asserting SOF9 output decodes **byte-identical** to the baseline SOF0 path
+  (and that restart framing does not change the rendered image).
+
 - **Hierarchical arithmetic DCT progression (SOF9/SOF10 + SOF13/SOF14)**
   (T.81 §K.7.2.1 / §J.2.3.1 / §J.2.4). The `DHP` control loop now decodes
   the arithmetic-coded DCT hierarchical progression — the Q-coder

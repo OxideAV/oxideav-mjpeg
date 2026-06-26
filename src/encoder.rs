@@ -3657,6 +3657,135 @@ fn write_sof11_lossless_yuv(
     write_length_prefix(out, markers::SOF11, &payload);
 }
 
+// ---- Sequential arithmetic DCT (SOF9) grayscale encoder ------------------
+//
+// T.81 §F.2 / Annex D: the SOF9 (extended sequential DCT, arithmetic-coded)
+// process shares the SOF0/SOF1 MCU layout but replaces the Huffman entropy
+// stage with the binary Q-coder. Each 8×8 block is forward-DCT'd, quantised,
+// and emitted as a DC difference (§F.1.4.1) plus a full AC band (§F.1.4) under
+// the per-component DC/AC statistics areas. No DAC segment is written, so the
+// decoder applies the default conditioning `(L, U) = (0, 1)` and `Kx = 5`
+// (§F.1.4.4.1.3). The output round-trips bit-exact through this crate's SOF9
+// decode path.
+
+/// Write a SOF9 (extended sequential DCT, arithmetic) frame header for a
+/// single 8-bit grayscale component, `H = V = 1`, quantiser table 0.
+fn write_sof9_grayscale_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(8); // P = 8
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf = 1
+    payload.push(1); // component id 1
+    payload.push(0x11); // H = 1, V = 1
+    payload.push(0); // quantiser table 0
+    write_length_prefix(out, markers::SOF9, &payload);
+}
+
+/// Encode a single-component grayscale image as a standalone **sequential,
+/// arithmetic-coded DCT** JPEG (SOF9) byte stream — the Q-coder counterpart
+/// of [`encode_jpeg_grayscale`]. Forward-DCT + quality-scaled quantisation
+/// are identical to the baseline path; only the entropy stage differs.
+///
+/// `restart_interval` (in MCUs) emits a DRI segment and re-initialises the
+/// Q-coder + per-component statistics + DC predictor at every `RST0..=RST7`
+/// boundary (§F.2.4.4 / §F.1.4.4.1.5). Passing `0` disables restart markers.
+/// Default arithmetic conditioning is used (no DAC). Output is bit-exact
+/// through the SOF9 decode path.
+pub fn encode_arith_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    restart_interval: u16,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("arith-DCT encoder: zero-size image"));
+    }
+    if stride < w {
+        return Err(Error::invalid(
+            "arith-DCT encoder: stride smaller than width",
+        ));
+    }
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "arith-DCT encoder: samples shorter than stride*h",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+
+    let mut out: Vec<u8> = Vec::with_capacity(8_192);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_sof9_grayscale_8bit(&mut out, w as u16, h as u16);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    // SOS — one component (id 1), DC table 0, AC table 0, Ss=0 Se=63 Ah=Al=0.
+    write_sos_grayscale_8bit(&mut out);
+
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let total_mcus = mcus_x.saturating_mul(mcus_y);
+    let ri = restart_interval as usize;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: usize = 0;
+    let mut mcu_index: usize = 0;
+
+    let mut dc = DcStats::new();
+    let mut ac = AcStats::new();
+    let mut enc = ArithEncoder::new();
+
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            let mut blk = [0.0f32; 64];
+            fill_block(&mut blk, samples, stride, w, h, mx * 8, my * 8);
+            fdct8x8(&mut blk);
+            // Quantise to natural order, then reorder into zigzag-index
+            // order for the arithmetic AC band coder (which indexes by the
+            // zigzag position `k`).
+            let mut zz = [0i32; 64];
+            for k in 0..64 {
+                let v = blk[ZIGZAG[k]] / luma_q[ZIGZAG[k]] as f32;
+                zz[k] = if v >= 0.0 {
+                    (v + 0.5) as i32
+                } else {
+                    -((-v + 0.5) as i32)
+                };
+            }
+            arith_encode_block(&mut enc, &mut dc, &mut ac, &zz);
+
+            mcu_index += 1;
+            mcus_since_restart += 1;
+
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                // Flush the arithmetic segment, emit RSTn, then re-init the
+                // coder + stats + DC predictor for the next interval.
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                dc = DcStats::new();
+                ac = AcStats::new();
+                mcus_since_restart = 0;
+            }
+        }
+    }
+    out.extend_from_slice(&enc.finish());
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Encode a single-component grayscale image as a standalone **lossless,
 /// arithmetic-coded** JPEG (SOF11) byte stream — the entropy-coder
 /// counterpart of [`encode_lossless_jpeg_grayscale`].

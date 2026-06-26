@@ -75,8 +75,25 @@
 //! every precision, every predictor, point transform and restart
 //! intervals.
 //!
+//! Hierarchical-mode (DHP-introduced) JPEGs are decoded across both
+//! progression families (T.81 Annex J / §K.7.2): the spatial-lossless
+//! progression (non-differential SOF3 / SOF11 first frame + differential
+//! SOF7 / SOF15 refinements) and the DCT progression (non-differential
+//! SOF0 / SOF1 / SOF2 Huffman or SOF9 / SOF10 arithmetic first frame +
+//! differential SOF5 / SOF6 Huffman or SOF13 / SOF14 arithmetic
+//! refinements, optionally SOF7 / SOF15-terminated). EXP ×2 upsampling,
+//! the §J.2.1 modulo-2^16 reference reconstruction and the §J.2.3.1
+//! differential coding model (direct DC, no level shift) are all handled.
+//!
+//! On the **encode** path, SOF9 (sequential arithmetic DCT) grayscale is
+//! produced by [`encoder::encode_arith_jpeg_grayscale`] (with optional
+//! restart-interval framing) alongside the baseline / progressive /
+//! lossless (Huffman and arithmetic) encoders.
+//!
 //! **Not supported** (will return `Error::Unsupported`):
-//! - Hierarchical (SOF5..SOF7, SOF13..SOF15) JPEGs
+//! - Bare differential frames (SOF5..SOF7 / SOF13..SOF15) **without** a
+//!   preceding DHP marker — a differential frame is only meaningful inside
+//!   a hierarchical sequence.
 //! - 12-bit progressive 4-component JPEGs (the workspace `PixelFormat`
 //!   enum has no 12-bit CMYK variant; `P=8` 4-component CMYK / YCCK
 //!   *is* supported on both the sequential and progressive scan

@@ -1222,6 +1222,120 @@ pub(crate) fn encode_magnitude(
     }
 }
 
+/// Encoder-side §F.1.4.1 DC difference for the sequential / progressive
+/// DCT arithmetic models — the exact mirror of [`decode_dc_diff`]. Codes the
+/// difference `diff = V − Pred` using the DC statistics area `dc`, updates
+/// `dc.prev_diff` (the `Da` conditioning input for the next block) and
+/// returns. The caller owns the `dc.pred` accumulation. `|diff|` must fit the
+/// 15-bit magnitude tree (enforced by the SOF9/SOF10 emit paths, whose
+/// 8-/12-bit samples bound the DC range).
+pub(crate) fn encode_dc_diff(e: &mut ArithEncoder, dc: &mut DcStats, diff: i32) {
+    let s0 = dc.dc_context();
+    if diff == 0 {
+        e.code_bit(&mut dc.bins[s0], 0);
+        dc.prev_diff = 0;
+        return;
+    }
+    e.code_bit(&mut dc.bins[s0], 1);
+    let sign = u8::from(diff < 0);
+    e.code_bit(&mut dc.bins[s0 + 1], sign);
+    let sx = s0 + 2 + sign as usize;
+    // X1 base for DC is bin 20 (Table F.4); M-bins shadow X-bins at +14.
+    encode_magnitude(e, &mut dc.bins, sx, 20, diff.unsigned_abs() - 1);
+    dc.prev_diff = diff;
+}
+
+/// Encoder-side AC magnitude with the Table F.5 bin layout (SP = SN = X1 =
+/// S0 + 1; X2.. at 189 / 217 by `K <= Kx`; M-bins shadow X-bins at +14) —
+/// mirror of the AC arm of [`decode_magnitude`].
+fn encode_ac_mag(e: &mut ArithEncoder, bins: &mut [Context], k: usize, kx: u8, sz: u32) {
+    let s_first = 3 * (k - 1) + 2;
+    if sz == 0 {
+        e.code_bit(&mut bins[s_first], 0);
+        return;
+    }
+    e.code_bit(&mut bins[s_first], 1);
+    if sz < 2 {
+        // X1 coincides with the first-magnitude bin for AC.
+        e.code_bit(&mut bins[s_first], 0);
+        return;
+    }
+    e.code_bit(&mut bins[s_first], 1);
+    let mut m = 4u32;
+    let mut s = if (k as u8) <= kx { 189 } else { 217 };
+    while sz >= m {
+        e.code_bit(&mut bins[s], 1);
+        m <<= 1;
+        s += 1;
+    }
+    e.code_bit(&mut bins[s], 0);
+    let m_bin = s + 14;
+    let mut bit = m >> 2;
+    while bit != 0 {
+        e.code_bit(&mut bins[m_bin], u8::from(sz & bit != 0));
+        bit >>= 1;
+    }
+}
+
+/// Encoder-side AC band coder for one block (§F.1.4 / §G.1.3.2) — mirror of
+/// [`decode_ac`]. `vals` holds the coefficients in **zigzag-index** order
+/// (index `k` = the `k`-th coefficient in the zigzag scan). Codes the band
+/// `[ss, se]` with `ac`'s statistics, where `ss = 1`/`se = 63` is the full
+/// sequential AC band. The sign uses the fixed 0.5 estimate.
+pub(crate) fn encode_ac(
+    e: &mut ArithEncoder,
+    ac: &mut AcStats,
+    vals: &[i32; 64],
+    ss: usize,
+    se: usize,
+) {
+    let mut eob = ss;
+    for k in ss..=se {
+        if vals[k] != 0 {
+            eob = k + 1;
+        }
+    }
+    let mut k = ss;
+    loop {
+        let se_bin = 3 * (k - 1);
+        if k >= eob {
+            e.code_bit(&mut ac.bins[se_bin], 1);
+            return;
+        }
+        e.code_bit(&mut ac.bins[se_bin], 0);
+        while vals[k] == 0 {
+            e.code_bit(&mut ac.bins[3 * (k - 1) + 1], 0);
+            k += 1;
+        }
+        e.code_bit(&mut ac.bins[3 * (k - 1) + 1], 1);
+        let v = vals[k];
+        let mut sign_ctx = Context { idx: 0, mps: 0 };
+        e.code_bit(&mut sign_ctx, u8::from(v < 0));
+        encode_ac_mag(e, &mut ac.bins, k, ac.kx, v.unsigned_abs() - 1);
+        if k == se {
+            return;
+        }
+        k += 1;
+    }
+}
+
+/// Encode one DCT block (DC diff + AC zigzag) using the Q-coder and the
+/// per-component DC/AC statistics areas — encoder mirror of
+/// [`super::super::decoder::decode_arith_block`]. `block` holds the
+/// coefficients in zigzag-index order. The caller carries `dc.pred` across
+/// blocks (zeroing it per block yields the §J.2.3.1 differential model).
+pub(crate) fn encode_block(
+    e: &mut ArithEncoder,
+    dc: &mut DcStats,
+    ac: &mut AcStats,
+    block: &[i32; 64],
+) {
+    let diff = block[0] - dc.pred;
+    encode_dc_diff(e, dc, diff);
+    dc.pred = block[0];
+    encode_ac(e, ac, block, 1, 63);
+}
+
 // ---------------------------------------------------------------------------
 // Tests against the K.4 example trace (T.81 Annex K).
 // ---------------------------------------------------------------------------
@@ -1421,5 +1535,66 @@ mod tests {
         assert_eq!(s.next_byte(), 0); // marker triggered
         assert_eq!(s.seen_marker, Some(0xD9));
         assert_eq!(s.next_byte(), 0); // pads
+    }
+
+    /// The sequential DCT block encoder (`encode_block`) round-trips through
+    /// the decode-side DC-diff + AC procedures, with the DC predictor carried
+    /// across blocks. Exercises the §F.1.4.1 DC model and the §F.1.4 AC band
+    /// model end-to-end for a range of coefficient patterns.
+    ///
+    /// `encode_block` takes coefficients in **zigzag-index** order
+    /// (`vals[k]` = the `k`-th zigzag coefficient), while `decode_ac` writes
+    /// the recovered coefficients into **natural** order (`coefs[ZIGZAG[k]]`),
+    /// so the expectation is built in natural order via the same mapping.
+    #[test]
+    fn arith_dct_block_roundtrip() {
+        use crate::jpeg::zigzag::ZIGZAG;
+
+        // Deterministic zigzag-order coefficient blocks.
+        let mut zz_blocks: Vec<[i32; 64]> = Vec::new();
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..12 {
+            let mut b = [0i32; 64];
+            b[0] = (next() % 401) as i32 - 200; // DC in -200..=200
+            let acn = (next() % 12) as usize;
+            for _ in 0..acn {
+                let k = 1 + (next() as usize) % 63;
+                b[k] = (next() % 121) as i32 - 60;
+            }
+            zz_blocks.push(b);
+        }
+
+        // Encode all blocks into one entropy segment.
+        let mut e = ArithEncoder::new();
+        let mut dc_e = DcStats::new();
+        let mut ac_e = AcStats::new();
+        for b in &zz_blocks {
+            encode_block(&mut e, &mut dc_e, &mut ac_e, b);
+        }
+        let coded = e.finish();
+
+        // Decode (natural order) and compare against the natural-order
+        // mapping of each zigzag-order source block.
+        let mut d = ArithDecoder::new(&coded);
+        let mut dc_d = DcStats::new();
+        let mut ac_d = AcStats::new();
+        for (bi, zz) in zz_blocks.iter().enumerate() {
+            let mut want = [0i32; 64];
+            for k in 0..64 {
+                want[ZIGZAG[k]] = zz[k];
+            }
+            let mut got = [0i32; 64];
+            let diff = decode_dc_diff(&mut d, &mut dc_d).unwrap();
+            dc_d.pred = dc_d.pred.wrapping_add(diff);
+            got[0] = dc_d.pred;
+            decode_ac(&mut d, &mut ac_d, &mut got, 1, 63).unwrap();
+            assert_eq!(got, want, "block {bi} coefficient mismatch");
+        }
     }
 }

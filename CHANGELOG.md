@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sequential arithmetic DCT encoder (SOF9), 3-component YCbCr.**
+  `encoder::encode_arith_jpeg_yuv` emits a standalone SOF9 (sequential
+  arithmetic DCT) YCbCr JPEG across 4:4:4 / 4:2:2 / 4:2:0 subsampling — the
+  Q-coder counterpart of the baseline `encode_jpeg`. The MCU interleave,
+  forward DCT and quality-scaled quantisation match the baseline path; each
+  block is coded through the Q-coder under per-component statistics areas
+  with default conditioning. Optional restart-interval framing. New
+  integration round-trips assert the three planes decode byte-identical to
+  the baseline SOF0 YUV path at every subsampling, plus a restart-framing
+  invariance test.
+
 - **Sequential arithmetic DCT encoder (SOF9), grayscale.**
   `encoder::encode_arith_jpeg_grayscale` emits a standalone SOF9
   (extended-sequential DCT, arithmetic-coded) grayscale JPEG — the Q-coder

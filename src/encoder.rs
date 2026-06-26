@@ -3786,6 +3786,207 @@ pub fn encode_arith_jpeg_grayscale(
     Ok(out)
 }
 
+/// Write a SOF9 (extended sequential DCT, arithmetic) frame header for a
+/// three-component YCbCr frame: luma carries the `H × V` oversampling and
+/// quantiser table 0, the two chroma components are `1 × 1` and use
+/// quantiser table 1. Mirrors [`write_sof0`] but with the SOF9 marker.
+fn write_sof9_yuv(out: &mut Vec<u8>, width: u16, height: u16, h: u8, v: u8) {
+    let mut payload = Vec::with_capacity(8 + 9);
+    payload.push(8); // P = 8
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(3); // Nf
+    payload.push(1); // Y id
+    payload.push((h << 4) | v);
+    payload.push(0); // Tq = 0 (luma)
+    payload.push(2); // Cb id
+    payload.push(0x11);
+    payload.push(1); // Tq = 1 (chroma)
+    payload.push(3); // Cr id
+    payload.push(0x11);
+    payload.push(1);
+    write_length_prefix(out, markers::SOF9, &payload);
+}
+
+/// Encode a YCbCr `VideoFrame` (4:4:4 / 4:2:2 / 4:2:0) as a standalone
+/// **sequential, arithmetic-coded DCT** JPEG (SOF9) — the Q-coder
+/// counterpart of [`encode_jpeg`]. The MCU interleave, forward DCT and
+/// quality-scaled quantisation are identical to the baseline path; the
+/// entropy stage codes each block (DC diff + AC band) through the binary
+/// Q-coder under per-component statistics areas. Default conditioning is
+/// used (no DAC). `restart_interval` (in MCUs) emits DRI + cycling
+/// `RST0..=RST7` with per-interval re-initialisation. Output round-trips
+/// bit-exact through the SOF9 decode path.
+pub fn encode_arith_jpeg_yuv(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    quality: u8,
+    restart_interval: u16,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+
+    let width = width as usize;
+    let height = height as usize;
+    let (h_factor, v_factor) = match pix {
+        PixelFormat::Yuv444P => (1u8, 1u8),
+        PixelFormat::Yuv422P => (2, 1),
+        PixelFormat::Yuv420P => (2, 2),
+        _ => {
+            return Err(Error::unsupported(
+                "arith-DCT YUV encoder: unsupported pixel format",
+            ))
+        }
+    };
+    if frame.planes.len() != 3 {
+        return Err(Error::invalid("arith-DCT YUV encoder: expected 3 planes"));
+    }
+    if width == 0 || height == 0 {
+        return Err(Error::invalid("arith-DCT YUV encoder: zero-size image"));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let chroma_q = scale_for_quality(&DEFAULT_CHROMA_Q50, quality);
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_dqt(&mut out, 1, &chroma_q);
+    write_sof9_yuv(&mut out, width as u16, height as u16, h_factor, v_factor);
+    if restart_interval != 0 {
+        write_dri(&mut out, restart_interval);
+    }
+    write_sos(&mut out);
+
+    let mcu_w_px = 8 * h_factor as usize;
+    let mcu_h_px = 8 * v_factor as usize;
+    let mcus_x = width.div_ceil(mcu_w_px);
+    let mcus_y = height.div_ceil(mcu_h_px);
+    let total_mcus = mcus_x.saturating_mul(mcus_y);
+
+    let y_plane = &frame.planes[0];
+    let cb_plane = &frame.planes[1];
+    let cr_plane = &frame.planes[2];
+    let (c_w, c_h) = match pix {
+        PixelFormat::Yuv444P => (width, height),
+        PixelFormat::Yuv422P => (width.div_ceil(2), height),
+        PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
+        _ => unreachable!(),
+    };
+
+    // Per-component statistics: index 0 = luma, 1 = Cb, 2 = Cr. The decoder
+    // keeps DC/AC stats per SOF component too, so they stay in lockstep.
+    let mut dc = [DcStats::new(), DcStats::new(), DcStats::new()];
+    let mut ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+    let mut enc = ArithEncoder::new();
+
+    let ri = restart_interval as usize;
+    let mut rst_counter: u8 = 0;
+    let mut mcus_since_restart: usize = 0;
+    let mut mcu_index: usize = 0;
+
+    // Encode one block from `plane` at (x0, y0) under component `ci`.
+    let encode_one = |enc: &mut ArithEncoder,
+                      dc: &mut [DcStats; 3],
+                      ac: &mut [AcStats; 3],
+                      plane: &[u8],
+                      stride: usize,
+                      pw: usize,
+                      ph: usize,
+                      x0: usize,
+                      y0: usize,
+                      qt: &[u16; 64],
+                      ci: usize| {
+        let mut blk = [0.0f32; 64];
+        fill_block(&mut blk, plane, stride, pw, ph, x0, y0);
+        fdct8x8(&mut blk);
+        let mut zz = [0i32; 64];
+        for k in 0..64 {
+            let v = blk[ZIGZAG[k]] / qt[ZIGZAG[k]] as f32;
+            zz[k] = if v >= 0.0 {
+                (v + 0.5) as i32
+            } else {
+                -((-v + 0.5) as i32)
+            };
+        }
+        arith_encode_block(enc, &mut dc[ci], &mut ac[ci], &zz);
+    };
+
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            // Luma blocks (H×V per MCU).
+            for by in 0..v_factor as usize {
+                for bx in 0..h_factor as usize {
+                    let x0 = mx * mcu_w_px + bx * 8;
+                    let y0 = my * mcu_h_px + by * 8;
+                    encode_one(
+                        &mut enc,
+                        &mut dc,
+                        &mut ac,
+                        &y_plane.data,
+                        y_plane.stride,
+                        width,
+                        height,
+                        x0,
+                        y0,
+                        &luma_q,
+                        0,
+                    );
+                }
+            }
+            // Chroma: one block each per MCU.
+            let cx0 = mx * 8;
+            let cy0 = my * 8;
+            encode_one(
+                &mut enc,
+                &mut dc,
+                &mut ac,
+                &cb_plane.data,
+                cb_plane.stride,
+                c_w,
+                c_h,
+                cx0,
+                cy0,
+                &chroma_q,
+                1,
+            );
+            encode_one(
+                &mut enc,
+                &mut dc,
+                &mut ac,
+                &cr_plane.data,
+                cr_plane.stride,
+                c_w,
+                c_h,
+                cx0,
+                cy0,
+                &chroma_q,
+                2,
+            );
+
+            mcu_index += 1;
+            mcus_since_restart += 1;
+            if ri != 0 && mcus_since_restart == ri && mcu_index < total_mcus {
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.push(0xFF);
+                out.push(markers::RST0 + (rst_counter & 0x07));
+                rst_counter = rst_counter.wrapping_add(1);
+                dc = [DcStats::new(), DcStats::new(), DcStats::new()];
+                ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+                mcus_since_restart = 0;
+            }
+        }
+    }
+    out.extend_from_slice(&enc.finish());
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Encode a single-component grayscale image as a standalone **lossless,
 /// arithmetic-coded** JPEG (SOF11) byte stream — the entropy-coder
 /// counterpart of [`encode_lossless_jpeg_grayscale`].

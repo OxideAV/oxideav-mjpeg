@@ -1199,3 +1199,75 @@ fn decode_to_gray(jpeg: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
     }
     out
 }
+
+/// SOF9 (sequential arithmetic DCT) 3-component YUV encode → decode must
+/// produce planes byte-identical to the baseline SOF0 YUV path at the same
+/// quality, across 4:4:4 / 4:2:2 / 4:2:0 subsampling. Same forward DCT +
+/// quantiser; the Q-coder entropy stage is lossless.
+#[test]
+fn arith_sof9_yuv_matches_baseline_pixels() {
+    use oxideav_mjpeg::encoder::{encode_arith_jpeg_yuv, encode_jpeg};
+
+    for pix in [
+        PixelFormat::Yuv444P,
+        PixelFormat::Yuv422P,
+        PixelFormat::Yuv420P,
+    ] {
+        let (w, h) = (32u32, 24u32);
+        let frame = make_gradient_frame(w, h, pix);
+
+        let arith = encode_arith_jpeg_yuv(&frame, w, h, pix, 78, 0).expect("encode SOF9 YUV");
+        assert!(
+            arith.windows(2).any(|x| x == [0xFF, 0xC9]),
+            "{pix:?}: SOF9 marker missing"
+        );
+        let base = encode_jpeg(&frame, w, h, pix, 78).expect("encode SOF0 YUV");
+
+        let va = decode_planes(arith, w, h);
+        let vb = decode_planes(base, w, h);
+        assert_eq!(va.len(), vb.len(), "{pix:?}: plane count");
+        for (ci, (a, b)) in va.iter().zip(vb.iter()).enumerate() {
+            assert_eq!(a, b, "{pix:?}: plane {ci} mismatch (SOF9 vs SOF0)");
+        }
+    }
+}
+
+/// SOF9 YUV with a restart interval renders identically to the restart-free
+/// SOF9 output — confirms the multi-component RSTn re-initialisation stays
+/// in lockstep with the decoder.
+#[test]
+fn arith_sof9_yuv_restart_interval_roundtrip() {
+    use oxideav_mjpeg::encoder::encode_arith_jpeg_yuv;
+
+    let pix = PixelFormat::Yuv420P;
+    let (w, h) = (48u32, 32u32);
+    let frame = make_gradient_frame(w, h, pix);
+
+    let no_rst = encode_arith_jpeg_yuv(&frame, w, h, pix, 70, 0).expect("SOF9 YUV no rst");
+    let with_rst = encode_arith_jpeg_yuv(&frame, w, h, pix, 70, 2).expect("SOF9 YUV rst=2");
+    assert!(
+        with_rst
+            .windows(2)
+            .any(|x| x[0] == 0xFF && (0xD0..=0xD7).contains(&x[1])),
+        "no RSTn marker emitted"
+    );
+
+    let a = decode_planes(no_rst, w, h);
+    let b = decode_planes(with_rst, w, h);
+    for (ci, (pa, pb)) in a.iter().zip(b.iter()).enumerate() {
+        assert_eq!(pa, pb, "plane {ci}: restart framing changed the image");
+    }
+}
+
+fn decode_planes(jpeg: Vec<u8>, w: u32, h: u32) -> Vec<Vec<u8>> {
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+    let mut dec = oxideav_mjpeg::decoder::make_decoder(&dec_params).expect("dec");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), jpeg))
+        .expect("send");
+    let Frame::Video(v) = dec.receive_frame().expect("decode") else {
+        panic!("expected video")
+    };
+    v.planes.iter().map(|p| p.data.clone()).collect()
+}

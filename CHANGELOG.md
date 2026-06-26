@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.8...v0.2.0) - 2026-06-26
+
+### Added
+
+- *(decode)* hierarchical arithmetic spatial-lossless progression (SOF11 + SOF15)
+- *(decode)* hierarchical DCT progression — differential progressive SOF6 frame
+- *(decode)* hierarchical DCT progression terminated by a differential lossless SOF7 frame
+
+### Fixed
+
+- *(decode)* reject over-subscribed Huffman table (fuzz crash, never-panic)
+
+### Other
+
+- progressive arithmetic DCT emit (SOF10), grayscale (T.81 §G.1.3)
+- MjpegEncoder::set_arithmetic — SOF9 emit via the trait API
+- SOF9 arithmetic DCT emit for packed RGB24
+- SOF9 arithmetic DCT emit for 3-component YCbCr (4:4:4/4:2:2/4:2:0)
+- sequential arithmetic DCT emit (SOF9), grayscale (T.81 §F.2 / Annex D)
+- hierarchical arithmetic DCT progression — SOF9/10 + SOF13/14 (T.81 §K.7.2.1 / §J.2.3.1)
+- lock in 12-bit grayscale + RGB-class hierarchical DCT progressions
+- two-stage hierarchical DCT progression — 12-bit YUV-class (§J.2.1)
+- hierarchical DCT progression — 12-bit 3-component YUV-class (§K.7.2.1)
+- *(decode)* Huffman fast-table + IDCT DC/zero short-circuits (~1.5× baseline decode, bit-identical)
+- hierarchical DCT YCCK (Adobe transform=2) coverage + doc fixup
+- hierarchical DCT progression — 4-component CMYK-class frames (T.81 §K.7.2.1)
+- hierarchical DCT progression — 3-component YUV-class frames (T.81 §K.7.2.1)
+- document hierarchical DCT progression decode (§K.7.2.1)
+- hierarchical DCT progression — differential SOF5 frames (T.81 §J.2.3.1)
+- hierarchical DCT progression — non-differential frames (T.81 §K.7.2.1)
+- hierarchical spatial lossless — 3/4-component progressions
+- hierarchical-mode spatial lossless progression (T.81 Annex J)
+- typed DQT quantization-table view (T.81 §B.2.4.1) on JpegInfo
+- SOF11 subsampled YUV-class lossless arithmetic encode + decode
+- SOF3 subsampled YUV-class lossless encode + decode (T.81 A.2.3)
+- typed COM (comment) segments view (T.81 §B.2.4.5) on JpegInfo
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - **Decoder panic on an over-subscribed Huffman table (fuzz crash).**

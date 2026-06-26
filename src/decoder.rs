@@ -1567,6 +1567,25 @@ fn decode_arith_scan(
     scan: &[u8],
     coefs: &mut [Vec<[i32; 64]>],
 ) -> Result<()> {
+    decode_arith_scan_diff(state, sos, scan, coefs, false)
+}
+
+/// Sequential arithmetic-coded scan with an optional differential (§J.2.3.1)
+/// DC model. When `differential` is true the DC coefficient of every block
+/// is decoded **directly** — the per-component DC prediction is zeroed before
+/// each block so the stored coefficient is the two's-complement difference of
+/// a SOF13 differential-sequential-DCT hierarchical-mode frame. §J.2.4: the
+/// arithmetic coding models themselves already carry the precision the
+/// differential frame needs, so only the prediction is suppressed; the
+/// per-coefficient binary-decision trees are unchanged. The non-differential
+/// case (`differential = false`) is the ordinary SOF9 sequential scan.
+fn decode_arith_scan_diff(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+    differential: bool,
+) -> Result<()> {
     let sof = state
         .sof
         .as_ref()
@@ -1703,6 +1722,12 @@ fn decode_arith_scan(
                             let bidx_x = mx * c.h_factor as usize + bx;
                             let bidx_y = my * c.v_factor as usize + by;
                             let bi = bidx_y * blocks_x + bidx_x;
+                            // §J.2.3.1: a differential DCT frame decodes the DC
+                            // coefficient directly — zero the prediction state
+                            // before each block so no inter-block carry happens.
+                            if differential {
+                                dc_stats[sof_idx].pred = 0;
+                            }
                             decode_arith_block(
                                 &mut decoder,
                                 &mut dc_stats[sof_idx],
@@ -1717,6 +1742,9 @@ fn decode_arith_scan(
                 let c = sof.components[sof_idx];
                 let blocks_x = mcus_x * c.h_factor as usize;
                 let bi = my * blocks_x + mx;
+                if differential {
+                    dc_stats[sof_idx].pred = 0;
+                }
                 decode_arith_block(
                     &mut decoder,
                     &mut dc_stats[sof_idx],
@@ -1801,6 +1829,25 @@ fn decode_progressive_arith_scan(
     sos: &SosInfo,
     scan: &[u8],
     coefs: &mut [Vec<[i32; 64]>],
+) -> Result<()> {
+    decode_progressive_arith_scan_diff(state, sos, scan, coefs, false)
+}
+
+/// Progressive arithmetic-coded scan with an optional differential
+/// (§J.2.3.1) DC model. When `differential` is true the first DC scan
+/// (`Ah = 0`) decodes the DC coefficient **directly** — the per-component DC
+/// prediction is zeroed before each block — so the stored value is the
+/// two's-complement difference of a SOF14 differential-progressive-DCT
+/// hierarchical-mode frame. DC successive-approximation refinement scans
+/// (`Ah > 0`) and all AC scans are unaffected; §J.2.3.1 modifies only the
+/// first DC pass. §J.2.4: the arithmetic models already carry the needed
+/// precision, so only the prediction is suppressed.
+fn decode_progressive_arith_scan_diff(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    coefs: &mut [Vec<[i32; 64]>],
+    differential: bool,
 ) -> Result<()> {
     let sof = state
         .sof
@@ -1914,6 +1961,12 @@ fn decode_progressive_arith_scan(
                                 let bidx_x = mx * c.h_factor as usize + bx;
                                 let bidx_y = my * c.v_factor as usize + by;
                                 let bi = bidx_y * blocks_x + bidx_x;
+                                // §J.2.3.1: a differential frame's first DC
+                                // pass decodes the DC directly; zero the
+                                // prediction state before each block.
+                                if differential && sos.ah == 0 {
+                                    dc_stats[sidx].pred = 0;
+                                }
                                 prog_arith_decode_dc(
                                     &mut decoder,
                                     &mut dc_stats[sidx],
@@ -1929,6 +1982,9 @@ fn decode_progressive_arith_scan(
                     let c = sof.components[sof_idx];
                     let blocks_x = mcus_x * c.h_factor as usize;
                     let bi = my * blocks_x + mx;
+                    if differential && sos.ah == 0 {
+                        dc_stats[0].pred = 0;
+                    }
                     prog_arith_decode_dc(
                         &mut decoder,
                         &mut dc_stats[0],
@@ -3388,6 +3444,12 @@ fn decode_hierarchical(
     // planar `Yuv444P`, RGB-class as packed `Rgb24`. `None` for grayscale or
     // lossless progressions, where shaping is precision-driven.
     let mut dct_yuv_class: Option<bool> = None;
+    // Entropy coder of a DCT progression, fixed by the non-differential first
+    // DCT frame: `false` = Huffman (SOF0/1/2 + SOF5/6), `true` = arithmetic
+    // (SOF9/10 + SOF13/14). A differential DCT refinement frame must match its
+    // non-differential frame's coder; mixing the two is malformed (§K.7.2).
+    // Irrelevant for lossless progressions.
+    let mut dct_arith = false;
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -3519,7 +3581,7 @@ fn decode_hierarchical(
             // SOF2 = progressive — all Huffman-coded. The reconstructed
             // image samples (level-shifted, clamped to 0..2^P) become the
             // reference component planes.
-            SOF0 | SOF1 | SOF2 => {
+            SOF0 | SOF1 | SOF2 | markers::SOF9 | markers::SOF10 => {
                 if reference.is_some() {
                     return Err(Error::unsupported(
                         "hierarchical JPEG: a second non-differential frame is not supported",
@@ -3531,6 +3593,10 @@ fn decode_hierarchical(
                     ));
                 }
                 dct_mode = Some(true);
+                // SOF9 (extended sequential arith) / SOF10 (progressive arith)
+                // open an arithmetic DCT progression (§K.7.2.1); SOF0/1/2 open
+                // a Huffman one.
+                dct_arith = matches!(marker, markers::SOF9 | markers::SOF10);
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
                 validate_sof(&sof)?;
@@ -3555,30 +3621,41 @@ fn decode_hierarchical(
                     dct_yuv_class = Some(is_yuv);
                 }
                 state.sof = Some(sof.clone());
-                let progressive = marker == SOF2;
-                reference = Some(decode_hierarchical_dct_frame(
-                    &state,
-                    walker,
-                    false,
-                    progressive,
-                )?);
+                // SOF2 (Huffman) and SOF10 (arith) are progressive; SOF0/1/9
+                // are sequential.
+                let progressive = matches!(marker, SOF2 | markers::SOF10);
+                reference = Some(if dct_arith {
+                    decode_hierarchical_dct_arith_frame(&state, walker, false, progressive)?
+                } else {
+                    decode_hierarchical_dct_frame(&state, walker, false, progressive)?
+                });
             }
             // Differential DCT frame (a refinement stage). SOF5 = differential
-            // sequential, SOF6 = differential progressive — both Huffman-coded
-            // (§J.2.3.1). The decoded IDCT output is the signed two's-
-            // complement difference (no level shift, DC decoded directly); it
-            // is added modulo 2^16 to the upsampled reference (§J.2.1). SOF6
-            // routes its scans through the spectral-selection /
-            // successive-approximation accumulator (same decomposition as the
-            // non-hierarchical SOF2 progressive path) with the §J.2.3.1
-            // direct-DC modification.
-            SOF5 | SOF6 => {
+            // sequential, SOF6 = differential progressive (Huffman); SOF13 =
+            // differential sequential, SOF14 = differential progressive
+            // (arithmetic) — all §J.2.3.1. The decoded IDCT output is the
+            // signed two's-complement difference (no level shift, DC decoded
+            // directly); it is added modulo 2^16 to the upsampled reference
+            // (§J.2.1). SOF6/SOF14 route their scans through the
+            // spectral-selection / successive-approximation accumulator (same
+            // decomposition as the non-hierarchical SOF2/SOF10 progressive
+            // path) with the §J.2.3.1 direct-DC modification. The differential
+            // frame's coder must match the non-differential frame's: a
+            // Huffman differential refining an arithmetic progression (or vice
+            // versa) is a malformed mix of coders (§K.7.2).
+            SOF5 | SOF6 | markers::SOF13 | markers::SOF14 => {
                 if dct_mode != Some(true) {
                     return Err(Error::invalid(
                         "hierarchical JPEG: differential DCT frame without a DCT first frame",
                     ));
                 }
-                let prog = marker == SOF6;
+                let frame_arith = matches!(marker, markers::SOF13 | markers::SOF14);
+                if frame_arith != dct_arith {
+                    return Err(Error::invalid(
+                        "hierarchical JPEG: differential DCT frame coder (Huffman/arithmetic) differs from the non-differential frame",
+                    ));
+                }
+                let prog = matches!(marker, SOF6 | markers::SOF14);
                 let prev = reference.take().ok_or_else(|| {
                     Error::invalid(
                         "hierarchical JPEG: differential frame before a non-differential frame",
@@ -3603,7 +3680,11 @@ fn decode_hierarchical(
                     }
                 }
                 state.sof = Some(sof.clone());
-                let diff = decode_hierarchical_dct_frame(&state, walker, true, prog)?;
+                let diff = if frame_arith {
+                    decode_hierarchical_dct_arith_frame(&state, walker, true, prog)?
+                } else {
+                    decode_hierarchical_dct_frame(&state, walker, true, prog)?
+                };
                 if diff.len() != upsampled.len() {
                     return Err(Error::invalid(
                         "hierarchical JPEG: differential frame component count mismatch",
@@ -3786,12 +3867,14 @@ fn decode_hierarchical(
                 }
                 reference = Some(next);
             }
-            // Any remaining SOF (the arithmetic hierarchical DCT variants
-            // SOF13 / SOF14) is outside the slice this decoder covers.
+            // Any remaining SOF marker is outside the slice this decoder
+            // covers (all defined hierarchical SOFs — SOF0/1/2/3/9/10/11
+            // non-differential and SOF5/6/7/13/14/15 differential — are
+            // handled above).
             m if markers::is_sof(m) => {
                 let _ = walker.read_segment_payload();
                 return Err(Error::unsupported(
-                    "hierarchical JPEG: only the spatial lossless (SOF3/11 + SOF7/15) and DCT (SOF0/1/2 + SOF5/6, SOF7-terminated) progressions are supported",
+                    "hierarchical JPEG: unsupported SOF marker in hierarchical sequence",
                 ));
             }
             COM => {
@@ -4087,17 +4170,49 @@ fn decode_hierarchical_dct_frame(
     differential: bool,
     progressive: bool,
 ) -> Result<Vec<RefComponent>> {
+    decode_hierarchical_dct_frame_inner(state, walker, differential, progressive, false)
+}
+
+/// Arithmetic-coded variant of `decode_hierarchical_dct_frame`. Routes the
+/// frame's scans through the Q-coder sequential / progressive decoders
+/// (§G.1.3 / §F.2.4) instead of the Huffman ones. Used for the SOF9 / SOF10
+/// non-differential first DCT frames and the SOF13 / SOF14 differential
+/// refinement frames of an arithmetic DCT hierarchical progression
+/// (§K.7.2.1). The dequant + differential-IDCT reconstruction (§J.2.3.1, no
+/// level shift for the difference) is identical to the Huffman path.
+fn decode_hierarchical_dct_arith_frame(
+    state: &JpegState,
+    walker: &mut MarkerWalker<'_>,
+    differential: bool,
+    progressive: bool,
+) -> Result<Vec<RefComponent>> {
+    decode_hierarchical_dct_frame_inner(state, walker, differential, progressive, true)
+}
+
+fn decode_hierarchical_dct_frame_inner(
+    state: &JpegState,
+    walker: &mut MarkerWalker<'_>,
+    differential: bool,
+    progressive: bool,
+    arith: bool,
+) -> Result<Vec<RefComponent>> {
     let sof = state
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("hierarchical DCT: missing SOF"))?;
     // The DCT hierarchical slice covers P = 8 / P = 12 (the precisions the
     // baseline / extended-sequential / progressive DCT scan decoders and the
-    // IDCT render paths handle).
+    // IDCT render paths handle). The arithmetic Q-coder scan decoders are
+    // 8-bit only (§F.2 / §G.2), so an arithmetic DCT progression is P = 8.
     let precision = sof.precision as u32;
     if precision != 8 && precision != 12 {
         return Err(Error::unsupported(
             "hierarchical DCT frame: only P = 8 and P = 12 are supported",
+        ));
+    }
+    if arith && precision != 8 {
+        return Err(Error::unsupported(
+            "hierarchical arithmetic DCT frame: only P = 8 is supported",
         ));
     }
     let width = sof.width as usize;
@@ -4132,21 +4247,42 @@ fn decode_hierarchical_dct_frame(
                 let sos = parse_sos(p)?;
                 validate_sos(&sos)?;
                 let scan = walker.read_scan_data()?;
-                if progressive {
-                    decode_progressive_scan_diff(&fstate, &sos, scan, &mut coefs, differential)?;
-                } else {
-                    // A sequential differential frame decodes its DC
-                    // directly (no inter-block prediction). The shared
-                    // accumulator resets the predictor per SOS but carries
-                    // it across blocks; the differential variant zeroes it
-                    // per block instead.
-                    decode_sequential_scan_accum_diff(
-                        &fstate,
-                        &sos,
-                        scan,
-                        &mut coefs,
-                        differential,
-                    )?;
+                match (arith, progressive) {
+                    (false, true) => {
+                        decode_progressive_scan_diff(
+                            &fstate,
+                            &sos,
+                            scan,
+                            &mut coefs,
+                            differential,
+                        )?;
+                    }
+                    (false, false) => {
+                        // A sequential differential frame decodes its DC
+                        // directly (no inter-block prediction). The shared
+                        // accumulator resets the predictor per SOS but carries
+                        // it across blocks; the differential variant zeroes it
+                        // per block instead.
+                        decode_sequential_scan_accum_diff(
+                            &fstate,
+                            &sos,
+                            scan,
+                            &mut coefs,
+                            differential,
+                        )?;
+                    }
+                    (true, true) => {
+                        decode_progressive_arith_scan_diff(
+                            &fstate,
+                            &sos,
+                            scan,
+                            &mut coefs,
+                            differential,
+                        )?;
+                    }
+                    (true, false) => {
+                        decode_arith_scan_diff(&fstate, &sos, scan, &mut coefs, differential)?;
+                    }
                 }
             }
             DQT => {
@@ -4156,6 +4292,25 @@ fn decode_hierarchical_dct_frame(
             DHT => {
                 let p = walker.read_segment_payload()?;
                 parse_dht(p, &mut fstate.dc_huff, &mut fstate.ac_huff)?;
+            }
+            DAC => {
+                // Arithmetic conditioning may be redefined per-frame
+                // (§B.2.4.3). Relevant only for the arithmetic DCT
+                // progressions (SOF9/10 + SOF13/14); harmless otherwise.
+                let p = walker.read_segment_payload()?;
+                let entries = parse_dac(p)?;
+                for e in entries {
+                    if e.tc == 0 {
+                        let l = e.cs & 0x0F;
+                        let u = e.cs >> 4;
+                        if l > u || u > 15 {
+                            return Err(Error::invalid("DAC: invalid L/U bounds"));
+                        }
+                        fstate.arith_dc[e.tb as usize] = Some(ArithDcConditioning { l, u });
+                    } else {
+                        fstate.arith_ac[e.tb as usize] = Some(ArithAcConditioning { kx: e.cs });
+                    }
+                }
             }
             DRI => {
                 let p = walker.read_segment_payload()?;
@@ -7201,6 +7356,349 @@ mod sof10_tests {
         assert!(
             matches!(err, crate::error::MjpegError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
+        );
+    }
+
+    // ---- Hierarchical arithmetic DCT (SOF9/10 + SOF13/14) ----------------
+    //
+    // T.81 §K.7.2.1 pairs the DCT non-differential first frame (here SOF9
+    // sequential / SOF10 progressive, arithmetic-coded) with differential
+    // refinement frames (SOF13 sequential / SOF14 progressive). The §J.2.3.1
+    // differential decoder model decodes each block's DC directly (no
+    // inter-block prediction) and IDCTs without the level shift; the result
+    // is added modulo 2^16 to the upsampled reference (§J.2.1). These tests
+    // build the streams with the same Q-coder encoder scaffolding used for
+    // the standalone SOF10 round-trips and confirm the assembled image is the
+    // sample-exact §J.2.1 reconstruction.
+
+    /// Encode a single grayscale block's worth of coefficients as one
+    /// **sequential** arithmetic block (DC diff + full AC band) — encoder
+    /// mirror of `decode_arith_block`. `differential` zeroes the DC predictor
+    /// before this block (§J.2.3.1).
+    fn encode_seq_arith_block(
+        e: &mut ArithEncoder,
+        dc: &mut DcStats,
+        ac: &mut AcStats,
+        block: &[i32; 64],
+        differential: bool,
+    ) {
+        if differential {
+            dc.pred = 0;
+        }
+        let diff = block[0] - dc.pred;
+        encode_dc_diff(e, dc, diff);
+        dc.pred = block[0];
+        encode_ac_band(e, ac, block, 1, 63);
+    }
+
+    /// Append a frame to a hierarchical stream: the SOF marker + frame header
+    /// (P, Y, X, single grayscale component H=V=1) followed by one
+    /// sequential or progressive scan covering `blocks`. `sof_marker` is
+    /// 0xC9 (SOF9, sequential) or 0xCA (SOF10, progressive→single full DC+AC
+    /// is modelled as a sequential block here for simplicity) — for the
+    /// differential variants 0xCD (SOF13) / 0xCE (SOF14). `progressive`
+    /// selects the scan structure; we use a single sequential block for the
+    /// sequential markers and a DC+AC two-scan split for the progressive
+    /// ones. All quantiser values are 1.
+    #[allow(clippy::too_many_arguments)]
+    fn append_hier_gray_dct_frame(
+        out: &mut Vec<u8>,
+        sof_marker: u8,
+        w: usize,
+        h: usize,
+        blocks: &[[i32; 64]],
+        blocks_x: usize,
+        differential: bool,
+        progressive: bool,
+    ) {
+        // Frame header body.
+        let mut sof = vec![8u8];
+        sof.extend_from_slice(&(h as u16).to_be_bytes());
+        sof.extend_from_slice(&(w as u16).to_be_bytes());
+        sof.push(1);
+        sof.extend_from_slice(&[1, 0x11, 0]); // comp 1, H=V=1, qt 0
+        put_seg(out, sof_marker, &sof);
+
+        let blocks_y = blocks.len() / blocks_x;
+        if progressive {
+            // DC scan (Ss=Se=0) then AC band scan (Ss=1,Se=63).
+            for (ss, se) in [(0u8, 0u8), (1u8, 63u8)] {
+                let sos = vec![1u8, 1, 0x00, ss, se, 0x00];
+                put_seg(out, 0xDA, &sos);
+                let mut dc = DcStats::new();
+                let mut ac = AcStats::new();
+                let mut enc = ArithEncoder::new();
+                for by in 0..blocks_y {
+                    for bx in 0..blocks_x {
+                        let b = &blocks[by * blocks_x + bx];
+                        if ss == 0 {
+                            if differential {
+                                dc.pred = 0;
+                            }
+                            encode_dc_unit(&mut enc, &mut dc, b[0], 0, 0);
+                        } else {
+                            encode_ac_band(&mut enc, &mut ac, b, 1, 63);
+                        }
+                    }
+                }
+                out.extend_from_slice(&enc.finish());
+            }
+        } else {
+            let sos = vec![1u8, 1, 0x00, 0, 63, 0x00];
+            put_seg(out, 0xDA, &sos);
+            let mut dc = DcStats::new();
+            let mut ac = AcStats::new();
+            let mut enc = ArithEncoder::new();
+            for by in 0..blocks_y {
+                for bx in 0..blocks_x {
+                    let b = &blocks[by * blocks_x + bx];
+                    encode_seq_arith_block(&mut enc, &mut dc, &mut ac, b, differential);
+                }
+            }
+            out.extend_from_slice(&enc.finish());
+        }
+    }
+
+    /// Build a DHP frame header body (§B.3.2): same shape as a frame header,
+    /// single grayscale component H=V=1, at the completed-image resolution.
+    fn dhp_gray_body(w: usize, h: usize) -> Vec<u8> {
+        let mut b = vec![8u8];
+        b.extend_from_slice(&(h as u16).to_be_bytes());
+        b.extend_from_slice(&(w as u16).to_be_bytes());
+        b.push(1);
+        b.extend_from_slice(&[1, 0x11, 0]);
+        b
+    }
+
+    /// Reconstruct the §J.2.1 grayscale reference for a differential DCT
+    /// block stream: the difference is `idct(block)` with no level shift,
+    /// added modulo 2^16 to the upsampled reference, then folded into
+    /// 0..=255.
+    fn diff_idct_block(block: &[i32; 64]) -> [i32; 64] {
+        let mut nat = [0.0f32; 64];
+        for k in 0..64 {
+            nat[ZIGZAG[k]] = block[k] as f32;
+        }
+        idct8x8(&mut nat);
+        let mut out = [0i32; 64];
+        for i in 0..64 {
+            out[i] = (nat[i].round() as i32) & 0xFFFF;
+        }
+        out
+    }
+
+    /// Single-stage grayscale SOF9 hierarchical DCT progression decodes to
+    /// the same pixels as a direct IDCT render of the source coefficients —
+    /// confirming the DHP-prefixed arithmetic DCT path reconstructs the
+    /// non-differential first frame correctly.
+    #[test]
+    fn hier_sof9_gray_single_stage_matches_idct() {
+        let (w, h) = (16usize, 16usize);
+        let blocks_x = 2;
+        let blocks = gen_blocks(blocks_x * 2, 0x9A9A0001, 180, 50, 10);
+        let mut out = vec![0xFF, 0xD8]; // SOI
+        let mut dqt = vec![0u8];
+        dqt.extend(std::iter::repeat(1u8).take(64));
+        put_seg(&mut out, 0xDB, &dqt);
+        put_seg(&mut out, 0xDE, &dhp_gray_body(w, h)); // DHP
+        append_hier_gray_dct_frame(&mut out, 0xC9, w, h, &blocks, blocks_x, false, false);
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+
+        let v = decode_jpeg(&out, None).expect("decode hierarchical SOF9");
+        assert_eq!(v.planes.len(), 1);
+        assert_eq!(v.planes[0].stride, w);
+        let want = expected_plane_8(&blocks, blocks_x, w, h);
+        assert_eq!(v.planes[0].data, want);
+    }
+
+    /// Two-stage grayscale SOF9 + SOF13 differential progression (same
+    /// resolution, no EXP): the SOF13 frame's IDCT (no level shift) is added
+    /// modulo 2^16 to the first-frame reference and folded into 0..=255.
+    #[test]
+    fn hier_sof9_sof13_gray_differential_roundtrip() {
+        let (w, h) = (16usize, 16usize);
+        let blocks_x = 2;
+        let base = gen_blocks(blocks_x * 2, 0x1313AA01, 150, 40, 8);
+        // Small differential corrections.
+        let diff = gen_blocks(blocks_x * 2, 0x1313BB02, 6, 4, 5);
+        let mut out = vec![0xFF, 0xD8];
+        let mut dqt = vec![0u8];
+        dqt.extend(std::iter::repeat(1u8).take(64));
+        put_seg(&mut out, 0xDB, &dqt);
+        put_seg(&mut out, 0xDE, &dhp_gray_body(w, h));
+        append_hier_gray_dct_frame(&mut out, 0xC9, w, h, &base, blocks_x, false, false);
+        append_hier_gray_dct_frame(&mut out, 0xCD, w, h, &diff, blocks_x, true, false);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+
+        let v = decode_jpeg(&out, None).expect("decode hierarchical SOF9+SOF13");
+        assert_eq!(v.planes.len(), 1);
+
+        // Reference: base render (level-shifted, clamped) then + diff IDCT
+        // mod 2^16, folded to 0..=255.
+        let base_plane = expected_plane_8(&base, blocks_x, w, h);
+        let blocks_y = base.len() / blocks_x;
+        let bw = blocks_x * 8;
+        let mut full = vec![0u32; bw * blocks_y * 8];
+        for (bi, b) in base.iter().enumerate() {
+            // Re-expand base into the full grid as u32 references.
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            let mut nat = [0.0f32; 64];
+            for k in 0..64 {
+                nat[ZIGZAG[k]] = b[k] as f32;
+            }
+            idct8x8(&mut nat);
+            for j in 0..8 {
+                for i in 0..8 {
+                    let v = nat[j * 8 + i] + 128.0;
+                    let px = if v <= 0.0 {
+                        0
+                    } else if v >= 255.0 {
+                        255
+                    } else {
+                        v.round() as u32
+                    };
+                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
+                }
+            }
+        }
+        let mut want = vec![0u8; w * h];
+        for (bi, d) in diff.iter().enumerate() {
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            let dblk = diff_idct_block(d);
+            for j in 0..8 {
+                for i in 0..8 {
+                    let gx = bx * 8 + i;
+                    let gy = by * 8 + j;
+                    if gx >= w || gy >= h {
+                        continue;
+                    }
+                    let r = full[gy * bw + gx];
+                    let sum = (r.wrapping_add(dblk[j * 8 + i] as u32) & 0xFFFF) & 0xFF;
+                    want[gy * w + gx] = sum as u8;
+                }
+            }
+        }
+        let _ = base_plane;
+        assert_eq!(v.planes[0].data, want, "SOF13 differential reconstruction");
+    }
+
+    /// Two-stage grayscale SOF10 + SOF14 progressive differential
+    /// progression (same resolution, no EXP). The non-differential SOF10
+    /// frame and the differential SOF14 frame both split into a DC scan and
+    /// an AC band scan; the SOF14 DC scan decodes directly (§J.2.3.1).
+    #[test]
+    fn hier_sof10_sof14_gray_differential_roundtrip() {
+        let (w, h) = (16usize, 16usize);
+        let blocks_x = 2;
+        let base = gen_blocks(blocks_x * 2, 0x1414AA01, 150, 40, 8);
+        let diff = gen_blocks(blocks_x * 2, 0x1414BB02, 6, 4, 5);
+        let mut out = vec![0xFF, 0xD8];
+        let mut dqt = vec![0u8];
+        dqt.extend(std::iter::repeat(1u8).take(64));
+        put_seg(&mut out, 0xDB, &dqt);
+        put_seg(&mut out, 0xDE, &dhp_gray_body(w, h));
+        append_hier_gray_dct_frame(&mut out, 0xCA, w, h, &base, blocks_x, false, true);
+        append_hier_gray_dct_frame(&mut out, 0xCE, w, h, &diff, blocks_x, true, true);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+
+        let v = decode_jpeg(&out, None).expect("decode hierarchical SOF10+SOF14");
+        assert_eq!(v.planes.len(), 1);
+
+        // Same §J.2.1 reference reconstruction as the SOF13 case.
+        let blocks_y = base.len() / blocks_x;
+        let bw = blocks_x * 8;
+        let mut full = vec![0u32; bw * blocks_y * 8];
+        for (bi, b) in base.iter().enumerate() {
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            let mut nat = [0.0f32; 64];
+            for k in 0..64 {
+                nat[ZIGZAG[k]] = b[k] as f32;
+            }
+            idct8x8(&mut nat);
+            for j in 0..8 {
+                for i in 0..8 {
+                    let val = nat[j * 8 + i] + 128.0;
+                    let px = if val <= 0.0 {
+                        0
+                    } else if val >= 255.0 {
+                        255
+                    } else {
+                        val.round() as u32
+                    };
+                    full[(by * 8 + j) * bw + bx * 8 + i] = px;
+                }
+            }
+        }
+        let mut want = vec![0u8; w * h];
+        for (bi, d) in diff.iter().enumerate() {
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            let dblk = diff_idct_block(d);
+            for j in 0..8 {
+                for i in 0..8 {
+                    let gx = bx * 8 + i;
+                    let gy = by * 8 + j;
+                    if gx >= w || gy >= h {
+                        continue;
+                    }
+                    let r = full[gy * bw + gx];
+                    let sum = (r.wrapping_add(dblk[j * 8 + i] as u32) & 0xFFFF) & 0xFF;
+                    want[gy * w + gx] = sum as u8;
+                }
+            }
+        }
+        assert_eq!(v.planes[0].data, want, "SOF14 differential reconstruction");
+    }
+
+    /// A SOF13 (arithmetic) differential frame refining a SOF0 (Huffman)
+    /// non-differential frame is a malformed mix of coders (§K.7.2) and must
+    /// be rejected, not silently desynchronised.
+    #[test]
+    fn hier_coder_mismatch_rejected() {
+        // Build: SOI, DHP, SOF0 (Huffman baseline, trivial), then a SOF13.
+        // We only need the decoder to reach the coder-mismatch check, so the
+        // first frame is the smallest valid Huffman baseline.
+        let (w, h) = (8usize, 8usize);
+        let mut out = vec![0xFF, 0xD8];
+        let mut dqt = vec![0u8];
+        dqt.extend(std::iter::repeat(1u8).take(64));
+        put_seg(&mut out, 0xDB, &dqt);
+        put_seg(&mut out, 0xDE, &dhp_gray_body(w, h));
+        // Minimal Huffman SOF0 + DHT + a single all-zero block scan.
+        let mut sof = vec![8u8];
+        sof.extend_from_slice(&(h as u16).to_be_bytes());
+        sof.extend_from_slice(&(w as u16).to_be_bytes());
+        sof.push(1);
+        sof.extend_from_slice(&[1, 0x11, 0]);
+        put_seg(&mut out, 0xC0, &sof); // SOF0
+                                       // DHT: DC table 0 + AC table 0, single code 0-length-1 for value 0.
+        let dht_dc = [
+            0x00, // Tc=0, Th=0
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // one 1-bit code
+            0x00, // value 0
+        ];
+        put_seg(&mut out, 0xC4, &dht_dc);
+        let dht_ac = [
+            0x10, // Tc=1, Th=0
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, // EOB
+        ];
+        put_seg(&mut out, 0xC4, &dht_ac);
+        let sos = vec![1u8, 1, 0x00, 0, 63, 0x00];
+        put_seg(&mut out, 0xDA, &sos);
+        // Entropy: DC code "0" (1 bit) then AC EOB "0" (1 bit) → byte 0x00.
+        out.push(0x00);
+        // SOF13 differential frame (arith) refining the Huffman base.
+        let diff = gen_blocks(1, 0x1313CC03, 4, 3, 3);
+        append_hier_gray_dct_frame(&mut out, 0xCD, w, h, &diff, 1, true, false);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+
+        let err = decode_jpeg(&out, None).expect_err("coder mismatch must error");
+        assert!(
+            matches!(err, crate::error::MjpegError::InvalidData(_)),
+            "expected InvalidData for coder mismatch, got {err:?}"
         );
     }
 }

@@ -101,9 +101,16 @@ impl SofKind {
     }
 
     /// True for the SOF variants the in-tree decoder is documented to
-    /// accept (`lib.rs` module docstring: SOF0 / SOF1 / SOF2 / SOF3 /
-    /// SOF9 / SOF10 / SOF11). The "supported" line is data, not a
-    /// promise; callers that want to negotiate fallback can read it.
+    /// accept: the non-hierarchical SOF0 / SOF1 / SOF2 / SOF3 / SOF9 /
+    /// SOF10 / SOF11, plus the hierarchical-mode (DHP-prefixed) DCT and
+    /// lossless progressions, whose differential frames carry the
+    /// SOF5/6/7 (Huffman) and SOF13/14/15 (arithmetic) markers. The
+    /// "supported" line is data, not a promise; callers that want to
+    /// negotiate fallback can read it.
+    ///
+    /// Note: a `Hierarchical*` kind decodes only inside a DHP-introduced
+    /// hierarchical sequence — a bare differential SOF with no DHP is
+    /// still rejected by the decoder.
     pub fn is_supported_by_decoder(self) -> bool {
         matches!(
             self,
@@ -114,6 +121,8 @@ impl SofKind {
                 | Self::ExtendedSequentialArith
                 | Self::ProgressiveArith
                 | Self::LosslessArith
+                | Self::HierarchicalDct
+                | Self::HierarchicalArith
         )
     }
 
@@ -1820,11 +1829,32 @@ mod tests {
     }
 
     #[test]
-    fn hierarchical_dct_kind_not_supported() {
+    fn hierarchical_dct_kind_classification() {
+        // SOF5 (differential sequential DCT, Huffman) classifies as the
+        // hierarchical-DCT family. The decoder now routes these inside a
+        // DHP-introduced hierarchical sequence, so the support flag is true.
         let buf = build_prefix(0xC5, 8, 16, 16, &[(1, 1, 1, 0)], &[]);
         let info = inspect_jpeg(&buf).expect("inspect SOF5");
         assert_eq!(info.sof_kind, SofKind::HierarchicalDct);
-        assert!(!info.sof_kind.is_supported_by_decoder());
+        assert!(info.sof_kind.is_dct());
+        assert!(!info.sof_kind.is_arithmetic());
+        assert!(info.sof_kind.is_supported_by_decoder());
+    }
+
+    #[test]
+    fn hierarchical_arith_kind_classification() {
+        // SOF13 (differential sequential DCT, arithmetic) and SOF14
+        // (differential progressive DCT, arithmetic) both classify as the
+        // hierarchical-arithmetic family. The decoder routes them inside a
+        // DHP-introduced arithmetic DCT progression (§K.7.2.1).
+        for marker in [0xCDu8, 0xCE] {
+            let buf = build_prefix(marker, 8, 16, 16, &[(1, 1, 1, 0)], &[]);
+            let info = inspect_jpeg(&buf).expect("inspect SOF13/14");
+            assert_eq!(info.sof_kind, SofKind::HierarchicalArith);
+            assert!(info.sof_kind.is_dct());
+            assert!(info.sof_kind.is_arithmetic());
+            assert!(info.sof_kind.is_supported_by_decoder());
+        }
     }
 
     #[test]

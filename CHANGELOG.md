@@ -23,6 +23,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical arithmetic DCT progression (SOF9/SOF10 + SOF13/SOF14)**
+  (T.81 §K.7.2.1 / §J.2.3.1 / §J.2.4). The `DHP` control loop now decodes
+  the arithmetic-coded DCT hierarchical progression — the Q-coder
+  counterpart of the Huffman SOF0/1/2 + SOF5/6 path. A non-differential
+  `SOF9` (extended-sequential, arithmetic) or `SOF10` (progressive,
+  arithmetic) first frame seeds the reference planes; one or more
+  differential `SOF13` (differential-sequential) / `SOF14`
+  (differential-progressive) frames refine the image. Per §J.2.3.1 the
+  differential frames decode each block's DC coefficient **directly** (the
+  per-component arithmetic DC prediction is zeroed before each block) and
+  IDCT without the level shift; the signed difference is added modulo 2^16
+  to the EXP-upsampled reference (§J.2.1) and folded into the displayable
+  `0..2^P` range. §J.2.4: the arithmetic coding models already carry the
+  precision differential frames need, so only the prediction is suppressed.
+  A differential frame whose coder (Huffman vs arithmetic) disagrees with
+  the non-differential first frame is rejected as a malformed coder mix
+  (§K.7.2). The sequential (`decode_arith_scan`) and progressive
+  (`decode_progressive_arith_scan`) Q-coder scan decoders gained a
+  `differential` flag; new `decode_hierarchical_dct_arith_frame` routes a
+  hierarchical DCT frame through them. Adds four lib round-trip tests
+  (single-stage SOF9, two-stage SOF9+SOF13, two-stage SOF10+SOF14, and a
+  coder-mismatch rejection) built with the in-crate Q-coder encoder
+  scaffolding, all sample-exact against the §J.2.1 reference reconstruction,
+  plus inspector classification coverage for the `HierarchicalArith`
+  family. This is the last uncovered SOFn decode family.
+
 - **Hierarchical arithmetic spatial-lossless progression (SOF11 + SOF15)**
   (T.81 Annex J / §H.1.2.3). The `DHP` control loop now decodes an
   arithmetic spatial-lossless progression — the Q-coder counterpart of the

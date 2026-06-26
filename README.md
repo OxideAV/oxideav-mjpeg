@@ -13,11 +13,12 @@ SOF13 / SOF14 arithmetic, optionally SOF7 / SOF15-terminated) —
 covering every defined SOFn decode family. Single-component
 grayscale decodes at any precision `P ∈ 2..=16` plus three-component
 RGB-/YUV-class at `P = 8` (DCT also `P = 12`). Encodes baseline,
-progressive, **sequential arithmetic DCT (SOF9)** and lossless JPEG.
-The SOF9 arithmetic encoder produces grayscale, YUV
-(`Yuv444P`/`Yuv422P`/`Yuv420P`) and packed RGB24, with optional
-restart-interval framing, and is reachable via the trait API
-(`MjpegEncoder::set_arithmetic(true)`). The lossless path covers
+progressive, **arithmetic-coded DCT (SOF9 sequential + SOF10
+progressive)** and lossless JPEG. The SOF9 arithmetic encoder produces
+grayscale, YUV (`Yuv444P`/`Yuv422P`/`Yuv420P`) and packed RGB24, with
+optional restart-interval framing, and is reachable via the trait API
+(`MjpegEncoder::set_arithmetic(true)`); a SOF10 spectral-selection
+grayscale arithmetic encoder is available as a direct function. The lossless path covers
 single-component grayscale at every precision `P ∈ 2..=16`,
 three-component interleaved RGB at every precision `P ∈ 2..=16`, and
 three-component **subsampled YUV-class** at `P = 8`

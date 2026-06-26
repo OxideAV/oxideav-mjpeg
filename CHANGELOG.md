@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Progressive arithmetic DCT encoder (SOF10), grayscale.**
+  `encoder::encode_arith_jpeg_progressive_grayscale` emits a standalone
+  SOF10 grayscale JPEG — the Q-coder counterpart of
+  `encode_jpeg_progressive_grayscale`. Spectral-selection decomposition (no
+  successive approximation): one DC-first scan (`Ss=Se=0`) then two AC band
+  scans (`Ss=1..=5`, `Ss=6..=63`) at `Ah=Al=0`, each a fresh Q-coder segment
+  with re-initialised statistics (§G.1.3). Round-trip test asserts pixels
+  byte-identical to the Huffman progressive (SOF2) grayscale path.
+
 - **`MjpegEncoder::set_arithmetic(bool)` trait-API toggle.** The
   registry/`Encoder`-trait encoder now exposes the SOF9 arithmetic DCT path:
   `set_arithmetic(true)` routes `Gray8`, `Yuv420P/422P/444P` and `Rgb24`

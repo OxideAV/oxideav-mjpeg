@@ -1382,3 +1382,39 @@ fn trait_progressive_takes_precedence_over_arithmetic() {
         "SOF9 must NOT be emitted when progressive is on"
     );
 }
+
+/// SOF10 (progressive arithmetic DCT) grayscale encode → decode must produce
+/// pixels byte-identical to the Huffman progressive (SOF2) grayscale path:
+/// both use the same coefficient grid and the same spectral-selection scan
+/// decomposition, so the decoded image is the same.
+#[test]
+fn arith_sof10_grayscale_matches_progressive_huffman() {
+    use oxideav_mjpeg::encoder::{
+        encode_arith_jpeg_progressive_grayscale, encode_jpeg_progressive_grayscale,
+    };
+
+    let (w, h) = (40u32, 24u32);
+    let stride = w as usize;
+    let mut samples = vec![0u8; stride * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            samples[y * stride + x] = ((x * 6 + y * 4 + ((x ^ y) & 0x0F)) % 256) as u8;
+        }
+    }
+
+    let arith =
+        encode_arith_jpeg_progressive_grayscale(w, h, &samples, stride, 80).expect("encode SOF10");
+    assert!(
+        arith.windows(2).any(|x| x == [0xFF, 0xCA]),
+        "SOF10 marker missing"
+    );
+    let huff = encode_jpeg_progressive_grayscale(w, h, &samples, stride, 80).expect("encode SOF2");
+    assert!(
+        huff.windows(2).any(|x| x == [0xFF, 0xC2]),
+        "SOF2 marker missing"
+    );
+
+    let va = decode_to_gray(arith, w, h);
+    let vb = decode_to_gray(huff, w, h);
+    assert_eq!(va, vb, "SOF10 and SOF2 decoded pixels must be identical");
+}

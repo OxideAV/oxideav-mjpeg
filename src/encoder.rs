@@ -3786,6 +3786,111 @@ pub fn encode_arith_jpeg_grayscale(
     Ok(out)
 }
 
+/// Write a SOF10 (progressive DCT, arithmetic) frame header for a single
+/// 8-bit grayscale component, `H = V = 1`, quantiser table 0.
+fn write_sof10_grayscale_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
+    let mut payload = Vec::with_capacity(8 + 3);
+    payload.push(8); // P = 8
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(1); // Nf = 1
+    payload.push(1); // component id 1
+    payload.push(0x11); // H = 1, V = 1
+    payload.push(0); // quantiser table 0
+    write_length_prefix(out, markers::SOF10, &payload);
+}
+
+/// Encode a single-component grayscale image as a standalone **progressive,
+/// arithmetic-coded DCT** JPEG (SOF10) byte stream — the Q-coder counterpart
+/// of [`encode_jpeg_progressive_grayscale`]. The scan decomposition is
+/// spectral selection only (no successive approximation): one DC-first scan
+/// (`Ss = Se = 0`) followed by two AC band scans (`Ss = 1..=5` then
+/// `Ss = 6..=63`), all at `Ah = Al = 0`. Each scan is a fresh Q-coder
+/// segment with re-initialised statistics (§G.1.3). Default conditioning is
+/// used (no DAC). Output round-trips bit-exact through the SOF10 decode path.
+pub fn encode_arith_jpeg_progressive_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{
+        encode_ac as arith_encode_ac, encode_dc_diff, AcStats, ArithEncoder, DcStats,
+    };
+
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid(
+            "progressive arith-DCT encoder: zero-size image",
+        ));
+    }
+    if stride < w {
+        return Err(Error::invalid(
+            "progressive arith-DCT encoder: stride smaller than width",
+        ));
+    }
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "progressive arith-DCT encoder: samples shorter than stride*h",
+        ));
+    }
+
+    let luma_q = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+
+    // Build the full natural-order coefficient grid up-front: each AC band
+    // scan walks the entire block grid independently.
+    let blocks_x = w.div_ceil(8);
+    let blocks_y = h.div_ceil(8);
+    let mut coefs = vec![[0i32; 64]; blocks_x * blocks_y];
+    fill_coef_grid(
+        &mut coefs, samples, stride, w, h, blocks_x, blocks_y, &luma_q,
+    );
+
+    let mut out: Vec<u8> = Vec::with_capacity(8_192);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dqt(&mut out, 0, &luma_q);
+    write_sof10_grayscale_8bit(&mut out, w as u16, h as u16);
+
+    // ---- Scan 1: DC, Ss = Se = 0 ----
+    write_sos_progressive_ac(&mut out, 1, 0, 0, 0);
+    {
+        let mut enc = ArithEncoder::new();
+        let mut dc = DcStats::new();
+        for blk in &coefs {
+            // DC-first, Ah = Al = 0: code the difference from the running
+            // prediction directly (§G.1.3.1).
+            let diff = blk[0] - dc.pred;
+            encode_dc_diff(&mut enc, &mut dc, diff);
+            dc.pred = blk[0];
+        }
+        out.extend_from_slice(&enc.finish());
+    }
+
+    // ---- Scans 2 + 3: AC bands [1,5] then [6,63] ----
+    for (ss, se) in [(1u8, 5u8), (6u8, 63u8)] {
+        write_sos_progressive_ac(&mut out, 1, 0, ss, se);
+        let mut enc = ArithEncoder::new();
+        let mut ac = AcStats::new();
+        for blk in &coefs {
+            // Reorder the band into zigzag-index order for the AC coder.
+            let mut zz = [0i32; 64];
+            for k in ss as usize..=se as usize {
+                zz[k] = blk[ZIGZAG[k]];
+            }
+            arith_encode_ac(&mut enc, &mut ac, &zz, ss as usize, se as usize);
+        }
+        out.extend_from_slice(&enc.finish());
+    }
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
 /// Write a SOF9 (extended sequential DCT, arithmetic) frame header for a
 /// three-component YCbCr frame: luma carries the `H × V` oversampling and
 /// quantiser table 0, the two chroma components are `1 × 1` and use

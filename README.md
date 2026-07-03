@@ -1,5 +1,7 @@
 # oxideav-mjpeg
 
+[![CI](https://github.com/OxideAV/oxideav-mjpeg/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mjpeg/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mjpeg.svg)](https://crates.io/crates/oxideav-mjpeg) [![docs.rs](https://docs.rs/oxideav-mjpeg/badge.svg)](https://docs.rs/oxideav-mjpeg) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
 decodes baseline (SOF0), extended-sequential (SOF1 Huffman + SOF9
 arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic),

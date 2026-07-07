@@ -23,6 +23,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical spatial-lossless encoder (DHP + SOF3 + EXP + SOF7)**
+  (T.81 Annex J / §K.7.2.2). Three new public entry points —
+  `encoder::encode_hierarchical_lossless_jpeg_grayscale` (any precision
+  `P ∈ 2..=16`), `encode_hierarchical_lossless_jpeg_rgb` (`Nf = 3`,
+  `P ∈ 2..=16`) and `encode_hierarchical_lossless_jpeg_cmyk` (`Nf = 4`,
+  `P = 8`, Adobe APP14 transform flag as in the flat CMYK encoders) — emit
+  a `DHP`-introduced resolution pyramid: a non-differential lossless `SOF3`
+  lowest stage (Annex H predictors `1..=7`) plus `levels − 1` refinement
+  stages, each an `EXP` (`Eh = Ev = 1`, §B.3.3) followed by a differential
+  lossless `SOF7` frame coding the modulo-2^P difference against the ×2
+  bi-linearly upsampled previous stage (§J.1.1.2 / §J.2.1, difference coded
+  directly with `Ss = 0` per §J.2.3.2). The pyramid downsampling filter is
+  the truncating 2×2 mean (T.81 does not standardise it — only the
+  upsampling filter is normative, and the encoder mirrors the decoder's
+  exactly). Full-resolution dimensions must be divisible by
+  `2^(levels − 1)`; `levels = 1` emits a single non-differential frame
+  inside the DHP envelope. Reconstruction through the crate's hierarchical
+  decode path is **bit-exact** for every precision / predictor / component
+  count (YCCK stays a lossy interop convention; its K plane round-trips
+  exactly). New integration suite `tests/hierarchical_encode.rs` (11
+  round-trips: P = 2/8/12/16 grayscale over 1–3 stages, RGB at P = 8/12,
+  CMYK across all three Adobe transform conventions, plus geometry /
+  predictor rejection paths).
+
 - **Progressive arithmetic DCT encoder (SOF10), grayscale.**
   `encoder::encode_arith_jpeg_progressive_grayscale` emits a standalone
   SOF10 grayscale JPEG — the Q-coder counterpart of

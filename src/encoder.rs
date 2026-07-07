@@ -6106,6 +6106,607 @@ fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ns: u8, point_tran
     write_length_prefix(out, markers::SOS, &payload);
 }
 
+// ---- Hierarchical mode (T.81 Annex J) — spatial lossless encoder ----------
+//
+// A hierarchical spatial-lossless progression (§K.7.2.2) stores an image as
+// a resolution pyramid: a DHP segment (§B.3.2) declares the completed-image
+// geometry, a non-differential SOF3 frame codes the lowest-resolution
+// stage, and each higher-resolution stage is an EXP segment (§B.3.3 — ×2
+// reference expansion) followed by a differential SOF7 frame coding the
+// two's-complement difference between the stage's source samples and the ×2
+// bi-linearly upsampled reconstruction of the previous stage (§J.1.1.2 /
+// §J.2.1). Because every stage is lossless, the reconstruction of stage `k`
+// equals its source samples exactly, so the encoder can compute each
+// differential frame against its own pyramid without running a decoder.
+//
+// T.81 does **not** standardise the downsampling filter used to build the
+// pyramid (§J.1.1.1 — only the upsampling filter of §J.1.1.2 is normative,
+// because the decoder must reproduce it). This implementation downsamples
+// with the truncating mean of each 2×2 block; the differential frames
+// correct whatever filter is used, so the choice affects only how useful
+// the intermediate stages look, never correctness.
+
+/// Write a DHP (Define Hierarchical Progression, T.81 §B.3.2) segment. The
+/// payload has the same shape as a frame header but describes the
+/// *completed* image: precision, full-resolution Y / X, and the component
+/// list (ids 1..=nf, all `H = V = 1`, `Tq = 0` — the DHP carries no
+/// quantisation-table selection).
+fn write_dhp(out: &mut Vec<u8>, width: u16, height: u16, precision: u8, nf: u8) {
+    debug_assert!((1..=4).contains(&nf));
+    let mut payload = Vec::with_capacity(6 + 3 * nf as usize);
+    payload.push(precision);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(nf);
+    for ci in 1..=nf {
+        payload.push(ci); // component identifier
+        payload.push(0x11); // H = 1, V = 1
+        payload.push(0); // Tq = 0
+    }
+    write_length_prefix(out, markers::DHP, &payload);
+}
+
+/// Write an EXP (Expand Reference Components, T.81 §B.3.3) segment: one
+/// payload byte packing `Eh` (high nibble) and `Ev` (low nibble), each 1
+/// when the reference components must be ×2-expanded on that axis before
+/// the next differential frame is added.
+fn write_exp(out: &mut Vec<u8>, eh: bool, ev: bool) {
+    let byte = (u8::from(eh) << 4) | u8::from(ev);
+    write_length_prefix(out, markers::EXP, &[byte]);
+}
+
+/// Write a lossless frame header with a caller-chosen SOF marker — the
+/// hierarchical stages share the SOF3 payload shape across SOF3 / SOF7
+/// (Huffman) and SOF11 / SOF15 (arithmetic) per T.81 §B.2.2 / §B.3: `nf`
+/// components, ids 1..=nf, all `H = V = 1`, `Tq = 0`.
+fn write_sof_hier_lossless(
+    out: &mut Vec<u8>,
+    marker: u8,
+    width: u16,
+    height: u16,
+    precision: u8,
+    nf: u8,
+) {
+    debug_assert!((1..=4).contains(&nf));
+    let mut payload = Vec::with_capacity(6 + 3 * nf as usize);
+    payload.push(precision);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.push(nf);
+    for ci in 1..=nf {
+        payload.push(ci); // component identifier
+        payload.push(0x11); // H = 1, V = 1
+        payload.push(0); // Tq (ignored for lossless)
+    }
+    write_length_prefix(out, marker, &payload);
+}
+
+/// Downsample one component plane by 2 on both axes with the truncating
+/// mean of each 2×2 block. `w` and `h` must be even (enforced by
+/// [`hier_check_geometry`]). The filter itself is an encoder choice —
+/// T.81 §J.1.1.1 does not standardise it; only the ×2 *upsampling* filter
+/// is normative (§J.1.1.2).
+fn hier_downsample_2x2(plane: &[u32], w: usize, h: usize) -> Vec<u32> {
+    debug_assert!(w % 2 == 0 && h % 2 == 0);
+    let lw = w / 2;
+    let lh = h / 2;
+    let mut out = vec![0u32; lw * lh];
+    for y in 0..lh {
+        for x in 0..lw {
+            let a = plane[(2 * y) * w + 2 * x];
+            let b = plane[(2 * y) * w + 2 * x + 1];
+            let c = plane[(2 * y + 1) * w + 2 * x];
+            let d = plane[(2 * y + 1) * w + 2 * x + 1];
+            out[y * lw + x] = (a + b + c + d) / 4;
+        }
+    }
+    out
+}
+
+/// ×2 bi-linear upsampling of a reference plane along one axis per T.81
+/// §J.1.1.2: `Px = (Ra + Rb) / 2` with truncating division, the right
+/// column / bottom line replicating the boundary sample. This is the exact
+/// encoder-side mirror of the decoder's reference expansion (the decode
+/// path applies the same filter to reconstruct the reference the
+/// differential frame is added to), so the residuals computed against it
+/// land bit-exactly. Horizontal expansion is applied before vertical when
+/// both are signalled, matching the decoder.
+fn hier_upsample_axis(
+    plane: &[u32],
+    w: usize,
+    h: usize,
+    horizontal: bool,
+    modulus: u32,
+) -> Vec<u32> {
+    if horizontal {
+        let out_w = w * 2;
+        let mut out = vec![0u32; out_w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let ra = plane[y * w + x];
+                let rb = if x + 1 < w { plane[y * w + x + 1] } else { ra };
+                out[y * out_w + 2 * x] = ra;
+                out[y * out_w + 2 * x + 1] = ra.wrapping_add(rb) / 2 % modulus.max(1);
+            }
+        }
+        out
+    } else {
+        let out_h = h * 2;
+        let mut out = vec![0u32; w * out_h];
+        for y in 0..h {
+            for x in 0..w {
+                let ra = plane[y * w + x];
+                let rb = if y + 1 < h {
+                    plane[(y + 1) * w + x]
+                } else {
+                    ra
+                };
+                out[(2 * y) * w + x] = ra;
+                out[(2 * y + 1) * w + x] = ra.wrapping_add(rb) / 2 % modulus.max(1);
+            }
+        }
+        out
+    }
+}
+
+/// ×2 upsample a reference plane on both axes (horizontal first, then
+/// vertical — §J.1.1.2, matching the decoder's expansion order).
+fn hier_upsample_2x(plane: &[u32], w: usize, h: usize, modulus: u32) -> Vec<u32> {
+    let horiz = hier_upsample_axis(plane, w, h, true, modulus);
+    hier_upsample_axis(&horiz, w * 2, h, false, modulus)
+}
+
+/// Reduce a modulo-2^P difference (`0..2^P`) to the minimal-magnitude
+/// signed representative for entropy coding. Any representative that is
+/// congruent modulo 2^P decodes identically (the decoder masks the decoded
+/// value back into the sample range), but the minimal one produces the
+/// smallest SSSS category. For `P = 16` the half-modulus point 32768 stays
+/// positive so [`category_lossless`] maps it to the special `SSSS = 16`
+/// code (T.81 §H.1.2.2).
+fn hier_diff_signed(diff_mod: u32, precision: u8) -> i32 {
+    let half = 1i64 << (precision - 1);
+    let d = diff_mod as i64;
+    debug_assert!(d < (1i64 << precision));
+    if d > half {
+        (d - (1i64 << precision)) as i32
+    } else {
+        d as i32
+    }
+}
+
+/// Validate the pyramid geometry of a hierarchical encode request: `levels`
+/// stages, each ×2 smaller than the previous, all with integral dimensions.
+/// Every stage's frame must carry exact dimensions (the decoder checks each
+/// differential frame is exactly ×2 the upsampled reference), so the
+/// full-resolution dimensions must be divisible by `2^(levels − 1)`.
+fn hier_check_geometry(w: usize, h: usize, levels: u8) -> Result<()> {
+    if levels == 0 {
+        return Err(Error::invalid("hierarchical encoder: levels must be >= 1"));
+    }
+    if levels > 16 {
+        return Err(Error::invalid(
+            "hierarchical encoder: levels > 16 is meaningless for 16-bit dimensions",
+        ));
+    }
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    if w > u16::MAX as usize || h > u16::MAX as usize {
+        return Err(Error::invalid(
+            "hierarchical encoder: dimensions exceed the 16-bit frame-header fields",
+        ));
+    }
+    let factor = 1usize << (levels - 1);
+    if w % factor != 0 || h % factor != 0 {
+        return Err(Error::invalid(format!(
+            "hierarchical encoder: {w}x{h} is not divisible by 2^(levels-1) = {factor}; \
+             every stage must be exactly half the next (T.81 §J.1.1.2 EXP expansion is exact ×2)"
+        )));
+    }
+    Ok(())
+}
+
+/// Load one externally-supplied component plane into a flat `u32` buffer,
+/// validating the sample range against the declared precision. Samples for
+/// `P <= 8` are one byte each; wider precisions are 16-bit little-endian
+/// (two bytes per sample, `stride` in bytes) — the same conventions as the
+/// non-hierarchical lossless entry points.
+fn hier_load_plane(
+    samples: &[u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    precision: u8,
+) -> Result<Vec<u32>> {
+    let bytes_per_sample = if precision <= 8 { 1 } else { 2 };
+    if stride < w * bytes_per_sample {
+        return Err(Error::invalid(
+            "hierarchical encoder: stride smaller than width*bytes_per_sample",
+        ));
+    }
+    if samples.len() < stride * h {
+        return Err(Error::invalid(
+            "hierarchical encoder: plane shorter than stride*height",
+        ));
+    }
+    let max_sample: u32 = ((1u64 << precision) - 1) as u32;
+    let mut out = vec![0u32; w * h];
+    if precision <= 8 {
+        for y in 0..h {
+            for x in 0..w {
+                let v = samples[y * stride + x] as u32;
+                if v > max_sample {
+                    return Err(Error::invalid(format!(
+                        "hierarchical encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+                    )));
+                }
+                out[y * w + x] = v;
+            }
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                let lo = samples[y * stride + x * 2] as u32;
+                let hi = samples[y * stride + x * 2 + 1] as u32;
+                let v = lo | (hi << 8);
+                if v > max_sample {
+                    return Err(Error::invalid(format!(
+                        "hierarchical encoder: sample {v} exceeds precision-{precision} max {max_sample}"
+                    )));
+                }
+                out[y * w + x] = v;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Emit one non-differential lossless Huffman scan (Annex H) for `nc`
+/// all-`H = V = 1` component planes at `w × h`, interleaved one residual per
+/// component per pixel position. Mirrors the scan loops of the standalone
+/// SOF3 encoders (predictor per Table H.1, §H.1.2.1 first-line / first-
+/// column fall-backs, scan-origin default prediction). No restart markers.
+fn hier_write_lossless_scan_huff(
+    bw: &mut BitWriter<'_>,
+    planes: &[Vec<u32>],
+    w: usize,
+    h: usize,
+    predictor: u8,
+    origin: i32,
+    dc_huff: &HuffTable,
+) {
+    for y in 0..h {
+        for x in 0..w {
+            for plane in planes {
+                let actual = plane[y * w + x] as i32;
+                let pred: i32 = if y == 0 && x == 0 {
+                    origin
+                } else if y == 0 {
+                    plane[y * w + x - 1] as i32
+                } else if x == 0 {
+                    plane[(y - 1) * w + x] as i32
+                } else {
+                    let ra = plane[y * w + x - 1] as i32;
+                    let rb = plane[(y - 1) * w + x] as i32;
+                    let rc = plane[(y - 1) * w + x - 1] as i32;
+                    match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra + rb - rc,
+                        // H.1 footnote: divide-by-2 is an arithmetic shift.
+                        5 => ra + ((rb - rc) >> 1),
+                        6 => rb + ((ra - rc) >> 1),
+                        7 => (ra + rb) >> 1,
+                        _ => unreachable!(),
+                    }
+                };
+                let diff = actual - pred;
+                let (s, bits) = category_lossless(diff);
+                let hc = dc_huff.encode[s as usize];
+                debug_assert!(hc.len != 0, "DC Huffman code for SSSS={s} must be present");
+                bw.write_bits(hc.code as u32, hc.len as u32);
+                if s != 0 && s != 16 {
+                    bw.write_bits(bits, s as u32);
+                }
+            }
+        }
+    }
+}
+
+/// Emit one differential lossless Huffman scan (T.81 §J.2.3.2 — the
+/// difference is coded directly, without spatial prediction) for `nc`
+/// all-`H = V = 1` difference planes. Each plane holds the modulo-2^P
+/// difference `(source − upsampled_reference) mod 2^P`; the value coded is
+/// its minimal-magnitude signed representative, which the decoder adds to
+/// a zero prediction and masks back into the sample range.
+fn hier_write_lossless_diff_scan_huff(
+    bw: &mut BitWriter<'_>,
+    diffs: &[Vec<u32>],
+    n_pixels: usize,
+    precision: u8,
+    dc_huff: &HuffTable,
+) {
+    for i in 0..n_pixels {
+        for diff_plane in diffs {
+            let v = hier_diff_signed(diff_plane[i], precision);
+            let (s, bits) = category_lossless(v);
+            let hc = dc_huff.encode[s as usize];
+            debug_assert!(hc.len != 0, "DC Huffman code for SSSS={s} must be present");
+            bw.write_bits(hc.code as u32, hc.len as u32);
+            if s != 0 && s != 16 {
+                bw.write_bits(bits, s as u32);
+            }
+        }
+    }
+}
+
+/// Build the resolution pyramid for a hierarchical encode: index 0 is the
+/// full-resolution stage, index `levels − 1` the lowest-resolution one.
+fn hier_build_pyramid(planes: Vec<Vec<u32>>, w: usize, h: usize, levels: u8) -> Vec<Vec<Vec<u32>>> {
+    let mut pyramid: Vec<Vec<Vec<u32>>> = Vec::with_capacity(levels as usize);
+    pyramid.push(planes);
+    let (mut cw, mut ch) = (w, h);
+    for _ in 1..levels {
+        let prev = pyramid.last().unwrap();
+        let ds: Vec<Vec<u32>> = prev
+            .iter()
+            .map(|p| hier_downsample_2x2(p, cw, ch))
+            .collect();
+        pyramid.push(ds);
+        cw /= 2;
+        ch /= 2;
+    }
+    pyramid
+}
+
+/// Shared worker for the hierarchical spatial-lossless **Huffman** encoders:
+/// emits `SOI / JFIF APP0 / [Adobe APP14] / DHP / DHT / SOF3 stage /
+/// (EXP + SOF7 stage)* / EOI`. `planes` are full-resolution component
+/// planes (values already on the wire convention — any Adobe inversion has
+/// been applied by the caller).
+fn encode_hier_lossless_huffman(
+    planes: Vec<Vec<u32>>,
+    w: usize,
+    h: usize,
+    precision: u8,
+    predictor: u8,
+    levels: u8,
+    adobe_transform: Option<u8>,
+) -> Result<Vec<u8>> {
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "hierarchical lossless encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    if !(1..=7).contains(&predictor) {
+        return Err(Error::invalid(format!(
+            "hierarchical lossless encoder: predictor {predictor} not in 1..=7"
+        )));
+    }
+    hier_check_geometry(w, h, levels)?;
+    let nc = planes.len();
+    debug_assert!(matches!(nc, 1 | 3 | 4));
+
+    let modulus: u32 = 1u32 << precision;
+    let mask: u32 = modulus - 1;
+    let origin: i32 = 1i32 << (precision - 1);
+    let pyramid = hier_build_pyramid(planes, w, h, levels);
+    let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + nc * 2 * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    if let Some(tx) = adobe_transform {
+        write_adobe_app14(&mut out, tx);
+    }
+    write_dhp(&mut out, w as u16, h as u16, precision, nc as u8);
+    // One shared DC table for every stage; the hierarchical decode loop
+    // inherits table-specification segments seen before the first frame.
+    write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+
+    // Lowest-resolution stage: non-differential SOF3 frame.
+    let last = levels as usize - 1;
+    let (lw, lh) = (w >> last, h >> last);
+    write_sof_hier_lossless(
+        &mut out,
+        markers::SOF3,
+        lw as u16,
+        lh as u16,
+        precision,
+        nc as u8,
+    );
+    write_sos_lossless_multi(&mut out, predictor, nc as u8, 0);
+    {
+        let mut bw = BitWriter::new(&mut out);
+        hier_write_lossless_scan_huff(&mut bw, &pyramid[last], lw, lh, predictor, origin, &dc_huff);
+        bw.finish();
+    }
+
+    // Refinement stages: EXP (×2 both axes) + differential SOF7 frame.
+    // Every stage is lossless, so the decoder's reconstruction of stage k
+    // equals pyramid[k] exactly and the next residual can be computed
+    // against the pyramid directly.
+    let (mut rw, mut rh) = (lw, lh);
+    for k in (0..last).rev() {
+        let reference = &pyramid[k + 1];
+        let up: Vec<Vec<u32>> = reference
+            .iter()
+            .map(|p| hier_upsample_2x(p, rw, rh, modulus))
+            .collect();
+        rw *= 2;
+        rh *= 2;
+        let cur = &pyramid[k];
+        let diffs: Vec<Vec<u32>> = (0..nc)
+            .map(|c| {
+                (0..rw * rh)
+                    .map(|i| cur[c][i].wrapping_sub(up[c][i]) & mask)
+                    .collect()
+            })
+            .collect();
+        write_exp(&mut out, true, true);
+        write_sof_hier_lossless(
+            &mut out,
+            markers::SOF7,
+            rw as u16,
+            rh as u16,
+            precision,
+            nc as u8,
+        );
+        write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
+        let mut bw = BitWriter::new(&mut out);
+        hier_write_lossless_diff_scan_huff(&mut bw, &diffs, rw * rh, precision, &dc_huff);
+        bw.finish();
+    }
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// Encode a single-component grayscale image as a standalone
+/// **hierarchical spatial-lossless** JPEG (T.81 Annex J / §K.7.2.2): a
+/// `DHP`-introduced resolution pyramid of `levels` stages whose lowest
+/// stage is a non-differential lossless `SOF3` frame and whose higher
+/// stages are `EXP`-expanded differential lossless `SOF7` frames.
+///
+/// * `samples` / `stride` — row-major samples, one byte each for
+///   `precision <= 8`, 16-bit little-endian (two bytes) for wider
+///   precisions; `stride` is in bytes. Same conventions as
+///   [`encode_lossless_jpeg_grayscale`].
+/// * `precision` — bits per sample, `2..=16`.
+/// * `predictor` — Annex H Table H.1 selector `1..=7` used by the
+///   non-differential lowest-resolution stage (differential stages code
+///   the difference directly per §J.2.3.2 and carry `Ss = 0`).
+/// * `levels` — number of pyramid stages, `>= 1`. `levels = 1` emits a
+///   single non-differential frame inside the DHP envelope. `width` and
+///   `height` must be divisible by `2^(levels - 1)` (the §B.3.3 EXP
+///   expansion is an exact ×2, so every stage is exactly half the next).
+///
+/// The complete progression reconstructs **bit-exact** through the crate's
+/// hierarchical decode path: each differential stage corrects the ×2
+/// bi-linear upsample (§J.1.1.2) of the previous stage with the exact
+/// modulo-2^P residual (§J.2.1). Point transform is fixed at `Pt = 0` and
+/// no restart markers are emitted (matching the decoder's hierarchical
+/// slice).
+pub fn encode_hierarchical_lossless_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    precision: u8,
+    predictor: u8,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "hierarchical lossless encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    let plane = hier_load_plane(samples, w, h, stride, precision)?;
+    encode_hier_lossless_huffman(vec![plane], w, h, precision, predictor, levels, None)
+}
+
+/// Encode three component planes (R, G, B — or any three independent
+/// monochrome planes; the codec is colour-agnostic, matching
+/// [`encode_lossless_jpeg_rgb`]) as a standalone **hierarchical
+/// spatial-lossless** JPEG: `DHP` + non-differential `SOF3` lowest stage +
+/// `EXP`-expanded differential `SOF7` refinement stages, all frames
+/// `Nf = 3` interleaved with every component `H = V = 1`.
+///
+/// Sample layout per plane follows [`encode_lossless_jpeg_rgb`] (bytes for
+/// `precision <= 8`, 16-bit LE otherwise); the decode output shape is the
+/// same precision-driven policy (`P = 8` → packed `Rgb24`,
+/// `P ∈ {10, 12, 14}` → planar `Gbrp*Le`, else packed `Rgb48Le`).
+/// Reconstruction is bit-exact. See
+/// [`encode_hierarchical_lossless_jpeg_grayscale`] for the `levels`
+/// geometry rule.
+pub fn encode_hierarchical_lossless_jpeg_rgb(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    precision: u8,
+    predictor: u8,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "hierarchical lossless encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    let mut loaded = Vec::with_capacity(3);
+    for c in 0..3 {
+        loaded.push(hier_load_plane(planes[c], w, h, strides[c], precision)?);
+    }
+    encode_hier_lossless_huffman(loaded, w, h, precision, predictor, levels, None)
+}
+
+/// Encode four 8-bit component planes (C, M, Y, K) as a standalone
+/// **hierarchical spatial-lossless** JPEG: `DHP` + non-differential `SOF3`
+/// lowest stage + `EXP`-expanded differential `SOF7` refinement stages,
+/// all frames `Nf = 4` interleaved with every component `H = V = 1` at
+/// `P = 8` (the workspace `PixelFormat` enum has no high-bit-depth CMYK
+/// variant, matching the non-hierarchical four-component paths).
+///
+/// `adobe_transform` selects the Adobe APP14 colour-transform convention,
+/// identically to [`encode_lossless_jpeg_cmyk`]: `None` writes no APP14
+/// (plain "regular" CMYK), `Some(0)` writes Adobe CMYK and inverts every
+/// sample on the wire, `Some(2)` writes Adobe YCCK (input interpreted as
+/// `[Y, Cb, Cr, K]`, only K inverted). The no-APP14 and Adobe-CMYK
+/// round-trips are bit-exact; YCCK is a lossy interop convention by
+/// construction (BT.601 YCbCr → RGB → CMY clamps on decode; the K plane
+/// round-trips exactly). See
+/// [`encode_hierarchical_lossless_jpeg_grayscale`] for the `levels`
+/// geometry rule.
+pub fn encode_hierarchical_lossless_jpeg_cmyk(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 4],
+    strides: [usize; 4],
+    predictor: u8,
+    adobe_transform: Option<u8>,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    match adobe_transform {
+        None | Some(0) | Some(2) => {}
+        Some(other) => {
+            return Err(Error::invalid(format!(
+                "hierarchical CMYK encoder: adobe_transform = {other} (only None / Some(0) / Some(2) are supported)"
+            )));
+        }
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let invert_all = matches!(adobe_transform, Some(0));
+    let invert_k_only = matches!(adobe_transform, Some(2));
+    let mut loaded = Vec::with_capacity(4);
+    for c in 0..4 {
+        let mut plane = hier_load_plane(planes[c], w, h, strides[c], 8)?;
+        if invert_all || (invert_k_only && c == 3) {
+            for v in plane.iter_mut() {
+                *v = 255 - *v;
+            }
+        }
+        loaded.push(plane);
+    }
+    encode_hier_lossless_huffman(loaded, w, h, 8, predictor, levels, adobe_transform)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -364,6 +364,42 @@ predictor, adobe_transform)` directly:
   variants; restarts reset every component's predictor in lockstep, and
   `Pt` shifts every sample of every plane uniformly.
 
+### Hierarchical spatial-lossless (Annex J) encode
+
+The decoder's hierarchical coverage is matched by an encode path for the
+spatial-lossless progression (T.81 §K.7.2.2):
+
+```rust
+use oxideav_mjpeg::encoder::encode_hierarchical_lossless_jpeg_grayscale;
+
+// precision ∈ 2..=16, predictor ∈ 1..=7, levels >= 1 pyramid stages.
+let jpeg = encode_hierarchical_lossless_jpeg_grayscale(
+    width, height, &samples, stride, 8, 1, /* levels = */ 3,
+)?;
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+The output is a `DHP`-introduced resolution pyramid (§B.3.2): the lowest
+stage is a non-differential lossless `SOF3` frame (Annex H predictors
+`1..=7`), and each higher stage is an `EXP` segment (`Eh = Ev = 1`,
+§B.3.3) followed by a differential lossless `SOF7` frame whose samples
+are the modulo-2^P difference between the stage's source and the ×2
+bi-linearly upsampled previous stage (§J.1.1.2 / §J.2.1), coded directly
+with `Ss = 0` per §J.2.3.2. Because the upsampling filter mirrors the
+decoder's normative one exactly, reconstruction is **bit-exact** at every
+stage. The pyramid downsampler is the truncating 2×2 mean (T.81 leaves
+the downsampling filter to the encoder). Full-resolution dimensions must
+be divisible by `2^(levels − 1)`; `levels = 1` emits a single
+non-differential frame inside the DHP envelope. Companions:
+`encode_hierarchical_lossless_jpeg_rgb(width, height, [c0, c1, c2],
+strides, precision, predictor, levels)` (three-component interleaved,
+`P ∈ 2..=16`, same precision-shaped decode output as the flat RGB path)
+and `encode_hierarchical_lossless_jpeg_cmyk(width, height,
+[c0, c1, c2, c3], strides, predictor, adobe_transform, levels)`
+(four-component at `P = 8`, Adobe APP14 conventions identical to
+`encode_lossless_jpeg_cmyk`). Point transform is fixed at `Pt = 0` and no
+restart markers are emitted, matching the decoder's hierarchical slice.
+
 ### 4-component CMYK / YCCK encode
 
 The 4-component (CMYK / Adobe YCCK) decode paths are matched by a

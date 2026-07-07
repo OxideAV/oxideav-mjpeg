@@ -430,7 +430,13 @@ quantisation error below it: a single-stage progression tracks the
 flat baseline encoder at equal quality, and each added stage carries
 real correction energy. The progression is inherently lossy — for
 bit-exact hierarchical output use the spatial-lossless entry points
-above.
+above, or the **lossless-terminated** variants
+`encode_hierarchical_dct_jpeg_grayscale_lossless_final` /
+`encode_hierarchical_dct_jpeg_yuv444_lossless_final` (§K.7.2): they
+append one differential lossless `SOF7` frame after the last DCT stage
+(same resolution, no EXP) coding the exact residual per §J.2.3.2, so
+the whole DCT pyramid reconstructs bit-exact at any quality while
+keeping the progressive-display stages.
 
 ### 4-component CMYK / YCCK encode
 

@@ -697,3 +697,79 @@ fn hier_dct_yuv444_two_stage_decodes_with_high_fidelity() {
         assert!(db >= 35.0, "YUV444 plane {ci} PSNR {db:.2} dB < 35");
     }
 }
+
+// ---- DCT progression terminated by a lossless SOF7 frame (§K.7.2) ----------
+
+use oxideav_mjpeg::encoder::{
+    encode_hierarchical_dct_jpeg_grayscale_lossless_final,
+    encode_hierarchical_dct_jpeg_yuv444_lossless_final,
+};
+
+#[test]
+fn hier_dct_lossless_final_gray_two_stage_bit_exact() {
+    // Full-range noisy content: exactness must hold regardless of clamp /
+    // wrap effects in the lossy stages, because the SOF7 terminator codes
+    // the exact residual.
+    let (w, h) = (48usize, 32usize);
+    let img = mk_plane(w, h, 8, 0x50F7);
+    let bytes = plane_to_bytes(&img, 8);
+    for quality in [10u8, 75, 95] {
+        let jpeg = encode_hierarchical_dct_jpeg_grayscale_lossless_final(
+            w as u32, h as u32, &bytes, w, quality, 2,
+        )
+        .expect("encode");
+        let frame = decode(&jpeg, w as u32, h as u32);
+        assert_eq!(
+            gray_samples(&frame, w, h, 8),
+            img,
+            "quality {quality} must be bit-exact"
+        );
+    }
+}
+
+#[test]
+fn hier_dct_lossless_final_gray_single_stage_bit_exact() {
+    // levels = 1: SOF0 first frame + SOF7 terminator, no EXP anywhere.
+    let (w, h) = (17usize, 11usize);
+    let img = mk_plane(w, h, 8, 0x50F8);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg =
+        encode_hierarchical_dct_jpeg_grayscale_lossless_final(w as u32, h as u32, &bytes, w, 75, 1)
+            .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(gray_samples(&frame, w, h, 8), img);
+}
+
+#[test]
+fn hier_dct_lossless_final_yuv444_two_stage_bit_exact() {
+    let (w, h) = (32usize, 16usize);
+    let yp = mk_plane(w, h, 8, 0xF1);
+    let cb = mk_plane(w, h, 8, 0xF2);
+    let cr = mk_plane(w, h, 8, 0xF3);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_jpeg_yuv444_lossless_final(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        85,
+        2,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 3, "planar Yuv444P");
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    plane.data[y * plane.stride + x] as u32,
+                    src[y * w + x],
+                    "plane {ci} ({x},{y})"
+                );
+            }
+        }
+    }
+}

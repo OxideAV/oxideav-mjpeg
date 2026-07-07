@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lossless-terminated hierarchical DCT progressions** (T.81 §K.7.2 —
+  the final differential frame of a hierarchical sequence may use a
+  differential lossless process even when the earlier frames were
+  DCT-based). `encoder::encode_hierarchical_dct_jpeg_grayscale_lossless_final`
+  and `encode_hierarchical_dct_jpeg_yuv444_lossless_final` append one
+  differential lossless `SOF7` frame after the last DCT stage (same
+  resolution — no EXP) coding the exact modulo-2^8 difference between the
+  source and the encoder's mirror of the decoder's reconstruction
+  (§J.2.3.2, `Ss = 0`; the terminator's SSSS categories cap at 8, inside
+  the already-emitted Annex K DC table's coverage). The complete
+  progression — a DCT pyramid for progressive display with a truly
+  lossless final stage — reconstructs **bit-exact** at every quality.
+  Tests: full-range noisy grayscale at q10/q75/q95 over 1–2 stages and a
+  3-plane YUV 4:4:4 progression, all byte-identical.
+
 - **Hierarchical DCT-progression encoder (DHP + SOF0 + EXP + SOF5)**
   (T.81 §K.7.2.1 / §J.2.3.1). New public entry points
   `encoder::encode_hierarchical_dct_jpeg_grayscale` and

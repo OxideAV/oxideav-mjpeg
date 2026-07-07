@@ -7174,6 +7174,7 @@ fn encode_hier_dct_huffman(
     h: usize,
     quality: u8,
     levels: u8,
+    lossless_final: bool,
 ) -> Result<Vec<u8>> {
     hier_check_geometry(w, h, levels)?;
     let nc = planes.len();
@@ -7256,6 +7257,32 @@ fn encode_hier_dct_huffman(
             .collect();
     }
 
+    // Optional truly-lossless final stage (T.81 §K.7.2): one more
+    // differential frame at the same (full) resolution — no EXP — using a
+    // differential *lossless* process (SOF7, §J.2.3.2). The decoder adds
+    // the coded difference to the running modulo-2^16 reference and folds
+    // into 0..2^P, so coding `(source − reference) mod 2^8` makes the
+    // complete progression reconstruct bit-exact. The frame's DC-table
+    // selector resolves to the Annex K luma DC table written before the
+    // first frame — at P = 8 the terminator's SSSS categories cap at 8,
+    // well inside that table's 0..=11 coverage.
+    if lossless_final {
+        let dc_huff = &huff.luma_dc;
+        let src = &pyramid[0];
+        let diffs: Vec<Vec<u32>> = (0..nc)
+            .map(|c| {
+                (0..w * h)
+                    .map(|i| src[c][i].wrapping_sub(refp[c][i]) & 0xFF)
+                    .collect()
+            })
+            .collect();
+        write_sof_hier_frame(&mut out, markers::SOF7, w as u16, h as u16, 8, nc as u8);
+        write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
+        let mut bw = BitWriter::new(&mut out);
+        hier_write_lossless_diff_scan_huff(&mut bw, &diffs, w * h, 8, dc_huff);
+        bw.finish();
+    }
+
     out.push(0xFF);
     out.push(markers::EOI);
     Ok(out)
@@ -7294,7 +7321,7 @@ pub fn encode_hierarchical_dct_jpeg_grayscale(
         return Err(Error::invalid("hierarchical encoder: zero-size image"));
     }
     let plane = hier_load_plane(samples, w, h, stride, 8)?;
-    encode_hier_dct_huffman(vec![plane], w, h, quality, levels)
+    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, false)
 }
 
 /// Encode three full-resolution planar channels (Y, Cb, Cr — 4:4:4, every
@@ -7323,7 +7350,58 @@ pub fn encode_hierarchical_dct_jpeg_yuv444(
     for c in 0..3 {
         loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
     }
-    encode_hier_dct_huffman(loaded, w, h, quality, levels)
+    encode_hier_dct_huffman(loaded, w, h, quality, levels, false)
+}
+
+/// Like [`encode_hierarchical_dct_jpeg_grayscale`] but **terminated by a
+/// differential lossless `SOF7` frame** (T.81 §K.7.2 — the final
+/// differential frame of a hierarchical sequence may use a differential
+/// lossless process even when the earlier frames were DCT-based). After
+/// the last DCT stage the encoder codes the exact modulo-2^8 difference
+/// between the source and its mirror of the decoder's reconstruction
+/// (§J.2.3.2 — coded directly, `Ss = 0`, no EXP since the resolution does
+/// not change), so the complete progression reconstructs **bit-exact**:
+/// a DCT pyramid for progressive display with a truly lossless final
+/// stage.
+pub fn encode_hierarchical_dct_jpeg_grayscale_lossless_final(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let plane = hier_load_plane(samples, w, h, stride, 8)?;
+    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, true)
+}
+
+/// Like [`encode_hierarchical_dct_jpeg_yuv444`] but **terminated by a
+/// differential lossless `SOF7` frame** (T.81 §K.7.2) — see
+/// [`encode_hierarchical_dct_jpeg_grayscale_lossless_final`]. All three
+/// planes reconstruct **bit-exact**.
+pub fn encode_hierarchical_dct_jpeg_yuv444_lossless_final(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    quality: u8,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let mut loaded = Vec::with_capacity(3);
+    for c in 0..3 {
+        loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
+    }
+    encode_hier_dct_huffman(loaded, w, h, quality, levels, true)
 }
 
 #[cfg(test)]

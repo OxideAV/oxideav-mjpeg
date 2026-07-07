@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical progressive arithmetic DCT encoder (SOF10 + SOF14,
+  optional SOF15 terminator)** (T.81 §K.7.2.1 / §G.1.3 / §J.2.3.1).
+  `encoder::encode_hierarchical_dct_progressive_arith_jpeg_grayscale` /
+  `_yuv444` complete the hierarchical stage-frame matrix: progressive
+  Q-coder stages (non-differential `SOF10` + differential `SOF14`), each
+  scan a fresh arithmetic segment with re-initialised statistics per
+  §G.1.3 (interleaved §G.1.3.1 DC-first scan + one §G.1.3.2 full-band AC
+  scan per component), differential DC scans zeroing the per-block
+  prediction (§J.2.3.1 / §J.2.4). With this, the encode side emits
+  **every SOFn family the hierarchical decoder consumes** — SOF0/1-class,
+  SOF2, SOF3, SOF9, SOF10, SOF11 non-differential and SOF5, SOF6, SOF7,
+  SOF13, SOF14, SOF15 differential. Tests: pixel-identity against the
+  Huffman progressive progression and bit-exact SOF15-terminated
+  grayscale + YUV 4:4:4 round-trips.
+
 - **Hierarchical progressive-DCT encoder (SOF2 + SOF6, optional SOF7
   terminator)** (T.81 §K.7.2.1 / §J.2.3.1).
   `encoder::encode_hierarchical_dct_progressive_jpeg_grayscale` /

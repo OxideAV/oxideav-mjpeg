@@ -1007,3 +1007,79 @@ fn hier_prog_dct_yuv444_lossless_final_bit_exact() {
         }
     }
 }
+
+// ---- Progressive arithmetic DCT progression (SOF10 + SOF14) ----------------
+
+use oxideav_mjpeg::encoder::{
+    encode_hierarchical_dct_progressive_arith_jpeg_grayscale,
+    encode_hierarchical_dct_progressive_arith_jpeg_yuv444,
+};
+
+#[test]
+fn hier_prog_arith_gray_matches_huffman_progressive_pixels() {
+    // Same quantised coefficients through a different entropy coder: the
+    // SOF10+SOF14 progression must decode pixel-identically to the
+    // SOF2+SOF6 one (and hence to the sequential progressions too).
+    let (w, h) = (48usize, 32usize);
+    let img = mk_smooth_plane(w, h, 0xAD06);
+    let bytes = plane_to_bytes(&img, 8);
+    let arith = encode_hierarchical_dct_progressive_arith_jpeg_grayscale(
+        w as u32, h as u32, &bytes, w, 85, 2, false,
+    )
+    .expect("arith progressive encode");
+    let huff = encode_hierarchical_dct_progressive_jpeg_grayscale(
+        w as u32, h as u32, &bytes, w, 85, 2, false,
+    )
+    .expect("huffman progressive encode");
+    let a = gray_samples(&decode(&arith, w as u32, h as u32), w, h, 8);
+    let b = gray_samples(&decode(&huff, w as u32, h as u32), w, h, 8);
+    assert_eq!(a, b, "SOF10+SOF14 must decode pixel-identical to SOF2+SOF6");
+}
+
+#[test]
+fn hier_prog_arith_gray_lossless_final_bit_exact() {
+    let (w, h) = (32usize, 24usize);
+    let img = mk_plane(w, h, 8, 0xAD07);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg = encode_hierarchical_dct_progressive_arith_jpeg_grayscale(
+        w as u32, h as u32, &bytes, w, 40, 2, true,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(gray_samples(&frame, w, h, 8), img);
+}
+
+#[test]
+fn hier_prog_arith_yuv444_lossless_final_bit_exact() {
+    let (w, h) = (16usize, 16usize);
+    let yp = mk_plane(w, h, 8, 0xD4);
+    let cb = mk_plane(w, h, 8, 0xD5);
+    let cr = mk_plane(w, h, 8, 0xD6);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_progressive_arith_jpeg_yuv444(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        70,
+        2,
+        true,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 3, "planar Yuv444P");
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    plane.data[y * plane.stride + x] as u32,
+                    src[y * w + x],
+                    "plane {ci} ({x},{y})"
+                );
+            }
+        }
+    }
+}

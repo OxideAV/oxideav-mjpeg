@@ -458,7 +458,13 @@ interleaved DC-first scan plus one full-band AC scan per component
 (progressive AC scans are single-component, §B.2.3), with the
 differential frame's DC scan coded directly per §J.2.3.1 — decoding
 pixel-identical to the sequential progression at equal quality, with
-the same optional `SOF7` lossless terminator.
+the same optional `SOF7` lossless terminator. The arithmetic
+progressive variant
+(`encode_hierarchical_dct_progressive_arith_jpeg_grayscale` /
+`_yuv444`) emits `SOF10` + differential `SOF14` stages (fresh Q-coder
+segment + statistics per scan, §G.1.3) with the optional `SOF15`
+terminator — completing the encode side of **every SOFn family the
+hierarchical decoder consumes**.
 
 ### 4-component CMYK / YCCK encode
 

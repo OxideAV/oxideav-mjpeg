@@ -438,6 +438,18 @@ append one differential lossless `SOF7` frame after the last DCT stage
 the whole DCT pyramid reconstructs bit-exact at any quality while
 keeping the progressive-display stages.
 
+The **arithmetic-coded** DCT progression (`SOF9` non-differential +
+`SOF13` differential, §K.7.2.1) is emitted by
+`encode_hierarchical_dct_arith_jpeg_grayscale` /
+`_arith_jpeg_yuv444(…, quality, levels, lossless_final)`: one Q-coder
+segment per stage under the default conditioning (no DHT / DAC), the
+§J.2.3.1 direct-DC differential model (per-block DC prediction zeroed;
+§J.2.4 keeps the statistics conditioning unchanged), and pixel-identical
+reconstruction to the Huffman progression at equal quality. Passing
+`lossless_final = true` terminates with a differential lossless `SOF15`
+frame coding the exact residual — bit-exact output on a single entropy
+coder.
+
 ### 4-component CMYK / YCCK encode
 
 The 4-component (CMYK / Adobe YCCK) decode paths are matched by a

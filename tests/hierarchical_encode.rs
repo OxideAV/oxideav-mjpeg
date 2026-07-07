@@ -773,3 +773,130 @@ fn hier_dct_lossless_final_yuv444_two_stage_bit_exact() {
         }
     }
 }
+
+// ---- Arithmetic DCT progression (SOF9 + SOF13, optional SOF15 terminator) ---
+
+use oxideav_mjpeg::encoder::{
+    encode_hierarchical_dct_arith_jpeg_grayscale, encode_hierarchical_dct_arith_jpeg_yuv444,
+};
+
+#[test]
+fn hier_dct_arith_gray_two_stage_decodes_with_high_fidelity() {
+    let (w, h) = (64usize, 48usize);
+    let img = mk_smooth_plane(w, h, 0xA0DC);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg =
+        encode_hierarchical_dct_arith_jpeg_grayscale(w as u32, h as u32, &bytes, w, 90, 2, false)
+            .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    let got = gray_samples(&frame, w, h, 8);
+    let db = psnr(&img, &got, 255.0);
+    assert!(
+        db >= 35.0,
+        "arith two-stage hierarchical DCT PSNR {db:.2} dB < 35"
+    );
+}
+
+#[test]
+fn hier_dct_arith_matches_huffman_dct_pixels_exactly() {
+    // Same quantised coefficients, different entropy coder: the arithmetic
+    // progression must reconstruct pixel-identically to the Huffman one.
+    let (w, h) = (32usize, 32usize);
+    let img = mk_smooth_plane(w, h, 0xA0DD);
+    let bytes = plane_to_bytes(&img, 8);
+    let arith =
+        encode_hierarchical_dct_arith_jpeg_grayscale(w as u32, h as u32, &bytes, w, 85, 2, false)
+            .expect("arith encode");
+    let huff = encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 85, 2)
+        .expect("huffman encode");
+    let a = gray_samples(&decode(&arith, w as u32, h as u32), w, h, 8);
+    let b = gray_samples(&decode(&huff, w as u32, h as u32), w, h, 8);
+    assert_eq!(a, b, "SOF9+SOF13 must decode pixel-identical to SOF0+SOF5");
+}
+
+#[test]
+fn hier_dct_arith_lossless_final_gray_bit_exact() {
+    let (w, h) = (48usize, 32usize);
+    let img = mk_plane(w, h, 8, 0xA0DE);
+    let bytes = plane_to_bytes(&img, 8);
+    for quality in [10u8, 90] {
+        let jpeg = encode_hierarchical_dct_arith_jpeg_grayscale(
+            w as u32, h as u32, &bytes, w, quality, 2, true,
+        )
+        .expect("encode");
+        let frame = decode(&jpeg, w as u32, h as u32);
+        assert_eq!(
+            gray_samples(&frame, w, h, 8),
+            img,
+            "quality {quality} SOF15-terminated must be bit-exact"
+        );
+    }
+}
+
+#[test]
+fn hier_dct_arith_yuv444_lossless_final_bit_exact() {
+    let (w, h) = (32usize, 16usize);
+    let yp = mk_plane(w, h, 8, 0xA1);
+    let cb = mk_plane(w, h, 8, 0xA2);
+    let cr = mk_plane(w, h, 8, 0xA3);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_arith_jpeg_yuv444(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        80,
+        2,
+        true,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 3, "planar Yuv444P");
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    plane.data[y * plane.stride + x] as u32,
+                    src[y * w + x],
+                    "plane {ci} ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hier_dct_arith_yuv444_two_stage_decodes_with_high_fidelity() {
+    let (w, h) = (32usize, 32usize);
+    let yp = mk_smooth_plane(w, h, 0xB1);
+    let cb = mk_smooth_plane(w, h, 0xB2);
+    let cr = mk_smooth_plane(w, h, 0xB3);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_arith_jpeg_yuv444(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        90,
+        2,
+        false,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        let mut got = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                got[y * w + x] = plane.data[y * plane.stride + x] as u32;
+            }
+        }
+        let db = psnr(src, &got, 255.0);
+        assert!(db >= 35.0, "arith YUV444 plane {ci} PSNR {db:.2} dB < 35");
+    }
+}

@@ -23,6 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical arithmetic DCT-progression encoder (SOF9 + SOF13,
+  optional SOF15 terminator)** (T.81 §K.7.2.1 / §J.2.3.1 / §J.2.4). The
+  Q-coder counterparts of the Huffman DCT hierarchical entry points —
+  `encoder::encode_hierarchical_dct_arith_jpeg_grayscale` /
+  `_yuv444` — emit a non-differential extended-sequential `SOF9` lowest
+  stage plus `EXP`-expanded differential sequential `SOF13` refinements:
+  one arithmetic-coded segment per stage, per-component DC/AC statistics
+  areas under the default conditioning (no DHT / DAC), and the §J.2.3.1
+  differential model implemented by zeroing the per-block DC prediction
+  (§J.2.4 keeps the statistics conditioning itself unchanged). A
+  `lossless_final` flag terminates the progression with a differential
+  lossless `SOF15` frame (§K.7.2) coding the exact modulo-2^8 residual
+  under the §H.1.2.3 lossless statistical model → **bit-exact**
+  reconstruction. Tests: ≥ 35 dB two-stage grayscale + YUV 4:4:4, a
+  pixel-identity check against the Huffman SOF0+SOF5 progression (same
+  quantised coefficients, different entropy coder), and bit-exact
+  SOF15-terminated round-trips at q10/q90 (grayscale) and q80 (YUV).
+
 - **Lossless-terminated hierarchical DCT progressions** (T.81 §K.7.2 —
   the final differential frame of a hierarchical sequence may use a
   differential lossless process even when the earlier frames were

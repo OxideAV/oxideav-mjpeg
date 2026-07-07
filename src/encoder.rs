@@ -7404,6 +7404,244 @@ pub fn encode_hierarchical_dct_jpeg_yuv444_lossless_final(
     encode_hier_dct_huffman(loaded, w, h, quality, levels, true)
 }
 
+// ---- Hierarchical mode (T.81 Annex J) — arithmetic DCT progression --------
+
+/// Emit one hierarchical **arithmetic** DCT stage frame (SOF9
+/// non-differential or SOF13 differential) for `nc` all-`H = V = 1`
+/// component planes, and return the decoder-mirrored reconstruction —
+/// the Q-coder counterpart of [`hier_encode_dct_frame_huff`]. One
+/// arithmetic-coded entropy segment carries the whole interleaved scan;
+/// each component keeps its own DC/AC statistics areas with the default
+/// conditioning (`(L, U) = (0, 1)`, `Kx = 5` — no DAC). For a
+/// differential frame the per-component DC prediction is zeroed before
+/// every block (§J.2.3.1 — the DC coefficient is coded directly; §J.2.4:
+/// the statistics conditioning itself is unchanged), exactly mirroring
+/// the decode path.
+#[allow(clippy::too_many_arguments)]
+fn hier_encode_dct_frame_arith(
+    out: &mut Vec<u8>,
+    planes_i32: &[Vec<i32>],
+    w: usize,
+    h: usize,
+    quant: &[u16; 64],
+    differential: bool,
+) -> Vec<Vec<u32>> {
+    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+
+    let nc = planes_i32.len();
+    write_sof_hier_frame(
+        out,
+        if differential {
+            markers::SOF13
+        } else {
+            markers::SOF9
+        },
+        w as u16,
+        h as u16,
+        8,
+        nc as u8,
+    );
+    write_sos_hier_dct(out, nc as u8);
+
+    let mcus_x = w.div_ceil(8);
+    let mcus_y = h.div_ceil(8);
+    let comp_w = mcus_x * 8;
+    let comp_h = mcus_y * 8;
+    let mut recon_padded: Vec<Vec<f32>> = (0..nc).map(|_| vec![0.0f32; comp_w * comp_h]).collect();
+
+    let mut enc = ArithEncoder::new();
+    let mut dc_stats: Vec<DcStats> = (0..nc).map(|_| DcStats::new()).collect();
+    let mut ac_stats: Vec<AcStats> = (0..nc).map(|_| AcStats::new()).collect();
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for ci in 0..nc {
+                let q = hier_dct_quantise_block(&planes_i32[ci], w, h, mx * 8, my * 8, quant);
+                // The Q-coder block encoder consumes zigzag-index order.
+                let mut zz = [0i32; 64];
+                for k in 0..64 {
+                    zz[k] = q[ZIGZAG[k]];
+                }
+                if differential {
+                    // §J.2.3.1: code the DC directly — no inter-block
+                    // prediction carry.
+                    dc_stats[ci].pred = 0;
+                }
+                arith_encode_block(&mut enc, &mut dc_stats[ci], &mut ac_stats[ci], &zz);
+                let r = hier_dct_recon_block(&q, quant);
+                for j in 0..8 {
+                    for i in 0..8 {
+                        recon_padded[ci][(my * 8 + j) * comp_w + mx * 8 + i] = r[j * 8 + i];
+                    }
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&enc.finish());
+
+    let mut recon: Vec<Vec<u32>> = (0..nc).map(|_| vec![0u32; w * h]).collect();
+    for ci in 0..nc {
+        for y in 0..h {
+            for x in 0..w {
+                let v = recon_padded[ci][y * comp_w + x];
+                recon[ci][y * w + x] = if differential {
+                    (v.round() as i32 as u32) & 0xFFFF
+                } else {
+                    let sv = v + 128.0;
+                    if sv <= 0.0 {
+                        0
+                    } else if sv >= 255.0 {
+                        255
+                    } else {
+                        sv.round() as u32
+                    }
+                };
+            }
+        }
+    }
+    recon
+}
+
+/// Shared worker for the hierarchical **arithmetic DCT** encoders: emits
+/// `SOI / JFIF APP0 / DHP / DQT / SOF9 stage / (EXP + SOF13 stage)* /
+/// [SOF15 lossless terminator] / EOI`. No DHT / DAC segments — the Q-coder
+/// runs on the spec default conditioning.
+fn encode_hier_dct_arith(
+    planes: Vec<Vec<u32>>,
+    w: usize,
+    h: usize,
+    quality: u8,
+    levels: u8,
+    lossless_final: bool,
+) -> Result<Vec<u8>> {
+    hier_check_geometry(w, h, levels)?;
+    let nc = planes.len();
+    debug_assert!(matches!(nc, 1 | 3));
+
+    let quant = scale_for_quality(&DEFAULT_LUMA_Q50, quality);
+    let pyramid = hier_build_pyramid(planes, w, h, levels);
+
+    let mut out: Vec<u8> = Vec::with_capacity(16_384 + nc * w * h);
+    out.push(0xFF);
+    out.push(markers::SOI);
+    write_jfif_app0(&mut out);
+    write_dhp(&mut out, w as u16, h as u16, 8, nc as u8);
+    write_dqt(&mut out, 0, &quant);
+
+    let last = levels as usize - 1;
+    let (lw, lh) = (w >> last, h >> last);
+    let shifted: Vec<Vec<i32>> = pyramid[last]
+        .iter()
+        .map(|p| p.iter().map(|&v| v as i32 - 128).collect())
+        .collect();
+    let mut refp = hier_encode_dct_frame_arith(&mut out, &shifted, lw, lh, &quant, false);
+
+    let (mut rw, mut rh) = (lw, lh);
+    for k in (0..last).rev() {
+        let up: Vec<Vec<u32>> = refp
+            .iter()
+            .map(|p| hier_upsample_2x(p, rw, rh, 1u32 << 16))
+            .collect();
+        rw *= 2;
+        rh *= 2;
+        let cur = &pyramid[k];
+        let diffs: Vec<Vec<i32>> = (0..nc)
+            .map(|c| {
+                (0..rw * rh)
+                    .map(|i| cur[c][i] as i32 - up[c][i] as i32)
+                    .collect()
+            })
+            .collect();
+        write_exp(&mut out, true, true);
+        let recon_diff = hier_encode_dct_frame_arith(&mut out, &diffs, rw, rh, &quant, true);
+        refp = (0..nc)
+            .map(|c| {
+                (0..rw * rh)
+                    .map(|i| (up[c][i].wrapping_add(recon_diff[c][i]) & 0xFFFF) & 0xFF)
+                    .collect()
+            })
+            .collect();
+    }
+
+    // Optional truly-lossless final stage (§K.7.2): a differential
+    // lossless **SOF15** (arithmetic) frame at the same resolution — the
+    // Q-coder counterpart of the SOF7 terminator, keeping the whole
+    // progression on one entropy coder. Codes the exact modulo-2^8
+    // residual (§J.2.3.2); the decoder adds it modulo 2^16 and folds into
+    // 0..2^P, so reconstruction becomes bit-exact.
+    if lossless_final {
+        let src = &pyramid[0];
+        let diffs: Vec<Vec<u32>> = (0..nc)
+            .map(|c| {
+                (0..w * h)
+                    .map(|i| src[c][i].wrapping_sub(refp[c][i]) & 0xFF)
+                    .collect()
+            })
+            .collect();
+        write_sof_hier_frame(&mut out, markers::SOF15, w as u16, h as u16, 8, nc as u8);
+        write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
+        hier_write_lossless_arith_scan(&mut out, &diffs, w, h, 0, 0, true, 8)?;
+    }
+
+    out.push(0xFF);
+    out.push(markers::EOI);
+    Ok(out)
+}
+
+/// Encode a single-component grayscale image as a standalone
+/// **hierarchical arithmetic DCT-progression** JPEG (T.81 §K.7.2.1) — the
+/// Q-coder counterpart of [`encode_hierarchical_dct_jpeg_grayscale`]: a
+/// non-differential extended-sequential `SOF9` lowest stage plus
+/// `EXP`-expanded differential sequential `SOF13` refinement stages under
+/// the §J.2.3.1 model (no level shift, DC coded directly with the
+/// per-block prediction zeroed; §J.2.4 keeps the statistics conditioning
+/// unchanged). Default arithmetic conditioning throughout (no DAC). Set
+/// `lossless_final` to terminate the progression with a differential
+/// lossless `SOF15` frame (§K.7.2) coding the exact residual, which makes
+/// the complete reconstruction **bit-exact**.
+pub fn encode_hierarchical_dct_arith_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    levels: u8,
+    lossless_final: bool,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let plane = hier_load_plane(samples, w, h, stride, 8)?;
+    encode_hier_dct_arith(vec![plane], w, h, quality, levels, lossless_final)
+}
+
+/// Encode three full-resolution planar channels (Y, Cb, Cr — 4:4:4) as a
+/// standalone **hierarchical arithmetic DCT-progression** JPEG — the
+/// Q-coder counterpart of [`encode_hierarchical_dct_jpeg_yuv444`]; see
+/// [`encode_hierarchical_dct_arith_jpeg_grayscale`] for the stage
+/// structure and the `lossless_final` (SOF15 terminator) semantics.
+pub fn encode_hierarchical_dct_arith_jpeg_yuv444(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    quality: u8,
+    levels: u8,
+    lossless_final: bool,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let mut loaded = Vec::with_capacity(3);
+    for c in 0..3 {
+        loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
+    }
+    encode_hier_dct_arith(loaded, w, h, quality, levels, lossless_final)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

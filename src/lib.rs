@@ -88,7 +88,17 @@
 //! On the **encode** path, SOF9 (sequential arithmetic DCT) grayscale is
 //! produced by [`encoder::encode_arith_jpeg_grayscale`] (with optional
 //! restart-interval framing) alongside the baseline / progressive /
-//! lossless (Huffman and arithmetic) encoders.
+//! lossless (Huffman and arithmetic) encoders. **Hierarchical mode is
+//! encoded too** (T.81 Annex J): the spatial-lossless progression
+//! (`DHP` + `SOF3`/`SOF11` non-differential + `EXP` + `SOF7`/`SOF15`
+//! differential — bit-exact, 1/3/4-component, `P ∈ 2..=16`) via
+//! [`encoder::encode_hierarchical_lossless_jpeg_grayscale`] and friends,
+//! and the DCT progression (§K.7.2.1 — sequential `SOF0`+`SOF5`,
+//! progressive `SOF2`+`SOF6`, arithmetic `SOF9`+`SOF13` and
+//! `SOF10`+`SOF14` stage families, each optionally terminated by a
+//! differential lossless `SOF7`/`SOF15` frame for bit-exact output) via
+//! [`encoder::encode_hierarchical_dct_jpeg_grayscale`] and friends — the
+//! encoder emits every SOFn family the hierarchical decoder consumes.
 //!
 //! **Not supported** (will return `Error::Unsupported`):
 //! - Bare differential frames (SOF5..SOF7 / SOF13..SOF15) **without** a

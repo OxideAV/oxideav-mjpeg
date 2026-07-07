@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical encoder docs + inspector interop coverage.** Crate-level
+  docs and the README intro now describe the full Annex J encode surface;
+  a new integration test drives `inspect_jpeg` over all six hierarchical
+  progression families and locks in the documented behaviour (the
+  inspector reports the *first-stage* frame's kind and geometry — the
+  lowest pyramid resolution — since it walks the marker prefix to the
+  first SOS). Black-box note: hierarchical JPEG is unimplemented across
+  the external ecosystem — `djpeg` rejects the `DHP` marker (`0xDE`) and
+  `ffmpeg` rejects the differential coding types (`SOF5`/`SOF7`), both
+  verified empirically — so hierarchical conformance is validated by the
+  crate's own independently-built T.81 decode path (flat control encodes
+  decode cleanly in both tools).
+
 - **Hierarchical progressive arithmetic DCT encoder (SOF10 + SOF14,
   optional SOF15 terminator)** (T.81 §K.7.2.1 / §G.1.3 / §J.2.3.1).
   `encoder::encode_hierarchical_dct_progressive_arith_jpeg_grayscale` /

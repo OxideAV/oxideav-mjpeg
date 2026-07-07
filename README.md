@@ -16,7 +16,12 @@ covering every defined SOFn decode family. Single-component
 grayscale decodes at any precision `P ∈ 2..=16` plus three-component
 RGB-/YUV-class at `P = 8` (DCT also `P = 12`). Encodes baseline,
 progressive, **arithmetic-coded DCT (SOF9 sequential + SOF10
-progressive)** and lossless JPEG. The SOF9 arithmetic encoder produces
+progressive)**, lossless JPEG, and **hierarchical mode** (Annex J
+encode: the bit-exact spatial-lossless progression — SOF3/SOF11 +
+SOF7/SOF15 — plus all four DCT stage families SOF0+SOF5, SOF2+SOF6,
+SOF9+SOF13 and SOF10+SOF14, each optionally lossless-terminated per
+§K.7.2, so the encoder emits every SOFn family the hierarchical
+decoder consumes). The SOF9 arithmetic encoder produces
 grayscale, YUV (`Yuv444P`/`Yuv422P`/`Yuv420P`) and packed RGB24, with
 optional restart-interval framing, and is reachable via the trait API
 (`MjpegEncoder::set_arithmetic(true)`); a SOF10 spectral-selection

@@ -1083,3 +1083,65 @@ fn hier_prog_arith_yuv444_lossless_final_bit_exact() {
         }
     }
 }
+
+// ---- Inspector interop on hierarchical encoder output -----------------------
+
+#[test]
+fn inspector_classifies_hierarchical_encoder_output_by_first_stage() {
+    // `inspect_jpeg` walks the marker prefix up to the first SOS, so on a
+    // DHP-introduced stream it reports the *first-stage* frame kind — the
+    // non-differential SOF that opens the pyramid. Verify each progression
+    // family inspects cleanly with the expected first-stage classification.
+    use oxideav_mjpeg::{inspect_jpeg, SofKind};
+    let (w, h) = (16usize, 16usize);
+    let img = mk_plane(w, h, 8, 0x1257);
+    let bytes = plane_to_bytes(&img, 8);
+
+    let cases: Vec<(Vec<u8>, SofKind)> = vec![
+        (
+            encode_hierarchical_lossless_jpeg_grayscale(w as u32, h as u32, &bytes, w, 8, 1, 2)
+                .unwrap(),
+            SofKind::Lossless,
+        ),
+        (
+            encode_hierarchical_lossless_arith_jpeg_grayscale(
+                w as u32, h as u32, &bytes, w, 8, 1, 2,
+            )
+            .unwrap(),
+            SofKind::LosslessArith,
+        ),
+        (
+            encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 80, 2).unwrap(),
+            SofKind::Baseline,
+        ),
+        (
+            encode_hierarchical_dct_progressive_jpeg_grayscale(
+                w as u32, h as u32, &bytes, w, 80, 2, false,
+            )
+            .unwrap(),
+            SofKind::Progressive,
+        ),
+        (
+            encode_hierarchical_dct_arith_jpeg_grayscale(
+                w as u32, h as u32, &bytes, w, 80, 2, false,
+            )
+            .unwrap(),
+            SofKind::ExtendedSequentialArith,
+        ),
+        (
+            encode_hierarchical_dct_progressive_arith_jpeg_grayscale(
+                w as u32, h as u32, &bytes, w, 80, 2, false,
+            )
+            .unwrap(),
+            SofKind::ProgressiveArith,
+        ),
+    ];
+    for (jpeg, expected) in cases {
+        let info = inspect_jpeg(&jpeg).expect("inspect hierarchical stream");
+        assert_eq!(info.sof_kind, expected);
+        // The reported geometry is the first-stage frame's (the lowest
+        // pyramid resolution — here 16/2 = 8), not the DHP completed-image
+        // size: the inspector reads the first SOF it meets.
+        assert_eq!((info.width, info.height), (8, 8));
+    }
+}

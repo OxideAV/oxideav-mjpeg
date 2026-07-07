@@ -23,6 +23,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical DCT-progression encoder (DHP + SOF0 + EXP + SOF5)**
+  (T.81 §K.7.2.1 / §J.2.3.1). New public entry points
+  `encoder::encode_hierarchical_dct_jpeg_grayscale` and
+  `encode_hierarchical_dct_jpeg_yuv444` emit a `DHP`-introduced DCT
+  pyramid at `P = 8`: a non-differential baseline `SOF0` lowest stage
+  (Annex K luma quantiser scaled by `quality`, shared DC/AC tables, every
+  component `H = V = 1`) plus `EXP`-expanded differential sequential
+  `SOF5` refinement stages coded under the §J.2.3.1 model — forward DCT of
+  the raw signed stage residual with **no level shift** and the DC
+  coefficient coded **directly** (no inter-block prediction). Because a
+  DCT stage is lossy, the encoder mirrors the decoder's reconstruction
+  between stages (same `f32` dequantise, shared `idct8x8`, same rounding /
+  clamp / modulo-2^16 fold), so each refinement corrects the accumulated
+  quantisation error of the stages below it. New integration tests: 2- and
+  3-stage grayscale ≥ 35 dB at q90, single-stage parity with the flat
+  baseline encoder (±1 dB), a truncation test proving the differential
+  stage carries > 3 dB of correction energy, and a 3-plane YUV 4:4:4
+  progression ≥ 35 dB per plane.
+
 - **Hierarchical spatial-lossless arithmetic encoder (SOF11 + SOF15)**
   (T.81 Annex J / §K.7.2.2 / §H.1.2.3). The Q-coder counterparts of the
   Huffman hierarchical entry points —

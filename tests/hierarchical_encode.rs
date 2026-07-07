@@ -522,3 +522,178 @@ fn hier_arith_cmyk_two_stage_bit_exact() {
         }
     }
 }
+
+// ---- DCT progression (SOF0 + SOF5, Huffman) ---------------------------------
+
+use oxideav_mjpeg::encoder::{
+    encode_hierarchical_dct_jpeg_grayscale, encode_hierarchical_dct_jpeg_yuv444,
+};
+
+/// Smooth mid-range plane (30..=220) so DCT-stage PSNR assertions do not
+/// flap on clamp-edge wrap effects (a conformant §J.2.1 reconstruction
+/// wraps modulo 2^16 rather than clamping between stages).
+fn mk_smooth_plane(w: usize, h: usize, seed: u32) -> Vec<u32> {
+    let mut s = seed | 1;
+    let mut out = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let base = 30.0
+                + 90.0 * (1.0 + ((x as f32) * 0.19).sin()) / 2.0
+                + 90.0 * (1.0 + ((y as f32) * 0.13).cos()) / 2.0;
+            out[y * w + x] = (base as u32 + (s % 8)).clamp(30, 220);
+        }
+    }
+    out
+}
+
+fn psnr(orig: &[u32], got: &[u32], peak: f64) -> f64 {
+    assert_eq!(orig.len(), got.len());
+    let mse: f64 = orig
+        .iter()
+        .zip(got.iter())
+        .map(|(&a, &b)| {
+            let d = a as f64 - b as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / orig.len() as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (peak * peak / mse).log10()
+    }
+}
+
+#[test]
+fn hier_dct_gray_two_stage_decodes_with_high_fidelity() {
+    let (w, h) = (64usize, 48usize);
+    let img = mk_smooth_plane(w, h, 0xDC7);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg = encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 90, 2)
+        .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 1);
+    assert_eq!(frame.planes[0].stride, w, "Gray8 stride");
+    let got = gray_samples(&frame, w, h, 8);
+    let db = psnr(&img, &got, 255.0);
+    assert!(
+        db >= 35.0,
+        "two-stage hierarchical DCT PSNR {db:.2} dB < 35"
+    );
+}
+
+#[test]
+fn hier_dct_gray_three_stage_decodes_with_high_fidelity() {
+    let (w, h) = (64usize, 64usize);
+    let img = mk_smooth_plane(w, h, 0xDC8);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg = encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 90, 3)
+        .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    let got = gray_samples(&frame, w, h, 8);
+    let db = psnr(&img, &got, 255.0);
+    assert!(
+        db >= 35.0,
+        "three-stage hierarchical DCT PSNR {db:.2} dB < 35"
+    );
+}
+
+#[test]
+fn hier_dct_gray_single_stage_matches_flat_baseline_quality() {
+    // levels = 1 is a DHP envelope around one SOF0 frame; fidelity should
+    // be in the same band as the flat baseline encoder at equal quality.
+    let (w, h) = (32usize, 32usize);
+    let img = mk_smooth_plane(w, h, 0xDC9);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg = encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 90, 1)
+        .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    let got = gray_samples(&frame, w, h, 8);
+    let hier_db = psnr(&img, &got, 255.0);
+
+    let flat = oxideav_mjpeg::encoder::encode_jpeg_grayscale(w as u32, h as u32, &bytes, w, 90)
+        .expect("flat encode");
+    let flat_frame = decode(&flat, w as u32, h as u32);
+    let flat_got = gray_samples(&flat_frame, w, h, 8);
+    let flat_db = psnr(&img, &flat_got, 255.0);
+    assert!(
+        (hier_db - flat_db).abs() <= 1.0,
+        "single-stage hierarchical ({hier_db:.2} dB) should track the flat baseline ({flat_db:.2} dB)"
+    );
+}
+
+#[test]
+fn hier_dct_refinement_improves_over_truncated_stream() {
+    // Decoding only the first (low-resolution) stage upsampled to full
+    // resolution must be strictly worse than the full progression — the
+    // differential stage really does carry correction energy.
+    let (w, h) = (64usize, 48usize);
+    let img = mk_smooth_plane(w, h, 0xDCA);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg = encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 85, 2)
+        .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    let full_db = psnr(&img, &gray_samples(&frame, w, h, 8), 255.0);
+
+    // Baseline for comparison: the low-res stage alone, decoded via a flat
+    // baseline encode of the 2x-downsampled image, then nearest upsampled.
+    let (lw, lh) = (w / 2, h / 2);
+    let mut low = vec![0u32; lw * lh];
+    for y in 0..lh {
+        for x in 0..lw {
+            let a = img[(2 * y) * w + 2 * x];
+            let b = img[(2 * y) * w + 2 * x + 1];
+            let c = img[(2 * y + 1) * w + 2 * x];
+            let d = img[(2 * y + 1) * w + 2 * x + 1];
+            low[y * lw + x] = (a + b + c + d) / 4;
+        }
+    }
+    let mut up = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            up[y * w + x] = low[(y / 2) * lw + x / 2];
+        }
+    }
+    let low_db = psnr(&img, &up, 255.0);
+    assert!(
+        full_db > low_db + 3.0,
+        "full progression ({full_db:.2} dB) must beat the low-res stage alone ({low_db:.2} dB) by > 3 dB"
+    );
+}
+
+#[test]
+fn hier_dct_yuv444_two_stage_decodes_with_high_fidelity() {
+    let (w, h) = (32usize, 32usize);
+    let yp = mk_smooth_plane(w, h, 0xE1);
+    let cb = mk_smooth_plane(w, h, 0xE2);
+    let cr = mk_smooth_plane(w, h, 0xE3);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_jpeg_yuv444(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        90,
+        2,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 3, "planar Yuv444P");
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        assert_eq!(plane.stride, w, "full-resolution plane {ci}");
+        let mut got = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                got[y * w + x] = plane.data[y * plane.stride + x] as u32;
+            }
+        }
+        let db = psnr(src, &got, 255.0);
+        assert!(db >= 35.0, "YUV444 plane {ci} PSNR {db:.2} dB < 35");
+    }
+}

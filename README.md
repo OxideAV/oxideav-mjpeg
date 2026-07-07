@@ -411,6 +411,27 @@ per-component statistics areas and `L_Context(Da, Db)` /
 (default `(L, U) = (0, 1)` bounds per §H.1.2.3.3), and the same
 bit-exact reconstruction guarantee.
 
+### Hierarchical DCT-progression (Annex J) encode
+
+The DCT progression of §K.7.2.1 is emitted by
+`encode_hierarchical_dct_jpeg_grayscale(width, height, samples, stride,
+quality, levels)` and `encode_hierarchical_dct_jpeg_yuv444(width,
+height, [y, cb, cr], strides, quality, levels)` (`P = 8`, every
+component `H = V = 1`, component ids 1/2/3 so three-component output
+shapes as planar `Yuv444P`). The lowest stage is a non-differential
+baseline `SOF0` frame (Annex K luma quantiser scaled by `quality`, one
+shared DC/AC table pair); each refinement stage is `EXP` + a
+differential sequential `SOF5` frame coding the quantised forward DCT
+of the signed stage residual under the §J.2.3.1 model — no level
+shift, DC coded directly. The encoder mirrors the decoder's
+reconstruction between stages (same dequantise / `idct8x8` / rounding /
+modulo-2^16 fold), so every refinement corrects the accumulated
+quantisation error below it: a single-stage progression tracks the
+flat baseline encoder at equal quality, and each added stage carries
+real correction energy. The progression is inherently lossy — for
+bit-exact hierarchical output use the spatial-lossless entry points
+above.
+
 ### 4-component CMYK / YCCK encode
 
 The 4-component (CMYK / Adobe YCCK) decode paths are matched by a

@@ -7771,6 +7771,7 @@ fn hier_recon_from_blocks(
 /// single-component by definition (T.81 §B.2.3). For a differential frame
 /// the first DC scan codes each block's DC **directly** (§J.2.3.1 — no
 /// inter-block prediction); AC scans are unmodified.
+#[allow(clippy::too_many_arguments)]
 fn hier_encode_prog_frame_huff(
     out: &mut Vec<u8>,
     planes_i32: &[Vec<i32>],

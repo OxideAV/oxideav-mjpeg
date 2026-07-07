@@ -7175,6 +7175,7 @@ fn encode_hier_dct_huffman(
     quality: u8,
     levels: u8,
     lossless_final: bool,
+    progressive: bool,
 ) -> Result<Vec<u8>> {
     hier_check_geometry(w, h, levels)?;
     let nc = planes.len();
@@ -7204,16 +7205,29 @@ fn encode_hier_dct_huffman(
         .iter()
         .map(|p| p.iter().map(|&v| v as i32 - 128).collect())
         .collect();
-    let mut refp = hier_encode_dct_frame_huff(
-        &mut out,
-        &shifted,
-        lw,
-        lh,
-        &quant,
-        &huff.luma_dc,
-        &huff.luma_ac,
-        false,
-    );
+    let mut refp = if progressive {
+        hier_encode_prog_frame_huff(
+            &mut out,
+            &shifted,
+            lw,
+            lh,
+            &quant,
+            &huff.luma_dc,
+            &huff.luma_ac,
+            false,
+        )
+    } else {
+        hier_encode_dct_frame_huff(
+            &mut out,
+            &shifted,
+            lw,
+            lh,
+            &quant,
+            &huff.luma_dc,
+            &huff.luma_ac,
+            false,
+        )
+    };
 
     // Refinement stages: EXP (×2 both axes) + differential SOF5 frame. The
     // reference is upsampled with the §J.1.1.2 filter under the DCT
@@ -7238,16 +7252,29 @@ fn encode_hier_dct_huffman(
             })
             .collect();
         write_exp(&mut out, true, true);
-        let recon_diff = hier_encode_dct_frame_huff(
-            &mut out,
-            &diffs,
-            rw,
-            rh,
-            &quant,
-            &huff.luma_dc,
-            &huff.luma_ac,
-            true,
-        );
+        let recon_diff = if progressive {
+            hier_encode_prog_frame_huff(
+                &mut out,
+                &diffs,
+                rw,
+                rh,
+                &quant,
+                &huff.luma_dc,
+                &huff.luma_ac,
+                true,
+            )
+        } else {
+            hier_encode_dct_frame_huff(
+                &mut out,
+                &diffs,
+                rw,
+                rh,
+                &quant,
+                &huff.luma_dc,
+                &huff.luma_ac,
+                true,
+            )
+        };
         refp = (0..nc)
             .map(|c| {
                 (0..rw * rh)
@@ -7321,7 +7348,7 @@ pub fn encode_hierarchical_dct_jpeg_grayscale(
         return Err(Error::invalid("hierarchical encoder: zero-size image"));
     }
     let plane = hier_load_plane(samples, w, h, stride, 8)?;
-    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, false)
+    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, false, false)
 }
 
 /// Encode three full-resolution planar channels (Y, Cb, Cr — 4:4:4, every
@@ -7350,7 +7377,7 @@ pub fn encode_hierarchical_dct_jpeg_yuv444(
     for c in 0..3 {
         loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
     }
-    encode_hier_dct_huffman(loaded, w, h, quality, levels, false)
+    encode_hier_dct_huffman(loaded, w, h, quality, levels, false, false)
 }
 
 /// Like [`encode_hierarchical_dct_jpeg_grayscale`] but **terminated by a
@@ -7377,7 +7404,7 @@ pub fn encode_hierarchical_dct_jpeg_grayscale_lossless_final(
         return Err(Error::invalid("hierarchical encoder: zero-size image"));
     }
     let plane = hier_load_plane(samples, w, h, stride, 8)?;
-    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, true)
+    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, true, false)
 }
 
 /// Like [`encode_hierarchical_dct_jpeg_yuv444`] but **terminated by a
@@ -7401,7 +7428,7 @@ pub fn encode_hierarchical_dct_jpeg_yuv444_lossless_final(
     for c in 0..3 {
         loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
     }
-    encode_hier_dct_huffman(loaded, w, h, quality, levels, true)
+    encode_hier_dct_huffman(loaded, w, h, quality, levels, true, false)
 }
 
 // ---- Hierarchical mode (T.81 Annex J) — arithmetic DCT progression --------
@@ -7640,6 +7667,230 @@ pub fn encode_hierarchical_dct_arith_jpeg_yuv444(
         loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
     }
     encode_hier_dct_arith(loaded, w, h, quality, levels, lossless_final)
+}
+
+// ---- Hierarchical mode (T.81 Annex J) — progressive DCT stages ------------
+
+/// Write an interleaved progressive DC-first SOS for `ns` all-`H = V = 1`
+/// components: every component selects DC table 0, `Ss = Se = 0`,
+/// `Ah = Al = 0`.
+fn write_sos_hier_prog_dc(out: &mut Vec<u8>, ns: u8) {
+    debug_assert!((1..=4).contains(&ns));
+    let mut payload = Vec::with_capacity(4 + 2 * ns as usize);
+    payload.push(ns);
+    for ci in 1..=ns {
+        payload.push(ci); // component identifier
+        payload.push(0x00); // DC = 0 (AC unused in a DC scan)
+    }
+    payload.push(0); // Ss
+    payload.push(0); // Se
+    payload.push(0); // Ah | Al
+    write_length_prefix(out, markers::SOS, &payload);
+}
+
+/// Quantise every 8×8 block of each component plane (natural-order
+/// coefficients, raster block order, edge-replicated padding) — the
+/// multi-scan counterpart of the inline per-MCU quantisation in
+/// [`hier_encode_dct_frame_huff`].
+fn hier_quantise_planes(
+    planes_i32: &[Vec<i32>],
+    w: usize,
+    h: usize,
+    quant: &[u16; 64],
+) -> Vec<Vec<[i32; 64]>> {
+    let blocks_x = w.div_ceil(8);
+    let blocks_y = h.div_ceil(8);
+    planes_i32
+        .iter()
+        .map(|plane| {
+            let mut blocks = Vec::with_capacity(blocks_x * blocks_y);
+            for by in 0..blocks_y {
+                for bx in 0..blocks_x {
+                    blocks.push(hier_dct_quantise_block(plane, w, h, bx * 8, by * 8, quant));
+                }
+            }
+            blocks
+        })
+        .collect()
+}
+
+/// Dequantise + inverse-transform per-component quantised blocks into the
+/// decoder-mirrored reconstruction planes (cropped to `w × h`), applying
+/// the §J.2.3.1 convention: non-differential samples level-shift back and
+/// clamp into `0..=255`; differential samples round and store modulo 2^16.
+fn hier_recon_from_blocks(
+    blocks: &[Vec<[i32; 64]>],
+    w: usize,
+    h: usize,
+    quant: &[u16; 64],
+    differential: bool,
+) -> Vec<Vec<u32>> {
+    let nc = blocks.len();
+    let blocks_x = w.div_ceil(8);
+    let mut recon: Vec<Vec<u32>> = (0..nc).map(|_| vec![0u32; w * h]).collect();
+    for ci in 0..nc {
+        for (bi, q) in blocks[ci].iter().enumerate() {
+            let bx = bi % blocks_x;
+            let by = bi / blocks_x;
+            let r = hier_dct_recon_block(q, quant);
+            for j in 0..8 {
+                let y = by * 8 + j;
+                if y >= h {
+                    break;
+                }
+                for i in 0..8 {
+                    let x = bx * 8 + i;
+                    if x >= w {
+                        break;
+                    }
+                    let v = r[j * 8 + i];
+                    recon[ci][y * w + x] = if differential {
+                        (v.round() as i32 as u32) & 0xFFFF
+                    } else {
+                        let sv = v + 128.0;
+                        if sv <= 0.0 {
+                            0
+                        } else if sv >= 255.0 {
+                            255
+                        } else {
+                            sv.round() as u32
+                        }
+                    };
+                }
+            }
+        }
+    }
+    recon
+}
+
+/// Emit one hierarchical **progressive** DCT stage frame (SOF2
+/// non-differential or SOF6 differential) and return the decoder-mirrored
+/// reconstruction. The spectral-selection decomposition is one interleaved
+/// DC-first scan (`Ss = Se = 0`) followed by one full-band AC scan
+/// (`Ss = 1, Se = 63`) per component — progressive AC scans are
+/// single-component by definition (T.81 §B.2.3). For a differential frame
+/// the first DC scan codes each block's DC **directly** (§J.2.3.1 — no
+/// inter-block prediction); AC scans are unmodified.
+fn hier_encode_prog_frame_huff(
+    out: &mut Vec<u8>,
+    planes_i32: &[Vec<i32>],
+    w: usize,
+    h: usize,
+    quant: &[u16; 64],
+    dc_huff: &HuffTable,
+    ac_huff: &HuffTable,
+    differential: bool,
+) -> Vec<Vec<u32>> {
+    let nc = planes_i32.len();
+    let blocks = hier_quantise_planes(planes_i32, w, h, quant);
+    let blocks_x = w.div_ceil(8);
+    let blocks_y = h.div_ceil(8);
+
+    write_sof_hier_frame(
+        out,
+        if differential {
+            markers::SOF6
+        } else {
+            markers::SOF2
+        },
+        w as u16,
+        h as u16,
+        8,
+        nc as u8,
+    );
+
+    // Scan 1 — interleaved DC-first (every MCU is one block per component
+    // since all factors are 1×1).
+    write_sos_hier_prog_dc(out, nc as u8);
+    {
+        let mut bw = BitWriter::new(out);
+        let mut prev_dc = vec![0i32; nc];
+        for bi in 0..blocks_x * blocks_y {
+            for ci in 0..nc {
+                let dc = blocks[ci][bi][0];
+                let dc_val = if differential {
+                    // §J.2.3.1: the differential frame's first DC scan
+                    // codes the coefficient directly.
+                    dc
+                } else {
+                    let d = dc - prev_dc[ci];
+                    prev_dc[ci] = dc;
+                    d
+                };
+                let (size, bits) = category(dc_val);
+                let hc = dc_huff.encode[size as usize];
+                bw.write_bits(hc.code as u32, hc.len as u32);
+                if size > 0 {
+                    bw.write_bits(bits, size as u32);
+                }
+            }
+        }
+        bw.finish();
+    }
+
+    // Scans 2..=1+nc — one full-band AC scan per component.
+    for ci in 0..nc {
+        write_sos_progressive_ac(out, ci as u8 + 1, 0, 1, 63);
+        write_ac_scan(out, &blocks[ci], blocks_x * blocks_y, ac_huff, 1, 63);
+    }
+
+    hier_recon_from_blocks(&blocks, w, h, quant, differential)
+}
+
+/// Encode a single-component grayscale image as a standalone
+/// **hierarchical progressive-DCT** JPEG (T.81 §K.7.2.1): a
+/// `DHP`-introduced pyramid whose lowest stage is a non-differential
+/// progressive `SOF2` frame and whose refinements are `EXP`-expanded
+/// differential progressive `SOF6` frames. Each stage uses the
+/// spectral-selection decomposition "interleaved DC-first scan + one
+/// full-band AC scan per component"; a differential frame's DC scan codes
+/// each block's coefficient directly per §J.2.3.1. `lossless_final`
+/// appends a differential lossless `SOF7` terminator (§K.7.2) for a
+/// **bit-exact** reconstruction. Quantiser / table / `levels` semantics
+/// match [`encode_hierarchical_dct_jpeg_grayscale`]; the decoded pixels
+/// are identical to the sequential progression's at equal quality (same
+/// coefficients, different scan decomposition).
+pub fn encode_hierarchical_dct_progressive_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    quality: u8,
+    levels: u8,
+    lossless_final: bool,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let plane = hier_load_plane(samples, w, h, stride, 8)?;
+    encode_hier_dct_huffman(vec![plane], w, h, quality, levels, lossless_final, true)
+}
+
+/// Encode three full-resolution planar channels (Y, Cb, Cr — 4:4:4) as a
+/// standalone **hierarchical progressive-DCT** JPEG (`SOF2` + `SOF6`,
+/// optional `SOF7` terminator) — see
+/// [`encode_hierarchical_dct_progressive_jpeg_grayscale`].
+pub fn encode_hierarchical_dct_progressive_jpeg_yuv444(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    quality: u8,
+    levels: u8,
+    lossless_final: bool,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let mut loaded = Vec::with_capacity(3);
+    for c in 0..3 {
+        loaded.push(hier_load_plane(planes[c], w, h, strides[c], 8)?);
+    }
+    encode_hier_dct_huffman(loaded, w, h, quality, levels, lossless_final, true)
 }
 
 #[cfg(test)]

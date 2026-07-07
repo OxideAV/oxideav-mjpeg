@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical progressive-DCT encoder (SOF2 + SOF6, optional SOF7
+  terminator)** (T.81 §K.7.2.1 / §J.2.3.1).
+  `encoder::encode_hierarchical_dct_progressive_jpeg_grayscale` /
+  `_yuv444` emit the DCT pyramid with **progressive** stage frames: a
+  non-differential `SOF2` lowest stage and `EXP`-expanded differential
+  progressive `SOF6` refinements, each stage decomposed as one
+  interleaved DC-first scan (`Ss = Se = 0`) plus one full-band AC scan
+  (`Ss = 1, Se = 63`) per component (progressive AC scans are
+  single-component per §B.2.3). A differential frame's DC scan codes each
+  block's coefficient directly (§J.2.3.1). The `lossless_final` flag
+  appends the `SOF7` lossless terminator for bit-exact output. Tests: a
+  pixel-identity check against the sequential SOF0+SOF5 progression (same
+  coefficients, different scan decomposition), ≥ 35 dB 3-plane YUV 4:4:4,
+  and bit-exact SOF7-terminated round-trips for grayscale and YUV.
+
 - **Hierarchical arithmetic DCT-progression encoder (SOF9 + SOF13,
   optional SOF15 terminator)** (T.81 §K.7.2.1 / §J.2.3.1 / §J.2.4). The
   Q-coder counterparts of the Huffman DCT hierarchical entry points —

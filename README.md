@@ -450,6 +450,16 @@ reconstruction to the Huffman progression at equal quality. Passing
 frame coding the exact residual — bit-exact output on a single entropy
 coder.
 
+The **progressive** stage variant
+(`encode_hierarchical_dct_progressive_jpeg_grayscale` /
+`_progressive_jpeg_yuv444(…, quality, levels, lossless_final)`) emits
+`SOF2` + differential `SOF6` frames instead: each stage is one
+interleaved DC-first scan plus one full-band AC scan per component
+(progressive AC scans are single-component, §B.2.3), with the
+differential frame's DC scan coded directly per §J.2.3.1 — decoding
+pixel-identical to the sequential progression at equal quality, with
+the same optional `SOF7` lossless terminator.
+
 ### 4-component CMYK / YCCK encode
 
 The 4-component (CMYK / Adobe YCCK) decode paths are matched by a

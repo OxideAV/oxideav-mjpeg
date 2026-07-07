@@ -900,3 +900,110 @@ fn hier_dct_arith_yuv444_two_stage_decodes_with_high_fidelity() {
         assert!(db >= 35.0, "arith YUV444 plane {ci} PSNR {db:.2} dB < 35");
     }
 }
+
+// ---- Progressive DCT progression (SOF2 + SOF6, optional SOF7 terminator) ----
+
+use oxideav_mjpeg::encoder::{
+    encode_hierarchical_dct_progressive_jpeg_grayscale,
+    encode_hierarchical_dct_progressive_jpeg_yuv444,
+};
+
+#[test]
+fn hier_prog_dct_gray_matches_sequential_progression_pixels() {
+    // Same quantised coefficients, different scan decomposition: the
+    // progressive progression must decode pixel-identically to the
+    // sequential (SOF0 + SOF5) one.
+    let (w, h) = (48usize, 32usize);
+    let img = mk_smooth_plane(w, h, 0x9D06);
+    let bytes = plane_to_bytes(&img, 8);
+    let prog = encode_hierarchical_dct_progressive_jpeg_grayscale(
+        w as u32, h as u32, &bytes, w, 85, 2, false,
+    )
+    .expect("progressive encode");
+    let seq = encode_hierarchical_dct_jpeg_grayscale(w as u32, h as u32, &bytes, w, 85, 2)
+        .expect("sequential encode");
+    let a = gray_samples(&decode(&prog, w as u32, h as u32), w, h, 8);
+    let b = gray_samples(&decode(&seq, w as u32, h as u32), w, h, 8);
+    assert_eq!(a, b, "SOF2+SOF6 must decode pixel-identical to SOF0+SOF5");
+}
+
+#[test]
+fn hier_prog_dct_gray_lossless_final_bit_exact() {
+    let (w, h) = (32usize, 24usize);
+    let img = mk_plane(w, h, 8, 0x9D07);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg = encode_hierarchical_dct_progressive_jpeg_grayscale(
+        w as u32, h as u32, &bytes, w, 50, 2, true,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(gray_samples(&frame, w, h, 8), img);
+}
+
+#[test]
+fn hier_prog_dct_yuv444_two_stage_decodes_with_high_fidelity() {
+    let (w, h) = (32usize, 32usize);
+    let yp = mk_smooth_plane(w, h, 0xC1);
+    let cb = mk_smooth_plane(w, h, 0xC2);
+    let cr = mk_smooth_plane(w, h, 0xC3);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_progressive_jpeg_yuv444(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        90,
+        2,
+        false,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 3, "planar Yuv444P");
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        let mut got = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                got[y * w + x] = plane.data[y * plane.stride + x] as u32;
+            }
+        }
+        let db = psnr(src, &got, 255.0);
+        assert!(db >= 35.0, "prog YUV444 plane {ci} PSNR {db:.2} dB < 35");
+    }
+}
+
+#[test]
+fn hier_prog_dct_yuv444_lossless_final_bit_exact() {
+    let (w, h) = (16usize, 16usize);
+    let yp = mk_plane(w, h, 8, 0xC4);
+    let cb = mk_plane(w, h, 8, 0xC5);
+    let cr = mk_plane(w, h, 8, 0xC6);
+    let yb = plane_to_bytes(&yp, 8);
+    let cbb = plane_to_bytes(&cb, 8);
+    let crb = plane_to_bytes(&cr, 8);
+    let jpeg = encode_hierarchical_dct_progressive_jpeg_yuv444(
+        w as u32,
+        h as u32,
+        [&yb, &cbb, &crb],
+        [w, w, w],
+        75,
+        2,
+        true,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    for (ci, src) in [&yp, &cb, &cr].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    plane.data[y * plane.stride + x] as u32,
+                    src[y * w + x],
+                    "plane {ci} ({x},{y})"
+                );
+            }
+        }
+    }
+}

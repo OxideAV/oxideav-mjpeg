@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hierarchical spatial-lossless arithmetic encoder (SOF11 + SOF15)**
+  (T.81 Annex J / §K.7.2.2 / §H.1.2.3). The Q-coder counterparts of the
+  Huffman hierarchical entry points —
+  `encoder::encode_hierarchical_lossless_arith_jpeg_grayscale` / `_rgb` /
+  `_cmyk` — emit the same `DHP` + `EXP` pyramid with a non-differential
+  lossless `SOF11` lowest stage and differential lossless `SOF15`
+  refinement stages. Every stage is a single arithmetic-coded entropy
+  segment: each component keeps its own §H.1.2.3.2 statistics area and
+  `L_Context(Da, Db)` / `X1_Context(Db)` difference history, the
+  differential stages code the modulo-2^P stage residual directly
+  (§J.2.3.2, `Ss = 0`), and no DAC is emitted (default conditioning
+  `(L, U) = (0, 1)`, §H.1.2.3.3). Bit-exact reconstruction for grayscale /
+  RGB-class at every precision `P ∈ 2..=16` and CMYK-class at `P = 8`
+  (all three Adobe APP14 conventions). 7 new round-trip integration tests
+  (P = 8/12/14/16, 1–3 stages, full-range 16-bit extremes).
+
 - **Hierarchical spatial-lossless encoder (DHP + SOF3 + EXP + SOF7)**
   (T.81 Annex J / §K.7.2.2). Three new public entry points —
   `encoder::encode_hierarchical_lossless_jpeg_grayscale` (any precision

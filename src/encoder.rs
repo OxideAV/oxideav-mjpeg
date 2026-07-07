@@ -6441,6 +6441,97 @@ fn hier_write_lossless_diff_scan_huff(
     }
 }
 
+/// Emit one lossless **arithmetic** scan (T.81 §H.1.2.3 statistical model
+/// over the Annex D Q-coder) for `nc` all-`H = V = 1` component planes,
+/// interleaved one coded difference per component per pixel position, into
+/// a single arithmetic-coded entropy segment appended to `out`.
+///
+/// Non-differential (`differential = false`): the value coded is the
+/// modulo-2^16 prediction difference (Annex H Table H.1 predictor with the
+/// §H.1.2.1 first-line / first-column fall-backs, scan-origin default
+/// prediction `origin`). Differential (`differential = true`, §J.2.3.2):
+/// each plane already holds the modulo-2^P stage difference and its
+/// minimal-magnitude signed representative is coded directly (no spatial
+/// prediction). In both cases every component keeps its own statistics
+/// area and difference history — the `L_Context(Da, Db)` / `X1_Context(Db)`
+/// conditioning always reads the differences coded for the left / above
+/// neighbours (§H.1.2.3.2), exactly mirroring the decoder. No DAC segment
+/// is emitted, so the default conditioning bounds `(L, U) = (0, 1)` apply
+/// (§H.1.2.3.3). No restart markers.
+#[allow(clippy::too_many_arguments)]
+fn hier_write_lossless_arith_scan(
+    out: &mut Vec<u8>,
+    planes: &[Vec<u32>],
+    w: usize,
+    h: usize,
+    predictor: u8,
+    origin: u32,
+    differential: bool,
+    precision: u8,
+) -> Result<()> {
+    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+
+    let nc = planes.len();
+    let mut stats: Vec<LosslessStats> = (0..nc).map(|_| LosslessStats::new()).collect();
+    let mut prev_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w]).collect();
+    let mut cur_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w]).collect();
+    let mut enc = ArithEncoder::new();
+
+    for y in 0..h {
+        for x in 0..w {
+            for ci in 0..nc {
+                let plane = &planes[ci];
+                let coded: i32 = if differential {
+                    // §J.2.3.2: the difference is coded directly; the plane
+                    // holds it modulo 2^P.
+                    hier_diff_signed(plane[y * w + x], precision)
+                } else {
+                    let actual = plane[y * w + x];
+                    let pred: u32 = if y == 0 && x == 0 {
+                        origin
+                    } else if y == 0 {
+                        // First line uses Ra regardless of selector (§H.1.2.1).
+                        plane[y * w + x - 1]
+                    } else if x == 0 {
+                        plane[(y - 1) * w + x]
+                    } else {
+                        let ra = plane[y * w + x - 1];
+                        let rb = plane[(y - 1) * w + x];
+                        let rc = plane[(y - 1) * w + x - 1];
+                        match predictor {
+                            1 => ra,
+                            2 => rb,
+                            3 => rc,
+                            4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                            // §H.1 footnote: divide-by-2 is an arithmetic shift.
+                            5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                            6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                            7 => (ra.wrapping_add(rb)) >> 1,
+                            _ => unreachable!(),
+                        }
+                    };
+                    // Modulo-2^16 difference reduced to the canonical
+                    // -32768..=32767 representative (§H.1.2.1 / §H.1.2.2).
+                    let dm = (actual.wrapping_sub(pred) & 0xFFFF) as i32;
+                    if dm >= 0x8000 {
+                        dm - 0x1_0000
+                    } else {
+                        dm
+                    }
+                };
+                let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
+                let db = prev_diff[ci][x];
+                encode_lossless_diff(&mut enc, &mut stats[ci], da, db, coded)?;
+                cur_diff[ci][x] = coded;
+            }
+        }
+        std::mem::swap(&mut prev_diff, &mut cur_diff);
+    }
+
+    out.extend_from_slice(&enc.finish());
+    Ok(())
+}
+
 /// Build the resolution pyramid for a hierarchical encode: index 0 is the
 /// full-resolution stage, index `levels − 1` the lowest-resolution one.
 fn hier_build_pyramid(planes: Vec<Vec<u32>>, w: usize, h: usize, levels: u8) -> Vec<Vec<Vec<u32>>> {
@@ -6465,7 +6556,8 @@ fn hier_build_pyramid(planes: Vec<Vec<u32>>, w: usize, h: usize, levels: u8) -> 
 /// (EXP + SOF7 stage)* / EOI`. `planes` are full-resolution component
 /// planes (values already on the wire convention — any Adobe inversion has
 /// been applied by the caller).
-fn encode_hier_lossless_huffman(
+#[allow(clippy::too_many_arguments)]
+fn encode_hier_lossless(
     planes: Vec<Vec<u32>>,
     w: usize,
     h: usize,
@@ -6473,6 +6565,7 @@ fn encode_hier_lossless_huffman(
     predictor: u8,
     levels: u8,
     adobe_transform: Option<u8>,
+    arith: bool,
 ) -> Result<Vec<u8>> {
     if !(2..=16).contains(&precision) {
         return Err(Error::unsupported(format!(
@@ -6504,21 +6597,37 @@ fn encode_hier_lossless_huffman(
     write_dhp(&mut out, w as u16, h as u16, precision, nc as u8);
     // One shared DC table for every stage; the hierarchical decode loop
     // inherits table-specification segments seen before the first frame.
-    write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+    // The arithmetic progression needs no DHT (and no DAC — the decoder
+    // applies the §H.1.2.3.3 default conditioning bounds `(L, U) = (0, 1)`).
+    if !arith {
+        write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
+    }
 
-    // Lowest-resolution stage: non-differential SOF3 frame.
+    // Lowest-resolution stage: non-differential SOF3 (Huffman) or SOF11
+    // (arithmetic) frame.
     let last = levels as usize - 1;
     let (lw, lh) = (w >> last, h >> last);
     write_sof_hier_lossless(
         &mut out,
-        markers::SOF3,
+        if arith { markers::SOF11 } else { markers::SOF3 },
         lw as u16,
         lh as u16,
         precision,
         nc as u8,
     );
     write_sos_lossless_multi(&mut out, predictor, nc as u8, 0);
-    {
+    if arith {
+        hier_write_lossless_arith_scan(
+            &mut out,
+            &pyramid[last],
+            lw,
+            lh,
+            predictor,
+            origin as u32,
+            false,
+            precision,
+        )?;
+    } else {
         let mut bw = BitWriter::new(&mut out);
         hier_write_lossless_scan_huff(&mut bw, &pyramid[last], lw, lh, predictor, origin, &dc_huff);
         bw.finish();
@@ -6548,16 +6657,20 @@ fn encode_hier_lossless_huffman(
         write_exp(&mut out, true, true);
         write_sof_hier_lossless(
             &mut out,
-            markers::SOF7,
+            if arith { markers::SOF15 } else { markers::SOF7 },
             rw as u16,
             rh as u16,
             precision,
             nc as u8,
         );
         write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
-        let mut bw = BitWriter::new(&mut out);
-        hier_write_lossless_diff_scan_huff(&mut bw, &diffs, rw * rh, precision, &dc_huff);
-        bw.finish();
+        if arith {
+            hier_write_lossless_arith_scan(&mut out, &diffs, rw, rh, 0, 0, true, precision)?;
+        } else {
+            let mut bw = BitWriter::new(&mut out);
+            hier_write_lossless_diff_scan_huff(&mut bw, &diffs, rw * rh, precision, &dc_huff);
+            bw.finish();
+        }
     }
 
     out.push(0xFF);
@@ -6610,7 +6723,7 @@ pub fn encode_hierarchical_lossless_jpeg_grayscale(
         )));
     }
     let plane = hier_load_plane(samples, w, h, stride, precision)?;
-    encode_hier_lossless_huffman(vec![plane], w, h, precision, predictor, levels, None)
+    encode_hier_lossless(vec![plane], w, h, precision, predictor, levels, None, false)
 }
 
 /// Encode three component planes (R, G, B — or any three independent
@@ -6650,7 +6763,7 @@ pub fn encode_hierarchical_lossless_jpeg_rgb(
     for c in 0..3 {
         loaded.push(hier_load_plane(planes[c], w, h, strides[c], precision)?);
     }
-    encode_hier_lossless_huffman(loaded, w, h, precision, predictor, levels, None)
+    encode_hier_lossless(loaded, w, h, precision, predictor, levels, None, false)
 }
 
 /// Encode four 8-bit component planes (C, M, Y, K) as a standalone
@@ -6704,7 +6817,114 @@ pub fn encode_hierarchical_lossless_jpeg_cmyk(
         }
         loaded.push(plane);
     }
-    encode_hier_lossless_huffman(loaded, w, h, 8, predictor, levels, adobe_transform)
+    encode_hier_lossless(loaded, w, h, 8, predictor, levels, adobe_transform, false)
+}
+
+/// Encode a single-component grayscale image as a standalone **hierarchical
+/// spatial-lossless, arithmetic-coded** JPEG — the Q-coder counterpart of
+/// [`encode_hierarchical_lossless_jpeg_grayscale`]: a `DHP`-introduced
+/// pyramid whose lowest stage is a non-differential lossless `SOF11` frame
+/// and whose higher stages are `EXP`-expanded differential lossless `SOF15`
+/// frames (T.81 Annex J / §K.7.2.2). Every coded difference goes through
+/// the §H.1.2.3 two-dimensional statistical model (`L_Context(Da, Db)` /
+/// `X1_Context(Db)` conditioning, default `(L, U) = (0, 1)` — no DAC is
+/// emitted). Same sample conventions, `levels` geometry rule and bit-exact
+/// reconstruction guarantee as the Huffman variant.
+pub fn encode_hierarchical_lossless_arith_jpeg_grayscale(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    stride: usize,
+    precision: u8,
+    predictor: u8,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "hierarchical lossless encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    let plane = hier_load_plane(samples, w, h, stride, precision)?;
+    encode_hier_lossless(vec![plane], w, h, precision, predictor, levels, None, true)
+}
+
+/// Encode three component planes as a standalone **hierarchical
+/// spatial-lossless, arithmetic-coded** JPEG (`SOF11` + `SOF15`) — the
+/// Q-coder counterpart of [`encode_hierarchical_lossless_jpeg_rgb`]. Same
+/// colour-agnostic plane conventions, precision-shaped decode output,
+/// `levels` geometry rule and bit-exact reconstruction guarantee.
+pub fn encode_hierarchical_lossless_arith_jpeg_rgb(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+    precision: u8,
+    predictor: u8,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    if !(2..=16).contains(&precision) {
+        return Err(Error::unsupported(format!(
+            "hierarchical lossless encoder: precision {precision} out of range 2..=16"
+        )));
+    }
+    let mut loaded = Vec::with_capacity(3);
+    for c in 0..3 {
+        loaded.push(hier_load_plane(planes[c], w, h, strides[c], precision)?);
+    }
+    encode_hier_lossless(loaded, w, h, precision, predictor, levels, None, true)
+}
+
+/// Encode four 8-bit component planes (C, M, Y, K) as a standalone
+/// **hierarchical spatial-lossless, arithmetic-coded** JPEG (`SOF11` +
+/// `SOF15`) — the Q-coder counterpart of
+/// [`encode_hierarchical_lossless_jpeg_cmyk`]. `adobe_transform` follows
+/// the same APP14 conventions (`None` / `Some(0)` bit-exact, `Some(2)`
+/// YCCK lossy-by-convention with an exactly round-tripping K plane).
+pub fn encode_hierarchical_lossless_arith_jpeg_cmyk(
+    width: u32,
+    height: u32,
+    planes: [&[u8]; 4],
+    strides: [usize; 4],
+    predictor: u8,
+    adobe_transform: Option<u8>,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    match adobe_transform {
+        None | Some(0) | Some(2) => {}
+        Some(other) => {
+            return Err(Error::invalid(format!(
+                "hierarchical CMYK encoder: adobe_transform = {other} (only None / Some(0) / Some(2) are supported)"
+            )));
+        }
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Err(Error::invalid("hierarchical encoder: zero-size image"));
+    }
+    let invert_all = matches!(adobe_transform, Some(0));
+    let invert_k_only = matches!(adobe_transform, Some(2));
+    let mut loaded = Vec::with_capacity(4);
+    for c in 0..4 {
+        let mut plane = hier_load_plane(planes[c], w, h, strides[c], 8)?;
+        if invert_all || (invert_k_only && c == 3) {
+            for v in plane.iter_mut() {
+                *v = 255 - *v;
+            }
+        }
+        loaded.push(plane);
+    }
+    encode_hier_lossless(loaded, w, h, 8, predictor, levels, adobe_transform, true)
 }
 
 #[cfg(test)]

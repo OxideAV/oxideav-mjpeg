@@ -343,3 +343,182 @@ fn hier_cmyk_ycck_decodes_with_exact_k_plane() {
         }
     }
 }
+
+// ---- Arithmetic (SOF11 + SOF15) progression ---------------------------------
+
+use oxideav_mjpeg::encoder::{
+    encode_hierarchical_lossless_arith_jpeg_cmyk,
+    encode_hierarchical_lossless_arith_jpeg_grayscale, encode_hierarchical_lossless_arith_jpeg_rgb,
+};
+
+#[test]
+fn hier_arith_gray_p8_two_stage_bit_exact() {
+    let (w, h) = (32usize, 24usize);
+    for predictor in [1u8, 4, 7] {
+        let img = mk_plane(w, h, 8, 0xA11CE);
+        let bytes = plane_to_bytes(&img, 8);
+        let jpeg = encode_hierarchical_lossless_arith_jpeg_grayscale(
+            w as u32, h as u32, &bytes, w, 8, predictor, 2,
+        )
+        .expect("encode");
+        let frame = decode(&jpeg, w as u32, h as u32);
+        assert_eq!(gray_samples(&frame, w, h, 8), img, "predictor {predictor}");
+    }
+}
+
+#[test]
+fn hier_arith_gray_p8_three_stage_bit_exact() {
+    let (w, h) = (64usize, 32usize);
+    let img = mk_plane(w, h, 8, 0xD0D0);
+    let bytes = plane_to_bytes(&img, 8);
+    let jpeg =
+        encode_hierarchical_lossless_arith_jpeg_grayscale(w as u32, h as u32, &bytes, w, 8, 1, 3)
+            .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(gray_samples(&frame, w, h, 8), img);
+}
+
+#[test]
+fn hier_arith_gray_p16_full_range_two_stage_bit_exact() {
+    let (w, h) = (16usize, 12usize);
+    let mut img = mk_plane(w, h, 16, 0x5EED5);
+    img[0] = 0;
+    img[1] = 65_535;
+    img[w] = 65_535;
+    img[w + 1] = 0;
+    let bytes = plane_to_bytes(&img, 16);
+    let jpeg = encode_hierarchical_lossless_arith_jpeg_grayscale(
+        w as u32,
+        h as u32,
+        &bytes,
+        w * 2,
+        16,
+        1,
+        2,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes[0].stride, w * 2, "Gray16Le stride");
+    assert_eq!(gray_samples(&frame, w, h, 16), img);
+}
+
+#[test]
+fn hier_arith_gray_p12_single_stage_bit_exact() {
+    let (w, h) = (11usize, 9usize);
+    let img = mk_plane(w, h, 12, 0xF00D);
+    let bytes = plane_to_bytes(&img, 12);
+    let jpeg = encode_hierarchical_lossless_arith_jpeg_grayscale(
+        w as u32,
+        h as u32,
+        &bytes,
+        w * 2,
+        12,
+        6,
+        1,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(gray_samples(&frame, w, h, 12), img);
+}
+
+#[test]
+fn hier_arith_rgb_p8_two_stage_bit_exact() {
+    let (w, h) = (24usize, 16usize);
+    let r = mk_plane(w, h, 8, 0x11);
+    let g = mk_plane(w, h, 8, 0x22);
+    let b = mk_plane(w, h, 8, 0x33);
+    let rb = plane_to_bytes(&r, 8);
+    let gb = plane_to_bytes(&g, 8);
+    let bb = plane_to_bytes(&b, 8);
+    let jpeg = encode_hierarchical_lossless_arith_jpeg_rgb(
+        w as u32,
+        h as u32,
+        [&rb, &gb, &bb],
+        [w, w, w],
+        8,
+        4,
+        2,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes[0].stride, w * 3, "packed Rgb24 stride");
+    let plane = &frame.planes[0];
+    for y in 0..h {
+        for x in 0..w {
+            let o = y * plane.stride + x * 3;
+            assert_eq!(plane.data[o] as u32, r[y * w + x], "R ({x},{y})");
+            assert_eq!(plane.data[o + 1] as u32, g[y * w + x], "G ({x},{y})");
+            assert_eq!(plane.data[o + 2] as u32, b[y * w + x], "B ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn hier_arith_rgb_p14_two_stage_bit_exact() {
+    let (w, h) = (8usize, 8usize);
+    let g = mk_plane(w, h, 14, 0x44);
+    let b = mk_plane(w, h, 14, 0x55);
+    let r = mk_plane(w, h, 14, 0x66);
+    let gb = plane_to_bytes(&g, 14);
+    let bb = plane_to_bytes(&b, 14);
+    let rb = plane_to_bytes(&r, 14);
+    let jpeg = encode_hierarchical_lossless_arith_jpeg_rgb(
+        w as u32,
+        h as u32,
+        [&gb, &bb, &rb],
+        [w * 2, w * 2, w * 2],
+        14,
+        1,
+        2,
+    )
+    .expect("encode");
+    let frame = decode(&jpeg, w as u32, h as u32);
+    assert_eq!(frame.planes.len(), 3, "planar Gbrp14Le");
+    for (ci, src) in [&g, &b, &r].into_iter().enumerate() {
+        let plane = &frame.planes[ci];
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * plane.stride + x * 2;
+                let got = plane.data[o] as u32 | ((plane.data[o + 1] as u32) << 8);
+                assert_eq!(got, src[y * w + x], "component {ci} ({x},{y})");
+            }
+        }
+    }
+}
+
+#[test]
+fn hier_arith_cmyk_two_stage_bit_exact() {
+    let (w, h) = (16usize, 16usize);
+    let c = mk_plane(w, h, 8, 0x71);
+    let m = mk_plane(w, h, 8, 0x72);
+    let y = mk_plane(w, h, 8, 0x73);
+    let k = mk_plane(w, h, 8, 0x74);
+    let cb = plane_to_bytes(&c, 8);
+    let mb = plane_to_bytes(&m, 8);
+    let yb = plane_to_bytes(&y, 8);
+    let kb = plane_to_bytes(&k, 8);
+    for transform in [None, Some(0u8)] {
+        let jpeg = encode_hierarchical_lossless_arith_jpeg_cmyk(
+            w as u32,
+            h as u32,
+            [&cb, &mb, &yb, &kb],
+            [w, w, w, w],
+            1,
+            transform,
+            2,
+        )
+        .expect("encode");
+        let frame = decode(&jpeg, w as u32, h as u32);
+        assert_eq!(frame.planes[0].stride, w * 4, "packed Cmyk stride");
+        let plane = &frame.planes[0];
+        for yy in 0..h {
+            for x in 0..w {
+                let o = yy * plane.stride + x * 4;
+                assert_eq!(plane.data[o] as u32, c[yy * w + x], "C {transform:?}");
+                assert_eq!(plane.data[o + 1] as u32, m[yy * w + x], "M {transform:?}");
+                assert_eq!(plane.data[o + 2] as u32, y[yy * w + x], "Y {transform:?}");
+                assert_eq!(plane.data[o + 3] as u32, k[yy * w + x], "K {transform:?}");
+            }
+        }
+    }
+}

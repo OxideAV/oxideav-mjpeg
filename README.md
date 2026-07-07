@@ -400,6 +400,17 @@ and `encode_hierarchical_lossless_jpeg_cmyk(width, height,
 `encode_lossless_jpeg_cmyk`). Point transform is fixed at `Pt = 0` and no
 restart markers are emitted, matching the decoder's hierarchical slice.
 
+The **arithmetic-coded** progression (`SOF11` non-differential +
+`SOF15` differential — the Q-coder counterpart under the T.81
+§H.1.2.3 two-dimensional statistical model) is emitted by the matching
+`encode_hierarchical_lossless_arith_jpeg_grayscale` /
+`_arith_jpeg_rgb` / `_arith_jpeg_cmyk` entry points: same pyramid
+shape, one arithmetic-coded entropy segment per stage with independent
+per-component statistics areas and `L_Context(Da, Db)` /
+`X1_Context(Db)` difference-history conditioning, no DAC segment
+(default `(L, U) = (0, 1)` bounds per §H.1.2.3.3), and the same
+bit-exact reconstruction guarantee.
+
 ### 4-component CMYK / YCCK encode
 
 The 4-component (CMYK / Adobe YCCK) decode paths are matched by a

@@ -803,6 +803,21 @@ impl<'a> BitReader<'a> {
             return Err(Error::invalid("BitReader: requested > 24 bits"));
         }
         while self.nbits < needed {
+            // Bulk fast path: when the next two bytes are both plain entropy
+            // bytes (neither is 0xFF, so no stuffing / marker / fill-run
+            // logic can apply), committing them together is byte-for-byte
+            // identical to two iterations of the single-byte path below.
+            if self.nbits <= 16 && self.pos + 2 <= self.buf.len() {
+                let b0 = self.buf[self.pos];
+                let b1 = self.buf[self.pos + 1];
+                if b0 != 0xFF && b1 != 0xFF {
+                    let w = ((b0 as u32) << 8) | b1 as u32;
+                    self.bits |= w << (16 - self.nbits);
+                    self.nbits += 16;
+                    self.pos += 2;
+                    continue;
+                }
+            }
             match self.next_byte_with_stuff()? {
                 Some(b) => {
                     self.bits |= (b as u32) << (24 - self.nbits);
@@ -872,6 +887,20 @@ impl<'a> BitReader<'a> {
             return Err(Error::invalid("BitReader: peek_bits(n > 24)"));
         }
         while self.nbits < n {
+            // Bulk fast path: two plain entropy bytes (neither 0xFF) commit
+            // together — byte-for-byte identical to two iterations of the
+            // single-byte path below, and the dominant case between markers.
+            if self.nbits <= 16 && self.pos + 2 <= self.buf.len() {
+                let b0 = self.buf[self.pos];
+                let b1 = self.buf[self.pos + 1];
+                if b0 != 0xFF && b1 != 0xFF {
+                    let w = ((b0 as u32) << 8) | b1 as u32;
+                    self.bits |= w << (16 - self.nbits);
+                    self.nbits += 16;
+                    self.pos += 2;
+                    continue;
+                }
+            }
             // Only consume a *plain* byte (or a stuffed 0xFF00 → 0xFF). A
             // run-collapsed marker leaves `pos` untouched and pads.
             if self.pos >= self.buf.len() {
@@ -3008,6 +3037,84 @@ fn decode_lossless_scan(
 /// without spatial prediction (the predictor selector Ss must be 0), so
 /// every reconstructed sample is the modulo-2^(P-Pt) two's-complement
 /// difference itself rather than `pred + diff`.
+/// Decode one Annex H residual: Huffman SSSS category, then the extend()
+/// payload bits (SSSS = 16 is the no-extra-bits +32768 special of Table
+/// H.2). Exactly the per-sample sequence of the generic lossless loop.
+#[inline]
+fn lossless_residual(br: &mut BitReader<'_>, t: &HuffTable) -> Result<i32> {
+    let s = decode_huff(br, t)? as u32;
+    if s > 16 {
+        // Annex H Table H.2: SSSS = magnitude in 0..16. A Huffman table
+        // that produces a value > 16 here is either corrupt or maliciously
+        // crafted; the existing extend / get_bits machinery has no defined
+        // behaviour for it.
+        return Err(Error::invalid("lossless: SSSS > 16"));
+    }
+    Ok(if s == 0 {
+        0
+    } else if s == 16 {
+        32_768
+    } else {
+        let bits = br.get_bits(s)? as i32;
+        extend(bits, s)
+    })
+}
+
+/// Specialised raster decode for a flat (non-subsampled) single-component
+/// lossless scan with no restart intervals and no differential coding.
+///
+/// Bit-for-bit the same stream walk and sample arithmetic as the generic
+/// per-sample loop in `decode_lossless_scan_planes`, restructured so that:
+/// the very first sample predicts from the scan origin (H.1.2.1), the rest
+/// of row 0 predicts Ra, column 0 of later rows predicts Rb, and interior
+/// samples use `pred_fn(ra, rb, rc)` — the Table H.1 predictor
+/// monomorphised at the call site. Ra rides in a local, and rows are
+/// addressed through split slices so the hot loop carries no per-sample
+/// index arithmetic or predictor dispatch.
+#[allow(clippy::too_many_arguments)]
+fn decode_lossless_flat_rows(
+    br: &mut BitReader<'_>,
+    table: &HuffTable,
+    plane: &mut [u32],
+    width: usize,
+    height: usize,
+    origin: u32,
+    sample_mask: u32,
+    pred_fn: impl Fn(u32, u32, u32) -> u32,
+) -> Result<()> {
+    // Row 0: first sample from the origin, the rest chain on Ra.
+    let row0 = &mut plane[..width];
+    let mut ra = origin;
+    for slot in row0.iter_mut() {
+        let residual = lossless_residual(br, table)?;
+        let sv = ((ra as i32).wrapping_add(residual) as u32) & sample_mask;
+        *slot = sv;
+        ra = sv;
+    }
+    // Rows 1..: column 0 predicts Rb; interior samples use the predictor.
+    for y in 1..height {
+        let (prev, cur) = plane.split_at_mut(y * width);
+        let prev_row = &prev[(y - 1) * width..];
+        let cur_row = &mut cur[..width];
+
+        let residual = lossless_residual(br, table)?;
+        let sv = ((prev_row[0] as i32).wrapping_add(residual) as u32) & sample_mask;
+        cur_row[0] = sv;
+        let mut ra = sv;
+
+        for x in 1..width {
+            let rb = prev_row[x];
+            let rc = prev_row[x - 1];
+            let pred = pred_fn(ra, rb, rc);
+            let residual = lossless_residual(br, table)?;
+            let sv = ((pred as i32).wrapping_add(residual) as u32) & sample_mask;
+            cur_row[x] = sv;
+            ra = sv;
+        }
+    }
+    Ok(())
+}
+
 fn decode_lossless_scan_planes(
     state: &JpegState,
     sos: &SosInfo,
@@ -3134,6 +3241,102 @@ fn decode_lossless_scan_planes(
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = RST0;
     let mut reset_pred = true; // true at image start and after each RSTn.
+
+    // Specialised single-component raster path: no restart intervals, no
+    // differential coding, one component. This is the dominant SOF3 shape
+    // (plain lossless grayscale) and the per-sample generic loop below
+    // spends a measurable share of its time on the predictor `match`, the
+    // edge-case branches, and four bounds-checked plane indexings per
+    // sample. `decode_lossless_flat_rows` runs the same arithmetic with
+    // the predictor monomorphised and the neighbour window carried in
+    // locals over split row slices — identical bit consumption, identical
+    // sample values (verified by the pinned golden hashes and the
+    // exact-roundtrip suite).
+    if !subsampled && nc == 1 && !differential && state.restart_interval == 0 {
+        let plane = &mut samples[0];
+        let table = dc_tables[0];
+        // comp_w[0] == width in the flat path.
+        match predictor {
+            1 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |ra, _rb, _rc| ra,
+            ),
+            2 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |_ra, rb, _rc| rb,
+            ),
+            3 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |_ra, _rb, rc| rc,
+            ),
+            4 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |ra, rb, rc| ra.wrapping_add(rb).wrapping_sub(rc),
+            ),
+            5 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |ra, rb, rc| ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+            ),
+            6 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |ra, rb, rc| rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+            ),
+            7 => decode_lossless_flat_rows(
+                &mut br,
+                table,
+                plane,
+                width,
+                height,
+                origin,
+                sample_mask,
+                |ra, rb, _rc| ra.wrapping_add(rb) >> 1,
+            ),
+            _ => unreachable!("predictor validated to 1..=7 above"),
+        }?;
+        return Ok(LosslessPlanes {
+            samples,
+            comp_w,
+            comp_true_w,
+            comp_true_h,
+            subsampled,
+        });
+    }
 
     // Decode one sample at component-grid position (cy, cx) for component
     // `ci`. `decode_one` predicts from the component's own grid per Table

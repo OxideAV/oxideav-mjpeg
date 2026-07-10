@@ -972,6 +972,55 @@ fn extend(value: i32, size: u32) -> i32 {
     }
 }
 
+/// Convert a quant table to f32 once per scan so the per-block dequantise
+/// loop skips the u16 → f32 conversion. The conversion is exact (every u16
+/// is representable in f32), so hoisting it cannot change any product.
+fn quant_to_f32(qt: &QuantTable) -> [f32; 64] {
+    std::array::from_fn(|k| qt.values[k] as f32)
+}
+
+/// Dequantise one natural-order coefficient block, inverse-DCT it, and
+/// store the level-shifted clamped 8-bit samples into `buf` at
+/// `(dst_x0, dst_y0)`. Shared by the interleaved sequential path
+/// (`decode_scan`) and the coefficient-accumulator render
+/// (`render_from_coefs`).
+///
+/// The arithmetic is exactly the historical inline sequence — dequantise
+/// in f32 (avoids i32 overflow when a Pq=1 16-bit quantiser meets a
+/// coefficient at the top of its range), `idct8x8`, `+ 128.0` level shift,
+/// `<= 0.0` / `>= 255.0` clamp, `round()` — so the output is bit-identical;
+/// the store loop walks 8-sample row slices so the bounds check runs once
+/// per row instead of once per sample.
+#[inline]
+fn render_block_8bit(
+    block: &[i32; 64],
+    qtf: &[f32; 64],
+    buf: &mut [u8],
+    stride: usize,
+    dst_x0: usize,
+    dst_y0: usize,
+) {
+    let mut fblock = [0.0f32; 64];
+    for k in 0..64 {
+        fblock[k] = block[k] as f32 * qtf[k];
+    }
+    idct8x8(&mut fblock);
+    for j in 0..8 {
+        let dst = &mut buf[(dst_y0 + j) * stride + dst_x0..][..8];
+        let src = &fblock[j * 8..j * 8 + 8];
+        for (out, &f) in dst.iter_mut().zip(src) {
+            let v = f + 128.0;
+            *out = if v <= 0.0 {
+                0
+            } else if v >= 255.0 {
+                255
+            } else {
+                v.round() as u8
+            };
+        }
+    }
+}
+
 fn decode_scan(
     state: &JpegState,
     sos: &SosInfo,
@@ -1116,6 +1165,8 @@ fn decode_scan(
                 .ok_or_else(|| Error::invalid("quant table missing for component"))
         })
         .collect::<Result<Vec<_>>>()?;
+    // Per-component quantisers in f32, converted once for the whole scan.
+    let quant_f32: Vec<[f32; 64]> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
 
     let mut br = BitReader::new(scan);
     let mut prev_dc = vec![0i32; n_comp];
@@ -1184,35 +1235,17 @@ fn decode_scan(
                             &mut prev_dc[*sof_idx],
                             &mut block,
                         )?;
-                        // Dequantise.
-                        let qt = quant_tables[*sof_idx];
-                        let mut fblock = [0.0f32; 64];
-                        for k in 0..64 {
-                            // `block` is natural-order; `qt.values` is natural-order.
-                            // Multiply in f32 to avoid i32 overflow when Pq=1 (16-bit
-                            // quantiser, values up to 65535) meets a coefficient at the
-                            // top of its range — the IDCT input is f32 either way.
-                            fblock[k] = block[k] as f32 * qt.values[k] as f32;
-                        }
-                        idct8x8(&mut fblock);
-                        // Write 8×8 to component buffer at position (mx * H + bx, my * V + by).
+                        // Dequantise + IDCT + store 8×8 at (mx * H + bx, my * V + by).
                         let dst_x0 = mx * 8 * c.h_factor as usize + bx * 8;
                         let dst_y0 = my * 8 * c.v_factor as usize + by * 8;
-                        let stride = comp_stride[*sof_idx];
-                        let buf = &mut comp_buf[*sof_idx];
-                        for j in 0..8 {
-                            for i in 0..8 {
-                                let v = fblock[j * 8 + i] + 128.0;
-                                let px = if v <= 0.0 {
-                                    0
-                                } else if v >= 255.0 {
-                                    255
-                                } else {
-                                    v.round() as u8
-                                };
-                                buf[(dst_y0 + j) * stride + dst_x0 + i] = px;
-                            }
-                        }
+                        render_block_8bit(
+                            &block,
+                            &quant_f32[*sof_idx],
+                            &mut comp_buf[*sof_idx],
+                            comp_stride[*sof_idx],
+                            dst_x0,
+                            dst_y0,
+                        );
                     }
                 }
             }
@@ -2573,35 +2606,13 @@ fn render_from_coefs(
     for (ci, c) in sof.components.iter().enumerate() {
         let blocks_x = mcus_x * c.h_factor as usize;
         let blocks_y = mcus_y * c.v_factor as usize;
-        let qt = quant_tables[ci];
+        let qtf = quant_to_f32(quant_tables[ci]);
         let stride = comp_stride[ci];
         let buf = &mut comp_buf[ci];
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
-                let mut fblock = [0.0f32; 64];
-                for k in 0..64 {
-                    // Multiply in f32 to avoid i32 overflow when Pq=1 (16-bit
-                    // quantiser, values up to 65535) meets a coefficient at the
-                    // top of its range — the IDCT input is f32 either way.
-                    fblock[k] = block[k] as f32 * qt.values[k] as f32;
-                }
-                idct8x8(&mut fblock);
-                let dst_x0 = bx * 8;
-                let dst_y0 = by * 8;
-                for j in 0..8 {
-                    for i in 0..8 {
-                        let v = fblock[j * 8 + i] + 128.0;
-                        let px = if v <= 0.0 {
-                            0
-                        } else if v >= 255.0 {
-                            255
-                        } else {
-                            v.round() as u8
-                        };
-                        buf[(dst_y0 + j) * stride + dst_x0 + i] = px;
-                    }
-                }
+                render_block_8bit(block, &qtf, buf, stride, bx * 8, by * 8);
             }
         }
     }

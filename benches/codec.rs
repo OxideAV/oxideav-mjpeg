@@ -45,6 +45,20 @@
 //!     2-D variant in T.81 Table H.1. A/B against `pred1` measures
 //!     the predictor-loop cost.
 //!
+//! Round 410 (performance depth round) adds full decode-side coverage,
+//! all driven through the public `Decoder` trait (the per-packet MJPEG
+//! consumer path, including per-frame table build):
+//!
+//!   - **baseline_decode/{yuv420,yuv444,gray,restart8,rgb24}** — the
+//!     sequential Huffman path across chroma layouts, the RSTn resync
+//!     path, and the packed-RGB copy-out.
+//!   - **progressive_decode/yuv420_256x256_q75** — SOF2 multi-scan
+//!     coefficient accumulation + shared render.
+//!   - **arith_decode/yuv420_256x256_q75** — SOF9 Annex D Q-coder
+//!     entropy path.
+//!   - **lossless_decode/gray_pred{1,4}_256x256** — SOF3 per-sample
+//!     predictor + wide-magnitude Huffman decode.
+//!
 //! Run with:
 //!     cargo bench -p oxideav-mjpeg --bench codec
 
@@ -55,9 +69,27 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame};
 use oxideav_mjpeg::encoder::{
-    encode_jpeg, encode_jpeg_progressive, encode_lossless_jpeg_grayscale,
+    encode_arith_jpeg_yuv, encode_jpeg, encode_jpeg_grayscale, encode_jpeg_progressive,
+    encode_jpeg_rgb24, encode_jpeg_with_opts, encode_lossless_jpeg_grayscale,
 };
 use oxideav_mjpeg::registry::make_decoder;
+
+/// Decode a standalone JPEG through the public `Decoder` trait — the same
+/// per-packet path MJPEG stream consumers run. Returns the frame so the
+/// caller can black-box it.
+fn decode_once(params: &CodecParameters, jpeg: &[u8]) -> Frame {
+    let mut dec = make_decoder(params).expect("make_decoder");
+    let pkt = Packet::new(0, TimeBase::new(1, 25), jpeg.to_vec());
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.receive_frame().expect("receive_frame")
+}
+
+fn video_params(w: u32, h: u32) -> CodecParameters {
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.width = Some(w);
+    params.height = Some(h);
+    params
+}
 
 // ---- deterministic fixtures -------------------------------------------
 
@@ -199,28 +231,143 @@ fn bench_baseline_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("baseline_decode");
 
     let (w, h) = (256u32, 256u32);
+    let pixels = (w as u64) * (h as u64);
+    let params = video_params(w, h);
+
+    // 4:2:0 — canonical decode workload (interleaved single-scan SOF0:
+    // BitReader + Huffman + dequant + IDCT + planar copy-out).
     let frame_420 = make_natural_frame(w, h, PixelFormat::Yuv420P);
-    let jpeg = encode_jpeg(&frame_420, w, h, PixelFormat::Yuv420P, 75)
+    let jpeg_420 = encode_jpeg(&frame_420, w, h, PixelFormat::Yuv420P, 75)
         .expect("baseline 4:2:0 encode for decode bench");
-
-    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
-    params.width = Some(w);
-    params.height = Some(h);
-    params.pixel_format = Some(PixelFormat::Yuv420P);
-
-    group.throughput(Throughput::Elements((w as u64) * (h as u64)));
+    group.throughput(Throughput::Elements(pixels));
     group.bench_function("yuv420_256x256_q75", |b| {
         b.iter(|| {
-            let mut dec = make_decoder(&params).expect("make_decoder");
-            let pkt = Packet::new(0, TimeBase::new(1, 25), jpeg.clone());
-            dec.send_packet(black_box(&pkt)).expect("send_packet");
-            let frame = dec.receive_frame().expect("receive_frame");
+            let frame = decode_once(black_box(&params), black_box(&jpeg_420));
             if let Frame::Video(vf) = &frame {
                 black_box(vf.planes.len());
             }
             black_box(frame);
         })
     });
+
+    // 4:4:4 — 3x the chroma block count of 4:2:0 at the same picture size;
+    // isolates the per-block cost from the luma/chroma mix.
+    let frame_444 = make_natural_frame(w, h, PixelFormat::Yuv444P);
+    let jpeg_444 = encode_jpeg(&frame_444, w, h, PixelFormat::Yuv444P, 75)
+        .expect("baseline 4:4:4 encode for decode bench");
+    group.throughput(Throughput::Elements(pixels));
+    group.bench_function("yuv444_256x256_q75", |b| {
+        b.iter(|| {
+            black_box(decode_once(black_box(&params), black_box(&jpeg_444)));
+        })
+    });
+
+    // Grayscale — pure luma path: no chroma blocks, no MCU interleave.
+    let gray = make_natural_grayscale(w, h);
+    let jpeg_gray = encode_jpeg_grayscale(w, h, &gray, w as usize, 75)
+        .expect("grayscale encode for decode bench");
+    group.throughput(Throughput::Elements(pixels));
+    group.bench_function("gray_256x256_q75", |b| {
+        b.iter(|| {
+            black_box(decode_once(black_box(&params), black_box(&jpeg_gray)));
+        })
+    });
+
+    // Restart markers every 8 MCUs — exercises the RSTn resync path
+    // (bit-buffer reset + DC predictor reseed) on top of the 4:2:0 load.
+    let jpeg_rst = encode_jpeg_with_opts(&frame_420, w, h, PixelFormat::Yuv420P, 75, 8)
+        .expect("restart-interval encode for decode bench");
+    group.throughput(Throughput::Elements(pixels));
+    group.bench_function("restart8_yuv420_256x256_q75", |b| {
+        b.iter(|| {
+            black_box(decode_once(black_box(&params), black_box(&jpeg_rst)));
+        })
+    });
+
+    // RGB24 (Adobe transform=0, H=V=1) — packed-RGB copy-out instead of
+    // planar; measures the interleave loop in render_from_coefs.
+    let (wr, hr) = (128u32, 128u32);
+    let mut rgb = vec![0u8; (wr * hr * 3) as usize];
+    let rp = make_natural_grayscale(wr, hr);
+    let gp = make_natural_grayscale(hr, wr);
+    for k in 0..(wr * hr) as usize {
+        rgb[k * 3] = rp[k];
+        rgb[k * 3 + 1] = gp[k];
+        rgb[k * 3 + 2] = rp[k].wrapping_add(gp[k]);
+    }
+    let jpeg_rgb =
+        encode_jpeg_rgb24(wr, hr, &rgb, (wr * 3) as usize, 75).expect("rgb24 encode for bench");
+    let params_rgb = video_params(wr, hr);
+    group.throughput(Throughput::Elements((wr as u64) * (hr as u64)));
+    group.bench_function("rgb24_128x128_q75", |b| {
+        b.iter(|| {
+            black_box(decode_once(black_box(&params_rgb), black_box(&jpeg_rgb)));
+        })
+    });
+
+    group.finish();
+}
+
+// ---- benches: progressive + arithmetic + lossless decode ---------------
+
+fn bench_progressive_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("progressive_decode");
+
+    let (w, h) = (256u32, 256u32);
+    let frame = make_natural_frame(w, h, PixelFormat::Yuv420P);
+    let jpeg = encode_jpeg_progressive(&frame, w, h, PixelFormat::Yuv420P, 75)
+        .expect("progressive encode for decode bench");
+    let params = video_params(w, h);
+    group.throughput(Throughput::Elements((w as u64) * (h as u64)));
+    group.bench_function("yuv420_256x256_q75", |b| {
+        b.iter(|| {
+            black_box(decode_once(black_box(&params), black_box(&jpeg)));
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_arith_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("arith_decode");
+
+    let (w, h) = (256u32, 256u32);
+    let frame = make_natural_frame(w, h, PixelFormat::Yuv420P);
+    let jpeg = encode_arith_jpeg_yuv(&frame, w, h, PixelFormat::Yuv420P, 75, 0)
+        .expect("arithmetic encode for decode bench");
+    let params = video_params(w, h);
+    group.throughput(Throughput::Elements((w as u64) * (h as u64)));
+    group.bench_function("yuv420_256x256_q75", |b| {
+        b.iter(|| {
+            black_box(decode_once(black_box(&params), black_box(&jpeg)));
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_lossless_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lossless_decode");
+
+    let (w, h) = (256u32, 256u32);
+    let samples = make_natural_grayscale(w, h);
+    let params = video_params(w, h);
+    group.throughput(Throughput::Elements((w as u64) * (h as u64)));
+
+    for predictor in [1u8, 4u8] {
+        let jpeg = encode_lossless_jpeg_grayscale(w, h, &samples, w as usize, 8, predictor)
+            .expect("lossless encode for decode bench");
+        let label = match predictor {
+            1 => "gray_pred1_256x256",
+            4 => "gray_pred4_256x256",
+            _ => unreachable!(),
+        };
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                black_box(decode_once(black_box(&params), black_box(&jpeg)));
+            })
+        });
+    }
 
     group.finish();
 }
@@ -290,6 +437,9 @@ criterion_group!(
     benches,
     bench_baseline_encode,
     bench_baseline_decode,
+    bench_progressive_decode,
+    bench_arith_decode,
+    bench_lossless_decode,
     bench_progressive_encode,
     bench_lossless_encode,
 );

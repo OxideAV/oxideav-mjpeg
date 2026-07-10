@@ -1383,7 +1383,7 @@ fn detect_rgb_3comp(sof: &SofInfo, adobe_transform: Option<u8>) -> bool {
         sof.components[1].id,
         sof.components[2].id,
     ];
-    ids == [b'R', b'G', b'B']
+    ids == *b"RGB"
 }
 
 fn decode_block(
@@ -4186,7 +4186,7 @@ fn hier_dct_is_rgb_class(sof: &SofInfo, adobe_transform: Option<u8>) -> bool {
         return true;
     }
     let ids: Vec<u8> = sof.components.iter().map(|c| c.id).collect();
-    ids == [b'R', b'G', b'B']
+    ids == *b"RGB"
 }
 
 /// Decode one hierarchical-mode lossless frame and return its reconstructed

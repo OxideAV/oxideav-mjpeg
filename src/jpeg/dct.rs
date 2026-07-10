@@ -101,32 +101,64 @@ pub fn idct8x8(block: &mut [f32; 64]) {
     }
 }
 
+/// Transpose of [`cos_table`]: `tt[n][k] = t[k][n]`. Gives the forward
+/// transform's row pass a contiguous 8-lane row per input sample; the
+/// values are the very same f32s, only the storage order differs.
+fn cos_table_t() -> &'static [[f32; 8]; 8] {
+    static TT: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
+    TT.get_or_init(|| {
+        let t = cos_table();
+        let mut tt = [[0.0f32; 8]; 8];
+        for k in 0..8 {
+            for n in 0..8 {
+                tt[n][k] = t[k][n];
+            }
+        }
+        tt
+    })
+}
+
 /// Forward DCT of an 8×8 block in natural order, in-place. Caller should
 /// subtract 128 from sample values before calling so input is centred on 0.
+///
+/// Both passes run their reduction with the summation index `n` outermost
+/// over a whole-block accumulator: for every output the terms still land
+/// in ascending-n order starting from +0.0 — the exact accumulation
+/// sequence of the original scalar reduction, so results are bit-identical
+/// — while each n-step is 64 independent elementwise multiply-adds. The
+/// full 8×8 accumulator gives the compiler 16 independent vector chains
+/// (throughput-bound) instead of one serial reduction per output
+/// (latency-bound); the row pass reads the transposed table so every
+/// per-step row is contiguous.
 pub fn fdct8x8(block: &mut [f32; 64]) {
     let t = cos_table();
-    let mut tmp = [0.0f32; 64];
+    let tt = cos_table_t();
 
-    // Row-wise 1-D forward: for each row y, tmp[y][k] = Σn t[k][n] * block[y][n]
-    for y in 0..8 {
-        for k in 0..8 {
-            let mut s = 0.0f32;
-            for n in 0..8 {
-                s += t[k][n] * block[y * 8 + n];
+    // Row-wise 1-D forward: tmp[y][k] = Σn t[k][n] * block[y][n], with n
+    // outermost and tt[n][k] = t[k][n] providing the contiguous 8-lane row.
+    let mut tmp = [0.0f32; 64];
+    for n in 0..8 {
+        let tn = &tt[n];
+        for y in 0..8 {
+            let c = block[y * 8 + n];
+            for k in 0..8 {
+                tmp[y * 8 + k] += tn[k] * c;
             }
-            tmp[y * 8 + k] = s;
         }
     }
-    // Column-wise.
-    for x in 0..8 {
-        for k in 0..8 {
-            let mut s = 0.0f32;
-            for n in 0..8 {
-                s += t[k][n] * tmp[n * 8 + x];
+    // Column-wise: block[k][x] = Σn t[k][n] * tmp[n][x], with n outermost;
+    // `tmp[n][·]` rows are contiguous.
+    let mut out = [0.0f32; 64];
+    for n in 0..8 {
+        let tr = &tmp[n * 8..n * 8 + 8];
+        for (k, tk) in t.iter().enumerate() {
+            let c = tk[n];
+            for x in 0..8 {
+                out[k * 8 + x] += c * tr[x];
             }
-            block[k * 8 + x] = s;
         }
     }
+    *block = out;
 }
 
 #[cfg(test)]

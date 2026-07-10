@@ -1134,7 +1134,7 @@ fn frame_body_12bit(w: u16, h: u16) -> Vec<u8> {
 /// 12-bit RGB-class hierarchical DCT path), all H=V=1, Tq=0.
 fn frame_body_rgb_12bit(w: u16, h: u16) -> Vec<u8> {
     let mut v = vec![12, (h >> 8) as u8, h as u8, (w >> 8) as u8, w as u8, 3];
-    for id in [b'R', b'G', b'B'] {
+    for id in *b"RGB" {
         v.extend_from_slice(&[id, 0x11, 0]);
     }
     v

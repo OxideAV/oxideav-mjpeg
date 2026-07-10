@@ -1374,6 +1374,18 @@ fn fill_block(
     x0: usize,
     y0: usize,
 ) {
+    // Interior fast path: the block lies fully inside the picture, so every
+    // `.min(edge)` clamp is a no-op and each source row is a contiguous
+    // 8-byte slice — identical samples, one bounds check per row.
+    if x0 + 8 <= w && y0 + 8 <= h {
+        for j in 0..8 {
+            let src = &plane[(y0 + j) * stride + x0..][..8];
+            for (d, &s) in dst[j * 8..j * 8 + 8].iter_mut().zip(src) {
+                *d = (s as i32 - 128) as f32;
+            }
+        }
+        return;
+    }
     for j in 0..8 {
         let y = (y0 + j).min(h.saturating_sub(1));
         for i in 0..8 {
@@ -1393,15 +1405,18 @@ fn encode_block(
     ac_huff: &HuffTable,
 ) {
     fdct8x8(block);
-    // Quantise.
+    // Quantise. The branchless magnitude form is exactly the historical
+    // `if v >= 0.0 { (v + 0.5) as i32 } else { -((-v + 0.5) as i32) }`:
+    // for v >= 0.0 (including -0.0, whose magnitude is 0.0) `v.abs()` is the
+    // same value the positive branch used, and the negate is skipped; for
+    // v < 0.0 `v.abs() == -v` exactly. Removing the branch lets the whole
+    // divide / round loop vectorise (the `as i32` cast saturates in both
+    // forms).
     let mut q = [0i32; 64];
     for k in 0..64 {
         let v = block[k] / quant[k] as f32;
-        q[k] = if v >= 0.0 {
-            (v + 0.5) as i32
-        } else {
-            -((-v + 0.5) as i32)
-        };
+        let m = (v.abs() + 0.5) as i32;
+        q[k] = if v < 0.0 { -m } else { m };
     }
     // DC.
     let dc_diff = q[0] - *prev_dc;

@@ -563,29 +563,132 @@ fn progressive_sa_encode_roundtrip_yuv420p_64x64() {
     let Frame::Video(vss) = dec_ss.receive_frame().unwrap() else {
         panic!()
     };
-    // Compute cross-PSNR between SA and SS decoded images. Because both paths
-    // carry identical quantised coefficients the cross-PSNR should be very
-    // high (≥ 45 dB). Strict pixel-identity is not asserted because small
-    // differences can arise from the point-transform rounding for odd-valued
-    // coefficients in the DC successive-approximation path.
-    let mut cross_orig = Vec::new();
-    let mut cross_out = Vec::new();
-    for j in 0..sh {
-        for i in 0..sw {
-            cross_orig.push(vsa.planes[0].data[j * vsa.planes[0].stride + i]);
-            cross_out.push(vss.planes[0].data[j * vss.planes[0].stride + i]);
+    // SA reconstructs every quantised coefficient exactly: the initial scan
+    // codes the point transform (integer divide for AC per T.81 §A.4,
+    // arithmetic shift for DC) and the refinement scan restores the dropped
+    // LSB. Both streams therefore carry identical coefficients and the
+    // decoded planes must be bit-identical, not merely close.
+    assert_eq!(
+        vsa.planes.len(),
+        vss.planes.len(),
+        "SA and SS must decode to the same plane layout"
+    );
+    for (pi, (pa, ps)) in vsa.planes.iter().zip(vss.planes.iter()).enumerate() {
+        assert_eq!(pa.stride, ps.stride, "plane {pi} stride mismatch");
+        assert_eq!(
+            pa.data, ps.data,
+            "plane {pi}: SA and SS decodes must be bit-identical"
+        );
+    }
+}
+
+/// Regression: successive-approximation refinement on a *noisy* frame.
+///
+/// A spatially noisy source (gradient + triangle wave + xorshift jitter)
+/// produces AC-refinement bands where the last new-nonzero event falls
+/// short of `Se` with pre-existing nonzeros after it, and quantised
+/// coefficients of value -1 / negative odd magnitude. Two encoder bugs
+/// used to corrupt exactly this stream shape (the smooth-gradient test
+/// above never triggered either):
+///
+/// 1. `emit_ac_refine_block` left the band unterminated — no EOB — when
+///    the last new-nonzero event landed before `Se`. The decoder's RS loop
+///    re-enters whenever `k <= se`, so it misparsed the tail correction
+///    bits as a Huffman symbol and failed with "progressive AC refine: k
+///    past se".
+/// 2. `write_ac_scan_sa` applied an arithmetic shift as the AC point
+///    transform where T.81 §A.4 requires an integer divide (truncation
+///    toward zero): -3 >> 1 = -2 overstated negative odd coefficients by
+///    one step, which the magnitude-growing refinement model can never
+///    undo.
+///
+/// With both fixed, the SA stream must decode successfully and be
+/// bit-identical to the spectral-selection encode of the same frame.
+#[test]
+fn progressive_sa_noisy_matches_spectral_selection_bit_exact() {
+    use oxideav_mjpeg::encoder::{encode_jpeg_progressive, encode_jpeg_progressive_sa};
+    let w = 64u32;
+    let h = 64u32;
+    let pix = PixelFormat::Yuv420P;
+
+    // Deterministic gradient + triangle + jitter frame (spatially
+    // correlated, but rough enough to populate every AC band).
+    let mut rng = 0xA5A5_5A5Au32;
+    let mut xorshift = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng
+    };
+    let mut y = vec![0u8; (w * h) as usize];
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let base = ((i + j) as i32) & 0xFF;
+            let phase = (i as i32) & 31;
+            let tri = if phase < 16 { phase } else { 31 - phase };
+            let noise = (xorshift() & 0x07) as i32 - 4;
+            y[j * w as usize + i] = (base + tri + noise).clamp(0, 255) as u8;
         }
     }
-    let psnr_cross = psnr(&cross_orig, &cross_out);
-    eprintln!("SA vs SS cross-PSNR Y = {psnr_cross:.2} dB");
-    // The cross-PSNR measures how close SA and SS decoded images are to each
-    // other. They should be very similar since both encode the same quantised
-    // coefficients — a threshold of 40 dB ensures they are perceptually
-    // indistinguishable.
-    assert!(
-        psnr_cross >= 40.0,
-        "SA and SS decoded luma should be perceptually equivalent (≥ 40 dB), got {psnr_cross:.2} dB"
-    );
+    let cw = (w as usize).div_ceil(2);
+    let ch = (h as usize).div_ceil(2);
+    let mut cb = vec![0u8; cw * ch];
+    let mut cr = vec![0u8; cw * ch];
+    for j in 0..ch {
+        for i in 0..cw {
+            cb[j * cw + i] = (128 + ((i as i32) - (cw as i32) / 2) / 4).clamp(0, 255) as u8;
+            cr[j * cw + i] = (128 + ((j as i32) - (ch as i32) / 2) / 4).clamp(0, 255) as u8;
+        }
+    }
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize,
+                data: y,
+            },
+            oxideav_core::frame::VideoPlane {
+                stride: cw,
+                data: cb,
+            },
+            oxideav_core::frame::VideoPlane {
+                stride: cw,
+                data: cr,
+            },
+        ],
+    };
+
+    let sa = encode_jpeg_progressive_sa(&frame, w, h, pix, 75).expect("SA encode");
+    let ss = encode_jpeg_progressive(&frame, w, h, pix, 75).expect("SS encode");
+
+    let mut dec_params = CodecParameters::video(CodecId::new("mjpeg"));
+    dec_params.width = Some(w);
+    dec_params.height = Some(h);
+
+    let mut dec_sa = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec_sa
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), sa))
+        .unwrap();
+    let Frame::Video(vsa) = dec_sa.receive_frame().expect("SA stream must decode") else {
+        panic!("expected video frame")
+    };
+
+    let mut dec_ss = oxideav_mjpeg::decoder::make_decoder(&dec_params).unwrap();
+    dec_ss
+        .send_packet(&Packet::new(0, TimeBase::new(1, 30), ss))
+        .unwrap();
+    let Frame::Video(vss) = dec_ss.receive_frame().unwrap() else {
+        panic!("expected video frame")
+    };
+
+    assert_eq!(vsa.planes.len(), vss.planes.len());
+    for (pi, (pa, ps)) in vsa.planes.iter().zip(vss.planes.iter()).enumerate() {
+        assert_eq!(pa.stride, ps.stride, "plane {pi} stride mismatch");
+        assert_eq!(
+            pa.data, ps.data,
+            "plane {pi}: SA and SS decodes must be bit-identical"
+        );
+    }
 }
 
 /// Metadata pass-through: extract APP segments from a JPEG and re-encode

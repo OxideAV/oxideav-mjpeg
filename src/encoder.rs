@@ -892,7 +892,9 @@ fn write_dc_refine_scan_interleaved(
     bw.finish();
 }
 
-/// AC initial scan with point-transform `al`. Encodes `coef >> al`; any
+/// AC initial scan with point-transform `al`. Encodes the AC point
+/// transform `coef / 2^al` (integer divide truncating toward zero, §A.4 —
+/// equivalently `sign(coef) * (|coef| >> al)`); any
 /// coefficient whose magnitude rounds to zero is treated as zero in the
 /// first pass (it becomes a new nonzero in the refinement scan).
 fn write_ac_scan_sa(
@@ -909,7 +911,18 @@ fn write_ac_scan_sa(
         let block = &coefs[bi];
         let mut run: u32 = 0;
         for k in ss..=se {
-            let v = block[ZIGZAG[k]] >> al; // point-transform
+            // §A.4: the AC point transform is an *integer divide* by 2^Al
+            // (truncation toward zero, i.e. sign-magnitude) — unlike the DC
+            // point transform, which is an arithmetic shift. An arithmetic
+            // shift here would round negative odd coefficients toward -∞
+            // (e.g. -3 >> 1 = -2), overstating their first-pass magnitude
+            // by one step; the refinement scan's magnitude-LSB correction
+            // model can only ever *grow* a coefficient away from zero, so
+            // that error would be unrecoverable (-3 would reconstruct as
+            // -5 or stay -4).
+            let raw = block[ZIGZAG[k]];
+            let mag = (raw.unsigned_abs() >> al) as i32;
+            let v = if raw < 0 { -mag } else { mag }; // point-transform
             if v == 0 {
                 run += 1;
             } else {
@@ -978,8 +991,10 @@ fn write_ac_refine_scan(
 /// traversal order.  They are interleaved with zero-history counting, not
 /// appended after the RS code.
 ///
-/// After the last new-nonzero event the tail correction bits are emitted for
-/// any remaining pre-existing nonzeros.
+/// After the last new-nonzero event, if the band is not exhausted the block
+/// is terminated with EOB (RS=0x00) followed by the tail correction bits for
+/// any remaining pre-existing nonzeros — the decoder keeps expecting RS
+/// symbols until `k > se` or an EOB arrives.
 ///
 /// When no new nonzero exists the block is coded as EOB (RS=0x00) followed
 /// by the correction bits for all pre-existing nonzeros in the band.
@@ -990,12 +1005,13 @@ fn emit_ac_refine_block(
     se: usize,
     ac_huff: &HuffTable,
 ) {
-    // Determine whether there are any "new nonzero" positions (|coef >> 1| == 0
-    // but coef != 0) in the band.
-    let has_new = (ss..=se).any(|k| {
-        let v = block[ZIGZAG[k]];
-        (v >> 1) == 0 && v != 0
-    });
+    // Determine whether there are any "new nonzero" positions (positions
+    // whose first-pass value |coef| >> 1 was zero but coef != 0, i.e.
+    // |coef| == 1) in the band. The first pass codes the sign-magnitude
+    // point transform (integer divide, §A.4), so "pre-existing" is a
+    // *magnitude* test — `v >> 1` (arithmetic) would misclassify -1 as
+    // pre-existing.
+    let has_new = (ss..=se).any(|k| block[ZIGZAG[k]].unsigned_abs() == 1);
 
     if !has_new {
         // EOB: Huffman symbol, then correction bits for all pre-existing nonzeros.
@@ -1003,7 +1019,7 @@ fn emit_ac_refine_block(
         bw.write_bits(eob.code as u32, eob.len as u32);
         for k in ss..=se {
             let v = block[ZIGZAG[k]];
-            if (v >> 1) != 0 {
+            if v.unsigned_abs() >> 1 != 0 {
                 bw.write_bits(v.unsigned_abs() & 1, 1);
             }
         }
@@ -1029,11 +1045,12 @@ fn emit_ac_refine_block(
     // We collect (new_nonzero_pos, sign) events in a first pass, then emit them
     // in a second pass that simulates the decoder walk.
 
-    // Phase 1: collect new-nonzero positions and signs.
+    // Phase 1: collect new-nonzero positions and signs (|coef| == 1 —
+    // magnitude test, see `has_new` above).
     let mut new_nz: Vec<(usize, u32)> = Vec::new(); // (zigzag_k, sign)
     for k in ss..=se {
         let v = block[ZIGZAG[k]];
-        if (v >> 1) == 0 && v != 0 {
+        if v.unsigned_abs() == 1 {
             let sign = if v > 0 { 1u32 } else { 0u32 };
             new_nz.push((k, sign));
         }
@@ -1053,7 +1070,7 @@ fn emit_ac_refine_block(
                                            // Pre-populate with positions that were nonzero in the first pass.
     for k in ss..=se {
         let v = block[ZIGZAG[k]];
-        if (v >> 1) != 0 {
+        if v.unsigned_abs() >> 1 != 0 {
             decoder_nonzero[k] = true;
         }
     }
@@ -1113,24 +1130,27 @@ fn emit_ac_refine_block(
         k = event_k + 1;
     }
 
-    // Tail: emit correction bits for all remaining (pre-existing) nonzeros.
-    while k <= se {
-        if decoder_nonzero[k] {
-            // Was pre-existing nonzero: emit actual correction bit.
-            // (Newly-set positions in decoder_nonzero are from previous events
-            // and their correction bit = 0, but they appear before k so they're
-            // never reached here.)
-            let v = block[ZIGZAG[k]];
-            // Check if this position was pre-existing (|v >> 1| != 0) or newly set.
-            if (v >> 1) != 0 {
+    // Tail: if the band is not exhausted the decoder still expects a Huffman
+    // symbol — its RS loop re-enters whenever `k <= se` — so terminate the
+    // block with EOB exactly as in the no-new-nonzero case, then append the
+    // correction bits for the remaining pre-existing nonzeros in traversal
+    // order (the decoder's EOB handler refines the rest of the band).
+    // Without the EOB the next bits in the stream (this tail, or the next
+    // block's first RS) get misparsed as a Huffman symbol and the scan
+    // desyncs. When the last new-nonzero event landed exactly on `se` the
+    // decoder's loop exits on its own and no EOB is required (or allowed).
+    if k <= se {
+        let eob = ac_huff.encode[0x00];
+        bw.write_bits(eob.code as u32, eob.len as u32);
+        while k <= se {
+            if decoder_nonzero[k] {
+                // Pre-existing nonzero (newly-set positions from previous
+                // events all lie before `k`): emit its correction bit.
+                let v = block[ZIGZAG[k]];
                 bw.write_bits(v.unsigned_abs() & 1, 1);
-            } else {
-                // Newly set by a previous event (|v| == 1): correction bit = 0.
-                // This shouldn't happen here since k > last event_k.
-                bw.write_bits(0, 1);
             }
+            k += 1;
         }
-        k += 1;
     }
 }
 

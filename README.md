@@ -1113,33 +1113,45 @@ paths. Run with:
 cargo bench -p oxideav-mjpeg --bench codec
 ```
 
-Six scenarios, each fed by a deterministically-built in-bench fixture
-(xorshift32 + low-amplitude triangle-wave gradient — no committed
-payload files, no `docs/` reads, no third-party library calls):
+Fourteen scenarios, each fed by a deterministically-built in-bench
+fixture (xorshift32 + low-amplitude triangle-wave gradient — no
+committed payload files, no `docs/` reads, no third-party library
+calls):
 
-- `baseline_encode/yuv420_256x256_q75` — full SOF0 path: forward DCT,
-  AAN-style quantise, Huffman run-length encode, marker emission.
-- `baseline_encode/yuv444_64x64_q75` — same path on a small 4:4:4
-  fixture; isolates per-call header / Huffman-table-construction
-  overhead from the per-block cost.
-- `baseline_decode/yuv420_256x256_q75` — the inverse, driven through
-  the `Decoder` trait so the bench tracks the same code path
-  application callers exercise.
+- `baseline_encode/{yuv420_256x256_q75, yuv444_64x64_q75}` — full SOF0
+  path: forward DCT, quantise, Huffman run-length encode, marker
+  emission; the small 4:4:4 fixture isolates per-call header /
+  table-construction overhead from the per-block cost.
+- `baseline_decode/{yuv420, yuv444, gray, restart8, rgb24}` — the
+  sequential Huffman decode across chroma layouts, the RSTn resync
+  path, and the packed-RGB copy-out, all driven through the `Decoder`
+  trait so the bench tracks the same code path application callers
+  exercise.
+- `progressive_decode/yuv420_256x256_q75` — SOF2 multi-scan
+  coefficient accumulation + shared render.
+- `arith_decode/yuv420_256x256_q75` — SOF9 Annex D Q-coder entropy
+  path.
+- `lossless_decode/gray_pred{1,4}_256x256` — SOF3 per-sample predictor
+  + wide-magnitude Huffman decode.
 - `progressive_encode/yuv420_64x64_q75` — SOF2 spectral-selection
   decomposition (7 SOS scans).
-- `lossless_encode/gray_pred1_256x256` — SOF3 grayscale encode with
-  predictor 1 (Ra / left), the simplest case.
-- `lossless_encode/gray_pred4_256x256` — SOF3 grayscale encode with
-  predictor 4 (Ra + Rb − Rc), the most expensive 2-D Table H.1
-  variant; A/B against `pred1` measures the predictor-loop cost.
+- `lossless_encode/gray_pred{1,4}_256x256` — SOF3 grayscale encode;
+  pred 1 (Ra) vs pred 4 (Ra + Rb − Rc) A/Bs the predictor-loop cost.
 
-Headline numbers (Apple Silicon dev box, release profile, criterion
-`--quick`): baseline 4:2:0 encode 256x256 q75 runs
-~185 µs / call (≈ 353 Melem/s); the matching decode runs ~248 µs /
-call (≈ 264 Melem/s). The 256x256 lossless grayscale encode runs
-~370 µs / call independent of predictor choice (the magnitude /
-Huffman emission dominates the per-sample cost — the four extra
-predictor arithmetic ops in pred=4 disappear into the noise).
+Headline numbers (Apple Silicon dev box, release profile, after the
+round-410 hot-path tuning): baseline 4:2:0 encode 256×256 q75 runs
+~154 µs / call (≈ 425 Melem/s); the matching decode ~145 µs / call
+(≈ 450 Melem/s); progressive decode ~158 µs; arithmetic decode
+~236 µs; lossless grayscale decode ~480-495 µs and encode ~360 µs
+largely independent of predictor choice (magnitude / Huffman emission
+dominates the per-sample cost).
+
+Every optimisation to these paths must be **bit-transparent**:
+`tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the
+whole `docs/` fixture corpus and of the encoded bytes + decode-back
+planes for one call of every public encode family, so any change to
+rounding, accumulation order, or bitstream emission fails the suite
+instead of silently drifting.
 
 ## License
 

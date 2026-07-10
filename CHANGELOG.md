@@ -30,7 +30,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bit-identically; the roundtrip suite asserts exact plane equality on
   both the smooth and the noisy fixture.
 
+### Changed
+
+- **Hot-path performance round (bit-transparent — every pinned golden
+  hash unchanged).** Measured on Apple Silicon with the extended
+  Criterion suite, 256×256 q75 unless noted:
+  * forward DCT restructured to whole-block interleaved accumulation
+    (16 independent vector chains instead of one serial reduction per
+    output): baseline encode −15%, progressive encode −13%;
+  * shared `render_block_8bit` (per-scan f32 quantiser conversion +
+    row-sliced stores) for the sequential and accumulator render paths:
+    baseline decode −6 to −10% across 4:2:0/4:2:2/4:4:4/gray/RGB/restart;
+  * `BitReader` two-plain-byte bulk refill in `fill`/`peek_bits`, and a
+    predictor-monomorphised flat raster loop for plain SOF3 grayscale:
+    lossless decode −10 to −12%;
+  * branchless (vectorisable) quantise in `encode_block` + `fill_block`
+    interior fast path: further −11% on baseline encode.
+  Negative results (tried, measured slower, reverted): the same
+  interleave applied to the *inverse* DCT (the per-row zero-skip plus
+  64 independent scalar chains already win on sparse blocks), and a
+  source-level predictor specialisation of the lossless *encoder*
+  (LLVM already unswitches the predictor match; the restructure cost
+  ~18%).
+
 ### Added
+
+- **Decode-side benches.** `benches/codec.rs` grows from 6 to 14
+  scenarios: baseline decode across chroma layouts / grayscale /
+  restart / packed-RGB, progressive decode, arithmetic (SOF9 Q-coder)
+  decode, and lossless decode with predictors 1 and 4 — all driven
+  through the public `Decoder` trait.
 
 - **Golden output pins (`tests/golden.rs`).** FNV-1a-64 hashes of (a) the
   decoded planes of all 16 `docs/image/jpeg/fixtures/` corpus entries

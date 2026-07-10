@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Successive-approximation progressive encoder produced undecodable /
+  corrupt streams on rough content.** Two bugs in the SA scan writers,
+  both invisible to the smooth-gradient roundtrip test and exposed by a
+  noisy fixture:
+  1. `emit_ac_refine_block` never terminated the band with EOB when the
+     last new-nonzero event landed before `Se` — the decoder's RS loop
+     re-enters whenever `k <= se`, so the tail correction bits (or the
+     next block's first symbol) were misparsed as a Huffman code and the
+     scan desynced (`progressive AC refine: k past se`).
+  2. `write_ac_scan_sa` applied an arithmetic shift as the AC point
+     transform where T.81 §A.4 requires an integer divide truncating
+     toward zero: `-3 >> 1 = -2` overstated negative odd coefficients by
+     one step in the first pass, which the magnitude-growing refinement
+     model can never undo (reconstructed as -4/-5 instead of -3). The
+     magnitude/pre-existing classification in the refinement writer had
+     the matching error (`-1` was misclassified as pre-existing instead
+     of new-nonzero).
+  SA and spectral-selection encodes of the same frame now decode
+  bit-identically; the roundtrip suite asserts exact plane equality on
+  both the smooth and the noisy fixture.
+
+### Added
+
+- **Golden output pins (`tests/golden.rs`).** FNV-1a-64 hashes of (a) the
+  decoded planes of all 16 `docs/image/jpeg/fixtures/` corpus entries
+  (skipped when `docs/` is absent, e.g. in CI) and (b) the encoded byte
+  stream *plus* decode-back planes for 19 self-contained encoder cases
+  covering every public encode family. Safety net for performance work:
+  any change to rounding, accumulation order, or bitstream emission now
+  trips a hash mismatch instead of slipping through PSNR floors.
+
 - **Decoder panic on an over-subscribed Huffman table (fuzz crash).**
   `HuffTable::build` walked the canonical code counter without verifying
   the BITS list defines a valid prefix code. A crafted DHT with more

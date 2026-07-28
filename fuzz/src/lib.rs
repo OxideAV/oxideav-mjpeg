@@ -27,10 +27,19 @@ pub mod libjpeg {
 
     /// Conventional libturbojpeg shared-object names the loader will
     /// try in order. Covers macOS (`.dylib`), Linux (versioned + plain
-    /// `.so`), and Windows (`.dll`).
+    /// `.so`), and Windows (`.dll`). The bare names rely on the
+    /// platform loader's default search path, which on macOS does NOT
+    /// include the Homebrew prefix — so the two conventional Homebrew
+    /// install locations (Apple-silicon `/opt/homebrew`, Intel
+    /// `/usr/local`) are probed explicitly; without them the
+    /// cross-decode harnesses silently run blind (cov ~21, every
+    /// iteration early-returning) on a macOS host that has jpeg-turbo
+    /// installed.
     const CANDIDATES: &[&str] = &[
         "libturbojpeg.dylib",
         "libturbojpeg.0.dylib",
+        "/opt/homebrew/lib/libturbojpeg.dylib",
+        "/usr/local/lib/libturbojpeg.dylib",
         "libturbojpeg.so.0",
         "libturbojpeg.so",
         "turbojpeg.dll",

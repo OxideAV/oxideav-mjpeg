@@ -1,7 +1,7 @@
 name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
-# 30-minute total budget across the 4 targets (~7.5 min each). The
+# 55-minute total budget across the 11 targets (~5 min each). The
 # cross-decode harnesses dlopen libturbojpeg at runtime via libloading;
 # the CI runner needs `libturbojpeg0-dev` so they actually validate
 # instead of silently skipping.
@@ -16,5 +16,5 @@ jobs:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
       extra_packages_apt: "libturbojpeg0-dev"
-      time_budget_seconds: 1800
+      time_budget_seconds: 3300
     secrets: inherit

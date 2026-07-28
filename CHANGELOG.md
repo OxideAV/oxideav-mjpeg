@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Three new fuzz targets close the lossless / hierarchical coverage
+  gap** (`fuzz/` only, no library surface change): `lossless_decode`
+  (SOF3/SOF11 envelope robustness — full precision ladder 2..=16, raw
+  predictor / point-transform nibbles, DNL `Y = 0` resolution incl.
+  the `NL = 0` reject, restart + DAC control bits),
+  `lossless_self_roundtrip` (encoder-in-loop, bit-exact oracle across
+  Huffman/arithmetic × grayscale/3-component × predictor × Pt ×
+  restart), and `hierarchical_roundtrip` (encoder-in-loop over eight
+  Annex J modes — spatial-lossless pyramids, DCT pyramids, and
+  DCT-with-lossless-final — exercising DHP / EXP / differential-SOF
+  decode with bit-exact oracles on the lossless modes). Daily Fuzz
+  workflow budget raised 1800 s → 3300 s to keep ~5 min per target
+  across the 11 targets.
+
 ### Fixed
 
 - **Arithmetic-coded scans rejected a legal empty final restart

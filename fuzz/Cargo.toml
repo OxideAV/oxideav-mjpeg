@@ -105,3 +105,41 @@ name = "rtp_packetize"
 path = "fuzz_targets/rtp_packetize.rs"
 test = false
 doc = false
+
+# Robustness target — arbitrary bytes wrapped in a minimal SOF3
+# (Huffman) or SOF11 (arithmetic) lossless JPEG envelope, fed through
+# the public decoder. Drives the spatial-predictive scan decoder
+# across the full precision ladder 2..=16, raw predictor / point-
+# transform nibbles (including the invalid encodings), DNL (Y = 0)
+# resolution, and restart handling. Bar is "no panic". See
+# `fuzz_targets/lossless_decode.rs` for the documented attack
+# surfaces.
+[[bin]]
+name = "lossless_decode"
+path = "fuzz_targets/lossless_decode.rs"
+test = false
+doc = false
+
+# Oracle target — fuzz-derived pixels through the lossless encoders
+# (SOF3 / SOF11, grayscale + 3-component) and back through the public
+# decoder; reconstruction must be bit-exact after the point transform
+# (`(s >> Pt) << Pt`), zero tolerance. See
+# `fuzz_targets/lossless_self_roundtrip.rs`.
+[[bin]]
+name = "lossless_self_roundtrip"
+path = "fuzz_targets/lossless_self_roundtrip.rs"
+test = false
+doc = false
+
+# Oracle target — fuzz-derived pixels through the hierarchical
+# (Annex J) encoders — spatial-lossless pyramids, DCT pyramids, and
+# DCT pyramids terminated by a differential lossless stage — and back
+# through the public decoder. The lossless(-final) modes assert
+# bit-exact reconstruction; the lossy DCT modes assert decode success
+# and output geometry. Exercises DHP / EXP / differential-SOF decode
+# on every iteration. See `fuzz_targets/hierarchical_roundtrip.rs`.
+[[bin]]
+name = "hierarchical_roundtrip"
+path = "fuzz_targets/hierarchical_roundtrip.rs"
+test = false
+doc = false

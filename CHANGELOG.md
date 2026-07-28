@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fuzz harness re-resolved against oxideav-core 0.1.34.** The fuzz/
+  sub-crate resolves oxideav-core independently of the library, so its
+  lockfile had silently drifted to 0.1.26; the scheduled Fuzz workflow
+  was building against a nine-releases-old core. Re-locked and dropped
+  the three `Decoder as _` trait imports the 0.1.34 API no longer
+  needs.
+
 - **Successive-approximation progressive encoder produced undecodable /
   corrupt streams on rough content.** Two bugs in the SA scan writers,
   both invisible to the smooth-gradient roundtrip test and exposed by a

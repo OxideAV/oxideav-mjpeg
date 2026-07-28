@@ -13,7 +13,7 @@
 //! progressive scan decomposition adds no additional quantisation.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{CodecId, CodecParameters, Decoder as _, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_mjpeg::encoder::encode_jpeg_progressive;
 use oxideav_mjpeg_fuzz::{
     assert_within, rgb_image_from_fuzz_input, rgb_to_yuv444p_frame, SELF_TOLERANCE,

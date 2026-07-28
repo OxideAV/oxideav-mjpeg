@@ -13,7 +13,7 @@
 //! push past ±2 LSB even on a bit-perfect codec.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{CodecId, CodecParameters, Decoder as _, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_mjpeg::encoder::encode_jpeg;
 use oxideav_mjpeg_fuzz::{
     assert_within, rgb_image_from_fuzz_input, rgb_to_yuv444p_frame, SELF_TOLERANCE,

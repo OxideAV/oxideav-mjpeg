@@ -1760,12 +1760,9 @@ fn decode_arith_scan_diff(
                 // of fresh entropy data — so advance `scan_pos` and
                 // re-Initdec there. Statistics + DC predictor are reset
                 // per F.1.4.4.1.5 / F.2.4.4.
-                scan_pos = locate_next_marker_after(scan, scan_pos);
-                if scan_pos >= scan.len() {
-                    return Err(Error::invalid(
-                        "arithmetic scan: missing restart marker mid-scan",
-                    ));
-                }
+                scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
+                    Error::invalid("arithmetic scan: missing restart marker mid-scan")
+                })?;
                 for s in dc_stats.iter_mut() {
                     s.restart_reset();
                 }
@@ -1844,23 +1841,35 @@ fn decode_arith_block(
 /// Returns the byte offset just AFTER the marker pair (i.e. past 0xFF Mn).
 /// Used by the arithmetic-scan restart handler to position the decoder for
 /// a fresh Initdec.
-fn locate_next_marker_after(scan: &[u8], from: usize) -> usize {
+fn locate_next_marker_after(scan: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 1 < scan.len() {
         if scan[i] == 0xFF && scan[i + 1] != 0x00 {
-            // Skip 0xFF runs.
+            // Skip 0xFF runs (fill bytes before the marker code,
+            // §B.1.1.2).
             let mut j = i + 1;
             while j < scan.len() && scan[j] == 0xFF {
                 j += 1;
             }
             if j < scan.len() {
-                return j + 1; // byte AFTER the marker code
+                // Byte AFTER the marker code. This may equal
+                // `scan.len()`: a marker terminating the scan leaves an
+                // *empty* entropy segment behind it, which is legal —
+                // §D.1.8 lets the encoder discard trailing zero bytes
+                // before a marker, so a restart interval whose data
+                // compresses to all-zero bytes occupies zero bytes on
+                // the wire. Callers must treat `Some(scan.len())` as
+                // "restart found, next segment empty", not as a missing
+                // marker.
+                return Some(j + 1);
             }
-            return scan.len();
+            // 0xFF fill run reaches the end of the scan without a
+            // marker-code byte — no complete marker.
+            return None;
         }
         i += 1;
     }
-    scan.len()
+    None
 }
 
 // ---- Progressive arithmetic JPEG (SOF10) ---------------------------------
@@ -1999,12 +2008,9 @@ fn decode_progressive_arith_scan_diff(
             {
                 // Advance past the RSTn marker and re-Initdec there.
                 // Statistics + DC predictors reset per F.1.4.4.1.5.
-                scan_pos = locate_next_marker_after(scan, scan_pos);
-                if scan_pos >= scan.len() {
-                    return Err(Error::invalid(
-                        "progressive arith: missing restart marker mid-scan",
-                    ));
-                }
+                scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
+                    Error::invalid("progressive arith: missing restart marker mid-scan")
+                })?;
                 for s in dc_stats.iter_mut() {
                     s.restart_reset();
                 }
@@ -5097,12 +5103,9 @@ fn decode_lossless_arith_scan_planes(
                 && samples_since_restart != 0
                 && samples_since_restart % state.restart_interval as u32 == 0
             {
-                scan_pos = locate_next_marker_after(scan, scan_pos);
-                if scan_pos >= scan.len() {
-                    return Err(Error::invalid(
-                        "lossless arith: missing restart marker mid-scan",
-                    ));
-                }
+                scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
+                    Error::invalid("lossless arith: missing restart marker mid-scan")
+                })?;
                 for s in stats.iter_mut() {
                     s.reset();
                 }
@@ -5252,12 +5255,9 @@ fn decode_lossless_arith_scan_subsampled(
                 && mcus_since_restart != 0
                 && mcus_since_restart % state.restart_interval as u32 == 0
             {
-                scan_pos = locate_next_marker_after(scan, scan_pos);
-                if scan_pos >= scan.len() {
-                    return Err(Error::invalid(
-                        "lossless arith: missing restart marker mid-scan",
-                    ));
-                }
+                scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
+                    Error::invalid("lossless arith: missing restart marker mid-scan")
+                })?;
                 for s in stats.iter_mut() {
                     s.reset();
                 }

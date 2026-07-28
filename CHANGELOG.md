@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Arithmetic-coded scans rejected a legal empty final restart
+  segment.** T.81 §D.1.8 lets the encoder discard trailing zero bytes
+  before a marker, so a restart interval whose entropy data flushes to
+  all-zero bytes occupies zero bytes on the wire (`.. FF RSTn` directly
+  followed by EOI). The restart resync helper returned "byte after the
+  marker" and callers treated an offset equal to the scan length as a
+  *missing* marker, failing such streams with `missing restart marker
+  mid-scan` — including streams our own lossless arithmetic encoder
+  produces (found by the new `lossless_self_roundtrip` fuzz target
+  within its first minute). The helper now distinguishes "no marker
+  found" from "marker found, next segment empty"; the empty segment
+  decodes against Q-coder zero padding as the spec requires. Applies to
+  all four arithmetic restart paths (sequential, progressive, and both
+  lossless scan decoders); regression-pinned in
+  `lossless_arith_empty_final_restart_segment_decodes`.
+
 - **Fuzz harness re-resolved against oxideav-core 0.1.34.** The fuzz/
   sub-crate resolves oxideav-core independently of the library, so its
   lockfile had silently drifted to 0.1.26; the scheduled Fuzz workflow

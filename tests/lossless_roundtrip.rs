@@ -2174,3 +2174,34 @@ fn lossless_arith_yuv_rejects_unsupported_luma_factor() {
             || format!("{err:?}").to_lowercase().contains("sampling")
     );
 }
+
+/// Fuzz regression (`lossless_self_roundtrip` target, round 433): an
+/// arithmetic-coded lossless scan whose **final restart segment is
+/// empty** must decode.
+///
+/// T.81 §D.1.8 lets the encoder discard trailing zero bytes before a
+/// marker, so a restart interval whose entropy data flushes to all-zero
+/// bytes legally occupies *zero* bytes on the wire — the scan then ends
+/// `.. FF RSTn` immediately followed by EOI, and the decoder must feed
+/// the Q-coder zero padding for the last interval instead of reporting
+/// `missing restart marker mid-scan`. With samples `[0x00, 0x2B, 0x00,
+/// 0x40]` at P = 7, predictor 4, a 4×1 geometry puts exactly one sample
+/// (ri = 3) or one-plus-empty segments (ri = 1) after the last RSTn and
+/// the flushed segment is empty; ri = 2 (non-empty final segment) guards
+/// the unaffected path.
+#[test]
+fn lossless_arith_empty_final_restart_segment_decodes() {
+    let samples = [0x00u8, 0x2B, 0x00, 0x40];
+    for ri in [1u16, 2, 3] {
+        let jpeg = encode_lossless_arith_jpeg_grayscale_with_opts(4, 1, &samples, 4, 7, 4, ri, 0)
+            .unwrap_or_else(|e| panic!("encode ri={ri}: {e:?}"));
+        let v = decode_to_frame(jpeg, 4, 1);
+        // P = 7 widens onto a 16-bit LE container (Gray16Le policy).
+        assert_eq!(v.planes.len(), 1, "ri={ri}");
+        for (i, &want) in samples.iter().enumerate() {
+            let got =
+                (v.planes[0].data[i * 2] as u16) | ((v.planes[0].data[i * 2 + 1] as u16) << 8);
+            assert_eq!(got, want as u16, "ri={ri} sample {i}");
+        }
+    }
+}

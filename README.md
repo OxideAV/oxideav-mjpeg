@@ -1019,9 +1019,9 @@ Not supported (decoder returns `Error::Unsupported`):
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs eight cargo-fuzz harnesses against the
+The `fuzz/` sub-crate runs eleven cargo-fuzz harnesses against the
 public encoder + decoder + RTP surface, executed daily by the
-org-wide reusable fuzz workflow:
+org-wide reusable fuzz workflow (55-minute budget, ~5 min/target):
 
 - `decode` — feeds arbitrary bytes (≤ 64 KiB) through the public
   `Decoder` trait (`make_decoder` → `send_packet` → `receive_frame`).
@@ -1072,12 +1072,32 @@ org-wide reusable fuzz workflow:
   `src/rtp.rs`. Last local 15 s baseline: 21 819 067 runs, 0
   crashes (debug build, no instrumentation; daily CI runs the
   release-instrumented binary).
+- `lossless_decode` — wraps fuzz-supplied bytes (≤ 8 KiB) in a minimal
+  SOF3 (Huffman) / SOF11 (arithmetic) lossless envelope: full precision
+  ladder 2..=16 (incl. the SSSS=16 / `Di = 32768` half-modulus case),
+  raw predictor and point-transform nibbles (invalid encodings
+  included), DNL `Y = 0` resolution with an `NL = 0` corruption knob,
+  DRI and DAC control bits. Contract: never panic.
+- `lossless_self_roundtrip` — encoder-in-loop **bit-exact** oracle:
+  fuzz-derived pixels through the lossless encoders
+  (Huffman/arithmetic × grayscale/3-component × predictor 1..=7 ×
+  `Pt` × restart interval) and back through the public decoder;
+  reconstruction must equal `(s >> Pt) << Pt` with zero tolerance.
+  Found the empty-final-restart-segment decoder bug (see CHANGELOG)
+  within its first minute of running.
+- `hierarchical_roundtrip` — encoder-in-loop over eight Annex J modes
+  (spatial-lossless pyramids, DCT pyramids, DCT terminated by a
+  differential lossless stage; Huffman and arithmetic), driving DHP /
+  EXP / differential-SOF decode on every iteration. Bit-exact oracle
+  on the lossless(-final) modes; decode-success + geometry oracle on
+  the lossy DCT modes.
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
   encode → decode round-trip with ±2 LSB YUV tolerance.
 - `libjpeg_encode_oxideav_decode` / `oxideav_encode_libjpeg_decode` —
   cross-decode against a system JPEG library used as a black-box
   validator, loaded via `libloading` at runtime (no `*-sys` crate in
-  the dep tree).
+  the dep tree). The loader probes the conventional Homebrew install
+  paths explicitly so macOS hosts don't run blind.
 
 ## Fixture corpus
 

@@ -2467,8 +2467,7 @@ fn prog_decode_ac_refine(
             let rs = decode_huff(br, ac)?;
             let mut r = (rs >> 4) as usize;
             let s = (rs & 0x0F) as u32;
-            let new_val: i32;
-            if s == 0 {
+            let new_val: i32 = if s == 0 {
                 if r != 15 {
                     // EOBn: refine remaining non-zeros then schedule n-1 EOB blocks.
                     let extra = if r == 0 { 0 } else { br.get_bits(r as u32)? };
@@ -2476,14 +2475,18 @@ fn prog_decode_ac_refine(
                     break;
                 }
                 // ZRL: skip 16 zero-history positions (refining any current nonzeros).
-                new_val = 0;
+                0
             } else if s == 1 {
                 // A new nonzero: read the sign bit.
                 let sign_bit = br.get_bits(1)?;
-                new_val = if sign_bit == 0 { m1 } else { p1 };
+                if sign_bit == 0 {
+                    m1
+                } else {
+                    p1
+                }
             } else {
                 return Err(Error::invalid("progressive AC refine: bad s"));
-            }
+            };
 
             // Walk through zeros until we've skipped `r` zero-history positions,
             // refining any existing non-zero we pass along the way.

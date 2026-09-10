@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every T.81 §A.1.1 sampling-factor combination now decodes.** The
+  three-component paths (baseline fast path, sequential / progressive /
+  arithmetic coefficient renderers at `P = 8` and `P = 12`, and the
+  SOF3 / SOF11 lossless YUV-class path) only accepted luma layouts with
+  a planar `PixelFormat` (1×1 / 2×1 / 2×2 / 4×1 over 1×1 chroma) and
+  rejected everything else with `Unsupported` — 4×2 luma in particular,
+  although Table B.2 allows `Hi, Vi ∈ 1..=4` bounded only by the §B.2.3
+  `Σ Hi × Vi ≤ 10` interleave rule. A shared `yuv_layout` policy now
+  keeps the native planar formats for those layouts and resamples every
+  other legal combination (4×2 or 1×2 luma, mixed chroma factors, chroma
+  oversampled relative to luma, …) onto the frame grid by nearest-
+  neighbour replication (the inverse of the §A.1.1 component-dimension
+  expressions), emitting `Yuv444P` / `Yuv444P12Le`. Verified black-box
+  against `cjpeg -sample …` / `djpeg -nosmooth` with the new
+  `tests/fixtures/sampling/` corpus (luma within ±1 IDCT rounding, RGB
+  PSNR > 45 dB, 8- and 12-bit). `MjpegPixelFormat` gains no variant
+  (1×2 luma lands in 4:4:4 rather than a `Yuv440P` shape — a
+  semver-minor addition left for the next breaking release).
 - **Lossless restart intervals now follow T.81 §H.1.2.1 on both sides.**
   "The one-dimensional horizontal predictor (Ra) is used for the first
   line of samples at the start of the scan and at the beginning of each

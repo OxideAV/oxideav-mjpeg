@@ -5403,9 +5403,16 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
             "lossless YUV encoder: point_transform {point_transform} must be < precision 8"
         )));
     }
-    if !matches!((h_factor, v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
+    // T.81 Table B.2: Hi, Vi ∈ 1..=4. With both chroma components at 1×1
+    // the §B.2.3 interleave bound (Σ Hi × Vi ≤ 10) admits every luma
+    // factor pair up to 4×2 / 2×4; 3×3 (9 + 1 + 1 = 11) and 4×3 / 3×4 /
+    // 4×4 exceed it.
+    if !(1..=4).contains(&h_factor)
+        || !(1..=4).contains(&v_factor)
+        || h_factor as u32 * v_factor as u32 + 2 > 10
+    {
         return Err(Error::unsupported(format!(
-            "lossless YUV encoder: unsupported luma sampling {h_factor}x{v_factor} (supported: 1x1, 2x1, 2x2, 4x1)"
+            "lossless YUV encoder: luma sampling {h_factor}x{v_factor} outside T.81 Table B.2 / §B.2.3 (1..=4 each, Σ Hi×Vi ≤ 10)"
         )));
     }
     let w = width as usize;
@@ -5642,9 +5649,16 @@ pub fn encode_lossless_arith_jpeg_yuv_with_opts(
             "lossless-arith YUV encoder: point_transform {point_transform} must be < precision 8"
         )));
     }
-    if !matches!((h_factor, v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
+    // T.81 Table B.2: Hi, Vi ∈ 1..=4. With both chroma components at 1×1
+    // the §B.2.3 interleave bound (Σ Hi × Vi ≤ 10) admits every luma
+    // factor pair up to 4×2 / 2×4; 3×3 (9 + 1 + 1 = 11) and 4×3 / 3×4 /
+    // 4×4 exceed it.
+    if !(1..=4).contains(&h_factor)
+        || !(1..=4).contains(&v_factor)
+        || h_factor as u32 * v_factor as u32 + 2 > 10
+    {
         return Err(Error::unsupported(format!(
-            "lossless-arith YUV encoder: unsupported luma sampling {h_factor}x{v_factor} (supported: 1x1, 2x1, 2x2, 4x1)"
+            "lossless-arith YUV encoder: luma sampling {h_factor}x{v_factor} outside T.81 Table B.2 / §B.2.3 (1..=4 each, Σ Hi×Vi ≤ 10)"
         )));
     }
     let w = width as usize;

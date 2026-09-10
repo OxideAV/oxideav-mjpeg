@@ -220,30 +220,21 @@ fn validate_lossless_sof(sof: &SofInfo) -> Result<()> {
             }
         }
     } else if sof.components.len() == 3 {
-        let cb = &sof.components[1];
-        let cr = &sof.components[2];
-        if cb.h_factor != cr.h_factor || cb.v_factor != cr.v_factor {
-            return Err(Error::unsupported(
-                "lossless JPEG: chroma components have different sampling factors",
-            ));
-        }
-        if cb.h_factor != 1 || cb.v_factor != 1 {
-            return Err(Error::unsupported(
-                "lossless JPEG: chroma components must declare H = V = 1 (luma carries oversampling)",
-            ));
-        }
-        let y = &sof.components[0];
-        if !matches!((y.h_factor, y.v_factor), (1, 1) | (2, 1) | (2, 2) | (4, 1)) {
-            return Err(Error::unsupported(format!(
-                "lossless JPEG: unsupported luma sampling {}x{} (supported: 1x1, 2x1, 2x2, 4x1)",
-                y.h_factor, y.v_factor
-            )));
-        }
-        // Subsampled (luma-oversampled) YUV-class output is planar
-        // `Yuv*P`, which the workspace `PixelFormat` enum only models at
-        // 8-bit precision. The all-1×1 RGB-class case keeps its existing
-        // P ∈ 2..=16 support (packed Rgb24 / planar Gbrp*Le / Rgb48Le).
-        if (y.h_factor != 1 || y.v_factor != 1) && sof.precision != 8 {
+        // Every §A.1.1 sampling combination is accepted (`validate_sof`
+        // has bounded the factors to 1..=4); the output layout is chosen
+        // by `yuv_layout` — a native planar format when luma carries the
+        // maximum factors over 1×1 chroma, nearest-neighbour 4:4:4
+        // otherwise.
+        //
+        // Subsampled (non-1×1) YUV-class output is planar `Yuv*P`, which
+        // the workspace `PixelFormat` enum only models at 8-bit precision.
+        // The all-1×1 RGB-class case keeps its existing P ∈ 2..=16
+        // support (packed Rgb24 / planar Gbrp*Le / Rgb48Le).
+        let subsampled = sof
+            .components
+            .iter()
+            .any(|c| c.h_factor != 1 || c.v_factor != 1);
+        if subsampled && sof.precision != 8 {
             return Err(Error::unsupported(format!(
                 "lossless JPEG: subsampled three-component scans require precision 8, got {}",
                 sof.precision
@@ -1103,31 +1094,8 @@ fn decode_scan(
         }
         PixelFormat::Rgb24
     } else if n_comp == 3 {
-        let y = sof.components[0];
-        let cb = sof.components[1];
-        let cr = sof.components[2];
-        if cb.h_factor != cr.h_factor || cb.v_factor != cr.v_factor {
-            return Err(Error::unsupported(
-                "chroma components have different sampling factors",
-            ));
-        }
-        if cb.h_factor != 1 || cb.v_factor != 1 {
-            return Err(Error::unsupported(
-                "chroma components must have factor 1 (luma carries the oversampling)",
-            ));
-        }
-        match (y.h_factor, y.v_factor) {
-            (1, 1) => PixelFormat::Yuv444P,
-            (2, 1) => PixelFormat::Yuv422P,
-            (2, 2) => PixelFormat::Yuv420P,
-            (4, 1) => PixelFormat::Yuv411P,
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "luma sampling {}x{}",
-                    y.h_factor, y.v_factor
-                )))
-            }
-        }
+        // Every §A.1.1 sampling combination decodes; see `yuv_layout`.
+        yuv_layout(sof, sof.width as usize, sof.height as usize, false).format()
     } else {
         return Err(Error::unsupported("2-component JPEG"));
     };
@@ -1321,41 +1289,142 @@ fn decode_scan(
         | PixelFormat::Yuv422P
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
-            let (c_w, c_h) = match out_format {
-                PixelFormat::Yuv444P => (width, height),
-                PixelFormat::Yuv422P => (width.div_ceil(2), height),
-                PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
-                PixelFormat::Yuv411P => (width.div_ceil(4), height),
-                _ => unreachable!(),
-            };
-            // Y plane.
-            let y_stride = width;
-            let mut y_data = vec![0u8; y_stride * height];
-            let src_stride_y = comp_stride[0];
-            for y in 0..height {
-                y_data[y * y_stride..y * y_stride + width]
-                    .copy_from_slice(&comp_buf[0][y * src_stride_y..y * src_stride_y + width]);
-            }
-            planes.push(VideoPlane {
-                stride: y_stride,
-                data: y_data,
-            });
-            // Cb, Cr planes (each same size).
-            for ci in [1usize, 2] {
-                let src_stride = comp_stride[ci];
-                let stride = c_w;
-                let mut data = vec![0u8; stride * c_h];
-                for y in 0..c_h {
-                    data[y * stride..y * stride + c_w]
-                        .copy_from_slice(&comp_buf[ci][y * src_stride..y * src_stride + c_w]);
-                }
-                planes.push(VideoPlane { stride, data });
-            }
+            let layout = yuv_layout(sof, width, height, false);
+            planes.extend(shape_yuv_planes(
+                sof,
+                &comp_buf,
+                &comp_stride,
+                width,
+                height,
+                layout,
+                emit_plane_8bit,
+            ));
         }
         _ => unreachable!(),
     }
 
     Ok(VideoFrame { pts, planes })
+}
+
+/// Output layout of a three-component YCbCr frame. T.81 §A.1.1 allows
+/// every `Hi, Vi ∈ 1..=4` (subject only to the §B.2.3 interleave bound
+/// `Σ Hi × Vi ≤ 10`); only a handful of those combinations have a planar
+/// `PixelFormat`, the rest are resampled to 4:4:4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YuvLayout {
+    /// Luma carries `(Hmax, Vmax)`, both chroma components are `1×1`, and
+    /// the ratio has a planar pixel format: the chroma planes are emitted
+    /// at their coded resolution `c_w × c_h`.
+    Native {
+        format: PixelFormat,
+        c_w: usize,
+        c_h: usize,
+    },
+    /// Any other legal combination (4×2 or 1×2 luma, mixed chroma
+    /// factors, chroma oversampled relative to luma, …): every component
+    /// is resampled onto the frame grid by nearest-neighbour replication
+    /// (`sx = x × Hi / Hmax`, `sy = y × Vi / Vmax` — the inverse of the
+    /// §A.1.1 component-dimension expressions) and the frame is emitted
+    /// as 4:4:4.
+    Upsampled444 { format: PixelFormat },
+}
+
+impl YuvLayout {
+    fn format(self) -> PixelFormat {
+        match self {
+            YuvLayout::Native { format, .. } | YuvLayout::Upsampled444 { format } => format,
+        }
+    }
+}
+
+/// Classify the sampling layout of a three-component (non-RGB) frame.
+fn yuv_layout(sof: &SofInfo, width: usize, height: usize, twelve_bit: bool) -> YuvLayout {
+    let y = sof.components[0];
+    let cb = sof.components[1];
+    let cr = sof.components[2];
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
+    let chroma_unit = cb.h_factor == 1 && cb.v_factor == 1 && cr.h_factor == 1 && cr.v_factor == 1;
+    let luma_max = y.h_factor == h_max && y.v_factor == v_max;
+    let native = if chroma_unit && luma_max {
+        match (y.h_factor, y.v_factor, twelve_bit) {
+            (1, 1, false) => Some(PixelFormat::Yuv444P),
+            (2, 1, false) => Some(PixelFormat::Yuv422P),
+            (2, 2, false) => Some(PixelFormat::Yuv420P),
+            (4, 1, false) => Some(PixelFormat::Yuv411P),
+            (1, 1, true) => Some(PixelFormat::Yuv444P12Le),
+            (2, 1, true) => Some(PixelFormat::Yuv422P12Le),
+            (2, 2, true) => Some(PixelFormat::Yuv420P12Le),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match native {
+        Some(format) => YuvLayout::Native {
+            format,
+            c_w: width.div_ceil(h_max as usize),
+            c_h: height.div_ceil(v_max as usize),
+        },
+        None => YuvLayout::Upsampled444 {
+            format: if twelve_bit {
+                PixelFormat::Yuv444P12Le
+            } else {
+                PixelFormat::Yuv444P
+            },
+        },
+    }
+}
+
+/// Shape three component sample grids into the planes of `layout`.
+/// `comp[ci]` is component `ci`'s (MCU-padded) grid with row pitch
+/// `stride[ci]` samples; `emit(grid, pitch, w, h)` copies the top-left
+/// `w × h` window of a grid into an output plane.
+fn shape_yuv_planes<T: Copy + Default>(
+    sof: &SofInfo,
+    comp: &[Vec<T>],
+    stride: &[usize],
+    width: usize,
+    height: usize,
+    layout: YuvLayout,
+    emit: impl Fn(&[T], usize, usize, usize) -> VideoPlane,
+) -> Vec<VideoPlane> {
+    match layout {
+        YuvLayout::Native { c_w, c_h, .. } => vec![
+            emit(&comp[0], stride[0], width, height),
+            emit(&comp[1], stride[1], c_w, c_h),
+            emit(&comp[2], stride[2], c_w, c_h),
+        ],
+        YuvLayout::Upsampled444 { .. } => {
+            let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+            let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+            (0..3)
+                .map(|ci| {
+                    let hi = sof.components[ci].h_factor as usize;
+                    let vi = sof.components[ci].v_factor as usize;
+                    let mut full = vec![T::default(); width * height];
+                    for y in 0..height {
+                        let sy = y * vi / v_max;
+                        let row = &comp[ci][sy * stride[ci]..];
+                        let dst = &mut full[y * width..(y + 1) * width];
+                        for (x, d) in dst.iter_mut().enumerate() {
+                            *d = row[x * hi / h_max];
+                        }
+                    }
+                    emit(&full, width, width, height)
+                })
+                .collect()
+        }
+    }
+}
+
+/// Copy the top-left `w × h` window of an 8-bit sample grid into a plane.
+fn emit_plane_8bit(src: &[u8], src_stride: usize, w: usize, h: usize) -> VideoPlane {
+    let mut data = vec![0u8; w * h];
+    for y in 0..h {
+        data[y * w..(y + 1) * w].copy_from_slice(&src[y * src_stride..y * src_stride + w]);
+    }
+    VideoPlane { stride: w, data }
 }
 
 /// True when a 3-component baseline / sequential SOF should be decoded as
@@ -2585,29 +2654,8 @@ fn render_from_coefs(
         }
         PixelFormat::Rgb24
     } else if n_comp == 3 {
-        let y = sof.components[0];
-        let cb = sof.components[1];
-        let cr = sof.components[2];
-        if cb.h_factor != cr.h_factor || cb.v_factor != cr.v_factor {
-            return Err(Error::unsupported(
-                "chroma components have different sampling factors",
-            ));
-        }
-        if cb.h_factor != 1 || cb.v_factor != 1 {
-            return Err(Error::unsupported("chroma components must have factor 1"));
-        }
-        match (y.h_factor, y.v_factor) {
-            (1, 1) => PixelFormat::Yuv444P,
-            (2, 1) => PixelFormat::Yuv422P,
-            (2, 2) => PixelFormat::Yuv420P,
-            (4, 1) => PixelFormat::Yuv411P,
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "luma sampling {}x{}",
-                    y.h_factor, y.v_factor
-                )))
-            }
-        }
+        // Every §A.1.1 sampling combination decodes; see `yuv_layout`.
+        yuv_layout(sof, width, height, false).format()
     } else if n_comp == 4 {
         // 4-component scans: plain CMYK (no APP14, or APP14 transform=0) or
         // Adobe YCCK (APP14 transform=2). Either way the output is packed
@@ -2690,34 +2738,16 @@ fn render_from_coefs(
         | PixelFormat::Yuv422P
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
-            let (c_w, c_h) = match out_format {
-                PixelFormat::Yuv444P => (width, height),
-                PixelFormat::Yuv422P => (width.div_ceil(2), height),
-                PixelFormat::Yuv420P => (width.div_ceil(2), height.div_ceil(2)),
-                PixelFormat::Yuv411P => (width.div_ceil(4), height),
-                _ => unreachable!(),
-            };
-            let y_stride = width;
-            let mut y_data = vec![0u8; y_stride * height];
-            let src_stride_y = comp_stride[0];
-            for y in 0..height {
-                y_data[y * y_stride..y * y_stride + width]
-                    .copy_from_slice(&comp_buf[0][y * src_stride_y..y * src_stride_y + width]);
-            }
-            planes.push(VideoPlane {
-                stride: y_stride,
-                data: y_data,
-            });
-            for ci in [1usize, 2] {
-                let src_stride = comp_stride[ci];
-                let stride = c_w;
-                let mut data = vec![0u8; stride * c_h];
-                for y in 0..c_h {
-                    data[y * stride..y * stride + c_w]
-                        .copy_from_slice(&comp_buf[ci][y * src_stride..y * src_stride + c_w]);
-                }
-                planes.push(VideoPlane { stride, data });
-            }
+            let layout = yuv_layout(sof, width, height, false);
+            planes.extend(shape_yuv_planes(
+                sof,
+                &comp_buf,
+                &comp_stride,
+                width,
+                height,
+                layout,
+                emit_plane_8bit,
+            ));
         }
         PixelFormat::Cmyk => {
             // Pack the 4 per-component planes into a single row-major
@@ -2831,30 +2861,8 @@ fn render_from_coefs_12bit(
     let out_format = if grayscale {
         PixelFormat::Gray12Le
     } else if n_comp == 3 {
-        let y = sof.components[0];
-        let cb = sof.components[1];
-        let cr = sof.components[2];
-        if cb.h_factor != cr.h_factor || cb.v_factor != cr.v_factor {
-            return Err(Error::unsupported(
-                "12-bit: chroma components have different sampling factors",
-            ));
-        }
-        if cb.h_factor != 1 || cb.v_factor != 1 {
-            return Err(Error::unsupported(
-                "12-bit: chroma components must have factor 1",
-            ));
-        }
-        match (y.h_factor, y.v_factor) {
-            (1, 1) => PixelFormat::Yuv444P12Le,
-            (2, 1) => PixelFormat::Yuv422P12Le,
-            (2, 2) => PixelFormat::Yuv420P12Le,
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "12-bit: only 4:4:4 / 4:2:2 / 4:2:0 chroma sampling supported (got {}x{})",
-                    y.h_factor, y.v_factor
-                )))
-            }
-        }
+        // Every §A.1.1 sampling combination decodes; see `yuv_layout`.
+        yuv_layout(sof, width, height, true).format()
     } else {
         return Err(Error::unsupported(format!(
             "12-bit: {n_comp}-component JPEGs not supported"
@@ -2938,15 +2946,16 @@ fn render_from_coefs_12bit(
             planes.push(emit_plane(&comp_buf[0], comp_stride[0], width, height));
         }
         PixelFormat::Yuv420P12Le | PixelFormat::Yuv422P12Le | PixelFormat::Yuv444P12Le => {
-            let (c_w, c_h) = match out_format {
-                PixelFormat::Yuv444P12Le => (width, height),
-                PixelFormat::Yuv422P12Le => (width.div_ceil(2), height),
-                PixelFormat::Yuv420P12Le => (width.div_ceil(2), height.div_ceil(2)),
-                _ => unreachable!(),
-            };
-            planes.push(emit_plane(&comp_buf[0], comp_stride[0], width, height));
-            planes.push(emit_plane(&comp_buf[1], comp_stride[1], c_w, c_h));
-            planes.push(emit_plane(&comp_buf[2], comp_stride[2], c_w, c_h));
+            let layout = yuv_layout(sof, width, height, true);
+            planes.extend(shape_yuv_planes(
+                sof,
+                &comp_buf,
+                &comp_stride,
+                width,
+                height,
+                layout,
+                emit_plane,
+            ));
         }
         _ => unreachable!(),
     }
@@ -2993,8 +3002,6 @@ fn render_from_coefs_12bit(
 struct LosslessPlanes {
     samples: Vec<Vec<u32>>,
     comp_w: Vec<usize>,
-    comp_true_w: Vec<usize>,
-    comp_true_h: Vec<usize>,
     subsampled: bool,
 }
 
@@ -3016,10 +3023,9 @@ fn decode_lossless_scan(
     let planes = decode_lossless_scan_planes(state, sos, scan, false)?;
     if planes.subsampled {
         return shape_lossless_yuv_frame(
+            sof,
             &planes.samples,
             &planes.comp_w,
-            &planes.comp_true_w,
-            &planes.comp_true_h,
             width,
             height,
             pt,
@@ -3225,15 +3231,6 @@ fn decode_lossless_scan_planes(
     } else {
         (vec![width; nc], vec![height; nc])
     };
-    // True (un-padded) per-component extent used to size the output planes.
-    let comp_true_w: Vec<usize> = h_factors
-        .iter()
-        .map(|&h| (width * h).div_ceil(h_max))
-        .collect();
-    let comp_true_h: Vec<usize> = v_factors
-        .iter()
-        .map(|&v| (height * v).div_ceil(v_max))
-        .collect();
 
     // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
     let sample_bits = precision - pt;
@@ -3350,8 +3347,6 @@ fn decode_lossless_scan_planes(
         return Ok(LosslessPlanes {
             samples,
             comp_w,
-            comp_true_w,
-            comp_true_h,
             subsampled,
         });
     }
@@ -3514,8 +3509,6 @@ fn decode_lossless_scan_planes(
     Ok(LosslessPlanes {
         samples,
         comp_w,
-        comp_true_w,
-        comp_true_h,
         subsampled,
     })
 }
@@ -4914,43 +4907,38 @@ fn shape_lossless_frame(
 /// The scan decoder reconstructed each component onto its own MCU-padded
 /// sample grid (`comp_w[ci]` wide). Per T.81 A.2.4 the decoding process
 /// removes any samples the encoder added to round each component up to a
-/// whole number of MCUs, so here we crop component `ci` to its true extent
-/// `comp_true_w[ci] × comp_true_h[ci]` when copying into the output plane.
-/// Precision is fixed at `P = 8` for the YUV-class path (the only subsampled
-/// combination `validate_lossless_sof` admits), so each post-`<< pt` sample
-/// fits in a `u8`. Plane order is Y, Cb, Cr — the SOS scan order, matching
+/// whole number of MCUs, so here we crop each plane to its true extent
+/// when copying into the output plane. Precision is fixed at `P = 8` for
+/// the subsampled YUV-class path, so each post-`<< pt` sample fits in a
+/// `u8`. Plane order is Y, Cb, Cr — the SOS scan order, matching
 /// the lossy decoder's planar layout.
 #[allow(clippy::too_many_arguments)]
 fn shape_lossless_yuv_frame(
+    sof: &SofInfo,
     samples: &[Vec<u32>],
     comp_w: &[usize],
-    comp_true_w: &[usize],
-    comp_true_h: &[usize],
     width: usize,
     height: usize,
     pt: u32,
     pts: Option<i64>,
 ) -> Result<VideoFrame> {
-    let mut planes: Vec<VideoPlane> = Vec::with_capacity(3);
-    // Y plane is always full-resolution (width × height); the chroma
-    // planes carry their subsampled extent. We size each output plane to
-    // the component's true (un-padded) dimensions and copy row-by-row out
-    // of the wider padded grid.
-    for ci in 0..3 {
-        let cw = comp_w[ci];
-        let out_w = if ci == 0 { width } else { comp_true_w[ci] };
-        let out_h = if ci == 0 { height } else { comp_true_h[ci] };
-        let stride = out_w;
-        let mut data = vec![0u8; stride * out_h];
-        for y in 0..out_h {
-            let src_row = &samples[ci][y * cw..y * cw + out_w];
-            let dst_row = &mut data[y * stride..y * stride + out_w];
-            for (d, &s) in dst_row.iter_mut().zip(src_row) {
+    // Each component grid is MCU-padded (`comp_w[ci]` wide); the output
+    // layout follows the same §A.1.1 policy as the DCT paths — native
+    // planar chroma when luma carries the maximum factors over 1×1
+    // chroma, nearest-neighbour 4:4:4 otherwise. Samples are widened by
+    // the point transform on the way out.
+    let layout = yuv_layout(sof, width, height, false);
+    let emit = |src: &[u32], src_stride: usize, w: usize, h: usize| -> VideoPlane {
+        let mut data = vec![0u8; w * h];
+        for y in 0..h {
+            let src_row = &src[y * src_stride..y * src_stride + w];
+            for (d, &s) in data[y * w..(y + 1) * w].iter_mut().zip(src_row) {
                 *d = (s << pt) as u8;
             }
         }
-        planes.push(VideoPlane { stride, data });
-    }
+        VideoPlane { stride: w, data }
+    };
+    let planes = shape_yuv_planes(sof, samples, comp_w, width, height, layout, emit);
     Ok(VideoFrame { pts, planes })
 }
 
@@ -5246,14 +5234,6 @@ fn decode_lossless_arith_scan_subsampled(
     let mcus_y = height.div_ceil(v_max);
     let comp_w: Vec<usize> = h_factors.iter().map(|&hf| mcus_x * hf).collect();
     let comp_h: Vec<usize> = v_factors.iter().map(|&vf| mcus_y * vf).collect();
-    let comp_true_w: Vec<usize> = h_factors
-        .iter()
-        .map(|&hf| (width * hf).div_ceil(h_max))
-        .collect();
-    let comp_true_h: Vec<usize> = v_factors
-        .iter()
-        .map(|&vf| (height * vf).div_ceil(v_max))
-        .collect();
 
     let mut samples: Vec<Vec<u32>> = (0..nc)
         .map(|ci| vec![0u32; comp_w[ci] * comp_h[ci]])
@@ -5340,16 +5320,11 @@ fn decode_lossless_arith_scan_subsampled(
         }
     }
 
-    shape_lossless_yuv_frame(
-        &samples,
-        &comp_w,
-        &comp_true_w,
-        &comp_true_h,
-        width,
-        height,
-        pt,
-        pts,
-    )
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SOS before SOF"))?;
+    shape_lossless_yuv_frame(sof, &samples, &comp_w, width, height, pt, pts)
 }
 
 #[cfg(all(test, feature = "registry"))]
@@ -6247,14 +6222,15 @@ mod precision_12_tests {
         run_yuv_12bit_roundtrip(16, 16, 2, 2, PixelFormat::Yuv420P12Le);
     }
 
-    /// Non-2x luma sampling at P=12 (e.g. 4:1:1) is still rejected with
-    /// `Unsupported` — the matrix only covers the three common YUV
-    /// subsamplings the workspace `PixelFormat` enum carries at 12 bits.
+    /// Luma sampling without a 12-bit planar `PixelFormat` (e.g. 4:1:1)
+    /// decodes through the general §A.1.1 geometry: every component is
+    /// replicated onto the frame grid and the frame comes out as
+    /// `Yuv444P12Le` (three full-resolution 16-bit-LE planes).
     #[test]
-    fn yuv_12bit_4x1_luma_rejected() {
+    fn yuv_12bit_4x1_luma_upsampled_to_444() {
         let w = 16u32;
         let h = 16u32;
-        let (y, cb, cr, _c_w, _c_h) = build_yuv_12bit(w as usize, h as usize, 4, 1);
+        let (y, cb, cr, c_w, c_h) = build_yuv_12bit(w as usize, h as usize, 4, 1);
         let data =
             encode_yuv_jpeg_12bit(w, h, &y, &cb, &cr, 4, 1, 90).expect("encode 12-bit yuv 4:1:1");
 
@@ -6264,11 +6240,30 @@ mod precision_12_tests {
         let mut dec = make_decoder(&dec_params).unwrap();
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data))
             .unwrap();
-        let err = dec.receive_frame().expect_err("expected Unsupported");
-        assert!(
-            matches!(err, oxideav_core::Error::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("decoder did not emit a video frame")
+        };
+        assert_eq!(v.planes.len(), 3, "expected three planes");
+        for (pi, p) in v.planes.iter().enumerate() {
+            assert_eq!(p.stride, (w * 2) as usize, "plane {pi} stride (4:4:4)");
+            assert_eq!(p.data.len(), (w * 2 * h) as usize, "plane {pi} size");
+        }
+        let got_y = unpack_le_u16_plane(&v.planes[0].data, v.planes[0].stride, 16, 16);
+        assert_plane_close("Y", &y, &got_y);
+        // Chroma was coded at c_w × c_h and replicated 4× horizontally.
+        let upsample = |src: &[u16]| -> Vec<u16> {
+            let mut out = Vec::with_capacity(256);
+            for yy in 0..16usize {
+                for xx in 0..16usize {
+                    out.push(src[(yy * c_h / 16) * c_w + xx * c_w / 16]);
+                }
+            }
+            out
+        };
+        let got_cb = unpack_le_u16_plane(&v.planes[1].data, v.planes[1].stride, 16, 16);
+        let got_cr = unpack_le_u16_plane(&v.planes[2].data, v.planes[2].stride, 16, 16);
+        assert_plane_close("Cb", &upsample(&cb), &got_cb);
+        assert_plane_close("Cr", &upsample(&cr), &got_cr);
     }
 
     // ---- Progressive (SOF2) 12-bit precision roundtrip ------------------

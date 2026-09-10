@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`decoder::decode_jpeg` is public** (`decode_jpeg(&[u8], Option<i64>)
+  -> Result<VideoFrame>`): the framework-free single-image decode entry
+  point the crate docs always advertised, now reachable without going
+  through the `registry` trait plumbing (and available in the
+  `--no-default-features` build, where it returns `MjpegFrame`).
 - **Three new fuzz targets close the lossless / hierarchical coverage
   gap** (`fuzz/` only, no library surface change): `lossless_decode`
   (SOF3/SOF11 envelope robustness — full precision ladder 2..=16, raw
@@ -25,6 +30,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lossless restart intervals now follow T.81 §H.1.2.1 on both sides.**
+  "The one-dimensional horizontal predictor (Ra) is used for the first
+  line of samples at the start of the scan and at the beginning of each
+  restart interval" — the Huffman SOF3 decoder and the four Huffman
+  lossless encoders (grayscale / RGB-class / subsampled YUV-class /
+  CMYK-class) only reset the *first sample* of an interval to
+  `2^(P − Pt − 1)` and then fell straight back to the 2-D predictor
+  (Px 2–7) against the previous interval's line, so every restart
+  stream with a predictor other than 1 diverged from conformant readers
+  (the subsampled YUV pair additionally predicted the origin for every
+  sample of the first MCU). The interval's first line now uses `Ra`,
+  later lines use `Rb` at the line start and the selected predictor
+  elsewhere. Verified black-box against `cjpeg`/`djpeg` (libjpeg-turbo
+  3.2) with the new `tests/fixtures/lossless_restart/` corpus: the
+  validator's one-row-interval streams for predictors 1 / 4 / 7 are
+  byte-identical (every line is a first line), decode byte-exact here,
+  and our own restart streams for every predictor × interval decode
+  byte-exact in `djpeg`. The arithmetic SOF11 paths already applied the
+  rule and are unchanged.
+- **Lossless DC Huffman table no longer uses the all-ones code word.**
+  The shared SOF3 table (`BITS = 0,0,0,15,2`) filled the code space
+  exactly, so `SSSS = 16` was coded as `11111` — T.81 §C.2 requires
+  "the all-1-bits code word of any length is reserved as a prefix for
+  longer code words" (§K.2 reserves a code point for the same reason)
+  and conformant decoders reject the DHT as bogus. The table is now
+  `BITS = 0,0,0,14,3` (14 four-bit codes + `11100`/`11101`/`11110`);
+  every lossless Huffman stream changes byte-wise, reconstruction stays
+  bit-exact (golden decode hashes unchanged, byte hashes re-pinned).
+- **Lossless RGB-class and CMYK-class streams no longer carry a JFIF
+  APP0.** T.871 defines JFIF for `Nf = 1 or 3` with components
+  `Y / Cb / Cr` only, so validators applied a YCbCr→RGB conversion (or
+  refused it in lossless mode) to our three-component RGB streams.
+  The RGB-class lossless encoders (SOF3 + SOF11) now emit Adobe APP14
+  `transform = 0` and `'R' / 'G' / 'B'` component ids — the same
+  signalling as the baseline `encode_jpeg_rgb24_*` path — and the
+  CMYK-class ones emit only the configured Adobe APP14. Both decode in
+  `djpeg` / `magick` sample-exact.
 - **Arithmetic-coded scans rejected a legal empty final restart
   segment.** T.81 §D.1.8 lets the encoder discard trailing zero bytes
   before a marker, so a restart interval whose entropy data flushes to

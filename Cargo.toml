@@ -12,6 +12,9 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-mjpeg"
 keywords = ["multimedia", "mjpeg", "jpeg", "video", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
+# Test fixtures (`tests/fixtures/`) and the cargo-fuzz sub-crate are not
+# part of the published package; crates.io caps uploads at 10 MiB.
+exclude = ["/tests", "/fuzz"]
 
 [dependencies]
 # `oxideav-core` is gated behind the default-on `registry` feature so

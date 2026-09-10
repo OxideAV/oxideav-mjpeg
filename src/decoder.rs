@@ -402,7 +402,7 @@ fn apply_dnl_height(sof: &mut SofInfo, dnl_height: Option<u16>) {
     }
 }
 
-pub(crate) fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
@@ -3249,7 +3249,16 @@ fn decode_lossless_scan_planes(
     let mut br = BitReader::new(scan);
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = RST0;
-    let mut reset_pred = true; // true at image start and after each RSTn.
+    // T.81 §H.1.2.1 restart bookkeeping. `first_sample[ci]` is true until
+    // component `ci` has coded its first sample of the scan / of the
+    // current restart interval (that sample is predicted as the origin
+    // 2^(P − Pt − 1)); `first_line[ci]` is the component-grid row on
+    // which the current interval began — every other sample on that row
+    // uses the one-dimensional predictor Ra regardless of the selector,
+    // and only rows below it use Rb at the start of the line and the
+    // selected predictor elsewhere.
+    let mut first_sample: [bool; 4] = [true; 4];
+    let mut first_line: [usize; 4] = [0; 4];
 
     // Specialised single-component raster path: no restart intervals, no
     // differential coding, one component. This is the dominant SOF3 shape
@@ -3369,9 +3378,11 @@ fn decode_lossless_scan_planes(
             // fall-backs.
             let pred: u32 = if differential {
                 0
-            } else if reset_pred {
+            } else if first_sample[ci] {
+                first_sample[ci] = false;
                 origin
-            } else if cy == 0 {
+            } else if cy == first_line[ci] {
+                // First line of the scan / restart interval: Ra.
                 plane[cy * cw + cx - 1]
             } else if cx == 0 {
                 plane[(cy - 1) * cw + cx]
@@ -3438,7 +3449,7 @@ fn decode_lossless_scan_planes(
                     expected_rst + 1
                 };
                 br.reset_at_restart();
-                reset_pred = true;
+                first_sample = [true; 4];
             }
         }};
     }
@@ -3455,11 +3466,13 @@ fn decode_lossless_scan_planes(
                     && mcus_since_restart % state.restart_interval as u32 == 0
                 {
                     consume_restart!();
+                    if first_sample[0] {
+                        first_line = [y; 4];
+                    }
                 }
                 for ci in 0..nc {
                     decode_one!(ci, x, y);
                 }
-                reset_pred = false;
                 mcus_since_restart += 1;
             }
         }
@@ -3476,6 +3489,11 @@ fn decode_lossless_scan_planes(
                     && mcus_since_restart % state.restart_interval as u32 == 0
                 {
                     consume_restart!();
+                    if first_sample[0] {
+                        for ci in 0..nc {
+                            first_line[ci] = my * v_factors[ci];
+                        }
+                    }
                 }
                 for ci in 0..nc {
                     let h = h_factors[ci];
@@ -3488,7 +3506,6 @@ fn decode_lossless_scan_planes(
                         }
                     }
                 }
-                reset_pred = false;
                 mcus_since_restart += 1;
             }
         }

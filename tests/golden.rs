@@ -343,22 +343,22 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "lossless_gray8_pred1_128x128",
-        0x8ae032015e7f6aef,
+        0xdf6bdbfa170cf251,
         0xfcecae039d5d0877,
     ),
     (
         "lossless_gray8_pred4_128x128",
-        0x782033fbfa84e434,
+        0x5d60f254f77ddeae,
         0xfcecae039d5d0877,
     ),
     (
         "lossless_gray12_pred7_64x64",
-        0xfb0716f31afad0fa,
+        0x416638ef38dbb844,
         0xe72d46af3cdb067f,
     ),
     (
         "lossless_rgb8_pred2_64x64",
-        0x495d04c59e771ce7,
+        0x3c0253f44aeda9ff,
         0x6ad4973c7c333c48,
     ),
     (
@@ -368,7 +368,7 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "hier_lossless_gray8_pred1_l2_64x64",
-        0xe2db9f2b7afbaab0,
+        0x2236332574801432,
         0x7df50c02b665df32,
     ),
     (

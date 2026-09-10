@@ -3306,14 +3306,21 @@ pub(crate) fn encode_yuv_jpeg_progressive_12bit(
 /// every SSSS value in 0..=16 and is therefore valid for any precision
 /// `P ∈ 2..=16`.
 ///
-/// Layout (Kraft sum 1.0):
-///   * 15 symbols at code length 4 — SSSS 0..=14 (the common cases).
-///   * 2 symbols at code length 5 — SSSS 15 and 16 (large residuals).
+/// Layout (Kraft sum 31/32):
+///   * 14 symbols at code length 4 — SSSS 0..=13 (the common cases).
+///   * 3 symbols at code length 5 — SSSS 14, 15 and 16 (large residuals).
+///
+/// The code space is deliberately *not* filled: T.81 §C.2 requires that
+/// "the all-1-bits code word of any length is reserved as a prefix for
+/// longer code words" (§K.2 reserves a code point for the same reason),
+/// so a Kraft-complete list — whose last canonical code is all ones —
+/// is rejected as a bogus table by conformant decoders. With the
+/// layout above the longest code is `11110`.
 ///
 /// `STD_DC_LOSSLESS_BITS[L-1]` is the count of codes of length `L`, and
 /// `STD_DC_LOSSLESS_VALS` is the canonical-order symbol list per
 /// T.81 Annex C.2.
-const STD_DC_LOSSLESS_BITS: [u8; 16] = [0, 0, 0, 15, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+const STD_DC_LOSSLESS_BITS: [u8; 16] = [0, 0, 0, 14, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const STD_DC_LOSSLESS_VALS: [u8; 17] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// Category for a lossless residual computed modulo 2^16 (T.81 §H.1.2.1).
@@ -3454,7 +3461,7 @@ pub fn encode_lossless_jpeg_grayscale_with_opts(
     }
 
     // Build the wide-symbol DC Huffman table once per call. The
-    // STD_DC_LOSSLESS_* constants give a Kraft-complete (sum=1) layout
+    // STD_DC_LOSSLESS_* constants give a layout that covers every SSSS
     // valid for any precision in 2..=16, so no per-image table tuning
     // is required for spec correctness.
     let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
@@ -3542,7 +3549,11 @@ pub fn encode_lossless_jpeg_grayscale_with_opts(
     // RSTn so the next sample uses `origin` (not Ra/Rb/Rc from the
     // previous interval — those neighbours are still present in `src`
     // but the spec mandates we forget them at the restart boundary).
+    // `first_line_y` is the row on which the current interval began:
+    // T.81 §H.1.2.1 applies the one-dimensional predictor Ra to the
+    // whole first line of every restart interval, not just to row 0.
     let mut reset_pred = true;
+    let mut first_line_y = 0usize;
 
     let mut bw = BitWriter::new(&mut out);
     for y in 0..h {
@@ -3550,9 +3561,9 @@ pub fn encode_lossless_jpeg_grayscale_with_opts(
             let actual = src[y * w + x] as i32;
             let pred: i32 = if reset_pred {
                 origin
-            } else if y == 0 {
-                // First line uses Ra regardless of selector (Table H.1
-                // applies after the first line / restart).
+            } else if y == first_line_y {
+                // First line of the scan / interval uses Ra regardless of
+                // selector (Table H.1 applies to the lines below it).
                 src[y * w + x - 1] as i32
             } else if x == 0 {
                 // Start of a non-first line uses Rb.
@@ -3601,6 +3612,8 @@ pub fn encode_lossless_jpeg_grayscale_with_opts(
                 rst_counter = rst_counter.wrapping_add(1);
                 samples_since_restart = 0;
                 reset_pred = true;
+                // The interval opens on the row of the *next* sample.
+                first_line_y = if x + 1 == w { y + 1 } else { y };
             }
         }
     }
@@ -3647,14 +3660,20 @@ fn write_sof11_lossless(out: &mut Vec<u8>, width: u16, height: u16, precision: u
 /// layout for multi-component lossless per T.81 §H.1.2). Component
 /// identifiers start at 1 and increment by 1. This is the arithmetic-coder
 /// counterpart of [`write_sof_lossless_multi`] (which writes SOF3).
-fn write_sof11_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precision: u8, nf: u8) {
-    debug_assert!((1..=4).contains(&nf));
-    let mut payload = Vec::with_capacity(8 + 3 * nf as usize);
+fn write_sof11_lossless_multi(
+    out: &mut Vec<u8>,
+    width: u16,
+    height: u16,
+    precision: u8,
+    ids: &[u8],
+) {
+    debug_assert!((1..=4).contains(&ids.len()));
+    let mut payload = Vec::with_capacity(8 + 3 * ids.len());
     payload.push(precision);
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
-    payload.push(nf);
-    for ci in 1..=nf {
+    payload.push(ids.len() as u8);
+    for &ci in ids {
         payload.push(ci); // component identifier
         payload.push(0x11); // H=1 V=1
         payload.push(0); // Tq (ignored for lossless)
@@ -4650,12 +4669,15 @@ pub fn encode_lossless_arith_jpeg_rgb_with_opts(
     let mut out: Vec<u8> = Vec::with_capacity(16_384 + 3 * 2 * w * h);
     out.push(0xFF);
     out.push(markers::SOI);
-    write_jfif_app0(&mut out);
-    write_sof11_lossless_multi(&mut out, w as u16, h as u16, precision, 3);
+    // RGB-class frame: no JFIF APP0 (T.871 binds a three-component
+    // JFIF stream to YCbCr), Adobe APP14 `transform = 0` + 'R'/'G'/'B'
+    // component ids signal untransformed R/G/B samples instead.
+    write_adobe_app14(&mut out, 0);
+    write_sof11_lossless_multi(&mut out, w as u16, h as u16, precision, &LOSSLESS_IDS_RGB);
     if restart_interval != 0 {
         write_dri(&mut out, restart_interval);
     }
-    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_RGB, point_transform);
 
     // Default prediction for each component's first sample at scan start and
     // after each restart interval (§H.1.2.1). The working precision is
@@ -4926,15 +4948,15 @@ pub fn encode_lossless_arith_jpeg_cmyk_with_opts(
     let mut out: Vec<u8> = Vec::with_capacity(16_384 + 4 * w * h);
     out.push(0xFF);
     out.push(markers::SOI);
-    write_jfif_app0(&mut out);
+    // No JFIF APP0: T.871 only defines JFIF for Nf = 1 or 3.
     if let Some(tx) = adobe_transform {
         write_adobe_app14(&mut out, tx);
     }
-    write_sof11_lossless_multi(&mut out, w as u16, h as u16, 8, 4);
+    write_sof11_lossless_multi(&mut out, w as u16, h as u16, 8, &LOSSLESS_IDS_CMYK);
     if restart_interval != 0 {
         write_dri(&mut out, restart_interval);
     }
-    write_sos_lossless_multi(&mut out, predictor, 4, point_transform);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_CMYK, point_transform);
 
     // Default prediction for each component's first sample at scan start and
     // after each restart interval (§H.1.2.1). Working precision is `8 − Pt`.
@@ -5157,20 +5179,23 @@ pub fn encode_lossless_jpeg_rgb_with_opts(
         }
     }
 
-    // Single shared DC Huffman table (Td = 0). The Kraft-complete layout
-    // in STD_DC_LOSSLESS_* covers SSSS 0..=16, valid for any precision.
+    // Single shared DC Huffman table (Td = 0). The STD_DC_LOSSLESS_*
+    // layout covers SSSS 0..=16, valid for any precision.
     let dc_huff = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS)?;
 
     let mut out: Vec<u8> = Vec::with_capacity(16_384 + 3 * 2 * w * h);
     out.push(0xFF);
     out.push(markers::SOI);
-    write_jfif_app0(&mut out);
-    write_sof_lossless_multi(&mut out, w as u16, h as u16, precision, 3);
+    // RGB-class frame: no JFIF APP0 (T.871 binds a three-component
+    // JFIF stream to YCbCr), Adobe APP14 `transform = 0` + 'R'/'G'/'B'
+    // component ids signal untransformed R/G/B samples instead.
+    write_adobe_app14(&mut out, 0);
+    write_sof_lossless_multi(&mut out, w as u16, h as u16, precision, &LOSSLESS_IDS_RGB);
     write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
     if restart_interval != 0 {
         write_dri(&mut out, restart_interval);
     }
-    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_RGB, point_transform);
 
     let pt = point_transform as u32;
 
@@ -5244,6 +5269,9 @@ pub fn encode_lossless_jpeg_rgb_with_opts(
     let total_mcus: u64 = w as u64 * h as u64;
     let mut mcu_index: u64 = 0;
     let mut reset_pred = true;
+    // Row on which the current restart interval began (§H.1.2.1: the
+    // first line of every interval uses Ra, not just image row 0).
+    let mut first_line_y = 0usize;
 
     let mut bw = BitWriter::new(&mut out);
     for y in 0..h {
@@ -5257,8 +5285,9 @@ pub fn encode_lossless_jpeg_rgb_with_opts(
                 let actual = plane[y * w + x] as i32;
                 let pred: i32 = if reset_pred {
                     origin
-                } else if y == 0 {
-                    // First line: forced predictor 1 (Ra) per H.1.2.1.
+                } else if y == first_line_y {
+                    // First line of the scan / interval: forced predictor
+                    // 1 (Ra) per H.1.2.1.
                     plane[y * w + x - 1] as i32
                 } else if x == 0 {
                     // First column: forced predictor 2 (Rb) per H.1.2.1.
@@ -5303,6 +5332,7 @@ pub fn encode_lossless_jpeg_rgb_with_opts(
                 rst_counter = rst_counter.wrapping_add(1);
                 mcus_since_restart = 0;
                 reset_pred = true;
+                first_line_y = if x + 1 == w { y + 1 } else { y };
             }
         }
     }
@@ -5409,7 +5439,7 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
     if restart_interval != 0 {
         write_dri(&mut out, restart_interval);
     }
-    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_YUV, point_transform);
 
     let pt = point_transform as u32;
 
@@ -5457,7 +5487,12 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
     let mut mcus_since_restart: u32 = 0;
     let total_mcus: u64 = mcus_x as u64 * mcus_y as u64;
     let mut mcu_index: u64 = 0;
-    let mut reset_pred = true;
+    // §H.1.2.1 per component: `first_sample[c]` is true until the
+    // component has coded its first sample of the scan / interval (that
+    // one is predicted as the origin); `first_row[c]` is the grid row on
+    // which the current interval began (Ra on that whole row).
+    let mut first_sample = [true; 3];
+    let mut first_row: [usize; 3] = [0; 3];
 
     let mut bw = BitWriter::new(&mut out);
     for my in 0..mcus_y {
@@ -5472,9 +5507,10 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
                         let gx = mx * comp_hf[c] + sx;
                         let gy = my * comp_vf[c] + sy;
                         let actual = grid[gy * gw + gx] as i32;
-                        let pred: i32 = if reset_pred {
+                        let pred: i32 = if first_sample[c] {
+                            first_sample[c] = false;
                             origin
-                        } else if gy == 0 {
+                        } else if gy == first_row[c] {
                             grid[gy * gw + gx - 1] as i32
                         } else if gx == 0 {
                             grid[(gy - 1) * gw + gx] as i32
@@ -5505,7 +5541,6 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
                 }
             }
 
-            reset_pred = false;
             mcu_index += 1;
             mcus_since_restart += 1;
 
@@ -5514,7 +5549,12 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
                 bw.emit_raw_marker(markers::RST0 + (rst_counter & 0x07));
                 rst_counter = rst_counter.wrapping_add(1);
                 mcus_since_restart = 0;
-                reset_pred = true;
+                first_sample = [true; 3];
+                // The interval opens on the next MCU's grid rows.
+                let nmy = if mx + 1 == mcus_x { my + 1 } else { my };
+                for c in 0..3 {
+                    first_row[c] = nmy * comp_vf[c];
+                }
             }
         }
     }
@@ -5642,7 +5682,7 @@ pub fn encode_lossless_arith_jpeg_yuv_with_opts(
     if restart_interval != 0 {
         write_dri(&mut out, restart_interval);
     }
-    write_sos_lossless_multi(&mut out, predictor, 3, point_transform);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_YUV, point_transform);
 
     let pt = point_transform as u32;
 
@@ -5951,16 +5991,16 @@ pub fn encode_lossless_jpeg_cmyk_with_opts(
     let mut out: Vec<u8> = Vec::with_capacity(16_384 + 4 * w * h);
     out.push(0xFF);
     out.push(markers::SOI);
-    write_jfif_app0(&mut out);
+    // No JFIF APP0: T.871 only defines JFIF for Nf = 1 or 3.
     if let Some(tx) = adobe_transform {
         write_adobe_app14(&mut out, tx);
     }
-    write_sof_lossless_multi(&mut out, w as u16, h as u16, 8, 4);
+    write_sof_lossless_multi(&mut out, w as u16, h as u16, 8, &LOSSLESS_IDS_CMYK);
     write_dht(&mut out, 0, 0, &STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS);
     if restart_interval != 0 {
         write_dri(&mut out, restart_interval);
     }
-    write_sos_lossless_multi(&mut out, predictor, 4, point_transform);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_CMYK, point_transform);
 
     let pt = point_transform as u32;
 
@@ -5996,6 +6036,8 @@ pub fn encode_lossless_jpeg_cmyk_with_opts(
     let total_mcus: u64 = w as u64 * h as u64;
     let mut mcu_index: u64 = 0;
     let mut reset_pred = true;
+    // Row on which the current restart interval began (§H.1.2.1).
+    let mut first_line_y = 0usize;
 
     let mut bw = BitWriter::new(&mut out);
     for y in 0..h {
@@ -6005,7 +6047,7 @@ pub fn encode_lossless_jpeg_cmyk_with_opts(
                 let actual = plane[y * w + x] as i32;
                 let pred: i32 = if reset_pred {
                     origin
-                } else if y == 0 {
+                } else if y == first_line_y {
                     plane[y * w + x - 1] as i32
                 } else if x == 0 {
                     plane[(y - 1) * w + x] as i32
@@ -6044,6 +6086,7 @@ pub fn encode_lossless_jpeg_cmyk_with_opts(
                 rst_counter = rst_counter.wrapping_add(1);
                 mcus_since_restart = 0;
                 reset_pred = true;
+                first_line_y = if x + 1 == w { y + 1 } else { y };
             }
         }
     }
@@ -6083,20 +6126,29 @@ fn write_sos_lossless(out: &mut Vec<u8>, predictor: u8, point_transform: u8) {
 /// component declared `H_i = V_i = 1` (the natural interleaved layout for
 /// multi-component lossless per T.81 §H.1.2). Component identifiers start
 /// at 1 and increment by 1.
-fn write_sof_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precision: u8, nf: u8) {
-    debug_assert!((1..=4).contains(&nf));
-    let mut payload = Vec::with_capacity(8 + 3 * nf as usize);
+fn write_sof_lossless_multi(out: &mut Vec<u8>, width: u16, height: u16, precision: u8, ids: &[u8]) {
+    debug_assert!((1..=4).contains(&ids.len()));
+    let mut payload = Vec::with_capacity(8 + 3 * ids.len());
     payload.push(precision);
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
-    payload.push(nf);
-    for ci in 1..=nf {
+    payload.push(ids.len() as u8);
+    for &ci in ids {
         payload.push(ci); // component identifier
         payload.push(0x11); // H=1 V=1
         payload.push(0); // Tq (ignored for lossless)
     }
     write_length_prefix(out, markers::SOF3, &payload);
 }
+
+/// Component identifiers for the interleaved lossless frames. RGB-class
+/// frames use `'R' / 'G' / 'B'` (the same convention as the baseline
+/// `encode_jpeg_rgb24_*` path, recognised by this crate's decoder and by
+/// black-box validators alongside the Adobe APP14 `transform = 0`
+/// flag); everything else counts up from 1.
+const LOSSLESS_IDS_RGB: [u8; 3] = *b"RGB";
+const LOSSLESS_IDS_YUV: [u8; 3] = [1, 2, 3];
+const LOSSLESS_IDS_CMYK: [u8; 4] = [1, 2, 3, 4];
 
 /// Write an SOF3 segment for a subsampled three-component (YUV-class)
 /// lossless frame: the luma component (id 1) declares `(h_factor,
@@ -6126,12 +6178,12 @@ fn write_sof_lossless_yuv(out: &mut Vec<u8>, width: u16, height: u16, h_factor: 
 /// shared predictor selector, `Se = 0`, `Ah | Al` packs `Ah = 0` (no
 /// successive approximation in lossless) and the supplied
 /// `point_transform` in the low nibble (`Al = Pt`).
-fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ns: u8, point_transform: u8) {
-    debug_assert!((1..=4).contains(&ns));
+fn write_sos_lossless_multi(out: &mut Vec<u8>, predictor: u8, ids: &[u8], point_transform: u8) {
+    debug_assert!((1..=4).contains(&ids.len()));
     debug_assert!(point_transform <= 0x0F, "Pt must fit in 4 bits");
-    let mut payload = Vec::with_capacity(3 + 2 * ns as usize);
-    payload.push(ns);
-    for ci in 1..=ns {
+    let mut payload = Vec::with_capacity(3 + 2 * ids.len());
+    payload.push(ids.len() as u8);
+    for &ci in ids {
         payload.push(ci); // component identifier
         payload.push(0x00); // DC=0 AC=0
     }
@@ -6653,7 +6705,7 @@ fn encode_hier_lossless(
         precision,
         nc as u8,
     );
-    write_sos_lossless_multi(&mut out, predictor, nc as u8, 0);
+    write_sos_lossless_multi(&mut out, predictor, &LOSSLESS_IDS_CMYK[..nc], 0);
     if arith {
         hier_write_lossless_arith_scan(
             &mut out,
@@ -6701,7 +6753,7 @@ fn encode_hier_lossless(
             precision,
             nc as u8,
         );
-        write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
+        write_sos_lossless_multi(&mut out, 0, &LOSSLESS_IDS_CMYK[..nc], 0);
         if arith {
             hier_write_lossless_arith_scan(&mut out, &diffs, rw, rh, 0, 0, true, precision)?;
         } else {
@@ -7339,7 +7391,7 @@ fn encode_hier_dct_huffman(
             })
             .collect();
         write_sof_hier_frame(&mut out, markers::SOF7, w as u16, h as u16, 8, nc as u8);
-        write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
+        write_sos_lossless_multi(&mut out, 0, &LOSSLESS_IDS_CMYK[..nc], 0);
         let mut bw = BitWriter::new(&mut out);
         hier_write_lossless_diff_scan_huff(&mut bw, &diffs, w * h, 8, dc_huff);
         bw.finish();
@@ -7666,7 +7718,7 @@ fn encode_hier_dct_arith_inner(
             })
             .collect();
         write_sof_hier_frame(&mut out, markers::SOF15, w as u16, h as u16, 8, nc as u8);
-        write_sos_lossless_multi(&mut out, 0, nc as u8, 0);
+        write_sos_lossless_multi(&mut out, 0, &LOSSLESS_IDS_CMYK[..nc], 0);
         hier_write_lossless_arith_scan(&mut out, &diffs, w, h, 0, 0, true, 8)?;
     }
 
@@ -8835,15 +8887,26 @@ mod tests {
     }
 
     #[test]
-    fn lossless_dc_huff_table_kraft_complete() {
-        // STD_DC_LOSSLESS_BITS must satisfy the Kraft equality so every
-        // SSSS in 0..=16 has a unique prefix-free code.
+    fn lossless_dc_huff_table_is_prefix_free_and_reserves_all_ones() {
+        // STD_DC_LOSSLESS_BITS must satisfy the Kraft inequality so every
+        // SSSS in 0..=16 has a unique prefix-free code, and must leave the
+        // all-1-bits code word unused (T.81 §C.2).
         let mut kraft_num: u32 = 0; // numerator over 2^16
         for (i, &n) in STD_DC_LOSSLESS_BITS.iter().enumerate() {
             let len = (i + 1) as u32;
             kraft_num += (n as u32) * (1u32 << (16 - len));
         }
-        assert_eq!(kraft_num, 1 << 16, "Kraft inequality must equal exactly 1");
+        assert!(kraft_num < 1 << 16, "Kraft sum must be strictly below 1");
+        let t = HuffTable::build(&STD_DC_LOSSLESS_BITS, &STD_DC_LOSSLESS_VALS).unwrap();
+        for &v in &STD_DC_LOSSLESS_VALS {
+            let hc = t.encode[v as usize];
+            assert!(hc.len > 0);
+            assert_ne!(
+                hc.code as u32,
+                (1u32 << hc.len) - 1,
+                "SSSS {v} got the all-ones code"
+            );
+        }
         // Symbol coverage: all 17 SSSS values present.
         assert_eq!(STD_DC_LOSSLESS_VALS.len(), 17);
         let mut seen = [false; 17];

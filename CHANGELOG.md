@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Consumers: `oxideav-tiff` (and any other T.81 producer) re-point to
+`oxideav_mjpeg::t81` — the `JpegFrame` / `JpegComponent` /
+`JpegTableSet` / `HuffStats` / `gather_stats` / `encode_frame` surface
+mirrors the r457 in-crate tiff writer one-to-one (plus `id` on the
+component), and `decoder::decode_jpeg_with_tables` reads the
+abbreviated pair back.**
+
 ### Added
 
 - **`t81_roundtrip` fuzz target** (`fuzz/` only): fuzz-derived pixels

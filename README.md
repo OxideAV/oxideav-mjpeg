@@ -30,8 +30,13 @@ single-component grayscale at every precision `P ∈ 2..=16`,
 three-component interleaved RGB at every precision `P ∈ 2..=16`, and
 three-component **subsampled YUV-class** at `P = 8`
 (`Yuv444P`/`Yuv422P`/`Yuv420P`/`Yuv411P`), with every Annex H Table H.1
-predictor. YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. Zero C
-dependencies.
+predictor. YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. **The general
+T.81 writer** (`oxideav_mjpeg::t81`, see below) is the one JPEG
+encoder sibling crates build on: sequential 8-/12-bit (SOF0 / SOF1),
+progressive (SOF2) and lossless (SOF3) frames with any §A.1.1 sampling
+layout, per-component table destinations, restart intervals, Annex
+K.2 optimal Huffman tables and the §B.5 abbreviated (`JPEGTables`)
+streams. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -77,6 +82,106 @@ if let Ok(Frame::Video(vf)) = dec.receive_frame() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### General T.81 writer (`oxideav_mjpeg::t81`)
+
+The one JPEG encoder in the workspace. **Consumers (`oxideav-tiff`'s
+`Compression = 7` writer, and anything else that needs a T.81
+datastream) re-point here** instead of carrying their own writer;
+every item is re-exported at the crate root and the surface is
+additive.
+
+Typed options, one call:
+
+```rust
+use oxideav_mjpeg::t81::{HuffmanTables, JpegEncodeOptions, JpegProcess};
+
+// 12-bit extended-sequential (SOF1) 4:2:0, K.2 optimal tables, a
+// restart every 4 MCUs, emitted as the §B.5 abbreviated pair.
+let (w, h) = (640u32, 480u32);
+# let y: Vec<u16> = vec![2048; (w * h) as usize];
+# let c: Vec<u16> = vec![2048; ((w / 2) * (h / 2)) as usize];
+let opts = JpegEncodeOptions {
+    precision: 12,
+    process: JpegProcess::Sequential,
+    tables: HuffmanTables::Optimal,
+    sampling: vec![(2, 2), (1, 1), (1, 1)],
+    restart_interval: 4,
+    abbreviated: true,
+    ..JpegEncodeOptions::default()
+};
+let out = opts.encode(w, h, &[&y, &c, &c])?;
+let strip: Vec<u8> = out.data;              // SOI, SOF1, DRI, SOS…, EOI — no tables
+let jpegtables: Vec<u8> = out.tables.unwrap(); // SOI, DQT/DHT, EOI
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+`JpegEncodeOptions { quality, tables, process, precision,
+restart_interval, abbreviated, signalling, sampling, table_ids }`:
+
+- `process` — `Sequential` (`SOF0` when `P = 8`, destinations ≤ 1 and
+  8-bit quantisers; `SOF1` otherwise, incl. `P = 12`), `Progressive`
+  (`SOF2`, one interleaved DC scan + per-component AC bands `1..=5` /
+  `6..=63`, `P = 8` / `12`), `Lossless { predictor, point_transform }`
+  (`SOF3`, `P ∈ 2..=16`, Table H.1 predictors 1..=7).
+- `sampling` — per-component `(Hi, Vi)`; any T.81 §A.1.1 combination
+  under the §B.2.3 `Σ Hi × Vi ≤ 10` bound (4×2 luma, mixed chroma,
+  chroma oversampled relative to luma, …). Input planes are supplied
+  at the A.1.1 resolution `ceil(X × Hi / Hmax) × ceil(Y × Vi / Vmax)`.
+- `table_ids` — per-component `(Tq, Td = Ta)` destinations (0..=3).
+- `tables` — Annex K.3 typical, or Annex K.2 optimal from the frame's
+  own symbol statistics (Figures K.1–K.4, 16-bit length limit, the
+  all-ones code word reserved per §C.2). 12-bit DCT frames always use
+  optimal tables (the typical alphabet stops at `SSSS = 11`).
+- `restart_interval` — `DRI` + `RSTm` on every process (lossless: a
+  multiple of the MCUs per MCU-row, Table B.7).
+- `abbreviated` — table-less frame streams plus a separate tables-only
+  stream (§B.5), the TIFF Technical Note 2 `JPEGTables` carriage;
+  `tables_for_planes` + `encode_with_tables` code a whole strip / tile
+  sequence against one shared table set.
+- `signalling` — `Auto` (JFIF for 1 / 3 components, plain CMYK for 4),
+  `Jfif`, `Rgb` (Adobe APP14 `transform = 0` + `'R'/'G'/'B'` ids),
+  `Cmyk { adobe_transform }` (`None` / `Some(0)` inverted / `Some(2)`
+  YCCK), `None`.
+
+Frame-level API (what a TIFF writer calls per strip):
+
+```rust
+use oxideav_mjpeg::t81::{
+    encode_frame, gather_stats, HuffStats, JpegComponent, JpegFrame, JpegProcess, JpegTableSet,
+};
+
+# let (w, h) = (16u32, 8u32);
+# let a: Vec<u16> = vec![100; (w * h) as usize];
+# let b: Vec<u16> = vec![200; (w * h) as usize];
+let frame = JpegFrame { width: w as u16, height: h as u16, precision: 8,
+                        process: JpegProcess::Sequential, restart_interval: 0 };
+let comp = |s: &[u16]| JpegComponent { id: 1, samples: s, width: w as usize, height: h as usize,
+                                       h: 1, v: 1, quant_id: 0, huff_id: 0 };
+// One table set shared by every strip: typical quantisers, optimal
+// Huffman tables from the statistics of all strips.
+let mut tables = JpegTableSet::typical(90, 8, false, 1);
+let mut dc: [HuffStats; 4] = Default::default();
+let mut ac: [HuffStats; 4] = Default::default();
+gather_stats(&frame, &[comp(&a)], &tables, &mut dc, &mut ac)?;
+gather_stats(&frame, &[comp(&b)], &tables, &mut dc, &mut ac)?;
+tables.dc[0] = Some(dc[0].to_spec());
+tables.ac[0] = Some(ac[0].to_spec());
+let jpegtables = tables.tables_stream(true);           // JPEGTables field
+let strip_a = encode_frame(&frame, &[comp(&a)], &tables, false)?; // abbreviated
+let strip_b = encode_frame(&frame, &[comp(&b)], &tables, false)?;
+# let _ = (jpegtables, strip_a, strip_b);
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+The decode side of the pair is `decoder::decode_jpeg_with_tables(
+&jpegtables, &strip, pts)` — or, through the registry,
+`CodecParameters::extradata = jpegtables`.
+
+Every stream the writer emits is checked against this crate's own
+decoder (bit-exact for lossless, PSNR for the DCT processes) and
+black-box against `djpeg` (lossless byte-exact at 8 / 12 / 16 bits);
+see `tests/t81_encoder.rs`.
+
 ### Encoder
 
 ```rust
@@ -114,6 +219,17 @@ plain R/G/B. The decoder mirrors the convention — RGB JPEGs (signalled
 by either the Adobe APP14 flag or the `'R'/'G'/'B'` component-id
 triple) round-trip as a single packed `Rgb24` plane with no YCbCr
 conversion.
+
+Any key in `CodecParameters::options` routes `make_encoder` through the
+general T.81 writer with the `MjpegEncoderOptions` schema (`quality`,
+`tables = typical | optimal`, `process = sequential | progressive |
+lossless`, `precision`, `restart`, `abbreviated`, `predictor`,
+`point_transform`, `sampling = "HxV,…"`; unknown keys are rejected),
+and `MjpegEncoder::set_encode_options(JpegEncodeOptions)` does the same
+from typed code — precision and sampling are taken from (and checked
+against) the pixel format, colour signalling from the pixel format and
+`set_adobe_transform`. With `abbreviated` the shared tables stream is
+published in `output_params().extradata`.
 
 Restart markers (`RSTn` + DRI) are supported for interop and bitstream
 resiliency. They are **off by default** — call
@@ -807,7 +923,21 @@ Decoder:
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
   CMYK via BT.601 YCbCr→RGB→CMY and K inversion; no APP14 → plain
   ("regular", C=0 = no ink) pass-through.
-- Chroma subsampling: 4:4:4, 4:2:2, 4:2:0.
+- **Every T.81 §A.1.1 sampling layout.** Luma at `1×1` / `2×1` / `2×2`
+  / `4×1` over `1×1` chroma decodes to the native planar `Yuv444P` /
+  `Yuv422P` / `Yuv420P` / `Yuv411P` (`…P12Le` at `P = 12`); every other
+  legal combination (`4×2` or `1×2` luma, mixed chroma factors, chroma
+  oversampled relative to luma, …) is resampled onto the frame grid by
+  nearest-neighbour replication and emitted as 4:4:4. Verified within
+  ±1 of `djpeg -nosmooth` (`tests/fixtures/sampling/`).
+- **Non-interleaved scans** (one `SOS` per component, sequential or
+  progressive) cover the component's own `ceil(xi / 8) × ceil(yi / 8)`
+  block extent (§A.2.2 / §A.2.4), not the MCU-padded grid.
+- **§B.5 abbreviated streams**: `decoder::decode_jpeg_with_tables(
+  tables, data, pts)` preloads a tables-only stream (DQT / DHT / DAC /
+  DRI — TIFF `JPEGTables`) and decodes a table-less image stream against
+  it; the registry decoder takes the tables stream from
+  `CodecParameters::extradata`.
 - Grayscale (single-component → `Gray8`).
 - **Baseline RGB** (3-component SOF0 at `H = V = 1`, signalled by either
   an Adobe APP14 `transform = 0` segment or component IDs `'R'/'G'/'B'`
@@ -903,6 +1033,14 @@ Decoder:
 
 Encoder:
 
+- **General T.81 writer** (`oxideav_mjpeg::t81`, see "General T.81
+  writer" above) — sequential `SOF0` / `SOF1` at `P = 8` / `12`,
+  progressive `SOF2` at `P = 8` / `12`, lossless `SOF3` at `P ∈
+  2..=16`; 1..=4 components with any §A.1.1 sampling layout and
+  per-component table destinations; restart intervals on every
+  process; Annex K.3 typical or K.2 optimal Huffman tables; §B.5
+  abbreviated pairs; JFIF / RGB / CMYK / YCCK signalling. The
+  per-format entry points below predate it and stay for compatibility.
 - **SOF0** (baseline sequential) — 8-bit Huffman, Annex K tables.
   3-component YUV at 4:4:4 / 4:2:2 / 4:2:0, single-component `Gray8`
   (`H = V = 1`, one DQT + DC/AC luma Huffman pair + one-entry SOS),
@@ -1013,15 +1151,17 @@ Not supported (decoder returns `Error::Unsupported`):
   absolute grid coordinate so the §A.2.3 walk's non-raster sample order
   is handled correctly. The matching encoders are
   `encode_lossless_jpeg_yuv` / `_with_opts` (SOF3) and
-  `encode_lossless_arith_jpeg_yuv` / `_with_opts` (SOF11). Still
-  rejected with `Unsupported`: four-component subsampling, and luma
-  factors outside the `{1×1, 2×1, 2×2, 4×1}` set.
+  `encode_lossless_arith_jpeg_yuv` / `_with_opts` (SOF11), which accept
+  every luma factor pair the §B.2.3 bound admits; layouts without a
+  planar pixel format decode to 4:4:4 (see the decoder list). Still
+  rejected with `Unsupported`: four-component (CMYK-class) lossless
+  subsampling.
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs eleven cargo-fuzz harnesses against the
+The `fuzz/` sub-crate runs twelve cargo-fuzz harnesses against the
 public encoder + decoder + RTP surface, executed daily by the
-org-wide reusable fuzz workflow (55-minute budget, ~5 min/target):
+org-wide reusable fuzz workflow (60-minute budget, ~5 min/target):
 
 - `decode` — feeds arbitrary bytes (≤ 64 KiB) through the public
   `Decoder` trait (`make_decoder` → `send_packet` → `receive_frame`).
@@ -1091,6 +1231,15 @@ org-wide reusable fuzz workflow (55-minute budget, ~5 min/target):
   EXP / differential-SOF decode on every iteration. Bit-exact oracle
   on the lossless(-final) modes; decode-success + geometry oracle on
   the lossy DCT modes.
+- `t81_roundtrip` — encoder-in-loop over the general T.81 writer:
+  sequential / progressive / lossless, 8- and 12-bit (lossless
+  2..=16), every §A.1.1 sampling layout, typical vs K.2 optimal
+  tables, restart intervals, §B.5 abbreviated pairs (decoded through
+  `decode_jpeg_with_tables`) and JFIF / RGB / CMYK signalling.
+  Bit-exact oracle on the lossless process (incl. the Adobe-inverted
+  CMYK + point-transform composition), decode-success + geometry
+  oracle on the DCT processes. First 300 s foreground run: 2.08 M
+  executions, no findings.
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
   encode → decode round-trip with ±2 LSB YUV tolerance.
 - `libjpeg_encode_oxideav_decode` / `oxideav_encode_libjpeg_decode` —

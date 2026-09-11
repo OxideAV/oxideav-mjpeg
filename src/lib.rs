@@ -109,6 +109,17 @@
 //!   *is* supported on both the sequential and progressive scan
 //!   decompositions).
 //!
+//! **The general T.81 writer** lives in [`t81`] and is the one JPEG
+//! encoder sibling crates build on: [`t81::JpegEncodeOptions`] (typed
+//! options → [`t81::JpegEncodeOptions::encode`]) and the frame-level
+//! [`t81::encode_frame`] / [`t81::gather_stats`] / [`t81::JpegTableSet`]
+//! API code sequential (`SOF0` / `SOF1`, `P = 8` / `12`), progressive
+//! (`SOF2`) and lossless (`SOF3`, `P ∈ 2..=16`) frames with any §A.1.1
+//! sampling layout, per-component table destinations, restart
+//! intervals, Annex K.2 optimal Huffman tables and the §B.5 abbreviated
+//! (`JPEGTables`) streams; [`decoder::decode_jpeg_with_tables`] is the
+//! matching abbreviated-stream decode entry point.
+//!
 //! Motion-JPEG carried over RTP (RFC 2435) is supported on the decode
 //! path via [`rtp::JpegDepacketizer`], which reassembles fragmented
 //! RTP/JPEG payloads and reconstructs the absent SOI / DQT / SOF0 / DHT /

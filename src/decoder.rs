@@ -393,7 +393,85 @@ fn apply_dnl_height(sof: &mut SofInfo, dnl_height: Option<u16>) {
     }
 }
 
+/// Decode one complete JPEG interchange stream (`SOI … EOI`) into a
+/// frame. Framework-free entry point; `pts` is passed through.
 pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+    decode_jpeg_inner(JpegState::new(), data, pts)
+}
+
+/// Decode a T.81 §B.5 **abbreviated image** stream (`SOI`, frame, `EOI`
+/// without its table segments) against a separately supplied
+/// **abbreviated table-specification** stream (`SOI`, DQT / DHT / DAC /
+/// DRI …, `EOI`) — the TIFF Technical Note 2 `JPEGTables` carriage.
+/// Tables the image stream defines itself override the preloaded ones
+/// (B.2.4.1 / B.2.4.2 "replaces the previous tables stored in that
+/// destination"). A complete interchange stream decodes unchanged.
+pub fn decode_jpeg_with_tables(tables: &[u8], data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+    let mut state = JpegState::new();
+    load_table_stream(&mut state, tables)?;
+    decode_jpeg_inner(state, data, pts)
+}
+
+/// Apply a DAC segment payload (B.2.4.3) to the arithmetic conditioning
+/// state.
+fn apply_dac(state: &mut JpegState, payload: &[u8]) -> Result<()> {
+    for e in parse_dac(payload)? {
+        if e.tc == 0 {
+            // DC conditioning: cs packs L (low nibble) and U (high nibble).
+            let l = e.cs & 0x0F;
+            let u = e.cs >> 4;
+            if l > u || u > 15 {
+                return Err(Error::invalid("DAC: invalid L/U bounds"));
+            }
+            state.arith_dc[e.tb as usize] = Some(ArithDcConditioning { l, u });
+        } else {
+            // AC conditioning: cs is Kx in 1..=63.
+            state.arith_ac[e.tb as usize] = Some(ArithAcConditioning { kx: e.cs });
+        }
+    }
+    Ok(())
+}
+
+/// Preload the table segments of a §B.5 abbreviated table-specification
+/// stream. Only DQT / DHT / DAC / DRI carry state; APPn / COM segments
+/// are skipped; a frame or scan header is rejected (the stream "conveys
+/// table specifications or miscellaneous marker segments" only).
+fn load_table_stream(state: &mut JpegState, tables: &[u8]) -> Result<()> {
+    if tables.len() < 2 || tables[0] != 0xFF || tables[1] != markers::SOI {
+        return Err(Error::invalid("JPEG tables stream: missing SOI"));
+    }
+    let mut walker = MarkerWalker::new(&tables[2..]);
+    while let Some(marker) = walker.next_marker()? {
+        match marker {
+            EOI => return Ok(()),
+            SOI => {}
+            m if markers::is_rst(m) => {}
+            DQT => parse_dqt(walker.read_segment_payload()?, &mut state.quant)?,
+            DHT => parse_dht(
+                walker.read_segment_payload()?,
+                &mut state.dc_huff,
+                &mut state.ac_huff,
+            )?,
+            DAC => {
+                let p = walker.read_segment_payload()?;
+                apply_dac(state, p)?;
+            }
+            DRI => state.restart_interval = parse_dri(walker.read_segment_payload()?)?,
+            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | SOS | markers::DHP => {
+                return Err(Error::invalid(
+                    "JPEG tables stream: carries a frame or scan header (T.81 §B.5 allows table / miscellaneous segments only)",
+                ));
+            }
+            _ => {
+                let _ = walker.read_segment_payload()?;
+            }
+        }
+    }
+    // A missing EOI is tolerated: every table segment was consumed.
+    Ok(())
+}
+
+fn decode_jpeg_inner(mut state: JpegState, data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
@@ -407,7 +485,6 @@ pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     let dnl_height = resolve_dnl_height(&data[2..])?;
 
     let mut walker = MarkerWalker::new(&data[2..]);
-    let mut state = JpegState::new();
 
     // Coefficient accumulator, populated on progressive (SOF2) or when a
     // baseline scan turns out to be non-interleaved. One [i32;64] per block
@@ -441,21 +518,7 @@ pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             }
             DAC => {
                 let p = walker.read_segment_payload()?;
-                let entries = parse_dac(p)?;
-                for e in entries {
-                    if e.tc == 0 {
-                        // DC conditioning: cs packs L (low nibble) and U (high nibble).
-                        let l = e.cs & 0x0F;
-                        let u = e.cs >> 4;
-                        if l > u || u > 15 {
-                            return Err(Error::invalid("DAC: invalid L/U bounds"));
-                        }
-                        state.arith_dc[e.tb as usize] = Some(ArithDcConditioning { l, u });
-                    } else {
-                        // AC conditioning: cs is Kx in 1..=63.
-                        state.arith_ac[e.tb as usize] = Some(ArithAcConditioning { kx: e.cs });
-                    }
-                }
+                apply_dac(&mut state, p)?;
             }
             DRI => {
                 let p = walker.read_segment_payload()?;

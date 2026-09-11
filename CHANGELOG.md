@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§B.5 abbreviated streams decode, and the registry encoder speaks
+  the typed options.** `decoder::decode_jpeg_with_tables(tables, data,
+  pts)` preloads an abbreviated table-specification stream (DQT / DHT /
+  DAC / DRI, TIFF `JPEGTables`) and decodes a table-less image stream
+  against it; the registry decoder does the same with a tables stream in
+  `CodecParameters::extradata`. On the encode side `MjpegEncoderOptions`
+  (`quality`, `tables`, `process`, `precision`, `restart`,
+  `abbreviated`, `predictor`, `point_transform`, `sampling`) is the
+  strict `CodecOptions` schema mirroring `JpegEncodeOptions`; any key in
+  the bag routes `make_encoder` through the general T.81 writer, and
+  `MjpegEncoder::set_encode_options` / `encode_options` expose the typed
+  struct directly (precision / sampling resolved from — and checked
+  against — the pixel format; JFIF / RGB / CMYK signalling from the
+  pixel format and `set_adobe_transform`). With `abbreviated` the shared
+  tables stream is published in `output_params().extradata` (before the
+  first frame for typical tables, after it for optimal ones) and every
+  frame is coded against it.
 - **`oxideav_mjpeg::t81` — the general T.81 writer, the one JPEG
   encoder sibling crates build on** (`oxideav-tiff`'s `Compression = 7`
   writer re-points here next round; every item is re-exported at the

@@ -173,7 +173,9 @@ pub use jpeg::inspect::{
 // `registry` so image-library callers can build the crate without
 // dragging in `oxideav-core`.
 #[cfg(feature = "registry")]
-pub use registry::{__oxideav_entry, register, register_codecs, register_containers};
+pub use registry::{
+    __oxideav_entry, register, register_codecs, register_containers, MjpegEncoderOptions,
+};
 
 #[cfg(all(test, feature = "registry"))]
 mod register_tests {

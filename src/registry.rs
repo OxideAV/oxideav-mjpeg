@@ -22,13 +22,14 @@ use std::collections::VecDeque;
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
-    ContainerRegistry, Decoder, Encoder, Error, Frame, MediaType, Packet, PixelFormat, Result,
-    RuntimeContext, TimeBase, VideoFrame,
+    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, CodecTag, ContainerRegistry, Decoder, Encoder, Error, Frame, MediaType,
+    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, RuntimeContext, TimeBase,
+    VideoFrame,
 };
 
 use crate::container;
-use crate::decoder::decode_jpeg;
+use crate::decoder::{decode_jpeg, decode_jpeg_with_tables};
 use crate::encoder::{
     encode_arith_jpeg_grayscale, encode_arith_jpeg_rgb24, encode_arith_jpeg_yuv, encode_jpeg_cmyk,
     encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts, encode_jpeg_progressive,
@@ -38,6 +39,7 @@ use crate::encoder::{
 use crate::error::MjpegError;
 use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
 use crate::mjpeg_container;
+use crate::t81::{ColorSignalling, HuffmanTables, JpegEncodeOptions, JpegProcess, JpegTableSet};
 use crate::CODEC_ID_STR;
 
 // ---- Error / pixel-format / frame conversions --------------------------
@@ -188,8 +190,14 @@ oxideav_core::register!("mjpeg", register);
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let codec_id = params.codec_id.clone();
+    // A T.81 §B.5 abbreviated table-specification stream in `extradata`
+    // (TIFF `JPEGTables`) is preloaded ahead of every packet, so
+    // table-less abbreviated image streams decode.
+    let tables = (params.extradata.len() >= 2 && params.extradata[..2] == [0xFF, 0xD8])
+        .then(|| params.extradata.clone());
     Ok(Box::new(MjpegDecoder {
         codec_id,
+        tables,
         pending: None,
         eof: false,
     }))
@@ -197,6 +205,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 
 struct MjpegDecoder {
     codec_id: CodecId,
+    /// §B.5 tables-only stream shared by every packet (`extradata`).
+    tables: Option<Vec<u8>>,
     pending: Option<Packet>,
     eof: bool,
 }
@@ -228,7 +238,10 @@ impl Decoder for MjpegDecoder {
         // returns `oxideav_core::VideoFrame` (see the conditional
         // alias in `decoder.rs`), so the trait surface needs nothing
         // more than wrapping it in `Frame::Video`.
-        let vf = decode_jpeg(&pkt.data, pkt.pts)?;
+        let vf = match &self.tables {
+            Some(t) => decode_jpeg_with_tables(t, &pkt.data, pkt.pts)?,
+            None => decode_jpeg(&pkt.data, pkt.pts)?,
+        };
         Ok(Frame::Video(vf))
     }
 
@@ -242,6 +255,223 @@ impl Decoder for MjpegDecoder {
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     Ok(MjpegEncoder::from_params(params)?)
+}
+
+/// The `CodecOptions` schema of the registry encoder — the string-bag
+/// twin of [`JpegEncodeOptions`]. Any key present in
+/// `CodecParameters::options` routes the encoder through the general
+/// T.81 writer (`oxideav_mjpeg::t81`); an empty bag keeps the historical
+/// per-format paths.
+///
+/// | key               | kind                                   | default      |
+/// |-------------------|----------------------------------------|--------------|
+/// | `quality`         | 1..=100                                | 75           |
+/// | `tables`          | `typical` \| `optimal`                 | `typical`    |
+/// | `process`         | `sequential` \| `progressive` \| `lossless` | `sequential` |
+/// | `precision`       | 8 / 12 (DCT), 2..=16 (lossless); must match the pixel format | from the pixel format |
+/// | `restart`         | restart interval in MCUs               | 0            |
+/// | `abbreviated`     | §B.5 table-less frames, tables in `extradata` | false  |
+/// | `predictor`       | Table H.1 selector 1..=7 (lossless)    | 1            |
+/// | `point_transform` | `Pt` (lossless)                        | 0            |
+/// | `sampling`        | `HxV[,HxV…]` per component; must match the pixel format | from the pixel format |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MjpegEncoderOptions {
+    pub quality: u32,
+    pub tables: String,
+    pub process: String,
+    /// `0` = take the precision the pixel format implies.
+    pub precision: u32,
+    pub restart: u32,
+    pub abbreviated: bool,
+    pub predictor: u32,
+    pub point_transform: u32,
+    pub sampling: String,
+}
+
+impl Default for MjpegEncoderOptions {
+    fn default() -> Self {
+        MjpegEncoderOptions {
+            quality: u32::from(DEFAULT_QUALITY),
+            tables: "typical".into(),
+            process: "sequential".into(),
+            precision: 0,
+            restart: 0,
+            abbreviated: false,
+            predictor: 1,
+            point_transform: 0,
+            sampling: String::new(),
+        }
+    }
+}
+
+impl CodecOptionsStruct for MjpegEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "quality",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(DEFAULT_QUALITY as u32),
+            help: "quality factor 1..=100 (Annex K.1 quantiser scaling)",
+        },
+        OptionField {
+            name: "tables",
+            kind: OptionKind::Enum(&["typical", "optimal"]),
+            default: OptionValue::String(String::new()),
+            help: "Huffman tables: Annex K.3 typical or Annex K.2 optimal (per-frame statistics)",
+        },
+        OptionField {
+            name: "process",
+            kind: OptionKind::Enum(&["sequential", "progressive", "lossless"]),
+            default: OptionValue::String(String::new()),
+            help: "coding process: sequential DCT (SOF0/SOF1), progressive DCT (SOF2) or lossless (SOF3)",
+        },
+        OptionField {
+            name: "precision",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "sample precision P (8/12 DCT, 2..=16 lossless); 0 = from the pixel format",
+        },
+        OptionField {
+            name: "restart",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "restart interval in MCUs (0 = none; lossless: a multiple of the MCUs per row)",
+        },
+        OptionField {
+            name: "abbreviated",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "emit table-less frames; the shared tables stream is published in extradata",
+        },
+        OptionField {
+            name: "predictor",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "lossless predictor selection value (T.81 Table H.1, 1..=7)",
+        },
+        OptionField {
+            name: "point_transform",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "lossless point transform Pt (0..precision)",
+        },
+        OptionField {
+            name: "sampling",
+            kind: OptionKind::String,
+            default: OptionValue::String(String::new()),
+            help: "per-component sampling factors 'HxV[,HxV...]'; must match the pixel format",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
+        match key {
+            "quality" => self.quality = v.as_u32()?,
+            "tables" => self.tables = v.as_str()?.to_owned(),
+            "process" => self.process = v.as_str()?.to_owned(),
+            "precision" => self.precision = v.as_u32()?,
+            "restart" => self.restart = v.as_u32()?,
+            "abbreviated" => self.abbreviated = v.as_bool()?,
+            "predictor" => self.predictor = v.as_u32()?,
+            "point_transform" => self.point_transform = v.as_u32()?,
+            "sampling" => self.sampling = v.as_str()?.to_owned(),
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// Parse `HxV[,HxV…]` into sampling factor pairs.
+fn parse_sampling(s: &str) -> Result<Vec<(u8, u8)>> {
+    let mut out = Vec::new();
+    for item in s.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+        let (h, v) = item.split_once('x').ok_or_else(|| {
+            Error::invalid(format!("MJPEG encoder: sampling entry '{item}' is not HxV"))
+        })?;
+        let h: u8 = h
+            .trim()
+            .parse()
+            .map_err(|_| Error::invalid("MJPEG encoder: bad sampling H"))?;
+        let v: u8 = v
+            .trim()
+            .parse()
+            .map_err(|_| Error::invalid("MJPEG encoder: bad sampling V"))?;
+        out.push((h, v));
+    }
+    Ok(out)
+}
+
+impl MjpegEncoderOptions {
+    /// The typed options these string options denote. `precision = 0`
+    /// / empty `sampling` are resolved against the pixel format by the
+    /// encoder.
+    pub fn to_encode_options(&self) -> Result<JpegEncodeOptions> {
+        if !(1..=100).contains(&self.quality) {
+            return Err(Error::invalid("MJPEG encoder: quality must be in 1..=100"));
+        }
+        if self.restart > u32::from(u16::MAX) {
+            return Err(Error::invalid(
+                "MJPEG encoder: restart interval exceeds 65535",
+            ));
+        }
+        let tables = match self.tables.as_str() {
+            "typical" => HuffmanTables::Typical,
+            "optimal" => HuffmanTables::Optimal,
+            other => return Err(Error::invalid(format!("MJPEG encoder: tables '{other}'"))),
+        };
+        let process = match self.process.as_str() {
+            "sequential" => JpegProcess::Sequential,
+            "progressive" => JpegProcess::Progressive,
+            "lossless" => {
+                if !(1..=7).contains(&self.predictor) {
+                    return Err(Error::invalid("MJPEG encoder: predictor must be in 1..=7"));
+                }
+                if self.point_transform > 15 {
+                    return Err(Error::invalid(
+                        "MJPEG encoder: point_transform must be ≤ 15",
+                    ));
+                }
+                JpegProcess::Lossless {
+                    predictor: self.predictor as u8,
+                    point_transform: self.point_transform as u8,
+                }
+            }
+            other => return Err(Error::invalid(format!("MJPEG encoder: process '{other}'"))),
+        };
+        Ok(JpegEncodeOptions {
+            quality: self.quality as u8,
+            tables,
+            process,
+            precision: self.precision.min(16) as u8,
+            restart_interval: self.restart as u16,
+            abbreviated: self.abbreviated,
+            signalling: ColorSignalling::Auto,
+            sampling: parse_sampling(&self.sampling)?,
+            table_ids: Vec::new(),
+        })
+    }
+}
+
+/// What a pixel format implies for the general writer: sample
+/// precision, per-component sampling factors, component count and
+/// bytes per sample.
+fn pix_layout(pix: MjpegPixelFormat) -> (u8, Vec<(u8, u8)>, usize, usize) {
+    use MjpegPixelFormat as P;
+    match pix {
+        P::Gray8 => (8, vec![], 1, 1),
+        P::Gray10Le => (10, vec![], 1, 2),
+        P::Gray12Le => (12, vec![], 1, 2),
+        P::Gray16Le => (16, vec![], 1, 2),
+        P::Rgb24 => (8, vec![], 3, 1),
+        P::Cmyk => (8, vec![], 4, 1),
+        P::Yuv444P => (8, vec![], 3, 1),
+        P::Yuv422P => (8, vec![(2, 1), (1, 1), (1, 1)], 3, 1),
+        P::Yuv420P => (8, vec![(2, 2), (1, 1), (1, 1)], 3, 1),
+        P::Yuv411P => (8, vec![(4, 1), (1, 1), (1, 1)], 3, 1),
+        P::Yuv444P12Le => (12, vec![], 3, 2),
+        P::Yuv422P12Le => (12, vec![(2, 1), (1, 1), (1, 1)], 3, 2),
+        P::Yuv420P12Le => (12, vec![(2, 2), (1, 1), (1, 1)], 3, 2),
+        // Never reaches the general writer (from_params rejects them).
+        P::Rgb48Le | P::Gbrp10Le | P::Gbrp12Le | P::Gbrp14Le => (16, vec![], 3, 2),
+    }
 }
 
 /// JPEG encoder. Emits one self-contained JPEG bitstream (baseline SOF0
@@ -282,6 +512,12 @@ pub struct MjpegEncoder {
     ///
     /// Defaults to `None`. Ignored for non-CMYK pixel formats.
     cmyk_adobe_transform: Option<u8>,
+    /// When set, every frame goes through the general T.81 writer with
+    /// these options (see [`MjpegEncoder::set_encode_options`]).
+    general: Option<JpegEncodeOptions>,
+    /// The table set shared by every abbreviated frame (its §B.5 stream
+    /// is `output_params().extradata`).
+    shared_tables: Option<JpegTableSet>,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -347,7 +583,7 @@ impl MjpegEncoder {
         output_params.height = Some(height);
         output_params.pixel_format = Some(pix.into());
 
-        Ok(Box::new(Self {
+        let mut enc = Self {
             output_params,
             width,
             height,
@@ -363,12 +599,165 @@ impl MjpegEncoder {
             arithmetic: false,
             lossless_predictor: 1,
             cmyk_adobe_transform: None,
+            general: None,
+            shared_tables: None,
             time_base: params
                 .frame_rate
                 .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
             pending: VecDeque::new(),
             eof: false,
-        }))
+        };
+        // Any option key routes through the general T.81 writer with the
+        // typed options the string bag denotes (strict: unknown keys and
+        // malformed values are rejected here).
+        if !params.options.is_empty() {
+            let opts = parse_options::<MjpegEncoderOptions>(&params.options)?;
+            enc.set_encode_options(opts.to_encode_options()?)?;
+        }
+        Ok(Box::new(enc))
+    }
+
+    /// Route every frame through the general T.81 writer
+    /// (`oxideav_mjpeg::t81`) with `opts` — sequential / progressive /
+    /// lossless, 8- or 12-bit, optimal tables, restarts, abbreviated
+    /// streams. `precision = 0` and an empty `sampling` take the values
+    /// the pixel format implies; non-zero / non-empty values must match
+    /// them. With `abbreviated` the shared §B.5 tables stream is
+    /// published in `output_params().extradata` — immediately for
+    /// typical tables, after the first frame for optimal ones (the
+    /// statistics of the first frame define the shared set).
+    pub fn set_encode_options(&mut self, mut opts: JpegEncodeOptions) -> Result<()> {
+        let (precision, sampling, nf, _) = pix_layout(self.pix);
+        if opts.precision == 0 {
+            opts.precision = precision;
+        } else if opts.precision != precision {
+            return Err(Error::invalid(format!(
+                "MJPEG encoder: precision {} does not match the {:?} input (P = {precision})",
+                opts.precision, self.pix
+            )));
+        }
+        if opts.sampling.is_empty() {
+            opts.sampling = sampling;
+        } else if opts.sampling != sampling
+            && !(sampling.is_empty() && opts.sampling.iter().all(|&s| s == (1, 1)))
+        {
+            return Err(Error::invalid(format!(
+                "MJPEG encoder: sampling {:?} does not match the {:?} input",
+                opts.sampling, self.pix
+            )));
+        }
+        if opts.signalling == ColorSignalling::Auto {
+            opts.signalling = match self.pix {
+                MjpegPixelFormat::Rgb24 => ColorSignalling::Rgb,
+                MjpegPixelFormat::Cmyk => ColorSignalling::Cmyk {
+                    adobe_transform: self.cmyk_adobe_transform,
+                },
+                _ => ColorSignalling::Jfif,
+            };
+        }
+        if opts.process.is_dct() && !matches!(opts.precision, 8 | 12) {
+            return Err(Error::unsupported(format!(
+                "MJPEG encoder: the DCT processes need P = 8 or 12 (input {:?} is P = {})",
+                self.pix, opts.precision
+            )));
+        }
+        self.shared_tables = None;
+        self.output_params.extradata.clear();
+        if opts.abbreviated
+            && opts.tables == HuffmanTables::Typical
+            && !(opts.process.is_dct() && opts.precision > 8)
+        {
+            let t = JpegTableSet::typical(opts.quality, opts.precision, !opts.process.is_dct(), nf);
+            self.output_params.extradata = t.tables_stream(opts.process.is_dct());
+            self.shared_tables = Some(t);
+        }
+        self.general = Some(opts);
+        Ok(())
+    }
+
+    /// The general-writer options in force, if any.
+    pub fn encode_options(&self) -> Option<&JpegEncodeOptions> {
+        self.general.as_ref()
+    }
+
+    /// Split a frame into per-component `u16` planes at the A.1.1
+    /// resolutions the pixel format implies.
+    fn planes_u16(&self, v: &VideoFrame) -> Result<Vec<Vec<u16>>> {
+        let (_, sampling, nf, bps) = pix_layout(self.pix);
+        let (w, h) = (self.width as usize, self.height as usize);
+        let packed = matches!(self.pix, MjpegPixelFormat::Rgb24 | MjpegPixelFormat::Cmyk);
+        let need_planes = if packed { 1 } else { nf };
+        if v.planes.len() < need_planes {
+            return Err(Error::invalid(format!(
+                "MJPEG encoder: {:?} frame needs {need_planes} plane(s), got {}",
+                self.pix,
+                v.planes.len()
+            )));
+        }
+        let sample = |data: &[u8], o: usize| -> u16 {
+            if bps == 2 {
+                u16::from(data[o]) | u16::from(data[o + 1]) << 8
+            } else {
+                u16::from(data[o])
+            }
+        };
+        let mut out = Vec::with_capacity(nf);
+        if packed {
+            let pl = &v.planes[0];
+            if pl.stride < w * nf * bps || pl.data.len() < pl.stride * (h - 1) + w * nf * bps {
+                return Err(Error::invalid("MJPEG encoder: packed plane too small"));
+            }
+            for c in 0..nf {
+                let mut p = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    for x in 0..w {
+                        p.push(sample(&pl.data, y * pl.stride + (x * nf + c) * bps));
+                    }
+                }
+                out.push(p);
+            }
+        } else {
+            let hm = sampling.iter().map(|s| s.0).max().unwrap_or(1) as usize;
+            let vm = sampling.iter().map(|s| s.1).max().unwrap_or(1) as usize;
+            for c in 0..nf {
+                let (hi, vi) = sampling.get(c).copied().unwrap_or((1, 1));
+                let cw = (w * hi as usize).div_ceil(hm);
+                let ch = (h * vi as usize).div_ceil(vm);
+                let pl = &v.planes[c];
+                if pl.stride < cw * bps || pl.data.len() < pl.stride * (ch - 1) + cw * bps {
+                    return Err(Error::invalid(format!(
+                        "MJPEG encoder: plane {c} too small for {cw}x{ch}"
+                    )));
+                }
+                let mut p = Vec::with_capacity(cw * ch);
+                for y in 0..ch {
+                    for x in 0..cw {
+                        p.push(sample(&pl.data, y * pl.stride + x * bps));
+                    }
+                }
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Encode one frame through the general writer.
+    fn encode_general(&mut self, opts: &JpegEncodeOptions, v: &VideoFrame) -> Result<Vec<u8>> {
+        let planes = self.planes_u16(v)?;
+        let refs: Vec<&[u16]> = planes.iter().map(|p| p.as_slice()).collect();
+        if opts.abbreviated {
+            if self.shared_tables.is_none() {
+                let t = opts.tables_for_planes(self.width, self.height, &refs)?;
+                self.output_params.extradata = t.tables_stream(opts.process.is_dct());
+                self.shared_tables = Some(t);
+            }
+            let t = self.shared_tables.as_ref().expect("shared tables");
+            Ok(opts
+                .encode_with_tables(self.width, self.height, &refs, t)?
+                .data)
+        } else {
+            Ok(opts.encode(self.width, self.height, &refs)?.data)
+        }
     }
 
     /// Set the restart interval in MCUs (JPEG DRI field). `0` disables
@@ -510,201 +899,211 @@ impl Encoder for MjpegEncoder {
                 // conditional alias in `encoder.rs`), so we can pass
                 // the frame through without local-type bounce.
                 let pix = self.pix.into();
-                let data = match (self.pix, self.lossless) {
-                    // Grayscale + lossless → SOF3 path. Precision is
-                    // implied by the pixel format and we read row bytes
-                    // straight from plane 0.
-                    (MjpegPixelFormat::Gray8, true)
-                    | (MjpegPixelFormat::Gray10Le, true)
-                    | (MjpegPixelFormat::Gray12Le, true)
-                    | (MjpegPixelFormat::Gray16Le, true) => {
-                        if v.planes.is_empty() {
-                            return Err(Error::invalid(
-                                "MJPEG encoder: grayscale frame missing plane 0",
-                            ));
-                        }
-                        let plane = &v.planes[0];
-                        let precision: u8 = match self.pix {
-                            MjpegPixelFormat::Gray8 => 8,
-                            MjpegPixelFormat::Gray10Le => 10,
-                            MjpegPixelFormat::Gray12Le => 12,
-                            MjpegPixelFormat::Gray16Le => 16,
-                            _ => unreachable!(),
-                        };
-                        encode_lossless_jpeg_grayscale(
-                            self.width,
-                            self.height,
-                            &plane.data,
-                            plane.stride,
-                            precision,
-                            self.lossless_predictor,
-                        )?
-                    }
-                    // 8-bit grayscale without lossless mode takes the
-                    // baseline (SOF0) or progressive (SOF2) single-
-                    // component DCT path. The baseline bitstream layout
-                    // mirrors `encode_jpeg` reduced to one luma component
-                    // (one DQT + DC/AC luma Huffman tables + a one-entry
-                    // SOS); flipping `set_progressive(true)` takes the
-                    // matching SOF2 path (DC + AC-low + AC-high scans,
-                    // spectral-selection decomposition). Either way any
-                    // conformant decoder produces a `Gray8` frame
-                    // round-tripping with the usual DCT-quantise
-                    // distortion floor. `restart_interval` is ignored
-                    // on the progressive path because the 3-component
-                    // progressive encoder doesn't expose DRI emission
-                    // either — kept consistent so the flag has the same
-                    // meaning across every progressive variant.
-                    (MjpegPixelFormat::Gray8, false) => {
-                        if v.planes.is_empty() {
-                            return Err(Error::invalid(
-                                "MJPEG encoder: grayscale frame missing plane 0",
-                            ));
-                        }
-                        let plane = &v.planes[0];
-                        if self.progressive {
-                            encode_jpeg_progressive_grayscale(
+                let data = if let Some(opts) = self.general.clone() {
+                    self.encode_general(&opts, v)?
+                } else {
+                    match (self.pix, self.lossless) {
+                        // Grayscale + lossless → SOF3 path. Precision is
+                        // implied by the pixel format and we read row bytes
+                        // straight from plane 0.
+                        (MjpegPixelFormat::Gray8, true)
+                        | (MjpegPixelFormat::Gray10Le, true)
+                        | (MjpegPixelFormat::Gray12Le, true)
+                        | (MjpegPixelFormat::Gray16Le, true) => {
+                            if v.planes.is_empty() {
+                                return Err(Error::invalid(
+                                    "MJPEG encoder: grayscale frame missing plane 0",
+                                ));
+                            }
+                            let plane = &v.planes[0];
+                            let precision: u8 = match self.pix {
+                                MjpegPixelFormat::Gray8 => 8,
+                                MjpegPixelFormat::Gray10Le => 10,
+                                MjpegPixelFormat::Gray12Le => 12,
+                                MjpegPixelFormat::Gray16Le => 16,
+                                _ => unreachable!(),
+                            };
+                            encode_lossless_jpeg_grayscale(
                                 self.width,
                                 self.height,
                                 &plane.data,
                                 plane.stride,
-                                self.quality,
-                            )?
-                        } else if self.arithmetic {
-                            encode_arith_jpeg_grayscale(
-                                self.width,
-                                self.height,
-                                &plane.data,
-                                plane.stride,
-                                self.quality,
-                                self.restart_interval,
-                            )?
-                        } else {
-                            encode_jpeg_grayscale_with_opts(
-                                self.width,
-                                self.height,
-                                &plane.data,
-                                plane.stride,
-                                self.quality,
-                                self.restart_interval,
+                                precision,
+                                self.lossless_predictor,
                             )?
                         }
-                    }
-                    // Higher-precision grayscale (10 / 12 / 16-bit)
-                    // still requires `set_lossless(true)` — the
-                    // baseline DCT path is 8-bit by spec. Surface a
-                    // clear error rather than silently downgrading.
-                    (
-                        MjpegPixelFormat::Gray10Le
-                        | MjpegPixelFormat::Gray12Le
-                        | MjpegPixelFormat::Gray16Le,
-                        false,
-                    ) => {
-                        return Err(Error::unsupported(
+                        // 8-bit grayscale without lossless mode takes the
+                        // baseline (SOF0) or progressive (SOF2) single-
+                        // component DCT path. The baseline bitstream layout
+                        // mirrors `encode_jpeg` reduced to one luma component
+                        // (one DQT + DC/AC luma Huffman tables + a one-entry
+                        // SOS); flipping `set_progressive(true)` takes the
+                        // matching SOF2 path (DC + AC-low + AC-high scans,
+                        // spectral-selection decomposition). Either way any
+                        // conformant decoder produces a `Gray8` frame
+                        // round-tripping with the usual DCT-quantise
+                        // distortion floor. `restart_interval` is ignored
+                        // on the progressive path because the 3-component
+                        // progressive encoder doesn't expose DRI emission
+                        // either — kept consistent so the flag has the same
+                        // meaning across every progressive variant.
+                        (MjpegPixelFormat::Gray8, false) => {
+                            if v.planes.is_empty() {
+                                return Err(Error::invalid(
+                                    "MJPEG encoder: grayscale frame missing plane 0",
+                                ));
+                            }
+                            let plane = &v.planes[0];
+                            if self.progressive {
+                                encode_jpeg_progressive_grayscale(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                )?
+                            } else if self.arithmetic {
+                                encode_arith_jpeg_grayscale(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                    self.restart_interval,
+                                )?
+                            } else {
+                                encode_jpeg_grayscale_with_opts(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                    self.restart_interval,
+                                )?
+                            }
+                        }
+                        // Higher-precision grayscale (10 / 12 / 16-bit)
+                        // still requires `set_lossless(true)` — the
+                        // baseline DCT path is 8-bit by spec. Surface a
+                        // clear error rather than silently downgrading.
+                        (
+                            MjpegPixelFormat::Gray10Le
+                            | MjpegPixelFormat::Gray12Le
+                            | MjpegPixelFormat::Gray16Le,
+                            false,
+                        ) => {
+                            return Err(Error::unsupported(
                             "MJPEG encoder: high-bit-depth grayscale input requires set_lossless(true)",
                         ));
-                    }
-                    // Packed `Rgb24` input takes the baseline-SOF0 RGB
-                    // path. The single plane is laid out as
-                    // `[R, G, B]` at 3 bytes per pixel, matching the
-                    // decoder's `Rgb24` output shape. Progressive
-                    // (SOF2) RGB is not yet wired in here — flipping
-                    // `set_progressive(true)` with `Rgb24` input still
-                    // takes the baseline path.
-                    (MjpegPixelFormat::Rgb24, _) => {
-                        if v.planes.is_empty() {
-                            return Err(Error::invalid(
-                                "MJPEG encoder: RGB24 frame missing plane 0",
-                            ));
                         }
-                        let plane = &v.planes[0];
-                        let min_stride = (self.width as usize) * 3;
-                        if plane.stride < min_stride {
-                            return Err(Error::invalid(
-                                "MJPEG encoder: RGB24 plane stride must be at least width * 3",
-                            ));
+                        // Packed `Rgb24` input takes the baseline-SOF0 RGB
+                        // path. The single plane is laid out as
+                        // `[R, G, B]` at 3 bytes per pixel, matching the
+                        // decoder's `Rgb24` output shape. Progressive
+                        // (SOF2) RGB is not yet wired in here — flipping
+                        // `set_progressive(true)` with `Rgb24` input still
+                        // takes the baseline path.
+                        (MjpegPixelFormat::Rgb24, _) => {
+                            if v.planes.is_empty() {
+                                return Err(Error::invalid(
+                                    "MJPEG encoder: RGB24 frame missing plane 0",
+                                ));
+                            }
+                            let plane = &v.planes[0];
+                            let min_stride = (self.width as usize) * 3;
+                            if plane.stride < min_stride {
+                                return Err(Error::invalid(
+                                    "MJPEG encoder: RGB24 plane stride must be at least width * 3",
+                                ));
+                            }
+                            if self.arithmetic && !self.lossless {
+                                encode_arith_jpeg_rgb24(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                    self.restart_interval,
+                                )?
+                            } else {
+                                encode_jpeg_rgb24_with_opts(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                    self.restart_interval,
+                                )?
+                            }
                         }
-                        if self.arithmetic && !self.lossless {
-                            encode_arith_jpeg_rgb24(
-                                self.width,
-                                self.height,
-                                &plane.data,
-                                plane.stride,
-                                self.quality,
-                                self.restart_interval,
-                            )?
-                        } else {
-                            encode_jpeg_rgb24_with_opts(
-                                self.width,
-                                self.height,
-                                &plane.data,
-                                plane.stride,
-                                self.quality,
-                                self.restart_interval,
-                            )?
+                        // 4-component CMYK / YCCK input takes the dedicated
+                        // CMYK encode path. The single packed plane is laid
+                        // out as `[C, M, Y, K]` (or `[Y, Cb, Cr, K]` for
+                        // `set_adobe_transform(Some(2))`) at 4 bytes per
+                        // pixel, matching the decoder's output shape.
+                        (MjpegPixelFormat::Cmyk, _) => {
+                            if v.planes.is_empty() {
+                                return Err(Error::invalid(
+                                    "MJPEG encoder: CMYK frame missing plane 0",
+                                ));
+                            }
+                            let plane = &v.planes[0];
+                            let min_stride = (self.width as usize) * 4;
+                            if plane.stride < min_stride {
+                                return Err(Error::invalid(
+                                    "MJPEG encoder: CMYK plane stride must be at least width * 4",
+                                ));
+                            }
+                            if self.progressive {
+                                encode_jpeg_cmyk_progressive(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                    self.cmyk_adobe_transform,
+                                )?
+                            } else {
+                                encode_jpeg_cmyk(
+                                    self.width,
+                                    self.height,
+                                    &plane.data,
+                                    plane.stride,
+                                    self.quality,
+                                    self.cmyk_adobe_transform,
+                                )?
+                            }
                         }
-                    }
-                    // 4-component CMYK / YCCK input takes the dedicated
-                    // CMYK encode path. The single packed plane is laid
-                    // out as `[C, M, Y, K]` (or `[Y, Cb, Cr, K]` for
-                    // `set_adobe_transform(Some(2))`) at 4 bytes per
-                    // pixel, matching the decoder's output shape.
-                    (MjpegPixelFormat::Cmyk, _) => {
-                        if v.planes.is_empty() {
-                            return Err(Error::invalid(
-                                "MJPEG encoder: CMYK frame missing plane 0",
-                            ));
-                        }
-                        let plane = &v.planes[0];
-                        let min_stride = (self.width as usize) * 4;
-                        if plane.stride < min_stride {
-                            return Err(Error::invalid(
-                                "MJPEG encoder: CMYK plane stride must be at least width * 4",
-                            ));
-                        }
-                        if self.progressive {
-                            encode_jpeg_cmyk_progressive(
-                                self.width,
-                                self.height,
-                                &plane.data,
-                                plane.stride,
-                                self.quality,
-                                self.cmyk_adobe_transform,
-                            )?
-                        } else {
-                            encode_jpeg_cmyk(
-                                self.width,
-                                self.height,
-                                &plane.data,
-                                plane.stride,
-                                self.quality,
-                                self.cmyk_adobe_transform,
-                            )?
-                        }
-                    }
-                    // YUV inputs take the baseline / progressive / arithmetic
-                    // DCT path.
-                    _ => {
-                        if self.progressive {
-                            encode_jpeg_progressive(v, self.width, self.height, pix, self.quality)?
-                        } else if self.arithmetic {
-                            encode_arith_jpeg_yuv(
-                                v,
-                                self.width,
-                                self.height,
-                                pix,
-                                self.quality,
-                                self.restart_interval,
-                            )?
-                        } else {
-                            encode_jpeg_with_opts(
-                                v,
-                                self.width,
-                                self.height,
-                                pix,
-                                self.quality,
-                                self.restart_interval,
-                            )?
+                        // YUV inputs take the baseline / progressive / arithmetic
+                        // DCT path.
+                        _ => {
+                            if self.progressive {
+                                encode_jpeg_progressive(
+                                    v,
+                                    self.width,
+                                    self.height,
+                                    pix,
+                                    self.quality,
+                                )?
+                            } else if self.arithmetic {
+                                encode_arith_jpeg_yuv(
+                                    v,
+                                    self.width,
+                                    self.height,
+                                    pix,
+                                    self.quality,
+                                    self.restart_interval,
+                                )?
+                            } else {
+                                encode_jpeg_with_opts(
+                                    v,
+                                    self.width,
+                                    self.height,
+                                    pix,
+                                    self.quality,
+                                    self.restart_interval,
+                                )?
+                            }
                         }
                     }
                 };

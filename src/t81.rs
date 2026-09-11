@@ -1699,6 +1699,46 @@ fn write_adobe_app14(out: &mut Vec<u8>, transform: u8) {
     out.extend_from_slice(&[0, 100, 0, 0, 0, 0, transform]);
 }
 
+/// One component of a [`Prepared`] frame minus its sample slice.
+struct ComponentSpec {
+    id: u8,
+    width: usize,
+    height: usize,
+    h: u8,
+    v: u8,
+    quant_id: u8,
+    huff_id: u8,
+}
+
+/// A frame description resolved from [`JpegEncodeOptions`] + planes.
+struct Prepared<'a> {
+    frame: JpegFrame,
+    planes: Vec<&'a [u16]>,
+    /// Ink-inverted copies for Adobe-flagged CMYK components.
+    owned: Vec<Option<Vec<u16>>>,
+    spec: Vec<ComponentSpec>,
+    meta: Vec<u8>,
+}
+
+impl Prepared<'_> {
+    fn comps(&self) -> Vec<JpegComponent<'_>> {
+        self.spec
+            .iter()
+            .enumerate()
+            .map(|(i, c)| JpegComponent {
+                id: c.id,
+                samples: self.owned[i].as_deref().unwrap_or(self.planes[i]),
+                width: c.width,
+                height: c.height,
+                h: c.h,
+                v: c.v,
+                quant_id: c.quant_id,
+                huff_id: c.huff_id,
+            })
+            .collect()
+    }
+}
+
 impl JpegEncodeOptions {
     /// The effective signalling for `nf` components.
     fn resolve_signalling(&self, nf: usize) -> Result<ColorSignalling> {
@@ -1747,11 +1787,10 @@ impl JpegEncodeOptions {
         Ok(t)
     }
 
-    /// Encode `planes` — one row-major `u16` plane per component at the
-    /// component's own A.1.1 resolution (`ceil(width × Hi / Hmax) ×
-    /// ceil(height × Vi / Vmax)`), samples below `2^precision` — as one
-    /// JPEG frame. 1, 3 or 4 planes.
-    pub fn encode(&self, width: u32, height: u32, planes: &[&[u16]]) -> Result<EncodedJpeg> {
+    /// Resolve the frame description these options imply for `planes`
+    /// (validation, A.1.1 component geometry, table destinations, Adobe
+    /// ink inversion, colour-signalling segments).
+    fn prepare<'a>(&self, width: u32, height: u32, planes: &[&'a [u16]]) -> Result<Prepared<'a>> {
         let nf = planes.len();
         if !matches!(nf, 1 | 3 | 4) {
             return Err(Error::invalid(format!(
@@ -1816,7 +1855,7 @@ impl JpegEncodeOptions {
                 })
             })
             .collect();
-        let comps: Vec<JpegComponent<'_>> = (0..nf)
+        let spec: Vec<ComponentSpec> = (0..nf)
             .map(|i| {
                 let (h, v) = sampling[i];
                 let (quant_id, huff_id) = if self.table_ids.is_empty() {
@@ -1828,9 +1867,8 @@ impl JpegEncodeOptions {
                 } else {
                     self.table_ids[i]
                 };
-                JpegComponent {
+                ComponentSpec {
                     id: ids[i],
-                    samples: owned[i].as_deref().unwrap_or(planes[i]),
                     width: (width as usize * h.max(1) as usize).div_ceil(h_max),
                     height: (height as usize * v.max(1) as usize).div_ceil(v_max),
                     h,
@@ -1840,7 +1878,6 @@ impl JpegEncodeOptions {
                 }
             })
             .collect();
-        let tables = self.tables_for(&frame, &comps)?;
         let mut meta = Vec::new();
         match signalling {
             ColorSignalling::Jfif => write_jfif_app0(&mut meta),
@@ -1850,10 +1887,67 @@ impl JpegEncodeOptions {
             } => write_adobe_app14(&mut meta, t),
             _ => {}
         }
-        let data = encode_frame_with_meta(&frame, &comps, &tables, !self.abbreviated, &meta)?;
+        Ok(Prepared {
+            frame,
+            planes: planes.to_vec(),
+            owned,
+            spec,
+            meta,
+        })
+    }
+
+    /// The table set these options derive for `planes` (typical, or K.2
+    /// optimal from the frame's own statistics) — the set to install as
+    /// a shared `JPEGTables` when several frames are coded abbreviated
+    /// with [`JpegEncodeOptions::encode_with_tables`].
+    pub fn tables_for_planes(
+        &self,
+        width: u32,
+        height: u32,
+        planes: &[&[u16]],
+    ) -> Result<JpegTableSet> {
+        let prep = self.prepare(width, height, planes)?;
+        self.tables_for(&prep.frame, &prep.comps())
+    }
+
+    /// Encode `planes` — one row-major `u16` plane per component at the
+    /// component's own A.1.1 resolution (`ceil(width × Hi / Hmax) ×
+    /// ceil(height × Vi / Vmax)`), samples below `2^precision` — as one
+    /// JPEG frame. 1, 3 or 4 planes.
+    pub fn encode(&self, width: u32, height: u32, planes: &[&[u16]]) -> Result<EncodedJpeg> {
+        let prep = self.prepare(width, height, planes)?;
+        let tables = self.tables_for(&prep.frame, &prep.comps())?;
+        self.finish(&prep, &tables)
+    }
+
+    /// [`JpegEncodeOptions::encode`] with a caller-supplied table set
+    /// (no statistics pass; `tables` must define every destination the
+    /// components reference). With `abbreviated` set the frame stream
+    /// carries no table segments and `tables` is returned as the §B.5
+    /// tables-only stream, so a sequence of frames can share one
+    /// `JPEGTables`.
+    pub fn encode_with_tables(
+        &self,
+        width: u32,
+        height: u32,
+        planes: &[&[u16]],
+        tables: &JpegTableSet,
+    ) -> Result<EncodedJpeg> {
+        let prep = self.prepare(width, height, planes)?;
+        self.finish(&prep, tables)
+    }
+
+    fn finish(&self, prep: &Prepared<'_>, tables: &JpegTableSet) -> Result<EncodedJpeg> {
+        let data = encode_frame_with_meta(
+            &prep.frame,
+            &prep.comps(),
+            tables,
+            !self.abbreviated,
+            &prep.meta,
+        )?;
         let tables_stream = self
             .abbreviated
-            .then(|| tables.tables_stream(frame.process.is_dct()));
+            .then(|| tables.tables_stream(prep.frame.process.is_dct()));
         Ok(EncodedJpeg {
             data,
             tables: tables_stream,

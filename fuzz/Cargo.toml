@@ -143,3 +143,16 @@ name = "hierarchical_roundtrip"
 path = "fuzz_targets/hierarchical_roundtrip.rs"
 test = false
 doc = false
+
+# Oracle target — fuzz-derived pixels and fuzz-chosen options through
+# the general T.81 writer (`oxideav_mjpeg::t81`: sequential 8/12-bit,
+# progressive, lossless; every §A.1.1 sampling layout; typical vs
+# optimal tables; restarts; §B.5 abbreviated pairs; JFIF / RGB / CMYK
+# signalling) and back through the public decoder. Lossless asserts
+# bit-exact reconstruction, the DCT processes assert decode success and
+# output geometry. See `fuzz_targets/t81_roundtrip.rs`.
+[[bin]]
+name = "t81_roundtrip"
+path = "fuzz_targets/t81_roundtrip.rs"
+test = false
+doc = false

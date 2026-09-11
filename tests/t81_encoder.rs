@@ -101,7 +101,7 @@ fn read_plane(stride: usize, data: &[u8], w: usize, h: usize, bps: usize) -> Vec
 /// component order, for every shape the decoder produces: planar
 /// (possibly subsampled chroma), packed `Rgb24` / `Rgb48Le` / `Cmyk`,
 /// planar `Gbrp*Le` (G, B, R order).
-fn decoded_components(jpeg: &[u8], nf: usize, p: u8) -> Vec<Vec<u32>> {
+fn decoded_components(jpeg: &[u8], nf: usize, p: u8, sampling: &[(u8, u8)]) -> Vec<Vec<u32>> {
     let f = decode_jpeg(jpeg, None).expect("our decoder rejects our stream");
     let (w, h) = (W as usize, H as usize);
     // Bytes per sample from the geometry: plane 0 of a planar frame is
@@ -120,25 +120,32 @@ fn decoded_components(jpeg: &[u8], nf: usize, p: u8) -> Vec<Vec<u32>> {
         let comps: Vec<Vec<u32>> = f
             .planes
             .iter()
-            .map(|pl| {
+            .enumerate()
+            .map(|(c, pl)| {
                 let cw = pl.stride / bps;
                 let ch = pl.data.len() / pl.stride;
                 let raw = read_plane(pl.stride, &pl.data, cw, ch, bps);
                 let raw16: Vec<u16> = raw.iter().map(|&v| v as u16).collect();
-                // Native planar chroma is at `ceil(W / Hmax)`: recover the
-                // ratio from the plane extent (1..=4 each).
-                let ratio = |full: usize, got: usize| {
-                    (1..=4).find(|&r| full.div_ceil(r) == got).unwrap_or_else(|| {
-                        panic!(
-                            "nf{nf} P{p}: plane {cw}x{ch} ({} planes, stride {}) is no 1..=4 ratio of {w}x{h}",
-                            f.planes.len(),
-                            pl.stride
-                        )
-                    })
+                // Either the frame grid (4:4:4 output) or the component's
+                // own A.1.1 extent (native planar chroma).
+                let s: Vec<(u8, u8)> = if sampling.is_empty() {
+                    vec![(1, 1); nf]
+                } else {
+                    sampling.to_vec()
                 };
-                let hr = ratio(w, cw);
-                let vr = ratio(h, ch);
-                upsample(&raw16, cw, 1, 1, hr, vr)
+                let hm = s.iter().map(|x| x.0).max().unwrap() as usize;
+                let vm = s.iter().map(|x| x.1).max().unwrap() as usize;
+                if cw == w && ch == h {
+                    upsample(&raw16, cw, 1, 1, 1, 1)
+                } else {
+                    let (hi, vi) = (s[c].0 as usize, s[c].1 as usize);
+                    assert_eq!(
+                        (cw, ch),
+                        ((w * hi).div_ceil(hm), (h * vi).div_ceil(vm)),
+                        "nf{nf} P{p}: plane {c} extent"
+                    );
+                    upsample(&raw16, cw, hi, vi, hm, vm)
+                }
             })
             .collect();
         // Planar `Gbrp*Le` output (lossless 3-component at P = 10 / 12
@@ -299,7 +306,7 @@ fn dct_processes_every_layout_decode_in_our_decoder() {
                             ri > 0,
                             "{tag}: DRI"
                         );
-                        let got = decoded_components(&out.data, nf, precision);
+                        let got = decoded_components(&out.data, nf, precision, sampling);
                         let peak = ((1u32 << precision) - 1) as f64;
                         let s: Vec<(u8, u8)> = if sampling.is_empty() {
                             vec![(1, 1); nf]
@@ -349,8 +356,8 @@ fn optimal_tables_are_no_larger_than_typical() {
             typical.data.len()
         );
         assert_eq!(
-            decoded_components(&optimal.data, 3, 8),
-            decoded_components(&typical.data, 3, 8),
+            decoded_components(&optimal.data, 3, 8, &[(2, 2), (1, 1), (1, 1)]),
+            decoded_components(&typical.data, 3, 8, &[(2, 2), (1, 1), (1, 1)]),
             "{process:?}: same quantiser → same pixels"
         );
     }
@@ -405,7 +412,7 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
                             .encode(W, H, &refs)
                             .unwrap_or_else(|e| panic!("{tag}: {e}"));
                         assert!(matches!(sof_kind(&out.data), SofKind::Lossless), "{tag}");
-                        let got = decoded_components(&out.data, nf, precision);
+                        let got = decoded_components(&out.data, nf, precision, sampling);
                         let s: Vec<(u8, u8)> = if sampling.is_empty() {
                             vec![(1, 1); nf]
                         } else {
@@ -611,7 +618,7 @@ fn frame_api_shares_one_table_set_across_frames() {
         let strip = encode_frame(&frame, &[comp(s)], &tables, false).unwrap();
         let mut full = jpegtables[..jpegtables.len() - 2].to_vec();
         full.extend_from_slice(&strip[2..]);
-        let got = decoded_components(&full, 1, 12);
+        let got = decoded_components(&full, 1, 12, &[]);
         let want: Vec<u32> = s.iter().map(|&v| u32::from(v)).collect();
         assert!(psnr(&got[0], &want, 4095.0) > 34.0);
     }

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`t81_roundtrip` fuzz target** (`fuzz/` only): fuzz-derived pixels
+  and fuzz-chosen options through the general writer — sequential /
+  progressive / lossless, 8- and 12-bit (lossless 2..=16), every §A.1.1
+  layout, typical vs optimal tables, restarts, §B.5 abbreviated pairs
+  via `decode_jpeg_with_tables`, JFIF / RGB / CMYK signalling — and back
+  through the public decoder; lossless asserts bit-exact reconstruction
+  (incl. the Adobe-inverted CMYK + point-transform composition). Daily
+  Fuzz budget 3300 s → 3600 s for the twelve targets. First 300 s
+  foreground run: 2.08 M executions, no findings.
 - **§B.5 abbreviated streams decode, and the registry encoder speaks
   the typed options.** `decoder::decode_jpeg_with_tables(tables, data,
   pts)` preloads an abbreviated table-specification stream (DQT / DHT /

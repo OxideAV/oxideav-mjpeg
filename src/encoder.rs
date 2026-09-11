@@ -451,12 +451,20 @@ fn encode_jpeg_progressive_inner(
         );
 
         // AC initial: low and high bands.
+        // §A.2.2 / §A.2.4: the non-interleaved luma scans cover the true
+        // block extent, not the MCU-padded grid.
+        let y_true = true_extent_blocks(
+            &y_coefs,
+            luma_blocks_x,
+            width.div_ceil(8),
+            height.div_ceil(8),
+        );
         for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
             write_sos_progressive_ac_sa(&mut out, 1, 0, ss, se, 0, 1);
             write_ac_scan_sa(
                 &mut out,
-                &y_coefs,
-                luma_blocks_x * luma_blocks_y,
+                &y_true,
+                y_true.len(),
                 &huff.luma_ac,
                 ss as usize,
                 se as usize,
@@ -502,12 +510,20 @@ fn encode_jpeg_progressive_inner(
         );
 
         // AC refinement: low and high bands.
+        // §A.2.2 / §A.2.4: the non-interleaved luma scans cover the true
+        // block extent, not the MCU-padded grid.
+        let y_true = true_extent_blocks(
+            &y_coefs,
+            luma_blocks_x,
+            width.div_ceil(8),
+            height.div_ceil(8),
+        );
         for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
             write_sos_progressive_ac_sa(&mut out, 1, 0, ss, se, 1, 0);
             write_ac_refine_scan(
                 &mut out,
-                &y_coefs,
-                luma_blocks_x * luma_blocks_y,
+                &y_true,
+                y_true.len(),
                 &huff.luma_ac,
                 ss as usize,
                 se as usize,
@@ -551,13 +567,21 @@ fn encode_jpeg_progressive_inner(
         );
 
         // AC bands, low then high.
+        // §A.2.2 / §A.2.4: the non-interleaved luma scans cover the true
+        // block extent, not the MCU-padded grid.
+        let y_true = true_extent_blocks(
+            &y_coefs,
+            luma_blocks_x,
+            width.div_ceil(8),
+            height.div_ceil(8),
+        );
         for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
             // Luma AC.
             write_sos_progressive_ac(&mut out, 1, 0, ss, se);
             write_ac_scan(
                 &mut out,
-                &y_coefs,
-                luma_blocks_x * luma_blocks_y,
+                &y_true,
+                y_true.len(),
                 &huff.luma_ac,
                 ss as usize,
                 se as usize,
@@ -737,6 +761,25 @@ fn encode_dc(bw: &mut BitWriter<'_>, dc: i32, prev_dc: &mut i32, dc_huff: &HuffT
     if size > 0 {
         bw.write_bits(bits, size as u32);
     }
+}
+
+/// The blocks a non-interleaved scan codes (T.81 §A.2.2 / §A.2.4): the
+/// top-left `bx_true × by_true` window of a component's MCU-padded
+/// block grid (`blocks_x` blocks per padded row), in raster order. A
+/// component padded to a multiple of `Hi × Vi` blocks for the
+/// interleaved DC scan carries extra blocks a non-interleaved AC scan
+/// must not emit.
+fn true_extent_blocks(
+    coefs: &[[i32; 64]],
+    blocks_x: usize,
+    bx_true: usize,
+    by_true: usize,
+) -> Vec<[i32; 64]> {
+    let mut out = Vec::with_capacity(bx_true * by_true);
+    for by in 0..by_true {
+        out.extend_from_slice(&coefs[by * blocks_x..by * blocks_x + bx_true]);
+    }
+    out
 }
 
 /// Emit a non-interleaved AC-band scan over one component's blocks. Walks
@@ -1596,7 +1639,10 @@ pub(crate) fn encode_jpeg_non_interleaved(
         _ => unreachable!(),
     };
 
-    // Y scan: blocks per row = mcus_x * h_factor, rows = mcus_y * v_factor.
+    // Y scan: a non-interleaved scan covers the component's own block
+    // extent ceil(xi / 8) × ceil(yi / 8) (T.81 §A.2.2 / §A.2.4), not the
+    // MCU-padded mcus_x × h_factor grid.
+    let _ = (mcus_x, mcus_y);
     write_non_interleaved_sos(&mut out, 1, 0, 0);
     write_component_scan(
         &mut out,
@@ -1604,8 +1650,8 @@ pub(crate) fn encode_jpeg_non_interleaved(
         frame.planes[0].stride,
         width,
         height,
-        mcus_x * h_factor as usize,
-        mcus_y * v_factor as usize,
+        width.div_ceil(8),
+        height.div_ceil(8),
         &luma_q,
         &huff.luma_dc,
         &huff.luma_ac,
@@ -1619,8 +1665,8 @@ pub(crate) fn encode_jpeg_non_interleaved(
         frame.planes[1].stride,
         c_w,
         c_h,
-        mcus_x,
-        mcus_y,
+        c_w.div_ceil(8),
+        c_h.div_ceil(8),
         &chroma_q,
         &huff.chroma_dc,
         &huff.chroma_ac,
@@ -1634,8 +1680,8 @@ pub(crate) fn encode_jpeg_non_interleaved(
         frame.planes[2].stride,
         c_w,
         c_h,
-        mcus_x,
-        mcus_y,
+        c_w.div_ceil(8),
+        c_h.div_ceil(8),
         &chroma_q,
         &huff.chroma_dc,
         &huff.chroma_ac,
@@ -3260,12 +3306,20 @@ pub(crate) fn encode_yuv_jpeg_progressive_12bit(
     );
 
     // AC bands, low then high, per component (Y / Cb / Cr).
+    // §A.2.2 / §A.2.4: the non-interleaved luma scans cover the true
+    // block extent, not the MCU-padded grid.
+    let y_true = true_extent_blocks(
+        &y_coefs,
+        luma_blocks_x,
+        (width as usize).div_ceil(8),
+        (height as usize).div_ceil(8),
+    );
     for &(ss, se) in &[(1u8, 5u8), (6u8, 63u8)] {
         write_sos_progressive_ac(&mut out, 1, 0, ss, se);
         write_ac_scan(
             &mut out,
-            &y_coefs,
-            luma_blocks_x * luma_blocks_y,
+            &y_true,
+            y_true.len(),
             &huff.luma_ac,
             ss as usize,
             se as usize,

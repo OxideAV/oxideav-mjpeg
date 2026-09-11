@@ -689,6 +689,23 @@ pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     }
 }
 
+/// Data-unit extent of a non-interleaved scan (`Ns = 1`) of a component
+/// with sampling factors `h × v`: T.81 §A.2.2 walks the component's own
+/// blocks in raster order, and §A.2.4 only pads a component to a whole
+/// number of `Hi × Vi` block groups "if the component is to be
+/// interleaved" — so the scan covers `ceil(xi / 8) × ceil(yi / 8)` with
+/// `xi = ceil(X × Hi / Hmax)`, `yi = ceil(Y × Vi / Vmax)` (§A.1.1), which
+/// is fewer blocks than the MCU-padded grid whenever `ceil(xi / 8) <
+/// mcus_x × Hi`. The coefficient buffers keep the padded row pitch; only
+/// the walk is bounded.
+fn non_interleaved_extent(sof: &SofInfo, h: u8, v: u8) -> (usize, usize) {
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    let xi = (sof.width as usize * h as usize).div_ceil(h_max);
+    let yi = (sof.height as usize * v as usize).div_ceil(v_max);
+    (xi.div_ceil(8), yi.div_ceil(8))
+}
+
 /// Allocate a coefficient-accumulator plane for each component in the SOF.
 /// Dimensions match the MCU grid so that blocks line up with decoded scans.
 /// Shared by progressive (SOF2, multi-scan successive-approximation) and
@@ -1591,7 +1608,7 @@ fn decode_sequential_scan_accum_diff(
     } else {
         let sof_idx = sos_map[0];
         let c = sof.components[sof_idx];
-        (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+        non_interleaved_extent(sof, c.h_factor, c.v_factor)
     };
 
     let mut br = BitReader::new(scan);
@@ -1812,7 +1829,7 @@ fn decode_arith_scan_diff(
     } else {
         let sof_idx = sos_map[0];
         let c = sof.components[sof_idx];
-        (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+        non_interleaved_extent(sof, c.h_factor, c.v_factor)
     };
 
     for my in 0..scan_mcus_y {
@@ -2066,7 +2083,7 @@ fn decode_progressive_arith_scan_diff(
         (mcus_x, mcus_y)
     } else {
         let c = sof.components[sos_map[0]];
-        (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+        non_interleaved_extent(sof, c.h_factor, c.v_factor)
     };
 
     for my in 0..scan_mcus_y {
@@ -2317,10 +2334,10 @@ fn decode_progressive_scan_diff(
         let c = sof.components[ci];
         if sos.components.len() == 1 && sof.components.len() == 1 {
             // Single-component image: MCU grid equals block grid exactly.
-            (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+            non_interleaved_extent(sof, c.h_factor, c.v_factor)
         } else {
             // For a non-interleaved scan, iterate the component's full block grid.
-            (mcus_x * c.h_factor as usize, mcus_y * c.v_factor as usize)
+            non_interleaved_extent(sof, c.h_factor, c.v_factor)
         }
     };
 

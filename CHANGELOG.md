@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Non-interleaved scans cover the component's own block extent
+  (T.81 §A.2.2 / §A.2.4).** A.2.4 pads a component to a whole number of
+  `Hi × Vi` block groups only "if the component is to be interleaved",
+  so a scan with `Ns = 1` walks `ceil(xi / 8) × ceil(yi / 8)` data units.
+  The four accumulator scan decoders (sequential non-interleaved,
+  progressive Huffman, sequential and progressive arithmetic) and the
+  legacy progressive encoders' luma AC scans (`encode_jpeg_progressive*`,
+  the SA variant, the 12-bit helper) walked the MCU-padded grid
+  `mcus_x × Hi` instead — identical whenever the frame width is a
+  multiple of `8 × Hmax`, desynchronised otherwise (a 37-pixel-wide
+  4:2:2 progressive stream has 5 true luma blocks per row, 6 padded).
+  Verified black-box with `cjpeg -progressive -sample 2x1 / 2x2` and a
+  three-scan non-interleaved sequential script at 37×29
+  (`tests/fixtures/noninterleaved/`): luma within ±1 of `djpeg`.
 - **Every T.81 §A.1.1 sampling-factor combination now decodes.** The
   three-component paths (baseline fast path, sequential / progressive /
   arithmetic coefficient renderers at `P = 8` and `P = 12`, and the

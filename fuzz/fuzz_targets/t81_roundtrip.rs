@@ -157,7 +157,11 @@ fuzz_target!(|data: &[u8]| {
     };
     let abbreviated = data[3] & 2 != 0;
     let predictor = 1 + data[4] % 7;
-    let pt = if lossless { (data[4] >> 3) % precision.min(4) } else { 0 };
+    let pt = if lossless {
+        (data[4] >> 3) % precision.min(4)
+    } else {
+        0
+    };
     let quality = 50 + data[5] % 51;
     let width = 1 + (data[6] % 16) as usize;
     let sig_sel = data[7] % 3;
@@ -172,8 +176,8 @@ fuzz_target!(|data: &[u8]| {
         .map(|&(h, v)| h as usize * v as usize)
         .sum::<usize>()
         .max(1);
-    let height = (payload.len() / (width * per_pixel * bytes_per_sample))
-        .clamp(1, MAX_PIXELS / width);
+    let height =
+        (payload.len() / (width * per_pixel * bytes_per_sample)).clamp(1, MAX_PIXELS / width);
     let max = (1u32 << precision) - 1;
     let mut cursor = 0usize;
     let mut planes: Vec<Vec<u16>> = Vec::with_capacity(nf);

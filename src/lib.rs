@@ -133,6 +133,7 @@ pub mod error;
 pub mod image;
 pub mod jpeg;
 pub mod rtp;
+pub mod t81;
 
 #[cfg(feature = "registry")]
 pub mod container;
@@ -149,6 +150,13 @@ pub const CODEC_ID_STR: &str = "mjpeg";
 // `registry` feature.
 pub use error::{MjpegError, Result};
 pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
+
+// General T.81 writer surface (the one JPEG encoder sibling crates
+// build on): typed options plus the frame / table-set primitives.
+pub use t81::{
+    ColorSignalling, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
+    JpegEncodeOptions, JpegFrame, JpegProcess, JpegTableSet,
+};
 
 // Decode-free JPEG inspector — classifies the SOF variant + reports
 // dimensions / components / chroma-subsampling / colour hint without

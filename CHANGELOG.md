@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`oxideav_mjpeg::t81` — the general T.81 writer, the one JPEG
+  encoder sibling crates build on** (`oxideav-tiff`'s `Compression = 7`
+  writer re-points here next round; every item is re-exported at the
+  crate root). One engine codes an arbitrary frame description:
+  sequential DCT (`SOF0` baseline at `P = 8` / `SOF1` extended sequential
+  incl. `P = 12`), progressive DCT (`SOF2`, `P = 8` / `12`) and lossless
+  (`SOF3`, `P ∈ 2..=16`, predictors 1..=7, point transform), 1..=4
+  components, per-component sampling factors (any §A.1.1 combination
+  under the §B.2.3 `Σ Hi × Vi ≤ 10` bound — 4×2 luma included),
+  per-component quantisation / entropy table destinations, restart
+  intervals on every process (§E.1.3, Table B.7 row alignment enforced
+  for lossless), Annex K.3 typical **or** Annex K.2 *optimal* Huffman
+  tables (Figures K.1–K.4 from the frame's own symbol statistics, 16-bit
+  length limiting, all-ones code reserved per §C.2), and the §B.5
+  abbreviated formats (tables-only stream + table-less frame streams —
+  TIFF `JPEGTables` carriage).
+  - Frame API: `JpegFrame` / `JpegComponent` / `JpegProcess` /
+    `JpegTableSet` (`typical`, `optimise_huffman`, `write_tables`,
+    `tables_stream`) / `HuffSpec` (Tables K.3–K.6, `lossless_dc`,
+    `validate`) / `HuffStats` (`count`, `merge`, `to_spec`) /
+    `scaled_quant_table` / `gather_stats` / `encode_frame` /
+    `encode_frame_with_meta`.
+  - Typed options: `JpegEncodeOptions { quality, tables, process,
+    precision, restart_interval, abbreviated, signalling, sampling,
+    table_ids }` with `encode(width, height, &[&[u16]])` /
+    `encode_u8(...)` → `EncodedJpeg { data, tables }`, and
+    `ColorSignalling` (JFIF, RGB via Adobe APP14 `transform = 0` +
+    `'R'/'G'/'B'` ids, CMYK / YCCK via Adobe APP14, none).
+  - Oracles: every process × precision × layout decodes in this crate's
+    decoder (bit-exact lossless, PSNR for DCT) and in `djpeg` (lossless
+    byte-exact at 8 / 12 / 16 bits, DCT within the quantisation floor).
 - **`decoder::decode_jpeg` is public** (`decode_jpeg(&[u8], Option<i64>)
   -> Result<VideoFrame>`): the framework-free single-image decode entry
   point the crate docs always advertised, now reachable without going

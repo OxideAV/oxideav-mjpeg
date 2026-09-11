@@ -155,20 +155,22 @@ use oxideav_mjpeg::t81::{
 # let b: Vec<u16> = vec![200; (w * h) as usize];
 let frame = JpegFrame { width: w as u16, height: h as u16, precision: 8,
                         process: JpegProcess::Sequential, restart_interval: 0 };
-let comp = |s: &[u16]| JpegComponent { id: 1, samples: s, width: w as usize, height: h as usize,
-                                       h: 1, v: 1, quant_id: 0, huff_id: 0 };
+fn comp(s: &[u16], w: u32, h: u32) -> JpegComponent<'_> {
+    JpegComponent { id: 1, samples: s, width: w as usize, height: h as usize,
+                    h: 1, v: 1, quant_id: 0, huff_id: 0 }
+}
 // One table set shared by every strip: typical quantisers, optimal
 // Huffman tables from the statistics of all strips.
 let mut tables = JpegTableSet::typical(90, 8, false, 1);
 let mut dc: [HuffStats; 4] = Default::default();
 let mut ac: [HuffStats; 4] = Default::default();
-gather_stats(&frame, &[comp(&a)], &tables, &mut dc, &mut ac)?;
-gather_stats(&frame, &[comp(&b)], &tables, &mut dc, &mut ac)?;
+gather_stats(&frame, &[comp(&a, w, h)], &tables, &mut dc, &mut ac)?;
+gather_stats(&frame, &[comp(&b, w, h)], &tables, &mut dc, &mut ac)?;
 tables.dc[0] = Some(dc[0].to_spec());
 tables.ac[0] = Some(ac[0].to_spec());
 let jpegtables = tables.tables_stream(true);           // JPEGTables field
-let strip_a = encode_frame(&frame, &[comp(&a)], &tables, false)?; // abbreviated
-let strip_b = encode_frame(&frame, &[comp(&b)], &tables, false)?;
+let strip_a = encode_frame(&frame, &[comp(&a, w, h)], &tables, false)?; // abbreviated
+let strip_b = encode_frame(&frame, &[comp(&b, w, h)], &tables, false)?;
 # let _ = (jpegtables, strip_a, strip_b);
 # Ok::<(), oxideav_mjpeg::MjpegError>(())
 ```

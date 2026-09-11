@@ -1,3 +1,6 @@
+//! Registry-side surface: needs the default `registry` feature.
+#![cfg(feature = "registry")]
+
 //! Registry encoder options ↔ `JpegEncodeOptions` parity, and the
 //! §B.5 abbreviated pair through the registry (`extradata` tables).
 

@@ -49,7 +49,7 @@ impl From<MjpegError> for Error {
             MjpegError::InvalidData(s) => Error::InvalidData(s),
             MjpegError::Unsupported(s) => Error::Unsupported(s),
             MjpegError::LimitExceeded(s) => Error::InvalidData(format!("limit exceeded: {s}")),
-            MjpegError::Io(kind, s) => Error::Other(format!("I/O ({kind:?}): {s}")),
+            MjpegError::Io(e) => Error::Io(e),
             MjpegError::Other(s) => Error::Other(s),
             MjpegError::Eof => Error::Eof,
             MjpegError::NeedMore => Error::NeedMore,

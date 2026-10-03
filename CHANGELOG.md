@@ -10,10 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - *(api)* the workspace image-crate contract at the crate root, usable with `default-features = false`: `probe`, `info -> ImageInfo`, `decode -> JpegImage`, `decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`, `decode_rgba8 -> RgbaImage`, `decode_from<R: Read>`, `encode(&JpegImage, &EncodeOptions)`, `encode_rgb8` (full-range YCbCr 4:2:0 by default, `with_chroma`), `encode_rgba8` (alpha dropped — JPEG has none), `encode_to<W: Write>`
-- *(api)* `JpegImage { width, height, format, planes, color, metadata, precision }` with `new` / `from_rgb8` / `from_rgba8` / `with_*` / `as_bytes` / `into_raw` / `to_rgb8` / `to_rgba8` / `from_frame`; `Plane`, `RgbImage`, `RgbaImage`, `ColorInfo` + `ColorRange` (H.273 code points), `Metadata { icc, exif, xmp, gamma }`, `ImageInfo`, `DecodeOptions` (`max_width` / `max_height` / `max_pixels` / `max_bytes` / `strict` / `tables`), `PixelFormat` alias, `Error` alias; all records `#[non_exhaustive]`
+- *(api)* `JpegImage { width, height, format, planes, color, metadata, precision }` with `new` / `from_rgb8` / `from_rgba8` / `with_*` / `as_bytes` / `into_raw` / `to_rgb8` / `to_rgba8` / `from_frame`; `Plane`, `RgbImage`, `RgbaImage`, `ColorInfo` + `ColorRange` (H.273 code points), `Metadata { icc, exif, xmp, gamma }`, `ImageInfo`, `DecodeOptions` (`max_width` / `max_height` / `max_pixels` / `max_bytes` as `Option`, `None` = unlimited; `strict`; `tables`), `PixelFormat` alias, `Error` alias; all records `#[non_exhaustive]`
 - *(api)* `to_rgb8` / `to_rgba8` kernels: T.871 §7 inverse equations in exact integer arithmetic, nearest-neighbour chroma replication, CMYK ink inversion, deep samples rescaled by the frame precision, `Gbrp*` re-ordered — grayscale / RGB / 12-bit corpus fixtures reproduce the reference output bit-exactly
-- *(api)* `MjpegPixelFormat::{YuvJ420P, YuvJ422P, YuvJ444P}` — the decoder labels 8-bit planar YCbCr frames with a JFIF APP0 as full-range `YuvJ*`; helpers `plane_count` / `bytes_per_sample` / `nominal_bits` / `chroma_divisors` / `plane_dimensions` / `tight_stride` / `name` / `Display`
-- *(api)* `MjpegError::{LimitExceeded, Io}` (+ `From<std::io::Error>`)
+- *(api)* `MjpegPixelFormat::{YuvJ420P, YuvJ422P, YuvJ444P}` — the decoder labels every 8-bit planar YCbCr frame full-range `YuvJ*` (T.871 §7 / T.872 §6.1, JFIF or not; contract ruling 2026-10-03); helpers `plane_count` / `bytes_per_sample` / `nominal_bits` / `chroma_divisors` / `plane_dimensions` / `tight_stride` / `name` / `Display`
+- *(api)* `MjpegError::{LimitExceeded, Io(std::io::Error)}` (+ `From<std::io::Error>`, `source()`)
 - *(encode)* `EncodeOptions::{chroma, metadata}` + `with_*` builders; APP1 Exif / APP1 XMP / APP2 ICC chunk writer
 - *(registry)* `From<JpegImage> for VideoFrame`, `TryFrom<PixelFormat> for MjpegPixelFormat`, `From<ColorInfo> for ColorSignal` and back, `From<VideoPlane> for MjpegPlane`; the encoder accepts `YuvJ4xxP` input (encoded as its range-agnostic twin, label kept on the output parameters)
 - *(decode)* `DecodeOptions` limits are enforced on every frame header inside the decoder (hierarchical sequences included); the completed hierarchical image must match the DHP geometry (B.3.2)
@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(decode)* the decoder's return type no longer depends on the `registry` feature: the core produces the crate-local `JpegImage` (geometry and format travel with the planes) and the framework adapter converts with `From<JpegImage> for VideoFrame`; the registry `Decoder` calls the standalone `decode_with` — one implementation
 - *(encode)* `t81::JpegEncodeOptions` renamed `EncodeOptions` (`#[non_exhaustive]`; construct with `EncodeOptions::new()` / `default()` + `with_*`, fields stay readable)
 - *(image)* `MjpegPlane` is now an alias of `Plane` (same fields; `#[non_exhaustive]`, `Plane::new`)
-- *(error)* `MjpegError` is `#[non_exhaustive]`
+- *(error)* `MjpegError` is `#[non_exhaustive]` and no longer derives `Clone` / `PartialEq` / `Eq` (its `Io` variant carries `std::io::Error`); match on variants or `Display`
 - *(bench)* the Criterion harness builds without the `registry` feature (empty `main`)
 - *(deps)* the `registry` feature needs `oxideav-core` ≥ 0.1.37 (`ColorSignal`); `fuzz/Cargo.lock` refreshed
 

@@ -69,7 +69,8 @@ color: ColorInfo, metadata: Metadata, precision }` with `new` /
 `with_metadata` / `with_precision`, `as_bytes()` (packed layouts),
 `into_raw()` (planes concatenated), `to_rgb8()` / `to_rgba8()`.
 `Plane { stride, data }`; `PixelFormat = MjpegPixelFormat`; `Error =
-MjpegError` (`InvalidData`, `Unsupported`, `LimitExceeded`, `Io`, plus
+MjpegError` (`InvalidData`, `Unsupported`, `LimitExceeded`,
+`Io(std::io::Error)`, plus
 the video path's `Eof` / `NeedMore`). Every public record is
 `#[non_exhaustive]` with constructors / `with_*` builders.
 
@@ -129,15 +130,18 @@ JpegDepacketizer`. The historical `decoder::decode_jpeg(bytes, pts)` /
 
 ## Supported layouts
 
-Decode — the layout `decode` / `info` report for a stream (`YuvJ*`
-when a JFIF APP0 is present, `Yuv*` otherwise; both are full-range):
+Decode — the layout `decode` / `info` report for a stream. Every YCbCr
+JPEG is full range (T.871 §7; T.872 §6.1 extends the relationship to
+streams without a JFIF segment), so the 8-bit planar layouts are always
+the `YuvJ*` family, JFIF or not; the range-agnostic `Yuv*` names are
+accepted on encode as the same layouts:
 
 | Stream | `PixelFormat` | Notes |
 |---|---|---|
 | 1 component, `P = 8` | `Gray8` | |
 | 1 component, `P = 12` DCT; lossless `P = 10 / 12` | `Gray12Le` / `Gray10Le` | 16-bit LE storage |
 | 1 component, lossless other `P` | `Gray16Le` | sample in the low `P` bits; `JpegImage::precision` says which |
-| 3 components YCbCr, `P = 8` | `Yuv444P` / `Yuv422P` / `Yuv420P` / `Yuv411P` (`YuvJ4xxP` with JFIF) | luma `(Hmax, Vmax)` over `1×1` chroma; every other §A.1.1 combination is replicated to 4:4:4 |
+| 3 components YCbCr, `P = 8` | `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv411P` | luma `(Hmax, Vmax)` over `1×1` chroma; every other §A.1.1 combination is replicated to 4:4:4 |
 | 3 components YCbCr, `P = 12` | `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` | |
 | 3 components RGB-coded (Adobe `transform = 0` or ids `R G B`), `P = 8` | `Rgb24` | packed |
 | 3 components lossless, `P = 10 / 12 / 14` | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | planes in scan order |
@@ -181,9 +185,9 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 
 | Field | Default | Meaning |
 |---|---|---|
-| `max_width` / `max_height` | 65535 | Frame-header caps (checked before allocation, on every frame of a hierarchical sequence). |
-| `max_pixels` | `1 << 28` | `width × height` cap. |
-| `max_bytes` | unlimited | Input length cap. |
+| `max_width` / `max_height` | `Some(65535)` | Frame-header caps (checked before allocation, on every frame of a hierarchical sequence); `None` = unlimited. |
+| `max_pixels` | `Some(1 << 28)` | `width × height` cap (≈ 1 GiB of decoded 4:4:4 samples); `None` = unlimited. |
+| `max_bytes` | `None` | Input length cap; `None` = unlimited. |
 | `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
 | `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
 

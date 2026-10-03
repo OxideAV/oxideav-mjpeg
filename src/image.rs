@@ -138,21 +138,27 @@ pub enum MjpegPixelFormat {
     /// per sample). Produced by the lossless decoder for
     /// three-component P = 14 scans.
     Gbrp14Le,
-    /// 8-bit planar 4:1:1 YCbCr (luma 4× chroma horizontally).
+    /// 8-bit planar 4:1:1 YCbCr (luma 4× chroma horizontally). Full
+    /// range like every YCbCr JPEG; no `YuvJ411P` label exists.
     Yuv411P,
-    /// 8-bit planar 4:2:0 YCbCr.
+    /// 8-bit planar 4:2:0 YCbCr — accepted on encode; the decoder
+    /// reports [`YuvJ420P`](Self::YuvJ420P).
     Yuv420P,
-    /// 8-bit planar 4:2:2 YCbCr.
+    /// 8-bit planar 4:2:2 YCbCr — accepted on encode; the decoder
+    /// reports [`YuvJ422P`](Self::YuvJ422P).
     Yuv422P,
-    /// 8-bit planar 4:4:4 YCbCr.
+    /// 8-bit planar 4:4:4 YCbCr — accepted on encode; the decoder
+    /// reports [`YuvJ444P`](Self::YuvJ444P).
     Yuv444P,
     /// 8-bit planar 4:2:0 YCbCr, explicitly full-range ("J" = JPEG
-    /// range). The decoder labels a frame this way when a JFIF APP0
-    /// segment is present (T.871 §7 fixes the full 0..255 range).
+    /// range). Every YCbCr JPEG is full range (T.871 §7; T.872 §6.1
+    /// extends the relationship to streams without a JFIF segment), so
+    /// the decoder labels every 8-bit 4:2:0 frame this way; the
+    /// range-agnostic `Yuv420P` is accepted on input as the same layout.
     YuvJ420P,
-    /// 8-bit planar 4:2:2 YCbCr, explicitly full-range (JFIF).
+    /// 8-bit planar 4:2:2 YCbCr, explicitly full-range (every YCbCr JPEG).
     YuvJ422P,
-    /// 8-bit planar 4:4:4 YCbCr, explicitly full-range (JFIF).
+    /// 8-bit planar 4:4:4 YCbCr, explicitly full-range (every YCbCr JPEG).
     YuvJ444P,
     /// 12-bit planar 4:2:0 YCbCr (16-bit storage per sample, little-endian).
     Yuv420P12Le,
@@ -850,15 +856,17 @@ pub struct ImageInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DecodeOptions {
-    /// Largest accepted width (default `65535`, the T.81 maximum).
-    pub max_width: u32,
-    /// Largest accepted height (default `65535`).
-    pub max_height: u32,
-    /// Largest accepted `width × height` (default `1 << 28`, 268 Mpixel).
-    pub max_pixels: u64,
-    /// Largest accepted input length in bytes (default `usize::MAX`:
-    /// unlimited).
-    pub max_bytes: usize,
+    /// Largest accepted width; `None` = unlimited (default `65535`, the
+    /// T.81 maximum).
+    pub max_width: Option<u32>,
+    /// Largest accepted height; `None` = unlimited (default `65535`).
+    pub max_height: Option<u32>,
+    /// Largest accepted `width × height`; `None` = unlimited (default
+    /// `1 << 28`, 268 Mpixel — about 1 GiB of decoded 4:4:4 samples).
+    pub max_pixels: Option<u64>,
+    /// Largest accepted input length in bytes; `None` = unlimited (the
+    /// default).
+    pub max_bytes: Option<u64>,
     /// Strict mode: reject trailing bytes after `EOI`, and treat a
     /// malformed JFIF / Adobe / ICC metadata segment as an error
     /// instead of ignoring it. Default `false`.
@@ -873,10 +881,10 @@ pub struct DecodeOptions {
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
-            max_width: 65535,
-            max_height: 65535,
-            max_pixels: 1 << 28,
-            max_bytes: usize::MAX,
+            max_width: Some(65535),
+            max_height: Some(65535),
+            max_pixels: Some(1 << 28),
+            max_bytes: None,
             strict: false,
             tables: None,
         }
@@ -889,26 +897,26 @@ impl DecodeOptions {
         Self::default()
     }
 
-    /// Cap the accepted width.
-    pub fn with_max_width(mut self, max_width: u32) -> Self {
+    /// Cap the accepted width (`None` = unlimited).
+    pub fn with_max_width(mut self, max_width: Option<u32>) -> Self {
         self.max_width = max_width;
         self
     }
 
-    /// Cap the accepted height.
-    pub fn with_max_height(mut self, max_height: u32) -> Self {
+    /// Cap the accepted height (`None` = unlimited).
+    pub fn with_max_height(mut self, max_height: Option<u32>) -> Self {
         self.max_height = max_height;
         self
     }
 
-    /// Cap the accepted pixel count.
-    pub fn with_max_pixels(mut self, max_pixels: u64) -> Self {
+    /// Cap the accepted pixel count (`None` = unlimited).
+    pub fn with_max_pixels(mut self, max_pixels: Option<u64>) -> Self {
         self.max_pixels = max_pixels;
         self
     }
 
-    /// Cap the accepted input length.
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+    /// Cap the accepted input length (`None` = unlimited).
+    pub fn with_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
         self.max_bytes = max_bytes;
         self
     }
@@ -1019,15 +1027,16 @@ mod tests {
     #[test]
     fn decode_options_defaults_and_builders() {
         let d = DecodeOptions::default();
-        assert_eq!(d.max_width, 65535);
-        assert_eq!(d.max_pixels, 1 << 28);
+        assert_eq!(d.max_width, Some(65535));
+        assert_eq!(d.max_pixels, Some(1 << 28));
+        assert_eq!(d.max_bytes, None);
         assert!(!d.strict);
         assert!(d.tables.is_none());
         let o = DecodeOptions::new()
-            .with_max_width(10)
-            .with_max_height(11)
-            .with_max_pixels(12)
-            .with_max_bytes(13)
+            .with_max_width(Some(10))
+            .with_max_height(None)
+            .with_max_pixels(Some(12))
+            .with_max_bytes(Some(13))
             .with_strict(true)
             .with_tables(vec![0xFF, 0xD8, 0xFF, 0xD9]);
         assert_eq!(
@@ -1038,7 +1047,7 @@ mod tests {
                 o.max_bytes,
                 o.strict
             ),
-            (10, 11, 12, 13, true)
+            (Some(10), None, Some(12), Some(13), true)
         );
         assert_eq!(o.tables.as_deref(), Some(&[0xFF, 0xD8, 0xFF, 0xD9][..]));
     }

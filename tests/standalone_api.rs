@@ -70,7 +70,9 @@ fn parse_pnm(bytes: &[u8]) -> (usize, u32, u32, u32, Vec<u32>) {
 }
 
 /// Fixture name → the layout `decode` must report, whether `info` must
-/// flag JFIF, and the colour description.
+/// flag JFIF, and the colour description. Every YCbCr stream is
+/// `YuvJ*` (full range per T.871 / T.872 §6.1) whether or not a JFIF
+/// segment is present — see `without-jfif-marker`.
 const EXPECTED: &[(&str, F, bool, ColorInfo)] = &[
     ("tiny-baseline-1x1", F::Gray8, true, ColorInfo::gray()),
     (
@@ -144,7 +146,7 @@ const EXPECTED: &[(&str, F, bool, ColorInfo)] = &[
     ),
     (
         "without-jfif-marker",
-        F::Yuv420P,
+        F::YuvJ420P,
         false,
         ColorInfo::jfif_ycbcr(),
     ),
@@ -235,7 +237,7 @@ fn probe_info_decode_agree_over_the_corpus() {
         );
         assert!(
             matches!(
-                oxideav_mjpeg::decode_with(&jpg, &DecodeOptions::new().with_max_pixels(1)),
+                oxideav_mjpeg::decode_with(&jpg, &DecodeOptions::new().with_max_pixels(Some(1))),
                 Err(oxideav_mjpeg::Error::LimitExceeded(_))
             ) || w * h <= 1
         );
@@ -312,7 +314,7 @@ fn in_repo_fixtures_agree() {
             "{name}: strict"
         );
         assert!(matches!(
-            oxideav_mjpeg::decode_with(jpg, &DecodeOptions::new().with_max_pixels(1)),
+            oxideav_mjpeg::decode_with(jpg, &DecodeOptions::new().with_max_pixels(Some(1))),
             Err(oxideav_mjpeg::Error::LimitExceeded(_))
         ));
         #[cfg(feature = "registry")]

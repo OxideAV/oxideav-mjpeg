@@ -25,7 +25,7 @@ pub type Result<T> = core::result::Result<T, MjpegError>;
 /// `NeedMore`. Framework-specific errors (`FormatNotFound`,
 /// `CodecNotFound`) are intentionally absent — they originate in
 /// callers that are already linking `oxideav-core`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum MjpegError {
     /// The bitstream is malformed (bad marker, truncated segment,
@@ -40,9 +40,8 @@ pub enum MjpegError {
     /// sample buffer is allocated.
     LimitExceeded(String),
     /// An I/O error from [`decode_from`](crate::decode_from) /
-    /// [`encode_to`](crate::encode_to): the `std::io::ErrorKind` plus
-    /// the error's message.
-    Io(std::io::ErrorKind, String),
+    /// [`encode_to`](crate::encode_to).
+    Io(std::io::Error),
     /// Catch-all for misuse errors that aren't bitstream-level
     /// (e.g. trait-API contract violations).
     Other(String),
@@ -77,7 +76,7 @@ impl MjpegError {
 
 impl From<std::io::Error> for MjpegError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e.kind(), e.to_string())
+        Self::Io(e)
     }
 }
 
@@ -87,7 +86,7 @@ impl fmt::Display for MjpegError {
             Self::InvalidData(s) => write!(f, "invalid data: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::LimitExceeded(s) => write!(f, "limit exceeded: {s}"),
-            Self::Io(kind, s) => write!(f, "I/O error ({kind:?}): {s}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Other(s) => write!(f, "other: {s}"),
             Self::Eof => write!(f, "end of stream"),
             Self::NeedMore => write!(f, "need more data"),
@@ -95,4 +94,11 @@ impl fmt::Display for MjpegError {
     }
 }
 
-impl std::error::Error for MjpegError {}
+impl std::error::Error for MjpegError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}

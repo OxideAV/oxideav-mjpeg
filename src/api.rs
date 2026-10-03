@@ -83,26 +83,32 @@ pub fn decode(bytes: &[u8]) -> Result<JpegImage> {
 /// tables stream. Limits are checked against the header before any
 /// sample buffer is allocated.
 pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
-    if bytes.len() > opts.max_bytes {
-        return Err(Error::limit(format!(
-            "JPEG: input of {} bytes exceeds max_bytes = {}",
-            bytes.len(),
-            opts.max_bytes
-        )));
+    if let Some(max) = opts.max_bytes {
+        if bytes.len() as u64 > max {
+            return Err(Error::limit(format!(
+                "JPEG: input of {} bytes exceeds max_bytes = {max}",
+                bytes.len()
+            )));
+        }
     }
     let hdr = scan_header(bytes, opts.strict)?;
     // Reject the layouts the decoder cannot shape before decoding.
     infer_shape(&hdr)?;
     let (w, h) = (hdr.frame.width as u32, hdr.height);
-    if w > opts.max_width || h > opts.max_height {
+    let limits = crate::decoder::DecodeLimits {
+        max_width: opts.max_width.unwrap_or(u32::MAX),
+        max_height: opts.max_height.unwrap_or(u32::MAX),
+        max_pixels: opts.max_pixels.unwrap_or(u64::MAX),
+    };
+    if w > limits.max_width || h > limits.max_height {
         return Err(Error::limit(format!(
-            "JPEG: {w}×{h} exceeds max_width × max_height = {}×{}",
+            "JPEG: {w}×{h} exceeds max_width × max_height = {:?}×{:?}",
             opts.max_width, opts.max_height
         )));
     }
-    if (w as u64) * (h as u64) > opts.max_pixels {
+    if (w as u64) * (h as u64) > limits.max_pixels {
         return Err(Error::limit(format!(
-            "JPEG: {w}×{h} = {} pixels exceeds max_pixels = {}",
+            "JPEG: {w}×{h} = {} pixels exceeds max_pixels = {:?}",
             (w as u64) * (h as u64),
             opts.max_pixels
         )));
@@ -112,16 +118,11 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
     }
     // The same limits are re-checked on every frame header inside the
     // decoder (hierarchical sequences carry several).
-    let limits = crate::decoder::DecodeLimits {
-        max_width: opts.max_width,
-        max_height: opts.max_height,
-        max_pixels: opts.max_pixels,
-    };
     let mut img = crate::decoder::decode_planes_limited(opts.tables.as_deref(), bytes, limits)?;
-    // Full-range labelling where JFIF says so (T.871 §7).
-    if hdr.jfif {
-        img.format = img.format.full_range_label();
-    }
+    // Every YCbCr JPEG is full range (T.871 §7, T.872 §6.1): label the
+    // 8-bit planar layouts `YuvJ*` whether or not a JFIF segment is
+    // present.
+    img.format = img.format.full_range_label();
     img.color = color_for(img.format);
     img.metadata = hdr.metadata();
     Ok(img)
@@ -691,11 +692,7 @@ fn infer_shape(hdr: &Header) -> Result<Shape> {
             _ => return Err(Error::unsupported(format!("{nc}-component JPEG"))),
         }
     };
-    let format = if hdr.jfif {
-        format.full_range_label()
-    } else {
-        format
-    };
+    let format = format.full_range_label();
     Ok(Shape {
         format,
         color: color_for(format),
@@ -1170,22 +1167,28 @@ mod tests {
         let jpeg = encode_rgb8(16, 8, &rgb, &EncodeOptions::new()).unwrap();
         let lim = |o: DecodeOptions| decode_with(&jpeg, &o);
         assert!(matches!(
-            lim(DecodeOptions::new().with_max_width(15)),
+            lim(DecodeOptions::new().with_max_width(Some(15))),
             Err(Error::LimitExceeded(_))
         ));
         assert!(matches!(
-            lim(DecodeOptions::new().with_max_height(7)),
+            lim(DecodeOptions::new().with_max_height(Some(7))),
             Err(Error::LimitExceeded(_))
         ));
         assert!(matches!(
-            lim(DecodeOptions::new().with_max_pixels(127)),
+            lim(DecodeOptions::new().with_max_pixels(Some(127))),
             Err(Error::LimitExceeded(_))
         ));
         assert!(matches!(
-            lim(DecodeOptions::new().with_max_bytes(jpeg.len() - 1)),
+            lim(DecodeOptions::new().with_max_bytes(Some(jpeg.len() as u64 - 1))),
             Err(Error::LimitExceeded(_))
         ));
-        assert!(lim(DecodeOptions::new().with_max_pixels(128)).is_ok());
+        assert!(lim(DecodeOptions::new().with_max_pixels(Some(128))).is_ok());
+        assert!(lim(DecodeOptions::new()
+            .with_max_width(None)
+            .with_max_height(None)
+            .with_max_pixels(None)
+            .with_max_bytes(None))
+        .is_ok());
         assert!(lim(DecodeOptions::new().with_strict(true)).is_ok());
         let mut trailing = jpeg.clone();
         trailing.extend_from_slice(&[0, 0, 0]);
@@ -1219,6 +1222,16 @@ mod tests {
         assert_eq!((back.width, back.height), (5, 5));
         let e = decode_from(&b"not a jpeg"[..]).unwrap_err();
         assert!(matches!(e, Error::InvalidData(_)));
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken pipe"))
+            }
+        }
+        let e = decode_from(Broken).unwrap_err();
+        assert!(matches!(&e, Error::Io(io) if io.to_string() == "broken pipe"));
+        assert!(std::error::Error::source(&e).is_some());
+        assert_eq!(e.to_string(), "I/O error: broken pipe");
     }
 
     #[test]

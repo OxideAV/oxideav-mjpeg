@@ -40,9 +40,9 @@ fuzz_target!(|data: &[u8]| {
     // Every decode in this target is capped at 1 Mpixel so a fuzz-shaped
     // 65535 × 65535 frame header costs a `LimitExceeded`, not seconds of
     // allocation; the cap itself is one of the surfaces under test.
-    let cap = DecodeOptions::new().with_max_pixels(1 << 20);
+    let cap = DecodeOptions::new().with_max_pixels(Some(1 << 20));
     let opts = if data.len() % 2 == 1 {
-        cap.clone().with_max_pixels(4096)
+        cap.clone().with_max_pixels(Some(4096))
     } else {
         cap.clone().with_strict(true)
     };

@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-mjpeg"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG / Motion-JPEG codec for oxideav — baseline, extended-sequential, progressive, lossless, arithmetic and hierarchical decode; a general T.81 encoder (sequential 8/12-bit, progressive, lossless, optimal tables, abbreviated streams)"
+description = "Pure-Rust JPEG / Motion-JPEG codec for oxideav — standalone still-image API (probe / info / decode / encode, RGB8 and RGBA8 in and out); baseline, extended-sequential, progressive, lossless, arithmetic and hierarchical decode; a general T.81 encoder (sequential 8/12-bit, progressive, lossless, optimal tables, abbreviated streams)"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-mjpeg"
@@ -20,10 +20,12 @@ exclude = ["/tests", "/fuzz"]
 # `oxideav-core` is gated behind the default-on `registry` feature so
 # image-library consumers can depend on `oxideav-mjpeg` with
 # `default-features = false` and avoid the framework dependency tree
-# entirely. Without `registry` the crate exposes a free-standing
-# `decoder::decode_jpeg` / `encoder::encode_jpeg_*` API plus local
+# entirely. Without `registry` the crate exposes the still-image
+# contract API at its root (`probe` / `info` / `decode*` / `encode*`
+# over `JpegImage`, `EncodeOptions`, `DecodeOptions`, …) plus the local
 # `MjpegFrame` / `MjpegPlane` / `MjpegPixelFormat` / `MjpegError`
-# types and never references `oxideav-core`.
+# types and never references `oxideav-core`. The `registry` feature
+# needs the `ColorSignal` surface of 0.1.37+.
 oxideav-core = { version = "0.1", optional = true }
 
 [features]
@@ -34,7 +36,7 @@ default = ["registry"]
 # `register_codecs` / `register_containers` entry points against
 # `oxideav-core` so the crate can plug into the `oxideav` framework
 # registry. Default-on; turn off for image-library use-cases that
-# just want the standalone `decode_jpeg` / `encode_jpeg_*` API.
+# just want the standalone `decode` / `encode` API.
 registry = ["dep:oxideav-core"]
 
 [dev-dependencies]

@@ -2,67 +2,90 @@
 
 [![CI](https://github.com/OxideAV/oxideav-mjpeg/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mjpeg/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mjpeg.svg)](https://crates.io/crates/oxideav-mjpeg) [![docs.rs](https://docs.rs/oxideav-mjpeg/badge.svg)](https://docs.rs/oxideav-mjpeg) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust **JPEG / Motion-JPEG** codec and still-image container —
-decodes baseline (SOF0), extended-sequential (SOF1 Huffman + SOF9
-arithmetic), progressive (SOF2 Huffman + SOF10 arithmetic),
-lossless (SOF3 Huffman + SOF11 arithmetic) and the **full
-hierarchical mode** (T.81 Annex J — DHP-introduced progressions):
-the spatial-lossless progression (non-differential SOF3 / SOF11 +
-differential SOF7 / SOF15 + EXP, 1 / 3 / 4 components) **and** the
-DCT progression (non-differential SOF0 / SOF1 / SOF2 Huffman or
-SOF9 / SOF10 arithmetic + differential SOF5 / SOF6 Huffman or
-SOF13 / SOF14 arithmetic, optionally SOF7 / SOF15-terminated) —
-covering every defined SOFn decode family. Single-component
-grayscale decodes at any precision `P ∈ 2..=16` plus three-component
-RGB-/YUV-class at `P = 8` (DCT also `P = 12`). Encodes baseline,
-progressive, **arithmetic-coded DCT (SOF9 sequential + SOF10
-progressive)**, lossless JPEG, and **hierarchical mode** (Annex J
-encode: the bit-exact spatial-lossless progression — SOF3/SOF11 +
-SOF7/SOF15 — plus all four DCT stage families SOF0+SOF5, SOF2+SOF6,
-SOF9+SOF13 and SOF10+SOF14, each optionally lossless-terminated per
-§K.7.2, so the encoder emits every SOFn family the hierarchical
-decoder consumes). The SOF9 arithmetic encoder produces
-grayscale, YUV (`Yuv444P`/`Yuv422P`/`Yuv420P`) and packed RGB24, with
-optional restart-interval framing, and is reachable via the trait API
-(`MjpegEncoder::set_arithmetic(true)`); a SOF10 spectral-selection
-grayscale arithmetic encoder is available as a direct function. The lossless path covers
-single-component grayscale at every precision `P ∈ 2..=16`,
-three-component interleaved RGB at every precision `P ∈ 2..=16`, and
-three-component **subsampled YUV-class** at `P = 8`
-(`Yuv444P`/`Yuv422P`/`Yuv420P`/`Yuv411P`), with every Annex H Table H.1
-predictor. YUV 4:4:4 / 4:2:2 / 4:2:0 and grayscale. **The general
-T.81 writer** (`oxideav_mjpeg::t81`, see below) is the one JPEG
-encoder sibling crates build on: sequential 8-/12-bit (SOF0 / SOF1),
-progressive (SOF2) and lossless (SOF3) frames with any §A.1.1 sampling
-layout, per-component table destinations, restart intervals, Annex
-K.2 optimal Huffman tables and the §B.5 abbreviated (`JPEGTables`)
-streams. Zero C dependencies.
+Pure-Rust **JPEG** still-image codec and **Motion-JPEG** video codec,
+zero C dependencies. One decoder behind two doors:
+
+* a **standalone still-image API** at the crate root — `probe` / `info`
+  / `decode` / `decode_rgb8` / `decode_rgba8` / `encode` / `encode_rgb8`
+  / `encode_rgba8` over `JpegImage`, usable with
+  `default-features = false` and no `oxideav-core` (the workspace
+  image-crate API contract, `IMAGE_CRATE_API.md`);
+* the **framework video codec** (`registry` feature, default-on): the
+  `mjpeg` codec + `jpeg` / `mjpeg-raw` containers in the `oxideav-core`
+  registry, each video packet one complete JPEG.
+
+Decodes every T.81 SOFn family — baseline (SOF0), extended-sequential
+(SOF1 / SOF9), progressive (SOF2 / SOF10), lossless (SOF3 / SOF11) and
+the full hierarchical mode (Annex J, DHP-introduced spatial-lossless and
+DCT progressions) — at 8 / 12-bit DCT precision and `P ∈ 2..=16`
+lossless, with any §A.1.1 sampling layout, Huffman or arithmetic entropy
+coding, JFIF / Adobe APP14 colour signalling and CMYK / YCCK. Encodes
+sequential (8 / 12-bit), progressive, lossless, arithmetic and
+hierarchical streams; **the general T.81 writer** (`oxideav_mjpeg::t81`)
+is the one JPEG encoder sibling crates build on.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Installation
+## Standalone use
+
+```toml
+[dependencies]
+oxideav-mjpeg = { version = "0.1", default-features = false }
+```
+
+```rust
+# fn main() -> Result<(), oxideav_mjpeg::Error> {
+let bytes = std::fs::read("in.jpg").map_err(oxideav_mjpeg::Error::from)?;
+if oxideav_mjpeg::probe(&bytes) {
+    let info = oxideav_mjpeg::info(&bytes)?;      // header only: dims, layout, precision, metadata presence
+    let img  = oxideav_mjpeg::decode(&bytes)?;    // JpegImage, native layout (e.g. YuvJ420P)
+    let rgba: Vec<u8> = img.to_rgba8();           // tightly packed RGBA, 4 × width bytes per row
+    let (w, h) = (img.width(), img.height());
+    assert_eq!(info.format, img.format());
+
+    let opts = oxideav_mjpeg::EncodeOptions::default().with_quality(90);
+    let out: Vec<u8> = oxideav_mjpeg::encode_rgba8(w, h, &rgba, &opts)?; // alpha dropped (JPEG has none)
+    std::fs::write("out.jpg", out).map_err(oxideav_mjpeg::Error::from)?;
+}
+# Ok(()) }
+```
+
+| Item | What it does |
+|---|---|
+| `probe(&[u8]) -> bool` | `SOI` + marker-prefix sniff; no allocation, never panics. |
+| `info(&[u8]) -> Result<ImageInfo>` | Header walk up to the first `SOS`: `width`, `height`, `format` (the layout `decode` will produce), `precision`, `components`, `progressive` / `lossless` / `arithmetic` / `hierarchical`, `color`, `has_jfif` / `has_adobe` / `has_icc` / `has_exif` / `has_xmp`; `frames = 1`, `has_alpha = false`. |
+| `decode(&[u8]) -> Result<JpegImage>` | Native layout, `color` + `metadata` filled. `decode_with(&[u8], &DecodeOptions)` adds limits, strict mode and a §B.5 tables stream. |
+| `decode_rgb8` / `decode_rgba8` | One call to `RgbImage { width, height, data }` / `RgbaImage` (3 / 4 bytes per pixel, alpha `255`). |
+| `decode_from<R: Read>(r)` | Reads to end, then `decode`. |
+| `encode(&JpegImage, &EncodeOptions) -> Result<Vec<u8>>` | Writes the image **as given** (layout → stream table below); layouts the chosen process cannot carry are `Error::Unsupported`, never converted silently. |
+| `encode_rgb8(w, h, &[u8], &opts)` | RGB → full-range YCbCr (T.871 §7), chroma box-filtered to `opts.chroma` (4:2:0 default), JFIF APP0 written. |
+| `encode_rgba8(w, h, &[u8], &opts)` | Same, **alpha dropped** — JPEG has no alpha mechanism. |
+| `encode_to<W: Write>(&img, &opts, w)` | Streaming variant of `encode`. |
+
+`JpegImage { width, height, format: PixelFormat, planes: Vec<Plane>,
+color: ColorInfo, metadata: Metadata, precision }` with `new` /
+`from_rgb8` / `from_rgba8` (alpha dropped) / `with_color` /
+`with_metadata` / `with_precision`, `as_bytes()` (packed layouts),
+`into_raw()` (planes concatenated), `to_rgb8()` / `to_rgba8()`.
+`Plane { stride, data }`; `PixelFormat = MjpegPixelFormat`; `Error =
+MjpegError` (`InvalidData`, `Unsupported`, `LimitExceeded`, `Io`, plus
+the video path's `Eof` / `NeedMore`). Every public record is
+`#[non_exhaustive]` with constructors / `with_*` builders.
+
+## Framework use
 
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
-oxideav-mjpeg = "0.1"
+oxideav-mjpeg = "0.1"          # `registry` feature on by default
 ```
-
-## Quick use
-
-A JPEG file is a single SOI..EOI byte stream, so the still-image
-container is a pass-through: open the file, pull one packet, decode.
-Motion-JPEG streams (inside AVI / MOV / AMV / etc.) reuse the same
-codec — each video packet is a full JPEG.
 
 ```rust
 use oxideav_core::{Frame, RuntimeContext};
 
 let mut ctx = RuntimeContext::new();
-oxideav_mjpeg::register(&mut ctx);
+oxideav_mjpeg::register(&mut ctx);           // codec `mjpeg` + containers `jpeg`, `mjpeg-raw`
 let codecs = &ctx.codecs;
 let containers = &ctx.containers;
 
@@ -76,11 +99,144 @@ let mut dec = codecs.make_decoder(&stream.params)?;
 let pkt = dmx.next_packet()?;
 dec.send_packet(&pkt)?;
 if let Ok(Frame::Video(vf)) = dec.receive_frame() {
-    // vf.format is Yuv444P / Yuv422P / Yuv420P / Gray8
-    // vf.planes[0..] carry the planar samples.
+    // vf.planes[..] carry the planar samples; the pixel format and
+    // dimensions travel in `stream.params` (slim VideoFrame).
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`register(&mut RuntimeContext)` (also `register_codecs` /
+`register_containers`), `make_decoder` / `make_encoder`, the
+`MjpegEncoder` knobs (`set_progressive`, `set_lossless`,
+`set_arithmetic`, `set_restart_interval`, `set_adobe_transform`,
+`set_encode_options(EncodeOptions)`) and the `MjpegEncoderOptions`
+`CodecOptions` schema. The registry `Decoder` is a thin adapter over the
+standalone `decode_with` — one implementation — and the conversions
+`From<JpegImage> for VideoFrame`, `From<MjpegPixelFormat> for
+PixelFormat` / `TryFrom<PixelFormat>` (1:1 by name) and
+`From<ColorInfo> for ColorSignal` connect the two layers. `JpegImage`
+converts to the crate-local video frame with `MjpegFrame::from(img)`
+and back with `JpegImage::from_frame(frame, w, h, format)`.
+
+**Motion-JPEG.** The same decoder serves video: AVI / MOV / AMV `MJPG`
+packets are complete JPEG interchange streams, the `mjpeg-raw`
+container splits concatenated `SOI … EOI` frames (with seek), TIFF
+`JPEGTables` abbreviated streams arrive through `CodecParameters::
+extradata`, and RFC 2435 RTP/JPEG is reassembled by `rtp::
+JpegDepacketizer`. The historical `decoder::decode_jpeg(bytes, pts)` /
+`decode_jpeg_with_tables` and `t81::JpegEncodeOptions` names remain as
+`#[deprecated]` wrappers / alias for one release.
+
+## Supported layouts
+
+Decode — the layout `decode` / `info` report for a stream (`YuvJ*`
+when a JFIF APP0 is present, `Yuv*` otherwise; both are full-range):
+
+| Stream | `PixelFormat` | Notes |
+|---|---|---|
+| 1 component, `P = 8` | `Gray8` | |
+| 1 component, `P = 12` DCT; lossless `P = 10 / 12` | `Gray12Le` / `Gray10Le` | 16-bit LE storage |
+| 1 component, lossless other `P` | `Gray16Le` | sample in the low `P` bits; `JpegImage::precision` says which |
+| 3 components YCbCr, `P = 8` | `Yuv444P` / `Yuv422P` / `Yuv420P` / `Yuv411P` (`YuvJ4xxP` with JFIF) | luma `(Hmax, Vmax)` over `1×1` chroma; every other §A.1.1 combination is replicated to 4:4:4 |
+| 3 components YCbCr, `P = 12` | `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` | |
+| 3 components RGB-coded (Adobe `transform = 0` or ids `R G B`), `P = 8` | `Rgb24` | packed |
+| 3 components lossless, `P = 10 / 12 / 14` | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | planes in scan order |
+| 3 components lossless, other `P` | `Rgb48Le` | low `P` bits |
+| 4 components (CMYK / Adobe-inverted CMYK / YCCK), `P = 8` | `Cmyk` | plain ink amounts, `(0,0,0,0)` = white; Adobe complement / YCCK undone |
+
+Encode (`encode(&JpegImage, …)`, `Auto` signalling):
+
+| Layout | Components | Signalling | Processes |
+|---|---|---|---|
+| `Gray8` | 1 | JFIF | sequential / progressive / lossless |
+| `Gray12Le` | 1 | JFIF | sequential / progressive / lossless (`P = 12`) |
+| `Gray10Le` / `Gray16Le` | 1 | JFIF | lossless only |
+| `Yuv4xxP` / `YuvJ4xxP` | 3 subsampled | JFIF | sequential / progressive / lossless |
+| `Yuv4xxP12Le` | 3 subsampled | JFIF | sequential / progressive / lossless (`P = 12`) |
+| `Rgb24` | 3 | Adobe APP14 `transform = 0`, ids `R G B` | sequential / progressive / lossless |
+| `Rgb48Le` | 3 | Adobe RGB | lossless only |
+| `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | 3 (order kept, ids 1..3) | none | lossless only |
+| `Cmyk` | 4 | none (plain CMYK) | sequential / progressive / lossless |
+
+Lossless round trips (`decode(encode(img))`) reproduce planes and
+metadata exactly for every layout above (`tests/standalone_api.rs`,
+`src/api.rs` tests).
+
+## Options
+
+`EncodeOptions` (`Default` + `with_*`; the renamed `t81::JpegEncodeOptions`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `quality` | 75 | `1..=100`, Annex K quantiser scaling (DCT processes). |
+| `process` | `Sequential` | `with_progressive(bool)`, `with_lossless(predictor)`, `with_process(JpegProcess)`. |
+| `tables` | `Typical` | Annex K.3 typical or K.2 `Optimal` (`with_optimal_tables`). |
+| `chroma` | `Yuv420` | Layout `encode_rgb8` / `encode_rgba8` convert to (`Yuv444` / `Yuv422` / `Yuv420` / `Yuv411` / `GrayscaleOnly`). `encode(&JpegImage)` uses the image's own layout. |
+| `restart_interval` | 0 | `DRI` + `RSTm` every *n* MCUs. |
+| `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
+| `metadata` | empty | ICC / Exif / XMP blobs to embed (merged with `JpegImage::metadata`, the option winning per blob). |
+| `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
+
+`DecodeOptions` (`Default` + `with_*`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_width` / `max_height` | 65535 | Frame-header caps (checked before allocation, on every frame of a hierarchical sequence). |
+| `max_pixels` | `1 << 28` | `width × height` cap. |
+| `max_bytes` | unlimited | Input length cap. |
+| `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
+| `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
+
+Breaches are `Error::LimitExceeded`.
+
+## Metadata and colour
+
+* `Metadata { icc, exif, xmp, gamma }` — `icc` is the `APP2
+  "ICC_PROFILE\0"` chunk sequence reassembled in order (dropped when
+  incomplete; an error in strict mode); `exif` the `APP1 "Exif\0\0"`
+  payload after the identifier (a TIFF structure); `xmp` the `APP1`
+  XMP packet after `"http://ns.adobe.com/xap/1.0/\0"`; `gamma` is
+  always `None`. `encode` writes them back as `APP1 Exif`, `APP1 XMP`
+  and `APP2` chunks (≤ 65519 profile bytes each) after the colour
+  signalling segment.
+* `ColorInfo { range, primaries, transfer, matrix }` — range plus H.273
+  code points. YCbCr-coded frames report `jfif_ycbcr()` = full range,
+  matrix 5 (BT.601 / sYCC, `KR = 0.299`, `KB = 0.114`), primaries 1 and
+  transfer 13 (sRGB): T.871 §7 derives its Y/CB/CR from BT.601-625 and
+  its NOTE 3 records that practice follows sYCC with negligible
+  difference, so consumers treat decoded JPEG RGB as sRGB. RGB-coded
+  frames report `srgb()` (matrix 0), grayscale `gray()`, CMYK `cmyk()`
+  (code points unspecified — T.872 §3.1 leaves ink values device
+  dependent). The range is full for every YCbCr frame, JFIF or not
+  (T.872 §6.1 extends the T.871 relationship to every three-component
+  JPEG without an Adobe RGB flag). An embedded ICC profile takes
+  precedence for colour-managed consumers.
+* `to_rgb8` / `to_rgba8` — T.871 §7 inverse equations in exact integer
+  arithmetic (`Round(x) = ⌊x + 0.5⌋`, one rounding, clamped); chroma
+  **nearest-neighbour replication** (`(x / h, y / v)` — T.871 §9 sites
+  chroma centred between luma samples but leaves the reconstruction
+  filter to the decoder; this crate applies none, so a stream always
+  yields the same bytes); grayscale replicated; CMYK by `R = Round((255
+  − C)(255 − K) / 255)` (a documented convention, not a spec formula);
+  deep samples rescaled by `Round(v · 255 / (2^P − 1))` with the
+  frame's `precision`; `Gbrp*` re-ordered to R, G, B. Grayscale, RGB
+  and 12-bit corpus fixtures reproduce the reference PPMs bit-exactly.
+
+## Limits
+
+* Dimensions `1..=65535` (T.81 `X`, `Y`; `Y = 0` resolved through
+  `DNL`). Default `DecodeOptions` accept up to 268 Mpixel; the decoder
+  additionally caps `X × Y × Nf` at 64 M samples per frame.
+* `encode` rejects (never converts): plane count / size mismatches,
+  `sampling` disagreeing with the image layout, `Gbrp*` / `Rgb48Le` /
+  `Gray10Le` / `Gray16Le` under a DCT process, APPn payloads over
+  65533 bytes, ICC profiles needing more than 255 chunks.
+* Hostile input returns `Error`, never panics — thirteen fuzz targets
+  (`fuzz/`), `standalone_api` among them, run daily.
+* Not decoded: bare differential frames (SOF5–7 / SOF13–15) outside a
+  DHP sequence; 12-bit 4-component frames (no 12-bit CMYK layout).
+
+## JPEG specifics
 
 ### General T.81 writer (`oxideav_mjpeg::t81`)
 
@@ -93,30 +249,30 @@ additive.
 Typed options, one call:
 
 ```rust
-use oxideav_mjpeg::t81::{HuffmanTables, JpegEncodeOptions, JpegProcess};
+use oxideav_mjpeg::t81::{EncodeOptions, HuffmanTables, JpegProcess};
 
 // 12-bit extended-sequential (SOF1) 4:2:0, K.2 optimal tables, a
 // restart every 4 MCUs, emitted as the §B.5 abbreviated pair.
 let (w, h) = (640u32, 480u32);
 # let y: Vec<u16> = vec![2048; (w * h) as usize];
 # let c: Vec<u16> = vec![2048; ((w / 2) * (h / 2)) as usize];
-let opts = JpegEncodeOptions {
-    precision: 12,
-    process: JpegProcess::Sequential,
-    tables: HuffmanTables::Optimal,
-    sampling: vec![(2, 2), (1, 1), (1, 1)],
-    restart_interval: 4,
-    abbreviated: true,
-    ..JpegEncodeOptions::default()
-};
+let opts = EncodeOptions::new()
+    .with_precision(12)
+    .with_process(JpegProcess::Sequential)
+    .with_tables(HuffmanTables::Optimal)
+    .with_sampling(vec![(2, 2), (1, 1), (1, 1)])
+    .with_restart_interval(4)
+    .with_abbreviated(true);
 let out = opts.encode(w, h, &[&y, &c, &c])?;
 let strip: Vec<u8> = out.data;              // SOI, SOF1, DRI, SOS…, EOI — no tables
 let jpegtables: Vec<u8> = out.tables.unwrap(); // SOI, DQT/DHT, EOI
 # Ok::<(), oxideav_mjpeg::MjpegError>(())
 ```
 
-`JpegEncodeOptions { quality, tables, process, precision,
-restart_interval, abbreviated, signalling, sampling, table_ids }`:
+`EncodeOptions { quality, tables, process, precision, restart_interval,
+abbreviated, signalling, sampling, table_ids, chroma, metadata }`
+(`#[non_exhaustive]`, `Default` + `with_*` builders; the `chroma` and
+`metadata` fields are described under *Options* above):
 
 - `process` — `Sequential` (`SOF0` when `P = 8`, destinations ≤ 1 and
   8-bit quantisers; `SOF1` otherwise, incl. `P = 12`), `Progressive`
@@ -175,9 +331,9 @@ let strip_b = encode_frame(&frame, &[comp(&b, w, h)], &tables, false)?;
 # Ok::<(), oxideav_mjpeg::MjpegError>(())
 ```
 
-The decode side of the pair is `decoder::decode_jpeg_with_tables(
-&jpegtables, &strip, pts)` — or, through the registry,
-`CodecParameters::extradata = jpegtables`.
+The decode side of the pair is `decode_with(&strip,
+&DecodeOptions::new().with_tables(jpegtables))` — or, through the
+registry, `CodecParameters::extradata = jpegtables`.
 
 Every stream the writer emits is checked against this crate's own
 decoder (bit-exact for lossless, PSNR for the DCT processes) and
@@ -227,7 +383,7 @@ general T.81 writer with the `MjpegEncoderOptions` schema (`quality`,
 `tables = typical | optimal`, `process = sequential | progressive |
 lossless`, `precision`, `restart`, `abbreviated`, `predictor`,
 `point_transform`, `sampling = "HxV,…"`; unknown keys are rejected),
-and `MjpegEncoder::set_encode_options(JpegEncodeOptions)` does the same
+and `MjpegEncoder::set_encode_options(EncodeOptions)` does the same
 from typed code — precision and sampling are taken from (and checked
 against) the pixel format, colour signalling from the pixel format and
 `set_adobe_transform`. With `abbreviated` the shared tables stream is
@@ -935,11 +1091,11 @@ Decoder:
 - **Non-interleaved scans** (one `SOS` per component, sequential or
   progressive) cover the component's own `ceil(xi / 8) × ceil(yi / 8)`
   block extent (§A.2.2 / §A.2.4), not the MCU-padded grid.
-- **§B.5 abbreviated streams**: `decoder::decode_jpeg_with_tables(
-  tables, data, pts)` preloads a tables-only stream (DQT / DHT / DAC /
-  DRI — TIFF `JPEGTables`) and decodes a table-less image stream against
-  it; the registry decoder takes the tables stream from
-  `CodecParameters::extradata`.
+- **§B.5 abbreviated streams**: `decode_with(data,
+  &DecodeOptions::new().with_tables(tables))` preloads a tables-only
+  stream (DQT / DHT / DAC / DRI — TIFF `JPEGTables`) and decodes a
+  table-less image stream against it; the registry decoder takes the
+  tables stream from `CodecParameters::extradata`.
 - Grayscale (single-component → `Gray8`).
 - **Baseline RGB** (3-component SOF0 at `H = V = 1`, signalled by either
   an Adobe APP14 `transform = 0` segment or component IDs `'R'/'G'/'B'`
@@ -1161,9 +1317,19 @@ Not supported (decoder returns `Error::Unsupported`):
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs twelve cargo-fuzz harnesses against the
+The `fuzz/` sub-crate runs thirteen cargo-fuzz harnesses against the
 public encoder + decoder + RTP surface, executed daily by the
-org-wide reusable fuzz workflow (60-minute budget, ~5 min/target):
+org-wide reusable fuzz workflow (60-minute budget, ~4.5 min/target):
+
+- `standalone_api` — the still-image contract surface: arbitrary bytes
+  into `probe` / `info` / `decode_with` (1 Mpixel cap; 4096-pixel cap
+  or strict mode alternating) / `decode_rgba8`, asserting `info` and
+  `decode` agree on layout, geometry, precision and colour, then back
+  out through `encode` (lossless, bit-exact round trip) and
+  `encode_rgb8`. Found, on its first runs, two header-scan / decoder
+  disagreements (truncated-length skipping, differential-SOF
+  rejection order) — both fixed so `info` mirrors the decoder exactly.
+  Last local 300 s run: 782 k executions, cov 3317, no findings.
 
 - `decode` — feeds arbitrary bytes (≤ 64 KiB) through the public
   `Decoder` trait (`make_decoder` → `send_packet` → `receive_frame`).
@@ -1237,7 +1403,8 @@ org-wide reusable fuzz workflow (60-minute budget, ~5 min/target):
   sequential / progressive / lossless, 8- and 12-bit (lossless
   2..=16), every §A.1.1 sampling layout, typical vs K.2 optimal
   tables, restart intervals, §B.5 abbreviated pairs (decoded through
-  `decode_jpeg_with_tables`) and JFIF / RGB / CMYK signalling.
+  `decode_with` + `DecodeOptions::with_tables`) and JFIF / RGB / CMYK
+  signalling.
   Bit-exact oracle on the lossless process (incl. the Adobe-inverted
   CMYK + point-transform composition), decode-success + geometry
   oracle on the DCT processes. First 300 s foreground run: 2.08 M

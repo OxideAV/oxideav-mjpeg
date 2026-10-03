@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(api)* the workspace image-crate contract at the crate root, usable with `default-features = false`: `probe`, `info -> ImageInfo`, `decode -> JpegImage`, `decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`, `decode_rgba8 -> RgbaImage`, `decode_from<R: Read>`, `encode(&JpegImage, &EncodeOptions)`, `encode_rgb8` (full-range YCbCr 4:2:0 by default, `with_chroma`), `encode_rgba8` (alpha dropped — JPEG has none), `encode_to<W: Write>`
+- *(api)* `JpegImage { width, height, format, planes, color, metadata, precision }` with `new` / `from_rgb8` / `from_rgba8` / `with_*` / `as_bytes` / `into_raw` / `to_rgb8` / `to_rgba8` / `from_frame`; `Plane`, `RgbImage`, `RgbaImage`, `ColorInfo` + `ColorRange` (H.273 code points), `Metadata { icc, exif, xmp, gamma }`, `ImageInfo`, `DecodeOptions` (`max_width` / `max_height` / `max_pixels` / `max_bytes` / `strict` / `tables`), `PixelFormat` alias, `Error` alias; all records `#[non_exhaustive]`
+- *(api)* `to_rgb8` / `to_rgba8` kernels: T.871 §7 inverse equations in exact integer arithmetic, nearest-neighbour chroma replication, CMYK ink inversion, deep samples rescaled by the frame precision, `Gbrp*` re-ordered — grayscale / RGB / 12-bit corpus fixtures reproduce the reference output bit-exactly
+- *(api)* `MjpegPixelFormat::{YuvJ420P, YuvJ422P, YuvJ444P}` — the decoder labels 8-bit planar YCbCr frames with a JFIF APP0 as full-range `YuvJ*`; helpers `plane_count` / `bytes_per_sample` / `nominal_bits` / `chroma_divisors` / `plane_dimensions` / `tight_stride` / `name` / `Display`
+- *(api)* `MjpegError::{LimitExceeded, Io}` (+ `From<std::io::Error>`)
+- *(encode)* `EncodeOptions::{chroma, metadata}` + `with_*` builders; APP1 Exif / APP1 XMP / APP2 ICC chunk writer
+- *(registry)* `From<JpegImage> for VideoFrame`, `TryFrom<PixelFormat> for MjpegPixelFormat`, `From<ColorInfo> for ColorSignal` and back, `From<VideoPlane> for MjpegPlane`; the encoder accepts `YuvJ4xxP` input (encoded as its range-agnostic twin, label kept on the output parameters)
+- *(decode)* `DecodeOptions` limits are enforced on every frame header inside the decoder (hierarchical sequences included); the completed hierarchical image must match the DHP geometry (B.3.2)
+- *(fuzz)* `standalone_api` target (probe / info / decode_with / decode_rgba8 / encode round trip, asserting `info == decode`)
+- *(ci)* `ci-standalone` job: build + clippy + tests with `--no-default-features`
+- *(tests)* `tests/standalone_api.rs` over the docs fixture corpus and in-repo fixtures (info == decode shape, metadata, colour, one-call paths, registry planes identical); lossless round trips for every encodable layout with embedded metadata
+
+### Changed
+
+- *(decode)* the decoder's return type no longer depends on the `registry` feature: the core produces the crate-local `JpegImage` (geometry and format travel with the planes) and the framework adapter converts with `From<JpegImage> for VideoFrame`; the registry `Decoder` calls the standalone `decode_with` — one implementation
+- *(encode)* `t81::JpegEncodeOptions` renamed `EncodeOptions` (`#[non_exhaustive]`; construct with `EncodeOptions::new()` / `default()` + `with_*`, fields stay readable)
+- *(image)* `MjpegPlane` is now an alias of `Plane` (same fields; `#[non_exhaustive]`, `Plane::new`)
+- *(error)* `MjpegError` is `#[non_exhaustive]`
+- *(bench)* the Criterion harness builds without the `registry` feature (empty `main`)
+- *(deps)* the `registry` feature needs `oxideav-core` ≥ 0.1.37 (`ColorSignal`); `fuzz/Cargo.lock` refreshed
+
+### Deprecated
+
+- `decoder::decode_jpeg(bytes, pts)` and `decoder::decode_jpeg_with_tables(tables, bytes, pts)` — thin wrappers returning what they returned before (a framework `VideoFrame` with `registry`, an `MjpegFrame` without); use `decode` / `decode_with(bytes, &DecodeOptions::new().with_tables(tables))` and `VideoFrame::from(image)`
+- `JpegEncodeOptions` (root and `t81`) — alias of `EncodeOptions`
+
+### Fixed
+
+- *(encode)* hierarchical DCT Huffman pyramids: differential-stage quantised coefficients are clamped to the Annex K typical-table range (DC category ≤ 11, AC ≤ 10) before coding and before the mirrored reconstruction; a high-quality pyramid of noisy samples produced an AC category-11 coefficient the K.5 table cannot code and the decoder lost the block ("JPEG AC: run out of block") — found by the `hierarchical_roundtrip` fuzz target, regression test added, lossless-final stage still bit-exact
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.8...v0.1.9) - 2026-09-11
 
 ### Added

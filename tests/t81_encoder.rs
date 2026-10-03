@@ -6,9 +6,9 @@
 use std::io::Write;
 use std::process::Command;
 
-use oxideav_mjpeg::decoder::decode_jpeg;
+use oxideav_mjpeg::decode;
 use oxideav_mjpeg::t81::{
-    ColorSignalling, HuffmanTables, JpegEncodeOptions, JpegProcess, JpegTableSet,
+    ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet,
 };
 use oxideav_mjpeg::{inspect_jpeg, SofKind};
 
@@ -102,7 +102,7 @@ fn read_plane(stride: usize, data: &[u8], w: usize, h: usize, bps: usize) -> Vec
 /// (possibly subsampled chroma), packed `Rgb24` / `Rgb48Le` / `Cmyk`,
 /// planar `Gbrp*Le` (G, B, R order).
 fn decoded_components(jpeg: &[u8], nf: usize, p: u8, sampling: &[(u8, u8)]) -> Vec<Vec<u32>> {
-    let f = decode_jpeg(jpeg, None).expect("our decoder rejects our stream");
+    let f = decode(jpeg).expect("our decoder rejects our stream");
     let (w, h) = (W as usize, H as usize);
     // Bytes per sample from the geometry: plane 0 of a planar frame is
     // always full-width; a packed frame is `nf` samples per pixel.
@@ -272,14 +272,15 @@ fn dct_processes_every_layout_decode_in_our_decoder() {
                     for ri in [0u16, 3] {
                         let src = planes(nf, precision, sampling);
                         let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
-                        let opts = JpegEncodeOptions {
-                            quality: 92,
-                            tables,
-                            process,
-                            precision,
-                            restart_interval: ri,
-                            sampling: sampling.to_vec(),
-                            ..Default::default()
+                        let opts = {
+                            let mut o = EncodeOptions::default();
+                            o.quality = 92;
+                            o.tables = tables;
+                            o.process = process;
+                            o.precision = precision;
+                            o.restart_interval = ri;
+                            o.sampling = sampling.to_vec();
+                            o
                         };
                         let tag = format!(
                             "{process:?} P{precision} nf{nf} {sampling:?} {tables:?} ri{ri}"
@@ -336,16 +337,18 @@ fn optimal_tables_are_no_larger_than_typical() {
     for process in [JpegProcess::Sequential, JpegProcess::Progressive] {
         let src = planes(3, 8, &[(2, 2), (1, 1), (1, 1)]);
         let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
-        let base = JpegEncodeOptions {
-            quality: 85,
-            process,
-            sampling: vec![(2, 2), (1, 1), (1, 1)],
-            ..Default::default()
+        let base = {
+            let mut o = EncodeOptions::default();
+            o.quality = 85;
+            o.process = process;
+            o.sampling = vec![(2, 2), (1, 1), (1, 1)];
+            o
         };
         let typical = base.encode(W, H, &refs).unwrap();
-        let optimal = JpegEncodeOptions {
-            tables: HuffmanTables::Optimal,
-            ..base
+        let optimal = {
+            let mut o = base.clone();
+            o.tables = HuffmanTables::Optimal;
+            o
         }
         .encode(W, H, &refs)
         .unwrap();
@@ -392,20 +395,21 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
                         W as usize
                     };
                     for ri in [0u16, mcur as u16, 3 * mcur as u16] {
-                        let opts = JpegEncodeOptions {
-                            process: JpegProcess::Lossless {
+                        let opts = {
+                            let mut o = EncodeOptions::default();
+                            o.process = JpegProcess::Lossless {
                                 predictor,
                                 point_transform: pt,
-                            },
-                            precision,
-                            restart_interval: ri,
-                            sampling: sampling.to_vec(),
-                            signalling: if nf == 3 && sampling.is_empty() {
+                            };
+                            o.precision = precision;
+                            o.restart_interval = ri;
+                            o.sampling = sampling.to_vec();
+                            o.signalling = if nf == 3 && sampling.is_empty() {
                                 ColorSignalling::Rgb
                             } else {
                                 ColorSignalling::Auto
-                            },
-                            ..Default::default()
+                            };
+                            o
                         };
                         let tag = format!("lossless P{precision} nf{nf} {sampling:?} pred{predictor} pt{pt} ri{ri}");
                         let out = opts
@@ -459,18 +463,20 @@ fn abbreviated_pair_splices_into_the_interchange_stream() {
             } else {
                 (W as u16).div_ceil(2)
             };
-            let base = JpegEncodeOptions {
-                process,
-                precision,
-                restart_interval: ri,
-                tables: HuffmanTables::Optimal,
-                sampling: vec![(2, 2), (1, 1), (1, 1)],
-                ..Default::default()
+            let base = {
+                let mut o = EncodeOptions::default();
+                o.process = process;
+                o.precision = precision;
+                o.restart_interval = ri;
+                o.tables = HuffmanTables::Optimal;
+                o.sampling = vec![(2, 2), (1, 1), (1, 1)];
+                o
             };
             let full = base.encode(W, H, &refs).unwrap();
-            let abbr = JpegEncodeOptions {
-                abbreviated: true,
-                ..base
+            let abbr = {
+                let mut o = base.clone();
+                o.abbreviated = true;
+                o
             }
             .encode(W, H, &refs)
             .unwrap();
@@ -519,14 +525,15 @@ fn validators_decode_the_general_writer_output() {
             ] {
                 let src = planes(nf, precision, &sampling);
                 let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
-                let opts = JpegEncodeOptions {
-                    quality: 92,
-                    process,
-                    precision,
-                    restart_interval: 2,
-                    tables: HuffmanTables::Optimal,
-                    sampling: sampling.clone(),
-                    ..Default::default()
+                let opts = {
+                    let mut o = EncodeOptions::default();
+                    o.quality = 92;
+                    o.process = process;
+                    o.precision = precision;
+                    o.restart_interval = 2;
+                    o.tables = HuffmanTables::Optimal;
+                    o.sampling = sampling.clone();
+                    o
                 };
                 let out = opts.encode(W, H, &refs).unwrap();
                 let tag = format!("dct_{process:?}_P{precision}_nf{nf}_{}", sampling.len());
@@ -543,14 +550,15 @@ fn validators_decode_the_general_writer_output() {
     for precision in [8u8, 12, 16] {
         for predictor in [1u8, 4, 7] {
             let src = planes(1, precision, &[]);
-            let opts = JpegEncodeOptions {
-                process: JpegProcess::Lossless {
+            let opts = {
+                let mut o = EncodeOptions::default();
+                o.process = JpegProcess::Lossless {
                     predictor,
                     point_transform: 0,
-                },
-                precision,
-                restart_interval: 2 * W as u16,
-                ..Default::default()
+                };
+                o.precision = precision;
+                o.restart_interval = 2 * W as u16;
+                o
             };
             let out = opts.encode(W, H, &[&src[0]]).unwrap();
             let tag = format!("ll_P{precision}_p{predictor}");
@@ -561,14 +569,15 @@ fn validators_decode_the_general_writer_output() {
     }
     let src = planes(3, 8, &[]);
     let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
-    let out = JpegEncodeOptions {
-        process: JpegProcess::Lossless {
+    let out = {
+        let mut o = EncodeOptions::default();
+        o.process = JpegProcess::Lossless {
             predictor: 5,
             point_transform: 0,
-        },
-        signalling: ColorSignalling::Rgb,
-        restart_interval: W as u16,
-        ..Default::default()
+        };
+        o.signalling = ColorSignalling::Rgb;
+        o.restart_interval = W as u16;
+        o
     }
     .encode(W, H, &refs)
     .unwrap();

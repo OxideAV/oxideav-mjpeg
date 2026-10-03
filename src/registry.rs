@@ -29,7 +29,6 @@ use oxideav_core::{
 };
 
 use crate::container;
-use crate::decoder::{decode_jpeg, decode_jpeg_with_tables};
 use crate::encoder::{
     encode_arith_jpeg_grayscale, encode_arith_jpeg_rgb24, encode_arith_jpeg_yuv, encode_jpeg_cmyk,
     encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts, encode_jpeg_progressive,
@@ -37,9 +36,9 @@ use crate::encoder::{
     encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
-use crate::image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
+use crate::image::{ColorInfo, ColorRange, JpegImage, MjpegFrame, MjpegPixelFormat, MjpegPlane};
 use crate::mjpeg_container;
-use crate::t81::{ColorSignalling, HuffmanTables, JpegEncodeOptions, JpegProcess, JpegTableSet};
+use crate::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet};
 use crate::CODEC_ID_STR;
 
 // ---- Error / pixel-format / frame conversions --------------------------
@@ -49,6 +48,8 @@ impl From<MjpegError> for Error {
         match e {
             MjpegError::InvalidData(s) => Error::InvalidData(s),
             MjpegError::Unsupported(s) => Error::Unsupported(s),
+            MjpegError::LimitExceeded(s) => Error::InvalidData(format!("limit exceeded: {s}")),
+            MjpegError::Io(kind, s) => Error::Other(format!("I/O ({kind:?}): {s}")),
             MjpegError::Other(s) => Error::Other(s),
             MjpegError::Eof => Error::Eof,
             MjpegError::NeedMore => Error::NeedMore,
@@ -73,10 +74,26 @@ impl From<MjpegPixelFormat> for PixelFormat {
             MjpegPixelFormat::Yuv420P => PixelFormat::Yuv420P,
             MjpegPixelFormat::Yuv422P => PixelFormat::Yuv422P,
             MjpegPixelFormat::Yuv444P => PixelFormat::Yuv444P,
+            MjpegPixelFormat::YuvJ420P => PixelFormat::YuvJ420P,
+            MjpegPixelFormat::YuvJ422P => PixelFormat::YuvJ422P,
+            MjpegPixelFormat::YuvJ444P => PixelFormat::YuvJ444P,
             MjpegPixelFormat::Yuv420P12Le => PixelFormat::Yuv420P12Le,
             MjpegPixelFormat::Yuv422P12Le => PixelFormat::Yuv422P12Le,
             MjpegPixelFormat::Yuv444P12Le => PixelFormat::Yuv444P12Le,
         }
+    }
+}
+
+impl TryFrom<PixelFormat> for MjpegPixelFormat {
+    type Error = Error;
+
+    /// Inverse of [`From<MjpegPixelFormat> for PixelFormat`]:
+    /// `Error::Unsupported` for any framework pixel format the JPEG
+    /// codec neither produces nor accepts.
+    fn try_from(p: PixelFormat) -> Result<Self> {
+        pix_to_local(p).ok_or_else(|| {
+            Error::unsupported(format!("JPEG: pixel format {p:?} is not a JPEG layout"))
+        })
     }
 }
 
@@ -100,6 +117,9 @@ fn pix_to_local(p: PixelFormat) -> Option<MjpegPixelFormat> {
         PixelFormat::Yuv420P => MjpegPixelFormat::Yuv420P,
         PixelFormat::Yuv422P => MjpegPixelFormat::Yuv422P,
         PixelFormat::Yuv444P => MjpegPixelFormat::Yuv444P,
+        PixelFormat::YuvJ420P => MjpegPixelFormat::YuvJ420P,
+        PixelFormat::YuvJ422P => MjpegPixelFormat::YuvJ422P,
+        PixelFormat::YuvJ444P => MjpegPixelFormat::YuvJ444P,
         PixelFormat::Yuv420P12Le => MjpegPixelFormat::Yuv420P12Le,
         PixelFormat::Yuv422P12Le => MjpegPixelFormat::Yuv422P12Le,
         PixelFormat::Yuv444P12Le => MjpegPixelFormat::Yuv444P12Le,
@@ -129,6 +149,58 @@ impl From<MjpegPlane> for VideoPlane {
             stride: p.stride,
             data: p.data,
         }
+    }
+}
+
+impl From<VideoPlane> for MjpegPlane {
+    fn from(p: VideoPlane) -> Self {
+        MjpegPlane::new(p.stride, p.data)
+    }
+}
+
+impl From<JpegImage> for VideoFrame {
+    /// The planes, verbatim, `pts = None`. Geometry, pixel format and
+    /// colour travel in the stream's `CodecParameters` on the framework
+    /// side (`PixelFormat::from(image.format)`,
+    /// `ColorSignal::from(image.color)`); no side-channel record is
+    /// attached so the Motion-JPEG frame shape is unchanged.
+    fn from(img: JpegImage) -> Self {
+        VideoFrame {
+            pts: None,
+            planes: img.planes.into_iter().map(VideoPlane::from).collect(),
+        }
+    }
+}
+
+impl From<ColorInfo> for oxideav_core::ColorSignal {
+    fn from(c: ColorInfo) -> Self {
+        let range = match c.range {
+            ColorRange::Full => oxideav_core::ColorRange::Full,
+            ColorRange::Limited => oxideav_core::ColorRange::Limited,
+            _ => oxideav_core::ColorRange::Unspecified,
+        };
+        oxideav_core::ColorSignal::new(
+            range,
+            oxideav_core::ColorPrimaries::new(c.primaries),
+            oxideav_core::TransferCharacteristics::new(c.transfer),
+            oxideav_core::MatrixCoefficients::new(c.matrix),
+        )
+    }
+}
+
+impl From<oxideav_core::ColorSignal> for ColorInfo {
+    fn from(c: oxideav_core::ColorSignal) -> Self {
+        let range = match c.range {
+            oxideav_core::ColorRange::Full => ColorRange::Full,
+            oxideav_core::ColorRange::Limited => ColorRange::Limited,
+            _ => ColorRange::Unspecified,
+        };
+        ColorInfo::new(
+            range,
+            c.primaries.code_point(),
+            c.transfer.code_point(),
+            c.matrix.code_point(),
+        )
     }
 }
 
@@ -234,14 +306,17 @@ impl Decoder for MjpegDecoder {
                 Err(Error::NeedMore)
             };
         };
-        // With the `registry` feature on, `decode_jpeg` already
-        // returns `oxideav_core::VideoFrame` (see the conditional
-        // alias in `decoder.rs`), so the trait surface needs nothing
-        // more than wrapping it in `Frame::Video`.
-        let vf = match &self.tables {
-            Some(t) => decode_jpeg_with_tables(t, &pkt.data, pkt.pts)?,
-            None => decode_jpeg(&pkt.data, pkt.pts)?,
-        };
+        // One implementation: the registry decoder is a thin adapter
+        // over the standalone `decode_with` (the §B.5 tables stream
+        // travels in `DecodeOptions::tables`); the `JpegImage` becomes
+        // a framework frame by `From`, `pts` passed through.
+        let mut opts = crate::DecodeOptions::new();
+        if let Some(t) = &self.tables {
+            opts = opts.with_tables(t.clone());
+        }
+        let img = crate::decode_with(&pkt.data, &opts)?;
+        let mut vf = VideoFrame::from(img);
+        vf.pts = pkt.pts;
         Ok(Frame::Video(vf))
     }
 
@@ -258,7 +333,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 /// The `CodecOptions` schema of the registry encoder — the string-bag
-/// twin of [`JpegEncodeOptions`]. Any key present in
+/// twin of [`EncodeOptions`]. Any key present in
 /// `CodecParameters::options` routes the encoder through the general
 /// T.81 writer (`oxideav_mjpeg::t81`); an empty bag keeps the historical
 /// per-format paths.
@@ -403,7 +478,7 @@ impl MjpegEncoderOptions {
     /// The typed options these string options denote. `precision = 0`
     /// / empty `sampling` are resolved against the pixel format by the
     /// encoder.
-    pub fn to_encode_options(&self) -> Result<JpegEncodeOptions> {
+    pub fn to_encode_options(&self) -> Result<EncodeOptions> {
         if !(1..=100).contains(&self.quality) {
             return Err(Error::invalid("MJPEG encoder: quality must be in 1..=100"));
         }
@@ -436,7 +511,7 @@ impl MjpegEncoderOptions {
             }
             other => return Err(Error::invalid(format!("MJPEG encoder: process '{other}'"))),
         };
-        Ok(JpegEncodeOptions {
+        Ok(EncodeOptions {
             quality: self.quality as u8,
             tables,
             process,
@@ -445,7 +520,7 @@ impl MjpegEncoderOptions {
             abbreviated: self.abbreviated,
             signalling: ColorSignalling::Auto,
             sampling: parse_sampling(&self.sampling)?,
-            table_ids: Vec::new(),
+            ..EncodeOptions::default()
         })
     }
 }
@@ -462,9 +537,9 @@ fn pix_layout(pix: MjpegPixelFormat) -> (u8, Vec<(u8, u8)>, usize, usize) {
         P::Gray16Le => (16, vec![], 1, 2),
         P::Rgb24 => (8, vec![], 3, 1),
         P::Cmyk => (8, vec![], 4, 1),
-        P::Yuv444P => (8, vec![], 3, 1),
-        P::Yuv422P => (8, vec![(2, 1), (1, 1), (1, 1)], 3, 1),
-        P::Yuv420P => (8, vec![(2, 2), (1, 1), (1, 1)], 3, 1),
+        P::Yuv444P | P::YuvJ444P => (8, vec![], 3, 1),
+        P::Yuv422P | P::YuvJ422P => (8, vec![(2, 1), (1, 1), (1, 1)], 3, 1),
+        P::Yuv420P | P::YuvJ420P => (8, vec![(2, 2), (1, 1), (1, 1)], 3, 1),
         P::Yuv411P => (8, vec![(4, 1), (1, 1), (1, 1)], 3, 1),
         P::Yuv444P12Le => (12, vec![], 3, 2),
         P::Yuv422P12Le => (12, vec![(2, 1), (1, 1), (1, 1)], 3, 2),
@@ -514,7 +589,7 @@ pub struct MjpegEncoder {
     cmyk_adobe_transform: Option<u8>,
     /// When set, every frame goes through the general T.81 writer with
     /// these options (see [`MjpegEncoder::set_encode_options`]).
-    general: Option<JpegEncodeOptions>,
+    general: Option<EncodeOptions>,
     /// The table set shared by every abbreviated frame (its §B.5 stream
     /// is `output_params().extradata`).
     shared_tables: Option<JpegTableSet>,
@@ -536,11 +611,15 @@ impl MjpegEncoder {
             .height
             .ok_or_else(|| Error::invalid("MJPEG encoder: missing height"))?;
         let pix_core = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        let pix = pix_to_local(pix_core).ok_or_else(|| {
+        let pix_label = pix_to_local(pix_core).ok_or_else(|| {
             Error::unsupported(format!(
                 "MJPEG encoder: pixel format {pix_core:?} not supported"
             ))
         })?;
+        // JPEG YCbCr is full-range by definition (T.871 §7): a `YuvJ*`
+        // label encodes exactly like its range-agnostic twin. The
+        // caller's label is kept on the output parameters.
+        let pix = pix_label.range_agnostic_label();
         match pix {
             MjpegPixelFormat::Yuv420P | MjpegPixelFormat::Yuv422P | MjpegPixelFormat::Yuv444P => {}
             // Grayscale takes the lossless (SOF3) path when requested via
@@ -581,7 +660,7 @@ impl MjpegEncoder {
         output_params.codec_id = CodecId::new(CODEC_ID_STR);
         output_params.width = Some(width);
         output_params.height = Some(height);
-        output_params.pixel_format = Some(pix.into());
+        output_params.pixel_format = Some(pix_label.into());
 
         let mut enc = Self {
             output_params,
@@ -626,7 +705,7 @@ impl MjpegEncoder {
     /// published in `output_params().extradata` — immediately for
     /// typical tables, after the first frame for optimal ones (the
     /// statistics of the first frame define the shared set).
-    pub fn set_encode_options(&mut self, mut opts: JpegEncodeOptions) -> Result<()> {
+    pub fn set_encode_options(&mut self, mut opts: EncodeOptions) -> Result<()> {
         let (precision, sampling, nf, _) = pix_layout(self.pix);
         if opts.precision == 0 {
             opts.precision = precision;
@@ -676,7 +755,7 @@ impl MjpegEncoder {
     }
 
     /// The general-writer options in force, if any.
-    pub fn encode_options(&self) -> Option<&JpegEncodeOptions> {
+    pub fn encode_options(&self) -> Option<&EncodeOptions> {
         self.general.as_ref()
     }
 
@@ -742,7 +821,7 @@ impl MjpegEncoder {
     }
 
     /// Encode one frame through the general writer.
-    fn encode_general(&mut self, opts: &JpegEncodeOptions, v: &VideoFrame) -> Result<Vec<u8>> {
+    fn encode_general(&mut self, opts: &EncodeOptions, v: &VideoFrame) -> Result<Vec<u8>> {
         let planes = self.planes_u16(v)?;
         let refs: Vec<&[u16]> = planes.iter().map(|p| p.as_slice()).collect();
         if opts.abbreviated {

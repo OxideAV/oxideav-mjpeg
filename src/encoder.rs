@@ -8329,7 +8329,7 @@ mod tests {
         }
         let jpeg =
             encode_jpeg_grayscale(w as u32, h as u32, &samples, w, 100).expect("encode grayscale");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode");
         assert_eq!(frame.planes.len(), 1, "Gray8 frame has one plane");
         let recovered = &frame.planes[0].data;
         assert!(recovered.len() >= w * h, "recovered plane too short");
@@ -8367,7 +8367,7 @@ mod tests {
         }
         let jpeg = encode_jpeg_grayscale(w as u32, h as u32, &samples, w, DEFAULT_QUALITY)
             .expect("encode grayscale");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode");
         let recovered = &frame.planes[0].data;
         let stride = frame.planes[0].stride;
         let mut sse: f64 = 0.0;
@@ -8434,7 +8434,7 @@ mod tests {
         assert!(found_dri, "DRI segment must be present when interval > 0");
         assert!(found_rst, "at least one RSTn marker must be present");
         // Decode succeeds and shape matches.
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode DRI grayscale");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode DRI grayscale");
         assert_eq!(frame.planes.len(), 1);
     }
 
@@ -8463,7 +8463,7 @@ mod tests {
             "APP1 body not embedded"
         );
         // And the decoder still consumes the output cleanly.
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode with meta");
         assert_eq!(frame.planes.len(), 1);
     }
 
@@ -8596,7 +8596,7 @@ mod tests {
         }
         let jpeg = encode_jpeg_progressive_grayscale(w as u32, h as u32, &samples, w, 100)
             .expect("encode progressive grayscale");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode");
         assert_eq!(frame.planes.len(), 1, "Gray8 frame has one plane");
         let recovered = &frame.planes[0].data;
         let stride = frame.planes[0].stride;
@@ -8631,7 +8631,7 @@ mod tests {
         let jpeg =
             encode_jpeg_progressive_grayscale(w as u32, h as u32, &samples, w, DEFAULT_QUALITY)
                 .expect("encode progressive grayscale");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode");
         let recovered = &frame.planes[0].data;
         let stride = frame.planes[0].stride;
         let mut sse: f64 = 0.0;
@@ -8693,7 +8693,7 @@ mod tests {
             jpeg.windows(app1_body.len()).any(|win| win == app1_body),
             "APP1 body not embedded"
         );
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode with meta");
         assert_eq!(frame.planes.len(), 1);
     }
 
@@ -8809,7 +8809,7 @@ mod tests {
         }
         let jpeg =
             encode_jpeg_rgb24(w as u32, h as u32, &samples, w * 3, 100).expect("encode rgb24");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode");
         assert_eq!(frame.planes.len(), 1, "Rgb24 frame has one plane");
         let recovered = &frame.planes[0].data;
         let stride = frame.planes[0].stride;
@@ -8850,7 +8850,7 @@ mod tests {
         }
         let jpeg = encode_jpeg_rgb24(w as u32, h as u32, &samples, w * 3, DEFAULT_QUALITY)
             .expect("encode rgb24");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode");
         let recovered = &frame.planes[0].data;
         let stride = frame.planes[0].stride;
         let mut sse: f64 = 0.0;
@@ -8920,7 +8920,7 @@ mod tests {
         }
         assert!(found_dri, "DRI segment must be present when interval > 0");
         assert!(found_rst, "at least one RSTn marker must be present");
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode DRI rgb24");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode DRI rgb24");
         assert_eq!(frame.planes.len(), 1);
         assert_eq!(frame.planes[0].stride, (w * 3) as usize);
     }
@@ -8949,7 +8949,7 @@ mod tests {
         );
         // No Adobe APP14 was emitted on this path; the decoder still
         // recognises RGB via component IDs.
-        let frame = crate::decoder::decode_jpeg(&jpeg, None).expect("decode with meta");
+        let frame = crate::decoder::decode_planes(&jpeg).expect("decode with meta");
         assert_eq!(frame.planes.len(), 1);
         assert_eq!(frame.planes[0].stride, (w * 3) as usize);
     }

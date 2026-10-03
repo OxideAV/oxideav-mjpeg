@@ -18,7 +18,7 @@
 //! `0; 1; 2;`), and `*_y.pgm` is `djpeg -nosmooth -grayscale -pnm` (the
 //! luma plane, the ±1 IDCT-rounding oracle).
 
-use oxideav_mjpeg::decoder::decode_jpeg;
+use oxideav_mjpeg::decode;
 
 const W: usize = 37;
 const H: usize = 29;
@@ -50,7 +50,7 @@ fn pgm(data: &[u8]) -> Vec<u8> {
 #[test]
 fn non_interleaved_scans_of_odd_extent_frames_match_the_validator() {
     for &(name, jpeg, y) in FIXTURES {
-        let f = decode_jpeg(jpeg, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let f = decode(jpeg).unwrap_or_else(|e| panic!("{name}: {e}"));
         let want = pgm(y);
         let pl = &f.planes[0];
         let mut maxd = 0i32;

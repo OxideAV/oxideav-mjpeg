@@ -20,7 +20,7 @@
 //! 4:4:4 upsampled), `2x2,2x1,1x2` (mixed chroma factors) and
 //! `1x1,2x2,2x2` (chroma oversampled relative to luma — legal, exotic).
 
-use oxideav_mjpeg::decoder::decode_jpeg;
+use oxideav_mjpeg::decode;
 use oxideav_mjpeg::encoder::{encode_lossless_arith_jpeg_yuv, encode_lossless_jpeg_yuv};
 
 const W: usize = 25;
@@ -142,7 +142,7 @@ fn psnr(a: &[u32], b: &[u32], peak: f64) -> f64 {
 #[test]
 fn every_legal_sampling_layout_matches_the_validator_luma() {
     for fx in FIXTURES {
-        let f = decode_jpeg(fx.jpeg, None).unwrap_or_else(|e| panic!("{}: {e}", fx.name));
+        let f = decode(fx.jpeg).unwrap_or_else(|e| panic!("{}: {e}", fx.name));
         assert_eq!(f.planes.len(), 3, "{}: three planes", fx.name);
         // None of these layouts has a planar pixel format: every plane
         // comes out at full resolution (4:4:4).
@@ -181,7 +181,7 @@ fn every_legal_sampling_layout_matches_the_validator_luma() {
 #[test]
 fn every_legal_sampling_layout_matches_the_validator_rgb() {
     for fx in FIXTURES {
-        let f = decode_jpeg(fx.jpeg, None).unwrap();
+        let f = decode(fx.jpeg).unwrap();
         let peak = if fx.twelve_bit { 4095.0 } else { 255.0 };
         let half = if fx.twelve_bit { 2048.0 } else { 128.0 };
         let y = plane(f.planes[0].stride, &f.planes[0].data, fx.twelve_bit);
@@ -227,7 +227,7 @@ fn lossless_yuv_exotic_luma_factors_roundtrip_bit_exact() {
             encode_lossless_arith_jpeg_yuv(W as u32, H as u32, &y, W, &cb, cw, &cr, cw, hf, vf, 4)
                 .unwrap();
         for (tag, jpeg) in [("SOF3", huff), ("SOF11", arith)] {
-            let f = decode_jpeg(&jpeg, None).unwrap();
+            let f = decode(&jpeg).unwrap();
             assert_eq!(f.planes.len(), 3);
             for (pi, p) in f.planes.iter().enumerate() {
                 assert_eq!(p.stride, W, "{tag} {hf}x{vf}: plane {pi} is 4:4:4");

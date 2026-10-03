@@ -1,14 +1,45 @@
 // Parallel-array index loops are idiomatic in codec code; skip the lint.
 #![allow(clippy::needless_range_loop)]
-// When built without the `registry` feature, large swathes of the
-// decoder/encoder (the JPEG entry-point + render helpers) have no
-// callers — they're only reachable via the `Decoder` / `Encoder`
-// trait implementations that live behind the `registry` feature.
-// Suppress the resulting dead-code warnings rather than gating every
-// helper.
+// When built without the `registry` feature, parts of the encoder
+// (helpers only reachable from the `Encoder` trait implementation that
+// lives behind the `registry` feature) have no callers. Suppress the
+// resulting dead-code warnings rather than gating every helper.
 #![cfg_attr(not(feature = "registry"), allow(dead_code))]
 
 //! JPEG / Motion-JPEG codec, pure Rust.
+//!
+//! ## Still images — the standalone API
+//!
+//! The crate root follows the OxideAV image-crate contract and builds
+//! with `default-features = false` (no `oxideav-core`):
+//!
+//! ```no_run
+//! # fn main() -> Result<(), oxideav_mjpeg::Error> {
+//! let bytes = std::fs::read("in.jpg").map_err(oxideav_mjpeg::Error::from)?;
+//! if oxideav_mjpeg::probe(&bytes) {
+//!     let info = oxideav_mjpeg::info(&bytes)?;          // header only
+//!     let img = oxideav_mjpeg::decode(&bytes)?;         // JpegImage, native layout
+//!     let rgba: Vec<u8> = img.to_rgba8();               // packed RGBA, 4 × width bytes per row
+//!     let (w, h) = (img.width(), img.height());
+//!     let _ = info;
+//!
+//!     let opts = oxideav_mjpeg::EncodeOptions::default().with_quality(90);
+//!     let out: Vec<u8> = oxideav_mjpeg::encode_rgba8(w, h, &rgba, &opts)?; // alpha dropped
+//!     std::fs::write("out.jpg", out).map_err(oxideav_mjpeg::Error::from)?;
+//! }
+//! # Ok(()) }
+//! ```
+//!
+//! [`probe`] / [`info`] / [`decode`] / [`decode_with`] / [`decode_rgb8`]
+//! / [`decode_rgba8`] / [`decode_from`] and [`encode`] / [`encode_rgb8`]
+//! / [`encode_rgba8`] / [`encode_to`] over [`JpegImage`], [`RgbImage`],
+//! [`RgbaImage`], [`Plane`], [`ColorInfo`], [`Metadata`], [`ImageInfo`],
+//! [`EncodeOptions`], [`DecodeOptions`], [`PixelFormat`] and
+//! [`Error`]. The decoder below is the same one the Motion-JPEG video
+//! path uses; the still-image API is a second door to it, and the
+//! `registry` adapter is a thin layer over these functions.
+//!
+//! ## Motion-JPEG — the framework video codec
 //!
 //! Each video packet is a standalone JPEG (one full SOI..EOI). The decoder
 //! recognises baseline (SOF0), extended-sequential (SOF1), progressive
@@ -110,8 +141,8 @@
 //!   decompositions).
 //!
 //! **The general T.81 writer** lives in [`t81`] and is the one JPEG
-//! encoder sibling crates build on: [`t81::JpegEncodeOptions`] (typed
-//! options → [`t81::JpegEncodeOptions::encode`]) and the frame-level
+//! encoder sibling crates build on: [`t81::EncodeOptions`] (typed
+//! options → [`t81::EncodeOptions::encode`]) and the frame-level
 //! [`t81::encode_frame`] / [`t81::gather_stats`] / [`t81::JpegTableSet`]
 //! API code sequential (`SOF0` / `SOF1`, `P = 8` / `12`), progressive
 //! (`SOF2`) and lossless (`SOF3`, `P ∈ 2..=16`) frames with any §A.1.1
@@ -132,12 +163,15 @@
 //! The crate's default `registry` Cargo feature pulls in `oxideav-core`
 //! and exposes the `Decoder` / `Encoder` trait surface, the JPEG-still
 //! container, and the [`registry::register`] / [`registry::register_codecs`]
-//! / [`registry::register_containers`] entry points. Disable the feature (`default-features = false`) for
-//! an oxideav-core-free build that still exposes the standalone
-//! [`decoder::decode_jpeg`] API plus crate-local [`MjpegFrame`] /
-//! [`MjpegPlane`] / [`MjpegPixelFormat`] / [`MjpegError`] types built
-//! only on `std`.
+//! / [`registry::register_containers`] entry points, plus the
+//! `From<JpegImage> for VideoFrame` / pixel-format / colour-signal
+//! conversions. Disable the feature (`default-features = false`) for an
+//! oxideav-core-free build that still exposes the whole still-image API
+//! above plus the crate-local [`MjpegFrame`] / [`MjpegPlane`] /
+//! [`MjpegPixelFormat`] / [`MjpegError`] types built only on `std`.
 
+mod api;
+pub mod convert;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
@@ -159,15 +193,26 @@ pub const CODEC_ID_STR: &str = "mjpeg";
 
 // Standalone, framework-free API. Available regardless of the
 // `registry` feature.
-pub use error::{MjpegError, Result};
-pub use image::{MjpegFrame, MjpegPixelFormat, MjpegPlane};
+pub use api::{
+    decode, decode_from, decode_rgb8, decode_rgba8, decode_with, encode, encode_rgb8, encode_rgba8,
+    encode_to, info, probe,
+};
+pub use error::{Error, MjpegError, Result};
+pub use image::{
+    ColorInfo, ColorRange, DecodeOptions, ImageInfo, JpegImage, Metadata, MjpegFrame,
+    MjpegPixelFormat, MjpegPlane, PixelFormat, Plane, RgbImage, RgbaImage,
+};
 
 // General T.81 writer surface (the one JPEG encoder sibling crates
 // build on): typed options plus the frame / table-set primitives.
 pub use t81::{
-    ColorSignalling, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
-    JpegEncodeOptions, JpegFrame, JpegProcess, JpegTableSet,
+    ColorSignalling, EncodeOptions, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
+    JpegFrame, JpegProcess, JpegTableSet,
 };
+
+/// Historical name of [`EncodeOptions`].
+#[deprecated(since = "0.1.10", note = "renamed to `EncodeOptions`")]
+pub type JpegEncodeOptions = EncodeOptions;
 
 // Decode-free JPEG inspector — classifies the SOF variant + reports
 // dimensions / components / chroma-subsampling / colour hint without

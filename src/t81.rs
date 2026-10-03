@@ -40,26 +40,26 @@
 //! `docs/image/jpeg/tables/`.
 //!
 //! ```
-//! use oxideav_mjpeg::t81::{HuffmanTables, JpegEncodeOptions, JpegProcess};
+//! use oxideav_mjpeg::t81::{HuffmanTables, EncodeOptions, JpegProcess};
 //!
 //! // 12-bit extended-sequential 4:2:0 with optimal tables and restarts.
 //! let (w, h) = (16u32, 8u32);
 //! let y: Vec<u16> = (0..w * h).map(|i| (i * 37 % 4096) as u16).collect();
 //! let c: Vec<u16> = vec![2048; 8 * 4];
-//! let opts = JpegEncodeOptions {
-//!     precision: 12,
-//!     tables: HuffmanTables::Optimal,
-//!     sampling: vec![(2, 2), (1, 1), (1, 1)],
-//!     restart_interval: 2,
-//!     ..JpegEncodeOptions::default()
-//! };
+//! let opts = EncodeOptions::new()
+//!     .with_precision(12)
+//!     .with_tables(HuffmanTables::Optimal)
+//!     .with_sampling(vec![(2, 2), (1, 1), (1, 1)])
+//!     .with_restart_interval(2);
 //! let out = opts.encode(w, h, &[&y, &c, &c]).unwrap();
 //! assert!(out.data.windows(2).any(|m| m == [0xFF, 0xC1])); // SOF1
 //! # let _ = JpegProcess::Sequential;
 //! ```
 
 use crate::error::{MjpegError as Error, Result};
+use crate::image::Metadata;
 use crate::jpeg::dct::fdct8x8;
+use crate::jpeg::inspect::ChromaSubsampling;
 use crate::jpeg::markers;
 use crate::jpeg::zigzag::ZIGZAG;
 
@@ -1611,10 +1611,21 @@ pub enum ColorSignalling {
     None,
 }
 
-/// Typed encoder options — the single knob set behind the direct
-/// factories and the registry encoder's `CodecOptions`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JpegEncodeOptions {
+/// Typed encoder options — the single knob set behind the root
+/// [`crate::encode`] / [`crate::encode_rgb8`] entry points, the
+/// plane-level [`EncodeOptions::encode`] writer and the registry
+/// encoder's `CodecOptions`.
+///
+/// Construct with [`EncodeOptions::default`] / [`EncodeOptions::new`]
+/// and the `with_*` builders; the fields stay readable. `precision`,
+/// `sampling` and `table_ids` describe caller-supplied planes for the
+/// plane-level writer — the root [`crate::encode`] derives precision
+/// and sampling from the [`JpegImage`](crate::JpegImage) it is given
+/// and ignores those two fields, [`crate::encode_rgb8`] takes its
+/// chroma layout from [`EncodeOptions::chroma`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct EncodeOptions {
     /// Quality factor 1..=100 (DCT processes; see [`scaled_quant_table`]).
     pub quality: u8,
     /// Typical (Annex K.3) or optimal (Annex K.2) Huffman tables.
@@ -1638,11 +1649,29 @@ pub struct JpegEncodeOptions {
     /// Per-component table destinations `(Tq, Td = Ta)`; empty = the
     /// first component uses destination 0 and the others 1.
     pub table_ids: Vec<(u8, u8)>,
+    /// Chroma layout the RGB entry points ([`crate::encode_rgb8`] /
+    /// [`crate::encode_rgba8`]) convert to: 4:2:0 by default
+    /// (`ChromaSubsampling::Yuv420`); `Yuv422` / `Yuv444` / `Yuv411`
+    /// select the other planar layouts, `GrayscaleOnly` keeps luma only.
+    /// Ignored by [`crate::encode`] (the image's own layout rules) and
+    /// by the plane-level writer (use `sampling`).
+    pub chroma: ChromaSubsampling,
+    /// Metadata to embed: ICC profile (`APP2 "ICC_PROFILE\0"` chunks),
+    /// Exif (`APP1 "Exif\0\0"`), XMP (`APP1` with the XMP namespace).
+    /// Written after the colour-signalling segment and before the
+    /// tables. [`crate::encode`] merges the image's own
+    /// [`JpegImage::metadata`](crate::JpegImage::metadata) with this
+    /// field (the option wins where both set the same blob).
+    pub metadata: Metadata,
 }
 
-impl Default for JpegEncodeOptions {
+/// Historical name of [`EncodeOptions`].
+#[deprecated(since = "0.1.10", note = "renamed to `EncodeOptions`")]
+pub type JpegEncodeOptions = EncodeOptions;
+
+impl Default for EncodeOptions {
     fn default() -> Self {
-        JpegEncodeOptions {
+        EncodeOptions {
             quality: crate::encoder::DEFAULT_QUALITY,
             tables: HuffmanTables::Typical,
             process: JpegProcess::Sequential,
@@ -1652,11 +1681,180 @@ impl Default for JpegEncodeOptions {
             signalling: ColorSignalling::Auto,
             sampling: Vec::new(),
             table_ids: Vec::new(),
+            chroma: ChromaSubsampling::Yuv420,
+            metadata: Metadata::new(),
         }
     }
 }
 
-/// The output of [`JpegEncodeOptions::encode`].
+impl EncodeOptions {
+    /// The defaults: quality 75, typical tables, sequential, `P = 8`,
+    /// no restarts, interchange stream, automatic signalling, 4:2:0
+    /// for the RGB entry points, no metadata.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Quality factor `1..=100` (DCT processes).
+    pub fn with_quality(mut self, quality: u8) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    /// Typical (Annex K.3) or optimal (Annex K.2) Huffman tables.
+    pub fn with_tables(mut self, tables: HuffmanTables) -> Self {
+        self.tables = tables;
+        self
+    }
+
+    /// Optimal (`true`) or typical (`false`) Huffman tables.
+    pub fn with_optimal_tables(mut self, optimal: bool) -> Self {
+        self.tables = if optimal {
+            HuffmanTables::Optimal
+        } else {
+            HuffmanTables::Typical
+        };
+        self
+    }
+
+    /// The coding process (sequential / progressive / lossless).
+    pub fn with_process(mut self, process: JpegProcess) -> Self {
+        self.process = process;
+        self
+    }
+
+    /// Progressive (`SOF2`, `true`) or sequential (`SOF0` / `SOF1`,
+    /// `false`) DCT coding.
+    pub fn with_progressive(mut self, progressive: bool) -> Self {
+        self.process = if progressive {
+            JpegProcess::Progressive
+        } else {
+            JpegProcess::Sequential
+        };
+        self
+    }
+
+    /// Lossless coding (`SOF3`) with the Table H.1 predictor `1..=7`
+    /// and no point transform.
+    pub fn with_lossless(mut self, predictor: u8) -> Self {
+        self.process = JpegProcess::Lossless {
+            predictor,
+            point_transform: 0,
+        };
+        self
+    }
+
+    /// Sample precision `P` of caller-supplied planes (plane-level
+    /// writer only).
+    pub fn with_precision(mut self, precision: u8) -> Self {
+        self.precision = precision;
+        self
+    }
+
+    /// Restart interval in MCUs (`0` = none).
+    pub fn with_restart_interval(mut self, mcus: u16) -> Self {
+        self.restart_interval = mcus;
+        self
+    }
+
+    /// Emit the §B.5 abbreviated pair (tables stream + table-less frame).
+    pub fn with_abbreviated(mut self, abbreviated: bool) -> Self {
+        self.abbreviated = abbreviated;
+        self
+    }
+
+    /// Colour-space signalling (markers + component ids).
+    pub fn with_signalling(mut self, signalling: ColorSignalling) -> Self {
+        self.signalling = signalling;
+        self
+    }
+
+    /// Per-component sampling factors of caller-supplied planes
+    /// (plane-level writer only).
+    pub fn with_sampling(mut self, sampling: Vec<(u8, u8)>) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// Per-component table destinations `(Tq, Td = Ta)`.
+    pub fn with_table_ids(mut self, table_ids: Vec<(u8, u8)>) -> Self {
+        self.table_ids = table_ids;
+        self
+    }
+
+    /// Chroma layout for the RGB entry points (default 4:2:0).
+    pub fn with_chroma(mut self, chroma: ChromaSubsampling) -> Self {
+        self.chroma = chroma;
+        self
+    }
+
+    /// Metadata blobs to embed.
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Largest APPn payload after the two length bytes (`Lp ≤ 65535`).
+const MAX_APP_PAYLOAD: usize = 65533;
+/// `APP2 "ICC_PROFILE\0"` chunk header: 12-byte identifier + sequence
+/// number + chunk count (ICC.1 Annex B.4).
+const ICC_CHUNK_HEADER: usize = 14;
+/// Profile bytes per `APP2` chunk.
+const ICC_CHUNK_DATA: usize = MAX_APP_PAYLOAD - ICC_CHUNK_HEADER;
+
+/// Append one APPn segment (`0xFF marker, Lp, payload`).
+fn write_app_segment(out: &mut Vec<u8>, marker: u8, parts: &[&[u8]]) -> Result<()> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    if len > MAX_APP_PAYLOAD {
+        return Err(Error::unsupported(format!(
+            "JPEG encode: APP{} payload of {len} bytes exceeds the 65533-byte segment limit",
+            marker - markers::APP0
+        )));
+    }
+    out.extend_from_slice(&[0xFF, marker, ((len + 2) >> 8) as u8, (len + 2) as u8]);
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    Ok(())
+}
+
+/// Append the metadata segments: `APP1 Exif`, `APP1 XMP`, then the
+/// `APP2 ICC_PROFILE` chunk sequence (each chunk at most 65519 profile
+/// bytes, sequence numbers from 1, total chunk count in every chunk).
+fn write_metadata_segments(out: &mut Vec<u8>, meta: &Metadata) -> Result<()> {
+    if let Some(exif) = &meta.exif {
+        write_app_segment(out, markers::APP1, &[b"Exif\0\0", exif])?;
+    }
+    if let Some(xmp) = &meta.xmp {
+        write_app_segment(out, markers::APP1, &[XMP_IDENTIFIER, xmp])?;
+    }
+    if let Some(icc) = &meta.icc {
+        let chunks = icc.chunks(ICC_CHUNK_DATA).count().max(1);
+        if chunks > 255 {
+            return Err(Error::unsupported(format!(
+                "JPEG encode: ICC profile of {} bytes needs {chunks} APP2 chunks (255 maximum)",
+                icc.len()
+            )));
+        }
+        let total = chunks as u8;
+        if icc.is_empty() {
+            write_app_segment(out, markers::APP2, &[ICC_IDENTIFIER, &[1, total]])?;
+        }
+        for (i, chunk) in icc.chunks(ICC_CHUNK_DATA).enumerate() {
+            let seq = (i + 1) as u8;
+            write_app_segment(out, markers::APP2, &[ICC_IDENTIFIER, &[seq, total], chunk])?;
+        }
+    }
+    Ok(())
+}
+
+/// `APP1` XMP identifier (`"http://ns.adobe.com/xap/1.0/\0"`).
+pub(crate) const XMP_IDENTIFIER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+/// `APP2` ICC identifier (`"ICC_PROFILE\0"`).
+pub(crate) const ICC_IDENTIFIER: &[u8] = b"ICC_PROFILE\0";
+
+/// The output of [`EncodeOptions::encode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedJpeg {
     /// The frame stream (`SOI … EOI`). Complete interchange format
@@ -1710,7 +1908,7 @@ struct ComponentSpec {
     huff_id: u8,
 }
 
-/// A frame description resolved from [`JpegEncodeOptions`] + planes.
+/// A frame description resolved from [`EncodeOptions`] + planes.
 struct Prepared<'a> {
     frame: JpegFrame,
     planes: Vec<&'a [u16]>,
@@ -1739,7 +1937,7 @@ impl Prepared<'_> {
     }
 }
 
-impl JpegEncodeOptions {
+impl EncodeOptions {
     /// The effective signalling for `nf` components.
     fn resolve_signalling(&self, nf: usize) -> Result<ColorSignalling> {
         let s = match self.signalling {
@@ -1887,6 +2085,7 @@ impl JpegEncodeOptions {
             } => write_adobe_app14(&mut meta, t),
             _ => {}
         }
+        write_metadata_segments(&mut meta, &self.metadata)?;
         Ok(Prepared {
             frame,
             planes: planes.to_vec(),
@@ -1899,7 +2098,7 @@ impl JpegEncodeOptions {
     /// The table set these options derive for `planes` (typical, or K.2
     /// optimal from the frame's own statistics) — the set to install as
     /// a shared `JPEGTables` when several frames are coded abbreviated
-    /// with [`JpegEncodeOptions::encode_with_tables`].
+    /// with [`EncodeOptions::encode_with_tables`].
     pub fn tables_for_planes(
         &self,
         width: u32,
@@ -1920,7 +2119,7 @@ impl JpegEncodeOptions {
         self.finish(&prep, &tables)
     }
 
-    /// [`JpegEncodeOptions::encode`] with a caller-supplied table set
+    /// [`EncodeOptions::encode`] with a caller-supplied table set
     /// (no statistics pass; `tables` must define every destination the
     /// components reference). With `abbreviated` set the frame stream
     /// carries no table segments and `tables` is returned as the §B.5
@@ -1954,7 +2153,7 @@ impl JpegEncodeOptions {
         })
     }
 
-    /// [`JpegEncodeOptions::encode`] for 8-bit planes (`precision` must
+    /// [`EncodeOptions::encode`] for 8-bit planes (`precision` must
     /// be 8, or at most 8 for the lossless process).
     pub fn encode_u8(&self, width: u32, height: u32, planes: &[&[u8]]) -> Result<EncodedJpeg> {
         if self.precision > 8 {
@@ -2203,7 +2402,7 @@ mod tests {
         let s12: Vec<u16> = s.iter().map(|&v| v * 16).collect();
         frame.precision = 12;
         let c = comp(&s12, 24, 17);
-        let opts = JpegEncodeOptions {
+        let opts = EncodeOptions {
             precision: 12,
             quality: 90,
             ..Default::default()
@@ -2266,15 +2465,13 @@ mod tests {
     #[test]
     fn options_reject_bad_signalling_and_plane_counts() {
         let p = [0u16; 4];
-        let o = JpegEncodeOptions {
+        let o = EncodeOptions {
             signalling: ColorSignalling::Rgb,
             ..Default::default()
         };
         assert!(o.encode(2, 2, &[&p]).is_err());
-        assert!(JpegEncodeOptions::default()
-            .encode(2, 2, &[&p, &p])
-            .is_err());
-        let o = JpegEncodeOptions {
+        assert!(EncodeOptions::default().encode(2, 2, &[&p, &p]).is_err());
+        let o = EncodeOptions {
             signalling: ColorSignalling::Cmyk {
                 adobe_transform: Some(1),
             },

@@ -1,7 +1,7 @@
 //! Registry-side surface: needs the default `registry` feature.
 #![cfg(feature = "registry")]
 
-//! Registry encoder options ↔ `JpegEncodeOptions` parity, and the
+//! Registry encoder options ↔ `EncodeOptions` parity, and the
 //! §B.5 abbreviated pair through the registry (`extradata` tables).
 
 use oxideav_core::frame::VideoPlane;
@@ -9,10 +9,10 @@ use oxideav_core::{
     CodecId, CodecOptions, CodecParameters, Encoder, Frame, Packet, PixelFormat, TimeBase,
     VideoFrame,
 };
-use oxideav_mjpeg::decoder::{decode_jpeg, decode_jpeg_with_tables};
 use oxideav_mjpeg::encoder::MjpegEncoder;
 use oxideav_mjpeg::registry::{make_decoder, make_encoder};
-use oxideav_mjpeg::t81::{HuffmanTables, JpegEncodeOptions, JpegProcess};
+use oxideav_mjpeg::t81::{EncodeOptions, HuffmanTables, JpegProcess};
+use oxideav_mjpeg::DecodeOptions;
 
 const W: u32 = 41;
 const H: u32 = 23;
@@ -174,10 +174,12 @@ fn abbreviated_frames_decode_with_extradata_tables() {
                 "{pix:?}: frame carries DHT"
             );
             assert!(
-                decode_jpeg(data, None).is_err(),
+                oxideav_mjpeg::decode(data).is_err(),
                 "{pix:?}: table-less frame must not decode alone"
             );
-            let via_fn = decode_jpeg_with_tables(&tables, data, None).unwrap();
+            let via_fn =
+                oxideav_mjpeg::decode_with(data, &DecodeOptions::new().with_tables(tables.clone()))
+                    .unwrap();
             let via_reg = decode_with(&tables, data);
             assert_eq!(via_fn.planes.len(), via_reg.planes.len());
             assert_eq!(via_fn.planes[0].data, via_reg.planes[0].data, "{pix:?}");
@@ -252,11 +254,12 @@ fn typed_options_on_the_concrete_encoder_match_the_string_bag() {
         &src,
     );
     let mut enc = MjpegEncoder::from_params(&params(PixelFormat::Yuv420P, &[])).unwrap();
-    enc.set_encode_options(JpegEncodeOptions {
-        process: JpegProcess::Progressive,
-        tables: HuffmanTables::Optimal,
-        restart_interval: 3,
-        ..Default::default()
+    enc.set_encode_options({
+        let mut o = EncodeOptions::default();
+        o.process = JpegProcess::Progressive;
+        o.tables = HuffmanTables::Optimal;
+        o.restart_interval = 3;
+        o
     })
     .unwrap();
     assert_eq!(enc.encode_options().map(|o| o.precision), Some(8));

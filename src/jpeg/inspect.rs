@@ -85,7 +85,7 @@ impl SofKind {
     /// — the inspector caller has already filtered via `is_sof` so this
     /// is a total function over the legal SOF subset and a `None`
     /// elsewhere serves as a "should not happen" sentinel.
-    fn from_marker(b: u8) -> Option<Self> {
+    pub(crate) fn from_marker(b: u8) -> Option<Self> {
         match b {
             0xC0 => Some(Self::Baseline),
             0xC1 => Some(Self::ExtendedSequential),

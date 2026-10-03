@@ -2,26 +2,13 @@
 
 use crate::error::{MjpegError as Error, Result};
 
-// When the `registry` feature is on, the public `decode_jpeg` returns
-// `oxideav_core::VideoFrame` directly so the trait-side `Decoder`
-// impl can hand it to `Frame::Video(...)` without an extra
-// conversion. The inner decoder logic only touches plane
-// `(stride, data)` tuples and YUV / Gray / Cmyk pixel-format
-// discriminants — both type families share that shape, so the same
-// helpers compile against either alias unchanged.
-//
-// With `--no-default-features` the same names resolve to the
-// crate-local [`MjpegFrame`] / [`MjpegPixelFormat`] / [`MjpegPlane`]
-// types so the standalone build never references `oxideav-core`.
-#[cfg(feature = "registry")]
-use oxideav_core::frame::VideoPlane;
-#[cfg(feature = "registry")]
-use oxideav_core::{PixelFormat, VideoFrame};
-
-#[cfg(not(feature = "registry"))]
-use crate::image::{
-    MjpegFrame as VideoFrame, MjpegPixelFormat as PixelFormat, MjpegPlane as VideoPlane,
-};
+// The decoder produces the crate-local [`JpegImage`] whatever the
+// feature set — the return type never depends on `registry`. The
+// framework adapter in [`crate::registry`] converts to
+// `oxideav_core::VideoFrame` (same plane shape); the deprecated
+// `decode_jpeg` wrappers below do that conversion for callers of the
+// historical API.
+use crate::image::{JpegImage, MjpegPixelFormat as PixelFormat, Plane as VideoPlane};
 
 // Re-export the framework-side `Decoder` factory at its historical
 // path so consumers (and integration tests) that import
@@ -291,7 +278,7 @@ fn validate_sos(sos: &SosInfo) -> Result<()> {
 /// first scan (the segment is mandatory in that case), matching the
 /// spec's "this marker segment is mandatory if the number of lines (Y)
 /// specified in the frame header has the value zero".
-fn resolve_dnl_height(data: &[u8]) -> Result<Option<u16>> {
+pub(crate) fn resolve_dnl_height(data: &[u8]) -> Result<Option<u16>> {
     let mut walker = MarkerWalker::new(data);
     // Walk to the SOFn to read Y. Skip table / misc segments along the way.
     loop {
@@ -393,23 +380,98 @@ fn apply_dnl_height(sof: &mut SofInfo, dnl_height: Option<u16>) {
     }
 }
 
-/// Decode one complete JPEG interchange stream (`SOI … EOI`) into a
-/// frame. Framework-free entry point; `pts` is passed through.
-pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    decode_jpeg_inner(JpegState::new(), data, pts)
+/// Decode one complete JPEG interchange stream (`SOI … EOI`) into the
+/// native-layout planes: geometry + pixel format + planes, no colour /
+/// metadata (the root [`crate::decode`] fills those in). Shared core
+/// of every decode entry point, with or without the `registry` feature.
+#[doc(hidden)]
+pub fn decode_planes(data: &[u8]) -> Result<JpegImage> {
+    decode_jpeg_inner(JpegState::new(), data)
 }
 
-/// Decode a T.81 §B.5 **abbreviated image** stream (`SOI`, frame, `EOI`
-/// without its table segments) against a separately supplied
-/// **abbreviated table-specification** stream (`SOI`, DQT / DHT / DAC /
-/// DRI …, `EOI`) — the TIFF Technical Note 2 `JPEGTables` carriage.
-/// Tables the image stream defines itself override the preloaded ones
-/// (B.2.4.1 / B.2.4.2 "replaces the previous tables stored in that
-/// destination"). A complete interchange stream decodes unchanged.
-pub fn decode_jpeg_with_tables(tables: &[u8], data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+/// [`decode_planes`] for a T.81 §B.5 **abbreviated image** stream
+/// (`SOI`, frame, `EOI` without its table segments) against a
+/// separately supplied **abbreviated table-specification** stream
+/// (`SOI`, DQT / DHT / DAC / DRI …, `EOI`) — the TIFF Technical Note 2
+/// `JPEGTables` carriage. Tables the image stream defines itself
+/// override the preloaded ones (B.2.4.1 / B.2.4.2 "replaces the
+/// previous tables stored in that destination"). A complete
+/// interchange stream decodes unchanged.
+#[doc(hidden)]
+pub fn decode_planes_with_tables(tables: &[u8], data: &[u8]) -> Result<JpegImage> {
     let mut state = JpegState::new();
     load_table_stream(&mut state, tables)?;
-    decode_jpeg_inner(state, data, pts)
+    decode_jpeg_inner(state, data)
+}
+
+/// Decode one complete JPEG interchange stream (`SOI … EOI`) into a
+/// framework `VideoFrame`; `pts` is passed through.
+///
+/// Historical entry point of the Motion-JPEG video path. New code uses
+/// [`crate::decode`] (returns a [`JpegImage`] with geometry, colour and
+/// metadata, whatever the feature set) and converts with
+/// `VideoFrame::from(image)` when it needs a framework frame.
+#[cfg(feature = "registry")]
+#[deprecated(
+    since = "0.1.10",
+    note = "use `oxideav_mjpeg::decode` (returns `JpegImage`); convert with `VideoFrame::from`"
+)]
+pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<oxideav_core::VideoFrame> {
+    let mut vf = oxideav_core::VideoFrame::from(decode_planes(data)?);
+    vf.pts = pts;
+    Ok(vf)
+}
+
+/// Decode one complete JPEG interchange stream (`SOI … EOI`) into a
+/// crate-local [`MjpegFrame`](crate::MjpegFrame); `pts` is passed
+/// through. New code uses [`crate::decode`].
+#[cfg(not(feature = "registry"))]
+#[deprecated(
+    since = "0.1.10",
+    note = "use `oxideav_mjpeg::decode` (returns `JpegImage`); convert with `MjpegFrame::from`"
+)]
+pub fn decode_jpeg(data: &[u8], pts: Option<i64>) -> Result<crate::MjpegFrame> {
+    let mut f = crate::MjpegFrame::from(decode_planes(data)?);
+    f.pts = pts;
+    Ok(f)
+}
+
+/// Decode a §B.5 abbreviated image stream against a tables-only stream
+/// into a framework `VideoFrame` (see [`decode_planes_with_tables`]).
+/// New code uses [`crate::decode_with`] with
+/// [`DecodeOptions::with_tables`](crate::DecodeOptions::with_tables).
+#[cfg(feature = "registry")]
+#[deprecated(
+    since = "0.1.10",
+    note = "use `oxideav_mjpeg::decode_with(bytes, &DecodeOptions::new().with_tables(tables))`"
+)]
+pub fn decode_jpeg_with_tables(
+    tables: &[u8],
+    data: &[u8],
+    pts: Option<i64>,
+) -> Result<oxideav_core::VideoFrame> {
+    let mut vf = oxideav_core::VideoFrame::from(decode_planes_with_tables(tables, data)?);
+    vf.pts = pts;
+    Ok(vf)
+}
+
+/// Decode a §B.5 abbreviated image stream against a tables-only stream
+/// into a crate-local [`MjpegFrame`](crate::MjpegFrame). New code uses
+/// [`crate::decode_with`] with
+/// [`DecodeOptions::with_tables`](crate::DecodeOptions::with_tables).
+#[cfg(not(feature = "registry"))]
+#[deprecated(
+    since = "0.1.10",
+    note = "use `oxideav_mjpeg::decode_with(bytes, &DecodeOptions::new().with_tables(tables))`"
+)]
+pub fn decode_jpeg_with_tables(
+    tables: &[u8],
+    data: &[u8],
+    pts: Option<i64>,
+) -> Result<crate::MjpegFrame> {
+    let mut f = crate::MjpegFrame::from(decode_planes_with_tables(tables, data)?);
+    f.pts = pts;
+    Ok(f)
 }
 
 /// Apply a DAC segment payload (B.2.4.3) to the arithmetic conditioning
@@ -471,7 +533,7 @@ fn load_table_stream(state: &mut JpegState, tables: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn decode_jpeg_inner(mut state: JpegState, data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
@@ -502,7 +564,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8], pts: Option<i64>) -> Res
                     || state.arithmetic
                     || state.progressive_arith
                 {
-                    return render_from_coefs(&state, &coef_buf, pts);
+                    return render_from_coefs(&state, &coef_buf);
                 }
                 return Err(Error::invalid("JPEG: EOI before SOS"));
             }
@@ -667,7 +729,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8], pts: Option<i64>) -> Res
                     return Err(Error::invalid("JPEG: DHP after first SOF"));
                 }
                 let dhp_payload = walker.read_segment_payload()?;
-                return decode_hierarchical(dhp_payload, &mut walker, state, pts);
+                return decode_hierarchical(dhp_payload, &mut walker, state);
             }
             0xC5..=0xC7 | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
@@ -682,9 +744,9 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8], pts: Option<i64>) -> Res
                 let scan = walker.read_scan_data()?;
                 if state.lossless {
                     if state.lossless_arith {
-                        return decode_lossless_arith_scan(&state, &sos, scan, pts);
+                        return decode_lossless_arith_scan(&state, &sos, scan);
                     }
-                    return decode_lossless_scan(&state, &sos, scan, pts);
+                    return decode_lossless_scan(&state, &sos, scan);
                 }
                 if state.progressive_arith {
                     decode_progressive_arith_scan(&state, &sos, scan, &mut coef_buf)?;
@@ -711,7 +773,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8], pts: Option<i64>) -> Res
                         && sof.components.len() <= 3
                         && sof.precision == 8;
                     if fast_path_ok {
-                        return decode_scan(&state, &sos, scan, pts);
+                        return decode_scan(&state, &sos, scan);
                     }
                     if !state.seq_accum {
                         coef_buf = init_coef_buffers(sof)?;
@@ -1121,12 +1183,7 @@ fn render_block_8bit(
     }
 }
 
-fn decode_scan(
-    state: &JpegState,
-    sos: &SosInfo,
-    scan: &[u8],
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImage> {
     let sof = state
         .sof
         .as_ref()
@@ -1383,7 +1440,12 @@ fn decode_scan(
         _ => unreachable!(),
     }
 
-    Ok(VideoFrame { pts, planes })
+    Ok(JpegImage::new(
+        width as u32,
+        height as u32,
+        out_format,
+        planes,
+    ))
 }
 
 /// Output layout of a three-component YCbCr frame. T.81 §A.1.1 allows
@@ -2694,11 +2756,7 @@ fn prog_decode_ac_refine(
 
 /// After all scans land, dequantise + IDCT each component block and emit a
 /// VideoFrame. Shared by progressive and non-interleaved baseline paths.
-fn render_from_coefs(
-    state: &JpegState,
-    coefs: &[Vec<[i32; 64]>],
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<JpegImage> {
     let sof = state
         .sof
         .as_ref()
@@ -2706,7 +2764,7 @@ fn render_from_coefs(
     // 12-bit precision JPEGs take their own render path — different level
     // shift, different clamp range, 16-bit-LE output planes.
     if sof.precision == 12 {
-        return render_from_coefs_12bit(state, coefs, pts);
+        return render_from_coefs_12bit(state, coefs);
     }
     let n_comp = sof.components.len();
     let grayscale = n_comp == 1;
@@ -2911,7 +2969,12 @@ fn render_from_coefs(
         _ => unreachable!(),
     }
 
-    Ok(VideoFrame { pts, planes })
+    Ok(JpegImage::new(
+        width as u32,
+        height as u32,
+        out_format,
+        planes,
+    ))
 }
 
 /// 12-bit precision render path. Mirrors `render_from_coefs` but keeps
@@ -2920,11 +2983,7 @@ fn render_from_coefs(
 /// 4:2:0 / 4:2:2 / 4:4:4 chroma sampling are supported on output (the
 /// shared `PixelFormat` enum carries `Gray12Le` / `Yuv420P12Le` /
 /// `Yuv422P12Le` / `Yuv444P12Le` 16-bit-LE variants).
-fn render_from_coefs_12bit(
-    state: &JpegState,
-    coefs: &[Vec<[i32; 64]>],
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+fn render_from_coefs_12bit(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<JpegImage> {
     let sof = state
         .sof
         .as_ref()
@@ -3040,7 +3099,12 @@ fn render_from_coefs_12bit(
         _ => unreachable!(),
     }
 
-    Ok(VideoFrame { pts, planes })
+    Ok(JpegImage::new(
+        width as u32,
+        height as u32,
+        out_format,
+        planes,
+    ))
 }
 
 // ---- Lossless JPEG (SOF3) ------------------------------------------------
@@ -3085,12 +3149,7 @@ struct LosslessPlanes {
     subsampled: bool,
 }
 
-fn decode_lossless_scan(
-    state: &JpegState,
-    sos: &SosInfo,
-    scan: &[u8],
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+fn decode_lossless_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImage> {
     let sof = state
         .sof
         .as_ref()
@@ -3102,26 +3161,9 @@ fn decode_lossless_scan(
     let height = sof.height as usize;
     let planes = decode_lossless_scan_planes(state, sos, scan, false)?;
     if planes.subsampled {
-        return shape_lossless_yuv_frame(
-            sof,
-            &planes.samples,
-            &planes.comp_w,
-            width,
-            height,
-            pt,
-            pts,
-        );
+        return shape_lossless_yuv_frame(sof, &planes.samples, &planes.comp_w, width, height, pt);
     }
-    shape_lossless_frame(
-        &planes.samples,
-        nc,
-        width,
-        height,
-        pt,
-        precision,
-        state,
-        pts,
-    )
+    shape_lossless_frame(&planes.samples, nc, width, height, pt, precision, state)
 }
 
 /// Core of the Huffman lossless (SOF3) scan decoder: reconstruct the
@@ -3697,8 +3739,7 @@ fn decode_hierarchical(
     dhp_payload: &[u8],
     walker: &mut MarkerWalker<'_>,
     mut state: JpegState,
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+) -> Result<JpegImage> {
     // The DHP body is a frame header (§B.3.2): precision, Y, X, component
     // list. It fixes the completed-image precision and component identities.
     let dhp = parse_sof(dhp_payload)?;
@@ -3779,7 +3820,6 @@ fn decode_hierarchical(
                     precision,
                     dct_yuv_class.unwrap_or(false),
                     &state,
-                    pts,
                 );
             }
             SOI => continue,
@@ -4758,8 +4798,7 @@ fn shape_hierarchical_frame(
     precision: u32,
     yuv_class: bool,
     state: &JpegState,
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+) -> Result<JpegImage> {
     let nc = refs.len();
     let width = refs[0].width;
     let height = refs[0].height;
@@ -4795,12 +4834,19 @@ fn shape_hierarchical_frame(
                 out_planes.push(VideoPlane { stride, data });
             }
         }
-        return Ok(VideoFrame {
-            pts,
-            planes: out_planes,
-        });
+        let format = if precision == 12 {
+            PixelFormat::Yuv444P12Le
+        } else {
+            PixelFormat::Yuv444P
+        };
+        return Ok(JpegImage::new(
+            width as u32,
+            height as u32,
+            format,
+            out_planes,
+        ));
     }
-    shape_lossless_frame(&samples, nc, width, height, 0, precision, state, pts)
+    shape_lossless_frame(&samples, nc, width, height, 0, precision, state)
 }
 
 /// Shape the reconstructed per-component lossless sample planes into the
@@ -4816,8 +4862,7 @@ fn shape_lossless_frame(
     pt: u32,
     precision: u32,
     state: &JpegState,
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+) -> Result<JpegImage> {
     // Four-component decode: pack the per-component planes into a single
     // row-major `C M Y K` output (packed `PixelFormat::Cmyk`, 4
     // bytes/pixel). All components are `H_i = V_i = 1` in the lossless
@@ -4865,10 +4910,12 @@ fn shape_lossless_frame(
             data[o + 2] = yy;
             data[o + 3] = k;
         }
-        return Ok(VideoFrame {
-            pts,
-            planes: vec![VideoPlane { stride, data }],
-        });
+        return Ok(JpegImage::new(
+            width as u32,
+            height as u32,
+            PixelFormat::Cmyk,
+            vec![VideoPlane { stride, data }],
+        ));
     }
 
     // Three-component decode: shape the output planes by precision.
@@ -4885,10 +4932,12 @@ fn shape_lossless_frame(
                 data[i * 3 + 1] = (samples[1][i] << pt) as u8;
                 data[i * 3 + 2] = (samples[2][i] << pt) as u8;
             }
-            return Ok(VideoFrame {
-                pts,
-                planes: vec![VideoPlane { stride, data }],
-            });
+            return Ok(JpegImage::new(
+                width as u32,
+                height as u32,
+                PixelFormat::Rgb24,
+                vec![VideoPlane { stride, data }],
+            ));
         }
 
         // P ∈ {10, 12, 14}: planar `Gbrp{10,12,14}Le`. The encoder is
@@ -4914,10 +4963,15 @@ fn shape_lossless_frame(
                 }
                 out_planes.push(VideoPlane { stride, data });
             }
-            return Ok(VideoFrame {
-                pts,
-                planes: out_planes,
-            });
+            let format = match precision {
+                10 => PixelFormat::Gbrp10Le,
+                12 => PixelFormat::Gbrp12Le,
+                _ => PixelFormat::Gbrp14Le,
+            };
+            return Ok(
+                JpegImage::new(width as u32, height as u32, format, out_planes)
+                    .with_precision(precision as u8),
+            );
         }
 
         // Every remaining precision in 2..=16 (i.e. 2..=7, 9, 11, 13,
@@ -4940,10 +4994,13 @@ fn shape_lossless_frame(
             data[i * 6 + 4] = (c2 & 0xFF) as u8;
             data[i * 6 + 5] = (c2 >> 8) as u8;
         }
-        return Ok(VideoFrame {
-            pts,
-            planes: vec![VideoPlane { stride, data }],
-        });
+        return Ok(JpegImage::new(
+            width as u32,
+            height as u32,
+            PixelFormat::Rgb48Le,
+            vec![VideoPlane { stride, data }],
+        )
+        .with_precision(precision as u8));
     }
 
     // Single-component grayscale: select an output PixelFormat by
@@ -4975,10 +5032,10 @@ fn shape_lossless_frame(
         VideoPlane { stride, data }
     };
 
-    Ok(VideoFrame {
-        pts,
-        planes: vec![plane],
-    })
+    Ok(
+        JpegImage::new(width as u32, height as u32, out_format, vec![plane])
+            .with_precision(precision as u8),
+    )
 }
 
 /// Shape a subsampled three-component (YUV-class) lossless decode into a
@@ -5000,8 +5057,7 @@ fn shape_lossless_yuv_frame(
     width: usize,
     height: usize,
     pt: u32,
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+) -> Result<JpegImage> {
     // Each component grid is MCU-padded (`comp_w[ci]` wide); the output
     // layout follows the same §A.1.1 policy as the DCT paths — native
     // planar chroma when luma carries the maximum factors over 1×1
@@ -5019,7 +5075,12 @@ fn shape_lossless_yuv_frame(
         VideoPlane { stride: w, data }
     };
     let planes = shape_yuv_planes(sof, samples, comp_w, width, height, layout, emit);
-    Ok(VideoFrame { pts, planes })
+    Ok(JpegImage::new(
+        width as u32,
+        height as u32,
+        layout.format(),
+        planes,
+    ))
 }
 
 // ---- Lossless arithmetic JPEG (SOF11) -------------------------------------
@@ -5044,12 +5105,7 @@ fn shape_lossless_yuv_frame(
 // scan-header-selected predictor applies. Restart intervals are an
 // integer multiple of the samples per MCU-row (§H.1.1), so interval
 // boundaries are line-aligned in conformant streams.
-fn decode_lossless_arith_scan(
-    state: &JpegState,
-    sos: &SosInfo,
-    scan: &[u8],
-    pts: Option<i64>,
-) -> Result<VideoFrame> {
+fn decode_lossless_arith_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImage> {
     let sof = state
         .sof
         .as_ref()
@@ -5090,13 +5146,12 @@ fn decode_lossless_arith_scan(
             ));
         }
         return decode_lossless_arith_scan_subsampled(
-            state, sos, scan, pts, predictor, pt, width, height, &h_factors, &v_factors, h_max,
-            v_max,
+            state, sos, scan, predictor, pt, width, height, &h_factors, &v_factors, h_max, v_max,
         );
     }
 
     let samples = decode_lossless_arith_scan_planes(state, sos, scan, false)?;
-    shape_lossless_frame(&samples, nc, width, height, pt, precision, state, pts)
+    shape_lossless_frame(&samples, nc, width, height, pt, precision, state)
 }
 
 /// Decode a flat (all-`H = V = 1`) lossless arithmetic scan into per-component
@@ -5278,7 +5333,6 @@ fn decode_lossless_arith_scan_subsampled(
     state: &JpegState,
     sos: &SosInfo,
     scan: &[u8],
-    pts: Option<i64>,
     predictor: u8,
     pt: u32,
     width: usize,
@@ -5287,7 +5341,7 @@ fn decode_lossless_arith_scan_subsampled(
     v_factors: &[usize],
     h_max: usize,
     v_max: usize,
-) -> Result<VideoFrame> {
+) -> Result<JpegImage> {
     let nc = sos.components.len();
 
     // One statistics area per scan component (§H.1.2.3.2); the DAC L / U
@@ -5404,7 +5458,7 @@ fn decode_lossless_arith_scan_subsampled(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
-    shape_lossless_yuv_frame(sof, &samples, &comp_w, width, height, pt, pts)
+    shape_lossless_yuv_frame(sof, &samples, &comp_w, width, height, pt)
 }
 
 #[cfg(all(test, feature = "registry"))]
@@ -5664,10 +5718,11 @@ mod prog_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod non_interleaved_tests {
-    use super::*;
     use crate::encoder::{encode_jpeg, encode_jpeg_non_interleaved};
     use crate::registry::make_decoder;
-    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+    use oxideav_core::{
+        CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
+    };
 
     fn make_frame(w: u32, h: u32, pix: PixelFormat) -> VideoFrame {
         let (cw, ch) = match pix {
@@ -6573,7 +6628,7 @@ mod precision_12_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod lossless_tests {
-    use super::{decode_jpeg, Error};
+    use super::{decode_planes, Error};
     use crate::encoder::encode_lossless_grayscale_jpeg_8bit;
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -6776,7 +6831,7 @@ mod lossless_tests {
                 data.windows(2).any(|x| x == [0xFF, 0xCB]),
                 "SOF11 marker missing"
             );
-            let v = decode_jpeg(&data, None).unwrap();
+            let v = decode_planes(&data).unwrap();
             assert_eq!(v.planes.len(), 1);
             assert_eq!(v.planes[0].stride, w);
             for j in 0..h {
@@ -6807,7 +6862,7 @@ mod lossless_tests {
             *v = s & 0xFFFF;
         }
         let data = encode_sof11_jpeg(w, h, &[plane.clone()], 16, 4, 0, 0, None);
-        let v = decode_jpeg(&data, None).unwrap();
+        let v = decode_planes(&data).unwrap();
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w * 2);
         for i in 0..w * h {
@@ -6832,7 +6887,7 @@ mod lossless_tests {
             }
         }
         let data = encode_sof11_jpeg(w, h, &planes, 8, 1, 0, 0, None);
-        let v = decode_jpeg(&data, None).unwrap();
+        let v = decode_planes(&data).unwrap();
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w * 3);
         for i in 0..w * h {
@@ -6867,7 +6922,7 @@ mod lossless_tests {
                 .any(|x| x[0] == 0xFF && (0xD0..=0xD7).contains(&x[1])),
             "no RSTn marker found in the scan"
         );
-        let v = decode_jpeg(&data, None).unwrap();
+        let v = decode_planes(&data).unwrap();
         for i in 0..w * h {
             assert_eq!(v.planes[0].data[i] as u32, plane[i], "mismatch at {i}");
         }
@@ -6887,7 +6942,7 @@ mod lossless_tests {
             }
         }
         let data = encode_sof11_jpeg(w, h, &[plane.clone()], 8, 2, 0, 0, Some((2, 5)));
-        let v = decode_jpeg(&data, None).unwrap();
+        let v = decode_planes(&data).unwrap();
         for i in 0..w * h {
             assert_eq!(v.planes[0].data[i] as u32, plane[i], "mismatch at {i}");
         }
@@ -6909,7 +6964,7 @@ mod lossless_tests {
             }
         }
         let data = encode_sof11_jpeg(w, h, &[plane.clone()], 8, 1, pt, 0, None);
-        let v = decode_jpeg(&data, None).unwrap();
+        let v = decode_planes(&data).unwrap();
         for i in 0..w * h {
             assert_eq!(
                 v.planes[0].data[i] as u32,
@@ -6929,7 +6984,7 @@ mod lossless_tests {
             0xFF, 0xCD, 0x00, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, // SOF13 stub
             0xFF, 0xD9, // EOI
         ];
-        let err = decode_jpeg(&bytes, None).expect_err("expected decode error");
+        let err = decode_planes(&bytes).expect_err("expected decode error");
         assert!(
             matches!(err, Error::Unsupported(_)),
             "expected Unsupported, got {err:?}"
@@ -6966,7 +7021,7 @@ mod lossless_tests {
 
 #[cfg(test)]
 mod sof10_tests {
-    use super::decode_jpeg;
+    use super::decode_planes;
     use crate::jpeg::arith::{encode_magnitude, AcStats, ArithEncoder, Context, DcStats};
     use crate::jpeg::dct::idct8x8;
     use crate::jpeg::zigzag::ZIGZAG;
@@ -7406,7 +7461,7 @@ mod sof10_tests {
     }
 
     fn assert_gray8_exact(jpeg: &[u8], blocks: &[[i32; 64]], blocks_x: usize, w: usize, h: usize) {
-        let v = decode_jpeg(jpeg, None).expect("decode SOF10");
+        let v = decode_planes(jpeg).expect("decode SOF10");
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w);
         let want = expected_plane_8(blocks, blocks_x, w, h);
@@ -7525,7 +7580,7 @@ mod sof10_tests {
             (vec![2], 1, 63, 0, 0),
         ];
         let jpeg = encode_sof10_jpeg(w, h, 8, &comps, &blocks, &scans, 0, None);
-        let v = decode_jpeg(&jpeg, None).expect("decode SOF10 4:2:0");
+        let v = decode_planes(&jpeg).expect("decode SOF10 4:2:0");
         assert_eq!(v.planes.len(), 3);
         let dims = [(w, h, 4usize), (w / 2, h / 2, 2), (w / 2, h / 2, 2)];
         for ci in 0..3 {
@@ -7610,7 +7665,7 @@ mod sof10_tests {
             0,
             None,
         );
-        let v = decode_jpeg(&jpeg, None).expect("decode SOF10 12-bit");
+        let v = decode_planes(&jpeg).expect("decode SOF10 12-bit");
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w * 2);
         let want = expected_plane_12(&blocks, 2, w, h);
@@ -7635,7 +7690,7 @@ mod sof10_tests {
             scans.push((vec![ci], 1, 63, 0, 0));
         }
         let jpeg = encode_sof10_jpeg(w, h, 8, &comps, &blocks, &scans, 0, None);
-        let v = decode_jpeg(&jpeg, None).expect("decode SOF10 CMYK");
+        let v = decode_planes(&jpeg).expect("decode SOF10 CMYK");
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w * 4);
         let want: Vec<Vec<u8>> = blocks
@@ -7661,7 +7716,7 @@ mod sof10_tests {
         let blocks = gen_blocks(1, 1, 50, 10, 3);
         let scans: Vec<ScanDesc> = vec![(vec![0], 0, 0, 0, 0)];
         let jpeg = encode_sof10_jpeg(w, h, 10, &[(1, 1)], &[blocks], &scans, 0, None);
-        let err = decode_jpeg(&jpeg, None).expect_err("expected decode error");
+        let err = decode_planes(&jpeg).expect_err("expected decode error");
         assert!(
             matches!(err, crate::error::MjpegError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
@@ -7813,7 +7868,7 @@ mod sof10_tests {
         append_hier_gray_dct_frame(&mut out, 0xC9, w, h, &blocks, blocks_x, false, false);
         out.extend_from_slice(&[0xFF, 0xD9]); // EOI
 
-        let v = decode_jpeg(&out, None).expect("decode hierarchical SOF9");
+        let v = decode_planes(&out).expect("decode hierarchical SOF9");
         assert_eq!(v.planes.len(), 1);
         assert_eq!(v.planes[0].stride, w);
         let want = expected_plane_8(&blocks, blocks_x, w, h);
@@ -7839,7 +7894,7 @@ mod sof10_tests {
         append_hier_gray_dct_frame(&mut out, 0xCD, w, h, &diff, blocks_x, true, false);
         out.extend_from_slice(&[0xFF, 0xD9]);
 
-        let v = decode_jpeg(&out, None).expect("decode hierarchical SOF9+SOF13");
+        let v = decode_planes(&out).expect("decode hierarchical SOF9+SOF13");
         assert_eq!(v.planes.len(), 1);
 
         // Reference: base render (level-shifted, clamped) then + diff IDCT
@@ -7912,7 +7967,7 @@ mod sof10_tests {
         append_hier_gray_dct_frame(&mut out, 0xCE, w, h, &diff, blocks_x, true, true);
         out.extend_from_slice(&[0xFF, 0xD9]);
 
-        let v = decode_jpeg(&out, None).expect("decode hierarchical SOF10+SOF14");
+        let v = decode_planes(&out).expect("decode hierarchical SOF10+SOF14");
         assert_eq!(v.planes.len(), 1);
 
         // Same §J.2.1 reference reconstruction as the SOF13 case.
@@ -8004,7 +8059,7 @@ mod sof10_tests {
         append_hier_gray_dct_frame(&mut out, 0xCD, w, h, &diff, 1, true, false);
         out.extend_from_slice(&[0xFF, 0xD9]);
 
-        let err = decode_jpeg(&out, None).expect_err("coder mismatch must error");
+        let err = decode_planes(&out).expect_err("coder mismatch must error");
         assert!(
             matches!(err, crate::error::MjpegError::InvalidData(_)),
             "expected InvalidData for coder mismatch, got {err:?}"

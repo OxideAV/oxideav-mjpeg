@@ -27,8 +27,8 @@
 //! on every component.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mjpeg::decoder::{decode_jpeg, decode_jpeg_with_tables};
-use oxideav_mjpeg::t81::{ColorSignalling, HuffmanTables, JpegEncodeOptions, JpegProcess};
+use oxideav_mjpeg::DecodeOptions;
+use oxideav_mjpeg::t81::{ColorSignalling, HuffmanTables, EncodeOptions, JpegProcess};
 
 const MAX_PIXELS: usize = 512;
 
@@ -52,7 +52,7 @@ const LAYOUTS_4: &[&[(u8, u8)]] = &[
 /// with subsampled chroma, packed RGB / CMYK, planar GBR), or `None`
 /// when the geometry is not one of the shapes the decoder documents.
 fn decoded_components(
-    f: &oxideav_core::VideoFrame,
+    f: &oxideav_mjpeg::JpegImage,
     w: usize,
     h: usize,
     layout: &[(u8, u8)],
@@ -232,24 +232,29 @@ fuzz_target!(|data: &[u8]| {
             point_transform: pt,
         },
     };
-    let opts = JpegEncodeOptions {
-        quality,
-        tables,
-        process,
-        precision,
-        restart_interval,
-        abbreviated,
-        signalling,
-        sampling: layout.clone(),
-        table_ids: Vec::new(),
-    };
+    let opts = {
+ let mut o = EncodeOptions::default();
+ o.quality = quality;
+ o.tables = tables;
+ o.process = process;
+ o.precision = precision;
+ o.restart_interval = restart_interval;
+ o.abbreviated = abbreviated;
+ o.signalling = signalling;
+ o.sampling = layout.clone();
+ o.table_ids = Vec::new();
+ o
+};
     let refs: Vec<&[u16]> = planes.iter().map(|p| p.as_slice()).collect();
     let out = opts
         .encode(width as u32, height as u32, &refs)
         .unwrap_or_else(|e| panic!("t81 encode refused a legal combination ({opts:?}): {e}"));
     let decoded = match &out.tables {
-        Some(t) => decode_jpeg_with_tables(t, &out.data, None),
-        None => decode_jpeg(&out.data, None),
+        Some(t) => oxideav_mjpeg::decode_with(
+            &out.data,
+            &DecodeOptions::new().with_tables(t.clone()),
+        ),
+        None => oxideav_mjpeg::decode(&out.data),
     }
     .unwrap_or_else(|e| panic!("decoder rejected the t81 stream ({opts:?}): {e}"));
     let got = decoded_components(&decoded, width, height, &layout)

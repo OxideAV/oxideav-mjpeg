@@ -26,7 +26,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use oxideav_mjpeg::decoder::decode_jpeg;
+use oxideav_mjpeg::decode;
 use oxideav_mjpeg::encoder::{
     encode_lossless_jpeg_cmyk_with_opts, encode_lossless_jpeg_grayscale_with_opts,
     encode_lossless_jpeg_rgb_with_opts, encode_lossless_jpeg_yuv_with_opts,
@@ -122,7 +122,7 @@ fn magick_raw(jpeg: &[u8], space: &str, tag: &str) -> Option<Vec<u8>> {
 }
 
 fn decode_gray(jpeg: &[u8]) -> Vec<u8> {
-    let f = decode_jpeg(jpeg, None).expect("decode");
+    let f = decode(jpeg).expect("decode");
     assert_eq!(f.planes.len(), 1);
     let p = &f.planes[0];
     let mut out = Vec::with_capacity(W * H);
@@ -227,7 +227,7 @@ fn encoder_multi_component_restart_streams_decode_byte_exact() {
                 0,
             )
             .unwrap();
-            let f = decode_jpeg(&rgb, None).unwrap();
+            let f = decode(&rgb).unwrap();
             let pl = &f.planes[0];
             let mut packed = Vec::with_capacity(W * H * 3);
             for y in 0..H {
@@ -253,7 +253,7 @@ fn encoder_multi_component_restart_streams_decode_byte_exact() {
                 0,
             )
             .unwrap();
-            let f = decode_jpeg(&cmyk, None).unwrap();
+            let f = decode(&cmyk).unwrap();
             let pl = &f.planes[0];
             let mut want4 = Vec::with_capacity(W * H * 4);
             for y in 0..H {
@@ -293,7 +293,7 @@ fn encoder_multi_component_restart_streams_decode_byte_exact() {
             W as u32, H as u32, src, W, &cb, cw, &cr, cw, 2, 2, p, ri, 0,
         )
         .unwrap();
-        let f = decode_jpeg(&s, None).unwrap();
+        let f = decode(&s).unwrap();
         assert_eq!(f.planes.len(), 3);
         for y in 0..H {
             let pl = &f.planes[0];

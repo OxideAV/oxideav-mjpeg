@@ -5,6 +5,8 @@
 //! bytes before the payload byte is legal as fill.
 
 /// Start of Image.
+/// TEM — temporary private use in arithmetic coding; stand-alone (no length).
+pub const TEM: u8 = 0x01;
 pub const SOI: u8 = 0xD8;
 /// End of Image.
 pub const EOI: u8 = 0xD9;
@@ -91,6 +93,7 @@ pub const APP0: u8 = 0xE0;
 /// followed by a one-byte chunk-sequence number, a one-byte total-chunk
 /// count, and then the next slice of the ICC profile bytes (T.872 / Annex
 /// L of T.871 — see docs/image/jpeg/jpeg-fixtures-and-traces.md §3.11).
+pub const APP1: u8 = 0xE1;
 pub const APP2: u8 = 0xE2;
 /// APP14 — conventionally carries the Adobe colour-transform tag.
 pub const APP14: u8 = 0xEE;

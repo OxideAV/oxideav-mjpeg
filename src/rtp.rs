@@ -1674,7 +1674,7 @@ mod tests {
     // types in that build. ----
 
     #[cfg(feature = "registry")]
-    use crate::decoder::decode_jpeg;
+    use crate::decoder::decode_planes;
     #[cfg(feature = "registry")]
     use crate::encoder::encode_jpeg;
     #[cfg(feature = "registry")]
@@ -1787,7 +1787,7 @@ mod tests {
 
         // The reconstructed stream must decode without error and yield a
         // 3-plane 4:2:0 frame of the right dimensions.
-        let decoded = decode_jpeg(&rebuilt, None).expect("decode reconstructed RTP/JPEG");
+        let decoded = decode_planes(&rebuilt).expect("decode reconstructed RTP/JPEG");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
         assert_eq!(decoded.planes[1].data.len(), w.div_ceil(2) * h.div_ceil(2));
@@ -1823,7 +1823,7 @@ mod tests {
             Progress::Frame(j) => j,
             _ => panic!(),
         };
-        let decoded = decode_jpeg(&rebuilt, None).expect("decode Q-field RTP/JPEG");
+        let decoded = decode_planes(&rebuilt).expect("decode Q-field RTP/JPEG");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
     }
@@ -2027,7 +2027,7 @@ mod tests {
             }
         }
         let rebuilt = rebuilt.expect("frame reassembled");
-        let decoded = decode_jpeg(&rebuilt, None).expect("decode packetized RTP/JPEG");
+        let decoded = decode_planes(&rebuilt).expect("decode packetized RTP/JPEG");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
         assert_eq!(decoded.planes[1].data.len(), w.div_ceil(2) * h.div_ceil(2));
@@ -2051,7 +2051,7 @@ mod tests {
                 rebuilt = Some(j);
             }
         }
-        let decoded = decode_jpeg(&rebuilt.unwrap(), None).expect("decode");
+        let decoded = decode_planes(&rebuilt.unwrap()).expect("decode");
         assert_eq!(decoded.planes.len(), 3);
         assert_eq!(decoded.planes[0].data.len(), w * h);
     }

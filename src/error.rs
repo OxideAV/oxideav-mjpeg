@@ -10,6 +10,9 @@
 
 use core::fmt;
 
+/// Contract alias: the crate's error type.
+pub type Error = MjpegError;
+
 /// `Result` alias scoped to `oxideav-mjpeg`. Standalone (no
 /// `oxideav-core`) callers see this; framework callers convert via the
 /// gated `From<MjpegError> for oxideav_core::Error` impl.
@@ -17,11 +20,13 @@ pub type Result<T> = core::result::Result<T, MjpegError>;
 
 /// Crate-local error type for the JPEG decoder/encoder pipeline.
 ///
-/// Variants mirror the subset of `oxideav_core::Error` the codec can
-/// hit. Transport (`Io`) and framework-specific (`FormatNotFound`,
-/// `CodecNotFound`) errors are intentionally absent — they originate
-/// in callers that are already linking `oxideav-core`.
+/// The still-image contract variants (`InvalidData`, `Unsupported`,
+/// `LimitExceeded`, `Io`) plus the streaming video path's `Eof` /
+/// `NeedMore`. Framework-specific errors (`FormatNotFound`,
+/// `CodecNotFound`) are intentionally absent — they originate in
+/// callers that are already linking `oxideav-core`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MjpegError {
     /// The bitstream is malformed (bad marker, truncated segment,
     /// invalid Huffman code length, etc.).
@@ -30,6 +35,14 @@ pub enum MjpegError {
     /// (hierarchical SOF, progressive arithmetic, etc.) or the encoder
     /// was asked to emit a frame in a format it doesn't support.
     Unsupported(String),
+    /// A [`DecodeOptions`](crate::DecodeOptions) limit (dimensions,
+    /// pixel count, input length) was exceeded. Checked before any
+    /// sample buffer is allocated.
+    LimitExceeded(String),
+    /// An I/O error from [`decode_from`](crate::decode_from) /
+    /// [`encode_to`](crate::encode_to): the `std::io::ErrorKind` plus
+    /// the error's message.
+    Io(std::io::ErrorKind, String),
     /// Catch-all for misuse errors that aren't bitstream-level
     /// (e.g. trait-API contract violations).
     Other(String),
@@ -55,6 +68,17 @@ impl MjpegError {
     pub fn other(msg: impl Into<String>) -> Self {
         Self::Other(msg.into())
     }
+
+    /// Construct an [`MjpegError::LimitExceeded`] from a stringy message.
+    pub fn limit(msg: impl Into<String>) -> Self {
+        Self::LimitExceeded(msg.into())
+    }
+}
+
+impl From<std::io::Error> for MjpegError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e.kind(), e.to_string())
+    }
 }
 
 impl fmt::Display for MjpegError {
@@ -62,6 +86,8 @@ impl fmt::Display for MjpegError {
         match self {
             Self::InvalidData(s) => write!(f, "invalid data: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::LimitExceeded(s) => write!(f, "limit exceeded: {s}"),
+            Self::Io(kind, s) => write!(f, "I/O error ({kind:?}): {s}"),
             Self::Other(s) => write!(f, "other: {s}"),
             Self::Eof => write!(f, "end of stream"),
             Self::NeedMore => write!(f, "need more data"),

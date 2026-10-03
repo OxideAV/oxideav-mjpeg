@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.9...v0.1.10) - 2026-10-03
+
+### Added
+
+- *(registry)* frame bridge — JpegImage::from_video_frame(&VideoFrame, &CodecParameters) + TryFrom
+- still-image contract API — probe/info/decode/encode root vocabulary, JpegImage, exact T.871 to_rgb8
+
+### Fixed
+
+- CI-green standalone corpus test, ci-standalone job, standalone_api fuzz target, decode limits on every frame header, differential-DCT table overflow
+
+### Other
+
+- harmonise with the contract rulings — Io(std::io::Error), Option limits, YuvJ for every YCbCr JPEG
+- README in the contract's section order, CHANGELOG Added / Changed / Deprecated / Fixed, manifest notes
+
 ### Added
 
 - *(api)* the workspace image-crate contract at the crate root, usable with `default-features = false`: `probe`, `info -> ImageInfo`, `decode -> JpegImage`, `decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`, `decode_rgba8 -> RgbaImage`, `decode_from<R: Read>`, `encode(&JpegImage, &EncodeOptions)`, `encode_rgb8` (full-range YCbCr 4:2:0 by default, `with_chroma`), `encode_rgba8` (alpha dropped — JPEG has none), `encode_to<W: Write>`

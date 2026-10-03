@@ -1145,3 +1145,72 @@ fn inspector_classifies_hierarchical_encoder_output_by_first_stage() {
         assert_eq!((info.width, info.height), (8, 8));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Differential DCT stages must stay within the typical Huffman tables.
+// ---------------------------------------------------------------------------
+
+/// 4 × 88 grayscale samples (fuzz-derived, `hierarchical_roundtrip`
+/// 2026-10-03) whose three-level DCT pyramid at quality 96 produced a
+/// differential-stage AC coefficient of magnitude ≥ 1024 — category 11,
+/// which the Annex K.5 typical AC table does not define. The emitter
+/// wrote no code for it and the decoder lost the block ("JPEG AC: run
+/// out of block"). The encoder now clamps differential-stage
+/// coefficients to the table's range before coding and before mirroring
+/// the reconstruction, so the stream decodes and the lossless final stage
+/// still reconstructs bit-exact.
+const DIFF_OVERFLOW_4X88: [u8; 352] = [
+    195, 195, 0, 64, 0, 195, 0, 38, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109,
+    109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109, 109,
+    109, 109, 109, 109, 109, 109, 255, 1, 0, 0, 0, 0, 195, 195, 44, 255, 96, 108, 0, 28, 255, 123,
+    123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 255, 255, 255, 255, 255, 255, 255, 255,
+    123, 123, 123, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 207, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 250, 2, 0, 0, 0, 64, 9,
+    59, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 102, 93, 93, 255, 255, 255, 93, 93, 93, 93, 0,
+    64, 9, 59, 178, 37, 250, 73, 2, 0, 0, 0, 255, 255, 9, 255, 178, 255, 31, 37, 250, 0, 231, 231,
+    2, 42, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 231, 0, 17,
+    0, 0, 33, 0, 247, 6, 0, 0, 255, 255, 9, 255, 255, 28, 90, 44, 89, 0, 205, 0, 0, 0, 0, 0, 0,
+    255, 132, 91, 48, 96, 93, 93, 50, 204, 204, 204, 204, 204, 204, 204, 15, 0, 0, 0, 0, 0, 0, 0,
+    93, 93, 255, 255, 255, 255, 0, 0, 255, 255, 255, 255, 0, 255, 255, 240, 240, 93, 93, 93, 93,
+    93, 102, 93, 93, 255, 255, 255, 93, 93, 93, 93, 0, 64, 9, 59, 178, 37, 250, 73, 2, 0, 0, 0,
+    255, 255, 9, 255, 255, 255, 255, 9, 0, 28, 90, 44, 89, 0, 0, 251, 251, 251, 1, 0, 0, 0, 0, 0,
+    1, 8, 0, 3, 0, 178,
+];
+
+#[test]
+fn hier_dct_differential_stage_coefficients_fit_the_typical_tables() {
+    use oxideav_mjpeg::encoder::{
+        encode_hierarchical_dct_jpeg_grayscale,
+        encode_hierarchical_dct_jpeg_grayscale_lossless_final,
+        encode_hierarchical_dct_progressive_jpeg_grayscale,
+    };
+    let (w, h) = (4u32, 88u32);
+    let src = &DIFF_OVERFLOW_4X88[..];
+
+    let exact =
+        encode_hierarchical_dct_jpeg_grayscale_lossless_final(w, h, src, 4, 96, 3).expect("encode");
+    let img = oxideav_mjpeg::decode(&exact).expect("lossless-final pyramid must decode");
+    assert_eq!(img.format, oxideav_mjpeg::PixelFormat::Gray8);
+    assert_eq!(
+        &img.planes[0].data[..],
+        src,
+        "lossless final stage is bit-exact"
+    );
+
+    let lossy = encode_hierarchical_dct_jpeg_grayscale(w, h, src, 4, 96, 3).expect("encode");
+    let img = oxideav_mjpeg::decode(&lossy).expect("lossy pyramid must decode");
+    assert_eq!((img.width, img.height), (w, h));
+
+    for lossless_final in [false, true] {
+        let prog =
+            encode_hierarchical_dct_progressive_jpeg_grayscale(w, h, src, 4, 96, 3, lossless_final)
+                .expect("encode");
+        let img = oxideav_mjpeg::decode(&prog).expect("progressive pyramid must decode");
+        assert_eq!((img.width, img.height), (w, h));
+        if lossless_final {
+            assert_eq!(&img.planes[0].data[..], src);
+        }
+    }
+}

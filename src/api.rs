@@ -110,10 +110,14 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
     if opts.strict {
         strict_structure_check(bytes)?;
     }
-    let mut img = match &opts.tables {
-        Some(t) => crate::decoder::decode_planes_with_tables(t, bytes)?,
-        None => crate::decoder::decode_planes(bytes)?,
+    // The same limits are re-checked on every frame header inside the
+    // decoder (hierarchical sequences carry several).
+    let limits = crate::decoder::DecodeLimits {
+        max_width: opts.max_width,
+        max_height: opts.max_height,
+        max_pixels: opts.max_pixels,
     };
+    let mut img = crate::decoder::decode_planes_limited(opts.tables.as_deref(), bytes, limits)?;
     // Full-range labelling where JFIF says so (T.871 §7).
     if hdr.jfif {
         img.format = img.format.full_range_label();
@@ -294,7 +298,7 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
             break;
         };
         match marker {
-            markers::SOI | markers::TEM => continue,
+            markers::SOI => continue,
             m if markers::is_rst(m) => continue,
             markers::EOI => {
                 if sof.is_none() {
@@ -326,7 +330,9 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                 }
             }
             markers::APP0 => {
-                let p = walker.read_segment_payload()?;
+                let Some(p) = lenient_payload(&mut walker, strict)? else {
+                    continue;
+                };
                 if p.len() >= 5 && &p[..5] == b"JFIF\0" {
                     jfif = true;
                     if strict {
@@ -335,7 +341,9 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                 }
             }
             markers::APP1 => {
-                let p = walker.read_segment_payload()?;
+                let Some(p) = lenient_payload(&mut walker, strict)? else {
+                    continue;
+                };
                 if p.len() >= 6 && &p[..6] == b"Exif\0\0" {
                     if exif.is_none() {
                         exif = Some(p[6..].to_vec());
@@ -348,7 +356,9 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                 }
             }
             markers::APP2 => {
-                let p = walker.read_segment_payload()?;
+                let Some(p) = lenient_payload(&mut walker, strict)? else {
+                    continue;
+                };
                 if p.len() >= ICC_IDENTIFIER.len() && &p[..ICC_IDENTIFIER.len()] == ICC_IDENTIFIER {
                     icc_seen = true;
                     match crate::jpeg::inspect::parse_icc_profile_app2(p) {
@@ -370,7 +380,9 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                 }
             }
             markers::APP14 => {
-                let p = walker.read_segment_payload()?;
+                let Some(p) = lenient_payload(&mut walker, strict)? else {
+                    continue;
+                };
                 if p.len() >= 12 && &p[..5] == b"Adobe" {
                     if adobe.is_none() {
                         adobe = Some(p[11]);
@@ -381,7 +393,10 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                 }
             }
             _ => {
-                let _ = walker.read_segment_payload()?;
+                // Unknown length-prefixed segment: skipped; a truncated
+                // length is ignored (the decoder resynchronises on the
+                // next marker) unless strict.
+                lenient_payload(&mut walker, strict)?;
             }
         }
     }
@@ -445,16 +460,35 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
     })
 }
 
+/// Read a segment payload the way the decoder does for segments it
+/// does not interpret: a truncated length field is not fatal (`None`,
+/// the walker resynchronises on the next marker) — except in strict
+/// mode, where it is an error.
+fn lenient_payload<'a>(walker: &mut MarkerWalker<'a>, strict: bool) -> Result<Option<&'a [u8]>> {
+    match walker.read_segment_payload() {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if strict => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Strict mode: the stream must be `SOI`, segments and scans, `EOI`,
 /// with nothing after the `EOI`.
 fn strict_structure_check(bytes: &[u8]) -> Result<()> {
+    // B.1.1.3: SOI is followed directly by a marker segment — the lenient
+    // walker skips stray bytes, strict mode does not.
+    if !probe(bytes) {
+        return Err(Error::invalid(
+            "JPEG (strict): SOI is not followed by a marker",
+        ));
+    }
     let mut walker = MarkerWalker::new(&bytes[2..]);
     loop {
         let Some(marker) = walker.next_marker()? else {
             return Err(Error::invalid("JPEG (strict): no EOI"));
         };
         match marker {
-            markers::SOI | markers::TEM => {}
+            markers::SOI => {}
             m if markers::is_rst(m) => {}
             markers::EOI => {
                 if walker.pos != bytes.len() - 2 {
@@ -499,6 +533,7 @@ fn rgb_class(frame: &SofInfo, adobe: Option<u8>) -> bool {
 /// a native subsampled format when chroma is `1×1` under a
 /// maximal-factor luma, `4:4:4` for every other legal combination.
 fn yuv_layout(frame: &SofInfo, twelve_bit: bool) -> PixelFormat {
+    debug_assert_eq!(frame.components.len(), 3);
     let y = frame.components[0];
     let cb = frame.components[1];
     let cr = frame.components[2];
@@ -616,15 +651,27 @@ fn infer_shape(hdr: &Header) -> Result<Shape> {
             _ => return Err(Error::unsupported(format!("{nc}-component JPEG"))),
         }
     } else if lossless {
-        if subsampled {
-            yuv_layout(frame, false)
-        } else {
-            match nc {
-                1 => gray_format(p),
-                3 => rgb_lossless_format(p),
-                4 => PixelFormat::Cmyk,
-                _ => return Err(Error::unsupported(format!("{nc}-component JPEG"))),
+        if !(2..=16).contains(&p) {
+            return Err(Error::unsupported(format!(
+                "lossless JPEG: precision {p} out of range 2..=16"
+            )));
+        }
+        match nc {
+            1 => gray_format(p),
+            3 if subsampled && p == 8 => yuv_layout(frame, false),
+            3 if subsampled => {
+                return Err(Error::unsupported(format!(
+                    "lossless JPEG: subsampled three-component scans require precision 8, got {p}"
+                )))
             }
+            3 => rgb_lossless_format(p),
+            4 if p == 8 && !subsampled => PixelFormat::Cmyk,
+            4 => {
+                return Err(Error::unsupported(
+                    "lossless JPEG: four-component scans require P = 8 and H_i = V_i = 1",
+                ))
+            }
+            _ => return Err(Error::unsupported(format!("{nc}-component JPEG"))),
         }
     } else {
         match (nc, p) {
@@ -1145,6 +1192,14 @@ mod tests {
         assert!(decode(&trailing).is_ok());
         assert!(matches!(
             decode_with(&trailing, &DecodeOptions::new().with_strict(true)),
+            Err(Error::InvalidData(_))
+        ));
+        let mut stray = jpeg.clone();
+        stray.insert(2, 0x03);
+        assert!(decode(&stray).is_ok());
+        assert!(!probe(&stray));
+        assert!(matches!(
+            decode_with(&stray, &DecodeOptions::new().with_strict(true)),
             Err(Error::InvalidData(_))
         ));
         // Progressive output decodes too and reports as such.

@@ -156,3 +156,15 @@ name = "t81_roundtrip"
 path = "fuzz_targets/t81_roundtrip.rs"
 test = false
 doc = false
+
+# Contract-surface target — arbitrary bytes into the root `probe` /
+# `info` / `decode_with` / `decode_rgba8` functions (header scan, shape
+# inference, limits, strict mode, every `to_rgba8` kernel), then back
+# out through `encode` / `encode_rgb8` for inputs that decode. Asserts
+# `info` and `decode` agree on the layout and that the lossless
+# re-encode round-trips. See `fuzz_targets/standalone_api.rs`.
+[[bin]]
+name = "standalone_api"
+path = "fuzz_targets/standalone_api.rs"
+test = false
+doc = false

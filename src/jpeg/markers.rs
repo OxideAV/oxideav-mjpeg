@@ -5,8 +5,6 @@
 //! bytes before the payload byte is legal as fill.
 
 /// Start of Image.
-/// TEM — temporary private use in arithmetic coding; stand-alone (no length).
-pub const TEM: u8 = 0x01;
 pub const SOI: u8 = 0xD8;
 /// End of Image.
 pub const EOI: u8 = 0xD9;

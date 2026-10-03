@@ -7157,6 +7157,26 @@ fn hier_dct_quantise_block(
     q
 }
 
+/// Clamp a quantised block to the coefficient magnitudes the Annex K
+/// typical Huffman tables can code for an 8-bit frame: DC categories
+/// `0..=11` (Table K.3, `|DC| ≤ 2047`) and AC categories `1..=10`
+/// (Tables K.5 / K.6, `|AC| ≤ 1023`) — the Table F.1 / F.2 ranges of a
+/// non-differential 8-bit frame, which never trigger there. A
+/// **differential** frame (§J.2.3.1) codes signed stage differences
+/// whose range is twice the sample range, so an aggressive quantiser
+/// (high quality) can push a coefficient one category past the table;
+/// without this clamp the emitter would write a code the table does not
+/// define and the decoder would lose the block. The clamp is applied
+/// before the mirrored reconstruction, so the encoder's reference stays
+/// exactly what the decoder reconstructs; the lossless final stage (when
+/// requested) absorbs the residual.
+fn hier_clamp_block_for_typical_tables(q: &mut [i32; 64]) {
+    q[0] = q[0].clamp(-2047, 2047);
+    for v in &mut q[1..] {
+        *v = (*v).clamp(-1023, 1023);
+    }
+}
+
 /// Huffman-emit one quantised block (natural order): DC category + AC
 /// run/size pairs over the zigzag scan, exactly as the flat sequential
 /// encoder. `differential` selects the §J.2.3.1 DC model — the DC
@@ -7271,7 +7291,9 @@ fn hier_encode_dct_frame_huff(
         for my in 0..mcus_y {
             for mx in 0..mcus_x {
                 for ci in 0..nc {
-                    let q = hier_dct_quantise_block(&planes_i32[ci], w, h, mx * 8, my * 8, quant);
+                    let mut q =
+                        hier_dct_quantise_block(&planes_i32[ci], w, h, mx * 8, my * 8, quant);
+                    hier_clamp_block_for_typical_tables(&mut q);
                     hier_emit_block_huff(
                         &mut bw,
                         &q,
@@ -7964,7 +7986,12 @@ fn hier_encode_prog_frame_huff(
     differential: bool,
 ) -> Vec<Vec<u32>> {
     let nc = planes_i32.len();
-    let blocks = hier_quantise_planes(planes_i32, w, h, quant);
+    let mut blocks = hier_quantise_planes(planes_i32, w, h, quant);
+    for plane in &mut blocks {
+        for q in plane.iter_mut() {
+            hier_clamp_block_for_typical_tables(q);
+        }
+    }
     let blocks_x = w.div_ceil(8);
     let blocks_y = h.div_ceil(8);
 

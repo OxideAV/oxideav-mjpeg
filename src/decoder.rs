@@ -75,6 +75,8 @@ struct JpegState {
     /// Per-destination AC arithmetic conditioning (Kx threshold + stats).
     /// Indexed by Tb (0..3). Default Kx=5.
     arith_ac: [Option<ArithAcConditioning>; 4],
+    /// Caller-supplied geometry limits, checked on every frame header.
+    limits: DecodeLimits,
 }
 
 /// Container holding both the conditioning parameters (L, U) and the live
@@ -105,6 +107,7 @@ impl JpegState {
             adobe_transform: None,
             arithmetic: false,
             progressive_arith: false,
+            limits: DecodeLimits::default(),
             arith_dc: Default::default(),
             arith_ac: Default::default(),
         }
@@ -120,9 +123,29 @@ impl JpegState {
 /// largest possible decoder allocation in the low hundreds of MiB.
 const MAX_PIXEL_BUDGET: u64 = 64 * 1024 * 1024;
 
+/// Caller-supplied geometry limits ([`crate::DecodeOptions`]), checked
+/// against every frame header before any sample buffer is allocated —
+/// including the per-frame headers of a hierarchical sequence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodeLimits {
+    pub(crate) max_width: u32,
+    pub(crate) max_height: u32,
+    pub(crate) max_pixels: u64,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        DecodeLimits {
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            max_pixels: u64::MAX,
+        }
+    }
+}
+
 /// Centralised SOF validator. Run on every freshly-parsed SOF before
-/// it's stored as `state.sof`. Catches the panic surfaces a SOF can
-/// open downstream:
+/// it's stored as `state.sof`. Enforces the caller's [`DecodeLimits`]
+/// first, then catches the panic surfaces a SOF can open downstream:
 ///   * `Nf = 0` → empty component list → divisions by zero / empty
 ///     vec indexing.
 ///   * `Hi / Vi` outside `1..=4` (T.81 §B.2.2) → MCU geometry
@@ -130,7 +153,21 @@ const MAX_PIXEL_BUDGET: u64 = 64 * 1024 * 1024;
 ///   * `Tq > 3` → out-of-bounds index into the 4-wide quant table.
 ///   * `Wt × Ht × Nf > MAX_PIXEL_BUDGET` → unbounded
 ///     `vec![0u8; W × H]` allocation.
-fn validate_sof(sof: &SofInfo) -> Result<()> {
+fn validate_sof(sof: &SofInfo, limits: &DecodeLimits) -> Result<()> {
+    let (w, h) = (sof.width as u32, sof.height as u32);
+    if w > limits.max_width || h > limits.max_height {
+        return Err(Error::limit(format!(
+            "JPEG: frame {w}×{h} exceeds max_width × max_height = {}×{}",
+            limits.max_width, limits.max_height
+        )));
+    }
+    if u64::from(w) * u64::from(h) > limits.max_pixels {
+        return Err(Error::limit(format!(
+            "JPEG: frame {w}×{h} = {} pixels exceeds max_pixels = {}",
+            u64::from(w) * u64::from(h),
+            limits.max_pixels
+        )));
+    }
     if sof.components.is_empty() {
         return Err(Error::invalid("SOF: Nf = 0"));
     }
@@ -404,6 +441,21 @@ pub fn decode_planes_with_tables(tables: &[u8], data: &[u8]) -> Result<JpegImage
     decode_jpeg_inner(state, data)
 }
 
+/// [`decode_planes`] / [`decode_planes_with_tables`] with geometry
+/// limits enforced on every frame header (the `decode_with` core).
+pub(crate) fn decode_planes_limited(
+    tables: Option<&[u8]>,
+    data: &[u8],
+    limits: DecodeLimits,
+) -> Result<JpegImage> {
+    let mut state = JpegState::new();
+    state.limits = limits;
+    if let Some(t) = tables {
+        load_table_stream(&mut state, t)?;
+    }
+    decode_jpeg_inner(state, data)
+}
+
 /// Decode one complete JPEG interchange stream (`SOI … EOI`) into a
 /// framework `VideoFrame`; `pts` is passed through.
 ///
@@ -598,7 +650,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 let p = walker.read_segment_payload()?;
                 let mut sof = parse_sof(p)?;
                 apply_dnl_height(&mut sof, dnl_height);
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 state.sof = Some(sof);
             }
             SOF2 => {
@@ -608,7 +660,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 let p = walker.read_segment_payload()?;
                 let mut sof = parse_sof(p)?;
                 apply_dnl_height(&mut sof, dnl_height);
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 // T.81 §G.1.1 permits SOF2 at P = 8 or P = 12. The progressive
                 // scan path operates on i32 coefficient planes, so the
                 // increased magnitude range from a 12-bit DC/AC residual fits
@@ -655,7 +707,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 let p = walker.read_segment_payload()?;
                 let mut sof = parse_sof(p)?;
                 apply_dnl_height(&mut sof, dnl_height);
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
                 state.sof = Some(sof);
                 state.lossless = true;
@@ -674,7 +726,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 let p = walker.read_segment_payload()?;
                 let mut sof = parse_sof(p)?;
                 apply_dnl_height(&mut sof, dnl_height);
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 if sof.precision != 8 {
                     return Err(Error::unsupported(format!(
                         "arithmetic JPEG: precision {} (only 8 is supported)",
@@ -703,7 +755,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 let p = walker.read_segment_payload()?;
                 let mut sof = parse_sof(p)?;
                 apply_dnl_height(&mut sof, dnl_height);
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 if sof.precision != 8 && sof.precision != 12 {
                     return Err(Error::unsupported(format!(
                         "progressive arithmetic JPEG: precision {} (only 8 and 12 are supported)",
@@ -3743,6 +3795,7 @@ fn decode_hierarchical(
     // The DHP body is a frame header (§B.3.2): precision, Y, X, component
     // list. It fixes the completed-image precision and component identities.
     let dhp = parse_sof(dhp_payload)?;
+    validate_sof(&dhp, &state.limits)?;
     let nc = dhp.components.len();
     if !matches!(nc, 1 | 3 | 4) {
         return Err(Error::unsupported(format!(
@@ -3815,6 +3868,14 @@ fn decode_hierarchical(
             EOI => {
                 let rc = reference
                     .ok_or_else(|| Error::invalid("hierarchical JPEG: EOI before any frame"))?;
+                // B.3.2: the DHP parameters are those of the completed
+                // image — the final reference geometry must match them.
+                if rc[0].width != dhp.width as usize || rc[0].height != dhp.height as usize {
+                    return Err(Error::invalid(format!(
+                        "hierarchical JPEG: completed image is {}×{} but the DHP declares {}×{}",
+                        rc[0].width, rc[0].height, dhp.width, dhp.height
+                    )));
+                }
                 return shape_hierarchical_frame(
                     &rc,
                     precision,
@@ -3898,7 +3959,7 @@ fn decode_hierarchical(
                 arith_lossless = false;
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
                 check_hier_frame(&sof, nc, precision)?;
                 state.sof = Some(sof.clone());
@@ -3923,7 +3984,7 @@ fn decode_hierarchical(
                 arith_lossless = true;
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
                 check_hier_frame(&sof, nc, precision)?;
                 state.sof = Some(sof.clone());
@@ -3952,7 +4013,7 @@ fn decode_hierarchical(
                 dct_arith = matches!(marker, markers::SOF9 | markers::SOF10);
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 check_hier_dct_frame(&sof, nc, precision)?;
                 if nc == 3 {
                     // Pin the 3-component colour class from the first frame.
@@ -4016,7 +4077,7 @@ fn decode_hierarchical(
                 })?;
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 check_hier_dct_frame(&sof, nc, precision)?;
                 // ×2 upsample the reference per any preceding EXP. The DCT
                 // progression reconstructs modulo 2^16 (§J.2.1), so the
@@ -4100,7 +4161,7 @@ fn decode_hierarchical(
                 })?;
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
                 check_hier_frame(&sof, nc, precision)?;
                 // Upsample every reference component if an EXP segment
@@ -4178,7 +4239,7 @@ fn decode_hierarchical(
                 })?;
                 let p = walker.read_segment_payload()?;
                 let sof = parse_sof(p)?;
-                validate_sof(&sof)?;
+                validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
                 check_hier_frame(&sof, nc, precision)?;
                 let mut upsampled = prev;

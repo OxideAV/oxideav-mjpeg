@@ -27,8 +27,8 @@
 //! on every component.
 
 use libfuzzer_sys::fuzz_target;
+use oxideav_mjpeg::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess};
 use oxideav_mjpeg::DecodeOptions;
-use oxideav_mjpeg::t81::{ColorSignalling, HuffmanTables, EncodeOptions, JpegProcess};
 
 const MAX_PIXELS: usize = 512;
 
@@ -233,27 +233,26 @@ fuzz_target!(|data: &[u8]| {
         },
     };
     let opts = {
- let mut o = EncodeOptions::default();
- o.quality = quality;
- o.tables = tables;
- o.process = process;
- o.precision = precision;
- o.restart_interval = restart_interval;
- o.abbreviated = abbreviated;
- o.signalling = signalling;
- o.sampling = layout.clone();
- o.table_ids = Vec::new();
- o
-};
+        let mut o = EncodeOptions::default();
+        o.quality = quality;
+        o.tables = tables;
+        o.process = process;
+        o.precision = precision;
+        o.restart_interval = restart_interval;
+        o.abbreviated = abbreviated;
+        o.signalling = signalling;
+        o.sampling = layout.clone();
+        o.table_ids = Vec::new();
+        o
+    };
     let refs: Vec<&[u16]> = planes.iter().map(|p| p.as_slice()).collect();
     let out = opts
         .encode(width as u32, height as u32, &refs)
         .unwrap_or_else(|e| panic!("t81 encode refused a legal combination ({opts:?}): {e}"));
     let decoded = match &out.tables {
-        Some(t) => oxideav_mjpeg::decode_with(
-            &out.data,
-            &DecodeOptions::new().with_tables(t.clone()),
-        ),
+        Some(t) => {
+            oxideav_mjpeg::decode_with(&out.data, &DecodeOptions::new().with_tables(t.clone()))
+        }
         None => oxideav_mjpeg::decode(&out.data),
     }
     .unwrap_or_else(|e| panic!("decoder rejected the t81 stream ({opts:?}): {e}"));

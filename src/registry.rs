@@ -172,6 +172,51 @@ impl From<JpegImage> for VideoFrame {
     }
 }
 
+impl JpegImage {
+    /// Rebuild an image from a framework frame plus the stream's codec
+    /// parameters: `width`, `height` and `pixel_format` must be set
+    /// (`Error::InvalidData` otherwise, or when the pixel format is not
+    /// a JPEG layout or the image-plane count does not fit it); the
+    /// frame's own colour-signal side channel wins over
+    /// `params.color_signal`. Side-channel records are not copied —
+    /// only the image planes become `planes`.
+    pub fn from_video_frame(frame: &VideoFrame, params: &CodecParameters) -> Result<JpegImage> {
+        let width = params
+            .width
+            .ok_or_else(|| Error::invalid("JPEG image: codec parameters carry no width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Error::invalid("JPEG image: codec parameters carry no height"))?;
+        let pix = params
+            .pixel_format
+            .ok_or_else(|| Error::invalid("JPEG image: codec parameters carry no pixel format"))?;
+        let format = MjpegPixelFormat::try_from(pix)
+            .map_err(|e| Error::invalid(format!("JPEG image: {e}")))?;
+        let planes: Vec<MjpegPlane> = frame
+            .image_planes()
+            .iter()
+            .map(|p| MjpegPlane::new(p.stride, p.data.clone()))
+            .collect();
+        if planes.len() != format.plane_count() {
+            return Err(Error::invalid(format!(
+                "JPEG image: {} image plane(s) do not fit {format} ({} expected)",
+                planes.len(),
+                format.plane_count()
+            )));
+        }
+        let signal = frame.color_signal().unwrap_or(params.color_signal);
+        Ok(JpegImage::new(width, height, format, planes).with_color(ColorInfo::from(signal)))
+    }
+}
+
+impl TryFrom<(&VideoFrame, &CodecParameters)> for JpegImage {
+    type Error = Error;
+
+    fn try_from((frame, params): (&VideoFrame, &CodecParameters)) -> Result<Self> {
+        JpegImage::from_video_frame(frame, params)
+    }
+}
+
 impl From<ColorInfo> for oxideav_core::ColorSignal {
     fn from(c: ColorInfo) -> Self {
         let range = match c.range {

@@ -411,6 +411,43 @@ fn registry_decoder_hands_out_the_same_planes() {
         assert_eq!(back, *format);
         let as_frame = oxideav_core::VideoFrame::from(img.clone());
         assert_eq!(as_frame.planes.len(), img.planes.len());
+        // Frame bridge: parameters carry geometry / format / colour.
+        let mut params = CodecParameters::video(CodecId::new(oxideav_mjpeg::CODEC_ID_STR));
+        params.width = Some(img.width);
+        params.height = Some(img.height);
+        params.pixel_format = Some(core);
+        params.color_signal = oxideav_core::ColorSignal::from(img.color);
+        let back = oxideav_mjpeg::JpegImage::from_video_frame(&as_frame, &params).unwrap();
+        assert_eq!(back.planes, img.planes, "{name}");
+        assert_eq!(back.format, img.format, "{name}");
+        assert_eq!(back.color, img.color, "{name}");
+        let back2 = oxideav_mjpeg::JpegImage::try_from((&as_frame, &params)).unwrap();
+        assert_eq!(back2.planes, img.planes);
+        // A frame-level colour signal wins over the parameters'.
+        let tagged = as_frame
+            .clone()
+            .with_color_signal(oxideav_core::ColorSignal::srgb());
+        let back3 = oxideav_mjpeg::JpegImage::from_video_frame(&tagged, &params).unwrap();
+        assert_eq!(
+            back3.planes.len(),
+            img.planes.len(),
+            "{name}: side channel dropped"
+        );
+        assert_eq!(back3.color, ColorInfo::srgb());
+        // Missing / foreign parameters are errors, never panics.
+        let mut bad = params.clone();
+        bad.pixel_format = None;
+        assert!(oxideav_mjpeg::JpegImage::from_video_frame(&as_frame, &bad).is_err());
+        bad.pixel_format = Some(PixelFormat::Rgba);
+        assert!(oxideav_mjpeg::JpegImage::from_video_frame(&as_frame, &bad).is_err());
+        let mut wrong = params.clone();
+        // A layout with a different plane count cannot fit the frame.
+        wrong.pixel_format = Some(if format.plane_count() == 1 {
+            PixelFormat::Yuv444P
+        } else {
+            PixelFormat::Gray8
+        });
+        assert!(oxideav_mjpeg::JpegImage::from_video_frame(&as_frame, &wrong).is_err());
         let sig = oxideav_core::ColorSignal::from(img.color);
         assert_eq!(sig.matrix.code_point(), img.color.matrix);
         assert_eq!(ColorInfo::from(sig), img.color);

@@ -115,9 +115,12 @@ if let Ok(Frame::Video(vf)) = dec.receive_frame() {
 standalone `decode_with` — one implementation — and the conversions
 `From<JpegImage> for VideoFrame`, `From<MjpegPixelFormat> for
 PixelFormat` / `TryFrom<PixelFormat>` (1:1 by name) and
-`From<ColorInfo> for ColorSignal` connect the two layers. `JpegImage`
-converts to the crate-local video frame with `MjpegFrame::from(img)`
-and back with `JpegImage::from_frame(frame, w, h, format)`.
+`From<ColorInfo> for ColorSignal` connect the two layers; the frame
+bridge back is `JpegImage::from_video_frame(&VideoFrame,
+&CodecParameters)` (geometry, pixel format and colour signal from the
+parameters, plane count validated) or `JpegImage::try_from((&frame,
+&params))`. The Motion-JPEG path keeps the crate-local
+`MjpegFrame::from(img)` / `JpegImage::from_frame(frame, w, h, format)`.
 
 **Motion-JPEG.** The same decoder serves video: AVI / MOV / AMV `MJPG`
 packets are complete JPEG interchange streams, the `mjpeg-raw`

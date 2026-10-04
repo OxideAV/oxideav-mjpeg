@@ -87,21 +87,20 @@ use oxideav_core::{Frame, RuntimeContext};
 
 let mut ctx = RuntimeContext::new();
 oxideav_mjpeg::register(&mut ctx);           // codec `mjpeg` + containers `jpeg`, `mjpeg-raw`
-let codecs = &ctx.codecs;
-let containers = &ctx.containers;
 
 let input: Box<dyn oxideav_core::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("photo.jpg")?),
 );
-let mut dmx = containers.open("jpeg", input)?;
-let stream = &dmx.streams()[0];
-let mut dec = codecs.make_decoder(&stream.params)?;
+let mut dmx = ctx.containers.open_demuxer("jpeg", input, &ctx.codecs)?;
+let params = dmx.streams()[0].params.clone();
+let mut dec = ctx.codecs.first_decoder(&params)?;
 
 let pkt = dmx.next_packet()?;
 dec.send_packet(&pkt)?;
 if let Ok(Frame::Video(vf)) = dec.receive_frame() {
     // vf.planes[..] carry the planar samples; the pixel format and
-    // dimensions travel in `stream.params` (slim VideoFrame).
+    // dimensions travel in `params` (slim VideoFrame).
+    let _ = vf;
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -350,15 +349,24 @@ see `tests/t81_encoder.rs`.
 ### Encoder
 
 ```rust
-use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat};
+use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, RuntimeContext};
+# use oxideav_core::{VideoFrame, VideoPlane};
+# let (w, h) = (64u32, 48u32);
+# let plane = |pw: u32, ph: u32| VideoPlane { stride: pw as usize, data: vec![128; (pw * ph) as usize] };
+# let frame_yuv420 = VideoFrame { pts: Some(0), planes: vec![plane(w, h), plane(w / 2, h / 2), plane(w / 2, h / 2)] };
+
+let mut ctx = RuntimeContext::new();
+oxideav_mjpeg::register(&mut ctx);
 
 let mut params = CodecParameters::video(CodecId::new("mjpeg"));
 params.width = Some(w);
 params.height = Some(h);
 params.pixel_format = Some(PixelFormat::Yuv420P);
-let mut enc = codecs.make_encoder(&params)?;
+let mut enc = ctx.codecs.first_encoder(&params)?;
 enc.send_frame(&Frame::Video(frame_yuv420))?;
 let pkt = enc.receive_packet()?;
+# let _ = pkt;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The encoder accepts `Yuv444P`, `Yuv422P`, `Yuv420P`, `Gray8`, or packed
@@ -461,6 +469,10 @@ The trait-API encoder routes `Gray8` input + `set_progressive(true)`
 to the same path:
 
 ```rust
+# use oxideav_core::{CodecId, CodecParameters, Encoder, Frame, PixelFormat, VideoFrame, VideoPlane};
+# use oxideav_mjpeg::encoder::MjpegEncoder;
+# let (w, h) = (64u32, 48u32);
+# let frame_gray8 = VideoFrame { pts: Some(0), planes: vec![VideoPlane { stride: w as usize, data: vec![128; (w * h) as usize] }] };
 let mut params = CodecParameters::video(CodecId::new("mjpeg"));
 params.width = Some(w);
 params.height = Some(h);
@@ -468,6 +480,7 @@ params.pixel_format = Some(PixelFormat::Gray8);
 let mut enc = MjpegEncoder::from_params(&params)?;
 enc.set_progressive(true);
 enc.send_frame(&Frame::Video(frame_gray8))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `set_lossless(true)` continues to override `set_progressive` for
@@ -504,6 +517,10 @@ stride, precision, predictor)` directly:
 The same path is available through the trait-API encoder:
 
 ```rust
+# use oxideav_core::{CodecId, CodecParameters, Encoder, Frame, PixelFormat, VideoFrame, VideoPlane};
+# use oxideav_mjpeg::encoder::MjpegEncoder;
+# let (w, h) = (64u32, 48u32);
+# let frame = Frame::Video(VideoFrame { pts: Some(0), planes: vec![VideoPlane { stride: w as usize * 2, data: vec![0; (w * h * 2) as usize] }] });
 let mut params = CodecParameters::video(CodecId::new("mjpeg"));
 params.width = Some(w);
 params.height = Some(h);
@@ -512,6 +529,7 @@ let mut enc = MjpegEncoder::from_params(&params)?;
 enc.set_lossless(true);
 enc.set_lossless_predictor(4);
 enc.send_frame(&frame)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Without `set_lossless(true)` the trait-API encoder rejects grayscale
@@ -525,6 +543,8 @@ counterpart of the SOF3 path is exposed directly:
 ```rust
 use oxideav_mjpeg::encoder::encode_lossless_arith_jpeg_grayscale;
 
+# let (width, height, stride) = (16u32, 16u32, 16usize);
+# let samples = vec![0u8; stride * height as usize];
 // precision ∈ 2..=16, predictor ∈ 1..=7 (Annex H Table H.1).
 let jpeg = encode_lossless_arith_jpeg_grayscale(width, height, &samples, stride, 8, 1)?;
 # Ok::<(), oxideav_mjpeg::MjpegError>(())
@@ -658,6 +678,8 @@ spatial-lossless progression (T.81 §K.7.2.2):
 ```rust
 use oxideav_mjpeg::encoder::encode_hierarchical_lossless_jpeg_grayscale;
 
+# let (width, height, stride) = (16u32, 16u32, 16usize);
+# let samples = vec![0u8; stride * height as usize];
 // precision ∈ 2..=16, predictor ∈ 1..=7, levels >= 1 pyramid stages.
 let jpeg = encode_hierarchical_lossless_jpeg_grayscale(
     width, height, &samples, stride, 8, 1, /* levels = */ 3,
@@ -764,6 +786,8 @@ frame back into a JPEG is a single call:
 ```rust
 use oxideav_mjpeg::encoder::{encode_jpeg_cmyk, encode_jpeg_cmyk_progressive};
 
+# let (width, height) = (16u32, 16u32);
+# let packed = vec![0u8; (width * height * 4) as usize];
 let jpeg = encode_jpeg_cmyk(width, height, &packed, width as usize * 4, 90, None)?;
 let prog = encode_jpeg_cmyk_progressive(width, height, &packed, width as usize * 4, 90, None)?;
 # Ok::<(), oxideav_mjpeg::MjpegError>(())
@@ -782,6 +806,10 @@ buffers.
 The trait-API encoder accepts CMYK input as well:
 
 ```rust
+# use oxideav_core::{CodecId, CodecParameters, Encoder, Frame, PixelFormat, VideoFrame, VideoPlane};
+# use oxideav_mjpeg::encoder::MjpegEncoder;
+# let (w, h) = (64u32, 48u32);
+# let frame = Frame::Video(VideoFrame { pts: Some(0), planes: vec![VideoPlane { stride: w as usize * 4, data: vec![0; (w * h * 4) as usize] }] });
 let mut params = CodecParameters::video(CodecId::new("mjpeg"));
 params.width = Some(w);
 params.height = Some(h);
@@ -790,6 +818,7 @@ let mut enc = MjpegEncoder::from_params(&params)?;
 enc.set_adobe_transform(Some(2))?; // None / Some(0) / Some(2)
 enc.set_progressive(true);         // optional — SOF2 instead of SOF0
 enc.send_frame(&frame)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The plane stride must be at least `width * 4`; shorter strides are
@@ -1000,6 +1029,7 @@ the inspector requires neither the `registry` feature nor an
 ```rust
 use oxideav_mjpeg::{inspect_jpeg, SofKind, ChromaSubsampling};
 
+# let jpeg_bytes: Vec<u8> = std::fs::read("in.jpg").unwrap();
 let info = inspect_jpeg(&jpeg_bytes)?;
 println!(
     "{}x{} P={} comps={} subsampling={:?} kind={:?}",

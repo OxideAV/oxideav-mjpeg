@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.10...v0.1.11) - 2026-10-04
+
+### Other
+
+- fallible JpegImage constructors (image-crate API fleet sweep)
+- README examples use the current registry API
+
 ### Changed
 
 - **Fallible constructors (`IMAGE_CRATE_API` fleet sweep, breaking).**

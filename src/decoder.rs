@@ -1492,7 +1492,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
         _ => unreachable!(),
     }
 
-    Ok(JpegImage::new(
+    Ok(JpegImage::new_unchecked(
         width as u32,
         height as u32,
         out_format,
@@ -3021,7 +3021,7 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         _ => unreachable!(),
     }
 
-    Ok(JpegImage::new(
+    Ok(JpegImage::new_unchecked(
         width as u32,
         height as u32,
         out_format,
@@ -3151,7 +3151,7 @@ fn render_from_coefs_12bit(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Resul
         _ => unreachable!(),
     }
 
-    Ok(JpegImage::new(
+    Ok(JpegImage::new_unchecked(
         width as u32,
         height as u32,
         out_format,
@@ -4900,7 +4900,7 @@ fn shape_hierarchical_frame(
         } else {
             PixelFormat::Yuv444P
         };
-        return Ok(JpegImage::new(
+        return Ok(JpegImage::new_unchecked(
             width as u32,
             height as u32,
             format,
@@ -4971,7 +4971,7 @@ fn shape_lossless_frame(
             data[o + 2] = yy;
             data[o + 3] = k;
         }
-        return Ok(JpegImage::new(
+        return Ok(JpegImage::new_unchecked(
             width as u32,
             height as u32,
             PixelFormat::Cmyk,
@@ -4993,7 +4993,7 @@ fn shape_lossless_frame(
                 data[i * 3 + 1] = (samples[1][i] << pt) as u8;
                 data[i * 3 + 2] = (samples[2][i] << pt) as u8;
             }
-            return Ok(JpegImage::new(
+            return Ok(JpegImage::new_unchecked(
                 width as u32,
                 height as u32,
                 PixelFormat::Rgb24,
@@ -5030,7 +5030,7 @@ fn shape_lossless_frame(
                 _ => PixelFormat::Gbrp14Le,
             };
             return Ok(
-                JpegImage::new(width as u32, height as u32, format, out_planes)
+                JpegImage::new_unchecked(width as u32, height as u32, format, out_planes)
                     .with_precision(precision as u8),
             );
         }
@@ -5055,7 +5055,7 @@ fn shape_lossless_frame(
             data[i * 6 + 4] = (c2 & 0xFF) as u8;
             data[i * 6 + 5] = (c2 >> 8) as u8;
         }
-        return Ok(JpegImage::new(
+        return Ok(JpegImage::new_unchecked(
             width as u32,
             height as u32,
             PixelFormat::Rgb48Le,
@@ -5094,7 +5094,7 @@ fn shape_lossless_frame(
     };
 
     Ok(
-        JpegImage::new(width as u32, height as u32, out_format, vec![plane])
+        JpegImage::new_unchecked(width as u32, height as u32, out_format, vec![plane])
             .with_precision(precision as u8),
     )
 }
@@ -5136,7 +5136,7 @@ fn shape_lossless_yuv_frame(
         VideoPlane { stride: w, data }
     };
     let planes = shape_yuv_planes(sof, samples, comp_w, width, height, layout, emit);
-    Ok(JpegImage::new(
+    Ok(JpegImage::new_unchecked(
         width as u32,
         height as u32,
         layout.format(),

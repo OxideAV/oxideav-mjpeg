@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Fallible constructors (`IMAGE_CRATE_API` fleet sweep, breaking).**
+  `JpegImage::new` / `from_rgb8` / `from_rgba8` return
+  `Result<JpegImage, MjpegError>` and reject a geometry outside T.81's
+  `1..=65535` per axis, a plane count other than the format's, a stride
+  shorter than the plane's tight row, or a plane buffer shorter than
+  `(rows − 1) × stride + row` with `InvalidData`, so an image that
+  exists is always consistent (`from_frame` / `from_video_frame` share
+  the check). Callers append `?` (or `.unwrap()` for literal test
+  data); the infallible signatures are not kept.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.9...v0.1.10) - 2026-10-03
 
 ### Added

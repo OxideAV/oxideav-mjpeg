@@ -65,7 +65,9 @@ if oxideav_mjpeg::probe(&bytes) {
 
 `JpegImage { width, height, format: PixelFormat, planes: Vec<Plane>,
 color: ColorInfo, metadata: Metadata, precision }` with `new` /
-`from_rgb8` / `from_rgba8` (alpha dropped) / `with_color` /
+`from_rgb8` / `from_rgba8` (alpha dropped) — each a `Result`, refusing
+a geometry outside T.81's `1..=65535`, a wrong plane count, a short
+stride or a short buffer with `InvalidData` — / `with_color` /
 `with_metadata` / `with_precision`, `as_bytes()` (packed layouts),
 `into_raw()` (planes concatenated), `to_rgb8()` / `to_rgba8()`.
 `Plane { stride, data }`; `PixelFormat = MjpegPixelFormat`; `Error =

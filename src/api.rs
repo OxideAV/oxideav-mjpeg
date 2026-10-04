@@ -867,11 +867,7 @@ fn prepare_planes(image: &JpegImage, opts: &EncodeOptions) -> Result<PreparedPla
 fn rgb8_to_native(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<JpegImage> {
     let (w, h) = (width as usize, height as usize);
     if opts.signalling == ColorSignalling::Rgb {
-        return Ok(JpegImage::from_rgb8(
-            width,
-            height,
-            rgb[..w * h * 3].to_vec(),
-        ));
+        return JpegImage::from_rgb8(width, height, rgb[..w * h * 3].to_vec());
     }
     let (format, dh, dv) = match opts.chroma {
         ChromaSubsampling::Yuv444 => (PixelFormat::YuvJ444P, 1, 1),
@@ -926,7 +922,7 @@ fn rgb8_to_native(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> 
     } else {
         ColorInfo::jfif_ycbcr()
     };
-    Ok(JpegImage::new(width, height, format, planes).with_color(color))
+    Ok(JpegImage::new(width, height, format, planes)?.with_color(color))
 }
 
 /// `⌊num / den + 0.5⌋`, exact.
@@ -1040,6 +1036,7 @@ mod tests {
                 gradient_rgb(w, h)[..(w * h) as usize].to_vec(),
             )],
         )
+        .unwrap()
         .with_metadata(meta.clone());
         let bytes = encode(&g, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
@@ -1050,7 +1047,7 @@ mod tests {
         assert!(i.has_icc && i.has_exif && i.has_xmp && i.lossless);
 
         // Rgb24 (RGB-coded).
-        let rgb = JpegImage::from_rgb8(w, h, gradient_rgb(w, h));
+        let rgb = JpegImage::from_rgb8(w, h, gradient_rgb(w, h)).unwrap();
         let bytes = encode(&rgb, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, F::Rgb24);
@@ -1066,7 +1063,8 @@ mod tests {
             h,
             F::Gray16Le,
             vec![Plane::new(w as usize * 2, deep.clone())],
-        );
+        )
+        .unwrap();
         let bytes = encode(&g16, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, F::Gray16Le);
@@ -1076,7 +1074,8 @@ mod tests {
         let twelve: Vec<u8> = (0..w * h)
             .flat_map(|i| ((i * 173 % 4096) as u16).to_le_bytes())
             .collect();
-        let g12 = JpegImage::new(w, h, F::Gray12Le, vec![Plane::new(w as usize * 2, twelve)]);
+        let g12 =
+            JpegImage::new(w, h, F::Gray12Le, vec![Plane::new(w as usize * 2, twelve)]).unwrap();
         let bytes = encode(&g12, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, F::Gray12Le);
@@ -1097,7 +1096,8 @@ mod tests {
                     )
                 })
                 .collect(),
-        );
+        )
+        .unwrap();
         let bytes = encode(&gb, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, F::Gbrp12Le);
@@ -1118,7 +1118,8 @@ mod tests {
                 Plane::new(7, (0..7 * 4).map(|i| (i * 9) as u8).collect()),
                 Plane::new(7, (0..7 * 4).map(|i| (255 - i * 9) as u8).collect()),
             ],
-        );
+        )
+        .unwrap();
         let bytes = encode(&yuv, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, F::YuvJ420P);
@@ -1134,7 +1135,8 @@ mod tests {
                 w as usize * 4,
                 (0..w * h * 4).map(|i| (i * 31) as u8).collect(),
             )],
-        );
+        )
+        .unwrap();
         let bytes = encode(&cmyk, &lossless).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, F::Cmyk);
@@ -1144,15 +1146,21 @@ mod tests {
 
     #[test]
     fn encode_refuses_mismatched_planes_and_sampling() {
-        let img = JpegImage::new(4, 4, F::Yuv420P, vec![Plane::new(4, vec![0; 16])]);
+        // Mismatched planes cannot be built (the constructor refuses);
+        // the encoder keeps its own check for crate-assembled images.
+        assert!(matches!(
+            JpegImage::new(4, 4, F::Yuv420P, vec![Plane::new(4, vec![0; 16])]),
+            Err(Error::InvalidData(_))
+        ));
+        let img = JpegImage::new_unchecked(4, 4, F::Yuv420P, vec![Plane::new(4, vec![0; 16])]);
         assert!(matches!(
             encode(&img, &EncodeOptions::new()),
             Err(Error::InvalidData(_))
         ));
-        let img = JpegImage::from_rgb8(4, 4, vec![0; 48]);
+        let img = JpegImage::from_rgb8(4, 4, vec![0; 48]).unwrap();
         let opts = EncodeOptions::new().with_sampling(vec![(2, 2), (1, 1), (1, 1)]);
         assert!(matches!(encode(&img, &opts), Err(Error::Unsupported(_))));
-        let short = JpegImage::new(4, 4, F::Gray8, vec![Plane::new(4, vec![0; 3])]);
+        let short = JpegImage::new_unchecked(4, 4, F::Gray8, vec![Plane::new(4, vec![0; 3])]);
         assert!(matches!(
             encode(&short, &EncodeOptions::new()),
             Err(Error::InvalidData(_))
@@ -1214,7 +1222,7 @@ mod tests {
     #[test]
     fn decode_from_and_encode_to_stream() {
         let rgb = gradient_rgb(5, 5);
-        let img = JpegImage::from_rgb8(5, 5, rgb);
+        let img = JpegImage::from_rgb8(5, 5, rgb).unwrap();
         let mut out = Vec::new();
         encode_to(&img, &EncodeOptions::new(), &mut out).unwrap();
         let back = decode_from(std::io::Cursor::new(&out)).unwrap();
@@ -1236,7 +1244,7 @@ mod tests {
 
     #[test]
     fn abbreviated_tables_through_decode_options() {
-        let img = JpegImage::from_rgb8(8, 8, gradient_rgb(8, 8));
+        let img = JpegImage::from_rgb8(8, 8, gradient_rgb(8, 8)).unwrap();
         let opts = EncodeOptions::new().with_abbreviated(true).with_lossless(1);
         let prepared = prepare_planes(&img, &opts).unwrap();
         let refs: Vec<&[u16]> = prepared.planes.iter().map(|p| p.as_slice()).collect();

@@ -205,7 +205,7 @@ impl JpegImage {
             )));
         }
         let signal = frame.color_signal().unwrap_or(params.color_signal);
-        Ok(JpegImage::new(width, height, format, planes).with_color(ColorInfo::from(signal)))
+        Ok(JpegImage::new(width, height, format, planes)?.with_color(ColorInfo::from(signal)))
     }
 }
 

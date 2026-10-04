@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn gray_and_rgb_layouts() {
-        let g = JpegImage::new(2, 1, F::Gray8, vec![Plane::new(2, vec![7, 200])]);
+        let g = JpegImage::new(2, 1, F::Gray8, vec![Plane::new(2, vec![7, 200])]).unwrap();
         assert_eq!(to_rgb8(&g), vec![7, 7, 7, 200, 200, 200]);
         assert_eq!(to_rgba8(&g), vec![7, 7, 7, 255, 200, 200, 200, 255]);
 
@@ -352,11 +352,13 @@ mod tests {
             1,
             F::Gray10Le,
             vec![Plane::new(4, vec![0xFF, 0x03, 0x00, 0x02])],
-        );
+        )
+        .unwrap();
         assert_eq!(to_rgb8(&g10), vec![255, 255, 255, 128, 128, 128]);
 
         // 9-bit lossless grey carried in Gray16Le: 511 → 255.
         let g9 = JpegImage::new(1, 1, F::Gray16Le, vec![Plane::new(2, vec![0xFF, 0x01])])
+            .unwrap()
             .with_precision(9);
         assert_eq!(to_rgb8(&g9), vec![255, 255, 255]);
 
@@ -366,7 +368,8 @@ mod tests {
             2,
             F::Rgb24,
             vec![Plane::new(4, vec![1, 2, 3, 99, 4, 5, 6, 99])],
-        );
+        )
+        .unwrap();
         assert_eq!(to_rgb8(&rgb), vec![1, 2, 3, 4, 5, 6]);
 
         // Rgb48Le at P = 16: 0xFFFF → 255, 0x8000 → 128.
@@ -375,7 +378,8 @@ mod tests {
             1,
             F::Rgb48Le,
             vec![Plane::new(6, vec![0xFF, 0xFF, 0x00, 0x80, 0x00, 0x00])],
-        );
+        )
+        .unwrap();
         assert_eq!(to_rgb8(&rgb48), vec![255, 128, 0]);
 
         // Gbrp12Le re-orders planes G, B, R → R, G, B.
@@ -388,7 +392,8 @@ mod tests {
                 Plane::new(2, vec![0x00, 0x00]), // B = 0
                 Plane::new(2, vec![0x00, 0x08]), // R = 2048
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(to_rgb8(&gbrp), vec![128, 255, 0]);
     }
 
@@ -399,11 +404,13 @@ mod tests {
             1,
             F::Cmyk,
             vec![Plane::new(12, vec![0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 255])],
-        );
+        )
+        .unwrap();
         // white, pure cyan (no red), full black
         assert_eq!(to_rgb8(&img), vec![255, 255, 255, 0, 255, 255, 0, 0, 0]);
         // Half ink, half key: (255 − 128)(255 − 128) / 255 = 63.25 → 63.
-        let half = JpegImage::new(1, 1, F::Cmyk, vec![Plane::new(4, vec![128, 128, 128, 128])]);
+        let half =
+            JpegImage::new(1, 1, F::Cmyk, vec![Plane::new(4, vec![128, 128, 128, 128])]).unwrap();
         assert_eq!(to_rgb8(&half), vec![63, 63, 63]);
     }
 
@@ -422,7 +429,8 @@ mod tests {
                 Plane::new(2, vec![128, 128]),
                 Plane::new(2, vec![200, 128]),
             ],
-        );
+        )
+        .unwrap();
         let rgb = to_rgb8(&img);
         let px = |x: usize, y: usize| &rgb[(y * 3 + x) * 3..(y * 3 + x) * 3 + 3];
         let red = ycbcr_to_rgb8(128, 128, 200, 255);
@@ -431,17 +439,19 @@ mod tests {
         assert_eq!(px(2, 0), &[128, 128, 128]);
         assert_eq!(px(2, 1), &[128, 128, 128]);
         // The J label converts identically.
-        let j = JpegImage::new(3, 2, F::YuvJ420P, img.planes.clone());
+        let j = JpegImage::new(3, 2, F::YuvJ420P, img.planes.clone()).unwrap();
         assert_eq!(to_rgb8(&j), rgb);
     }
 
     #[test]
     fn short_planes_do_not_panic() {
-        let img = JpegImage::new(4, 4, F::Yuv444P, vec![Plane::new(4, vec![0; 4])]);
+        // `JpegImage::new` refuses these; the kernels still stay
+        // defensive for images assembled inside the crate.
+        let img = JpegImage::new_unchecked(4, 4, F::Yuv444P, vec![Plane::new(4, vec![0; 4])]);
         assert_eq!(to_rgb8(&img).len(), 48);
-        let img = JpegImage::new(4, 4, F::Rgb24, vec![Plane::new(12, vec![1; 5])]);
+        let img = JpegImage::new_unchecked(4, 4, F::Rgb24, vec![Plane::new(12, vec![1; 5])]);
         assert_eq!(to_rgba8(&img).len(), 64);
-        let img = JpegImage::new(0, 4, F::Gray8, vec![]);
+        let img = JpegImage::new_unchecked(0, 4, F::Gray8, vec![]);
         assert!(to_rgb8(&img).is_empty());
     }
 }

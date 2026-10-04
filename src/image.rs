@@ -593,9 +593,67 @@ pub struct JpegImage {
 impl JpegImage {
     /// Build an image from its geometry and planes. `color` is
     /// [`ColorInfo::unspecified`], `metadata` empty, `precision` the
-    /// format's nominal depth. The plane geometry is **not** validated
-    /// here; [`crate::encode`] validates before writing.
-    pub fn new(width: u32, height: u32, format: MjpegPixelFormat, planes: Vec<Plane>) -> Self {
+    /// format's nominal depth.
+    ///
+    /// Rejects with [`MjpegError::InvalidData`] a zero dimension or one
+    /// past T.81's 65535, a plane count other than
+    /// [`MjpegPixelFormat::plane_count`], a plane whose stride is
+    /// shorter than its tight row
+    /// ([`MjpegPixelFormat::tight_stride`]), or a plane buffer shorter
+    /// than the rows it must hold (`(rows − 1) × stride + tight row`;
+    /// the last row may be unpadded) — so an image that exists is
+    /// always consistent and [`Self::to_rgb8`] / [`Self::to_rgba8`]
+    /// never need to fail.
+    pub fn new(
+        width: u32,
+        height: u32,
+        format: MjpegPixelFormat,
+        planes: Vec<Plane>,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || width > 65535 || height > 65535 {
+            return Err(MjpegError::invalid(format!(
+                "JPEG image: {width}×{height} is outside T.81's 1..=65535 per axis"
+            )));
+        }
+        if planes.len() != format.plane_count() {
+            return Err(MjpegError::invalid(format!(
+                "JPEG image: {} plane(s) do not fit {format} ({} expected)",
+                planes.len(),
+                format.plane_count()
+            )));
+        }
+        for (i, p) in planes.iter().enumerate() {
+            let (_, rows) = format.plane_dimensions(width, height, i);
+            let row = format.tight_stride(width, height, i);
+            if p.stride < row {
+                return Err(MjpegError::invalid(format!(
+                    "JPEG image: plane {i} stride {} is shorter than its {row}-byte row",
+                    p.stride
+                )));
+            }
+            let needed = (rows - 1)
+                .checked_mul(p.stride)
+                .and_then(|v| v.checked_add(row))
+                .ok_or_else(|| MjpegError::invalid("JPEG image: plane size overflows usize"))?;
+            if p.data.len() < needed {
+                return Err(MjpegError::invalid(format!(
+                    "JPEG image: plane {i} holds {} bytes but {rows} rows at stride {} need {needed}",
+                    p.data.len(),
+                    p.stride
+                )));
+            }
+        }
+        Ok(Self::new_unchecked(width, height, format, planes))
+    }
+
+    /// [`Self::new`] without the geometry checks, for images the crate
+    /// assembles itself from already-validated buffers.
+    pub(crate) fn new_unchecked(
+        width: u32,
+        height: u32,
+        format: MjpegPixelFormat,
+        planes: Vec<Plane>,
+    ) -> Self {
         Self {
             width,
             height,
@@ -608,24 +666,38 @@ impl JpegImage {
     }
 
     /// Wrap tightly packed 8-bit RGB (`3 × width` bytes per row) as an
-    /// `Rgb24` image with the sRGB colour description.
-    pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Self {
+    /// `Rgb24` image with the sRGB colour description;
+    /// [`MjpegError::InvalidData`] when `data` is shorter than `3 ×
+    /// width × height` (or the geometry is outside T.81's range).
+    pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         let stride = width as usize * 3;
-        Self::new(
+        Ok(Self::new(
             width,
             height,
             MjpegPixelFormat::Rgb24,
             vec![Plane::new(stride, data)],
-        )
-        .with_color(ColorInfo::srgb())
+        )?
+        .with_color(ColorInfo::srgb()))
     }
 
     /// Wrap tightly packed 8-bit RGBA as an `Rgb24` image, **dropping
     /// the alpha channel** — JPEG has no alpha mechanism, so the three
     /// colour bytes of every pixel are kept and the fourth discarded.
-    /// The result carries the sRGB colour description.
-    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Self {
-        let rgb: Vec<u8> = data
+    /// The result carries the sRGB colour description;
+    /// [`MjpegError::InvalidData`] when `data` is shorter than `4 ×
+    /// width × height`.
+    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
+        let needed = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| MjpegError::invalid("JPEG image: pixel count overflows usize"))?;
+        if data.len() < needed {
+            return Err(MjpegError::invalid(format!(
+                "JPEG image: {} RGBA bytes supplied, {width}×{height} needs {needed}",
+                data.len()
+            )));
+        }
+        let rgb: Vec<u8> = data[..needed]
             .chunks_exact(4)
             .flat_map(|px| [px[0], px[1], px[2]])
             .collect();
@@ -709,7 +781,7 @@ impl JpegImage {
 
     /// Rebuild an image from a Motion-JPEG video frame plus the
     /// geometry the stream's parameters carry. Fails when the plane
-    /// count does not match `format`.
+    /// count or geometry does not match `format` (see [`Self::new`]).
     pub fn from_frame(
         frame: MjpegFrame,
         width: u32,
@@ -723,7 +795,7 @@ impl JpegImage {
                 format.plane_count()
             )));
         }
-        Ok(Self::new(width, height, format, frame.planes))
+        Self::new(width, height, format, frame.planes)
     }
 }
 
@@ -985,12 +1057,52 @@ mod tests {
 
     #[test]
     fn from_rgba8_drops_alpha() {
-        let img = JpegImage::from_rgba8(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let img = JpegImage::from_rgba8(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         assert_eq!(img.format, MjpegPixelFormat::Rgb24);
         assert_eq!(img.as_bytes(), Some(&[1u8, 2, 3, 5, 6, 7][..]));
         assert_eq!(img.planes[0].stride, 6);
         assert_eq!(img.color, ColorInfo::srgb());
         assert_eq!(img.precision, 8);
+    }
+
+    #[test]
+    fn constructors_reject_bad_geometry() {
+        let bad = |r: Result<JpegImage>| assert!(matches!(r, Err(MjpegError::InvalidData(_))));
+        bad(JpegImage::from_rgb8(2, 1, vec![0; 5]));
+        bad(JpegImage::from_rgba8(1, 2, vec![0; 7]));
+        bad(JpegImage::from_rgb8(0, 1, vec![]));
+        bad(JpegImage::from_rgb8(65536, 1, vec![0; 65536 * 3]));
+        bad(JpegImage::new(
+            4,
+            4,
+            MjpegPixelFormat::Yuv420P,
+            vec![Plane::new(4, vec![0; 16])],
+        ));
+        bad(JpegImage::new(
+            4,
+            4,
+            MjpegPixelFormat::Gray8,
+            vec![Plane::new(3, vec![0; 16])],
+        ));
+        bad(JpegImage::new(
+            4,
+            4,
+            MjpegPixelFormat::Gray8,
+            vec![Plane::new(4, vec![0; 15])],
+        ));
+        // The last row may be unpadded; chroma planes use their own geometry.
+        assert!(JpegImage::new(
+            3,
+            2,
+            MjpegPixelFormat::Yuv420P,
+            vec![
+                Plane::new(8, vec![0; 11]),
+                Plane::new(2, vec![0; 2]),
+                Plane::new(2, vec![0; 2]),
+            ],
+        )
+        .is_ok());
+        assert!(JpegImage::from_rgba8(1, 1, vec![0; 4]).is_ok());
     }
 
     #[test]
@@ -1004,7 +1116,8 @@ mod tests {
                 Plane::new(1, vec![5]),
                 Plane::new(1, vec![6]),
             ],
-        );
+        )
+        .unwrap();
         assert!(img.as_bytes().is_none());
         assert_eq!(img.clone().into_raw(), vec![1, 2, 3, 4, 5, 6]);
         let frame = MjpegFrame::from(img.clone());

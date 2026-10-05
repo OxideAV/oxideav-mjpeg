@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `jpeg` and `mjpeg-raw` demuxers declare what the decoder
+  emits.** The stream's `pixel_format` and `color_signal` now come from
+  the same header rules the standalone `info` / `decode` apply
+  (`stream_shape`: one implementation), for every process and colour
+  case: an Adobe `transform = 0` / `'R' 'G' 'B'` three-component frame
+  is `Rgb24` (it was labelled `Yuv444P` while the decoder emitted one
+  packed plane, which the `oxideav-image` gateway rejected as
+  inconsistent), YCbCr frames carry the full-range `YuvJ444P` /
+  `YuvJ422P` / `YuvJ420P` / `Yuv411P` labels with the sYCC signal
+  (T.871; they were `Yuv*`, a limited-range label), 12-bit frames their
+  `*12Le` labels, lossless frames the `Gray10Le` / `Gray12Le` /
+  `Gray16Le` / `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` / `Rgb48Le`
+  carriers, four-component frames `Cmyk`. The stream geometry is
+  `DNL`-aware. A layout the decoder refuses opens with `pixel_format`
+  unset instead of a guess. Pinned over every in-repo fixture and
+  sixteen synthesized process / colour cases: declared label ==
+  `decode().format`, frame plane count == label, image rebuilt from the
+  frame + stream == the standalone decode byte for byte.
+- **The registry encoder publishes its option schema**
+  (`CodecInfo::encoder_options::<MjpegEncoderOptions>()`), so
+  `encoder_options_schema("mjpeg")` lists `quality` / `tables` /
+  `process` / `precision` / `restart` / `abbreviated` / `predictor` /
+  `point_transform` / `sampling` and generic callers (the
+  `oxideav-image` gateway's `SaveOptions::quality`) can forward them.
+
 ## [0.1.11](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.10...v0.1.11) - 2026-10-04
 
 ### Other

@@ -7,9 +7,17 @@
 //! (Motion JPEG = concatenated stills, so a still is the N=1 case).
 //!
 //! * Demuxer: reads the file, walks its marker segments to discover the
-//!   canvas dimensions (SOF0/SOF1/SOF2/SOF3) and the SOI..EOI bounds
-//!   (robust against trailing garbage like some cameras append), and
-//!   emits the whole frame as one packet tagged `codec_id = "mjpeg"`.
+//!   canvas dimensions and the SOI..EOI bounds (robust against trailing
+//!   garbage like some cameras append), and emits the whole frame as
+//!   one packet tagged `codec_id = "mjpeg"`. The stream's
+//!   `pixel_format` and `color_signal` are exactly what the `mjpeg`
+//!   decoder emits for that file — the same header rules the standalone
+//!   `info` / `decode` apply (packed `Rgb24` for an Adobe `transform =
+//!   0` / `'R' 'G' 'B'` three-component frame, `YuvJ*` full-range
+//!   planar YCbCr with the sYCC signal, `Gray8` / `Gray12Le` /
+//!   `Gray16Le`, `Cmyk`, the lossless `Gbrp*` / `Rgb48Le` carriers) —
+//!   so a frame read through the registry can be labelled from the
+//!   stream. A layout the decoder refuses leaves `pixel_format` unset.
 //! * Muxer: writes the encoded packet's bytes verbatim. JPEG has no
 //!   container wrapping, so this is a pass-through.
 //! * Probe: three-byte magic `FF D8 FF` at offset 0 → score 100.
@@ -78,14 +86,9 @@ fn open_demuxer(
     }
     let data = buf[start..end].to_vec();
 
-    // Sniff frame size (SOF) so the stream can report width/height up-front.
-    let sof = scan_for_sof(&data)?;
-
     let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
     params.media_type = MediaType::Video;
-    params.width = Some(sof.width as u32);
-    params.height = Some(sof.height as u32);
-    params.pixel_format = Some(pixel_format_for_sof(&sof));
+    declare_shape(&mut params, &data)?;
 
     let time_base = TimeBase::new(1, 1);
     let stream = StreamInfo {
@@ -182,23 +185,30 @@ fn scan_for_sof(data: &[u8]) -> Result<SofInfo> {
     }
 }
 
-fn pixel_format_for_sof(sof: &SofInfo) -> PixelFormat {
-    match sof.components.len() {
-        1 => PixelFormat::Gray8,
-        3 => {
-            // Default to 4:2:0 if we can read the sampling factors; fall back
-            // to 4:4:4 otherwise. The decoder double-checks and rejects
-            // truly weird layouts.
-            let y = sof.components[0];
-            match (y.h_factor, y.v_factor) {
-                (2, 2) => PixelFormat::Yuv420P,
-                (2, 1) => PixelFormat::Yuv422P,
-                (1, 1) => PixelFormat::Yuv444P,
-                _ => PixelFormat::Yuv420P,
-            }
+/// Fill `params` with what the `mjpeg` decoder emits for the JPEG in
+/// `data`: geometry, the native `pixel_format` and the colour signal,
+/// from the header rules the standalone `decode` applies
+/// ([`crate::api::stream_shape`]). A layout the decoder refuses still
+/// opens (geometry from the SOF) with `pixel_format` left unset, so a
+/// consumer sees "unknown" rather than a guess; a header the decoder
+/// cannot parse at all is an error.
+pub(crate) fn declare_shape(params: &mut CodecParameters, data: &[u8]) -> Result<()> {
+    match crate::api::stream_shape(data) {
+        Ok((width, height, format, color)) => {
+            params.width = Some(width);
+            params.height = Some(height);
+            params.pixel_format = Some(PixelFormat::from(format));
+            params.color_signal = oxideav_core::ColorSignal::from(color);
         }
-        _ => PixelFormat::Yuv420P,
+        Err(crate::MjpegError::Unsupported(_)) => {
+            let sof = scan_for_sof(data)?;
+            params.width = Some(u32::from(sof.width));
+            params.height = Some(u32::from(sof.height));
+            params.pixel_format = None;
+        }
+        Err(e) => return Err(e.into()),
     }
+    Ok(())
 }
 
 struct JpegDemuxer {

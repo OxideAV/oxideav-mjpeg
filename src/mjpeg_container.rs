@@ -43,13 +43,12 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Demuxer, Error, MediaType, Packet, PixelFormat,
-    ProbeData, Rational, ReadSeek, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Demuxer, Error, MediaType, Packet, ProbeData,
+    Rational, ReadSeek, Result, StreamInfo, TimeBase,
 };
 use oxideav_core::{ContainerRegistry, ProbeScore};
 
 use crate::jpeg::markers::{self, EOI, SOI};
-use crate::jpeg::parser::{parse_sof, SofInfo};
 
 /// Default frame rate assumed for headerless raw `.mjpeg` files.
 /// 25 fps matches the historical "PAL" cadence used when timing
@@ -101,13 +100,11 @@ fn open_demuxer(
     let mut first_bytes = vec![0u8; (first_end - first_start) as usize];
     input.seek(SeekFrom::Start(first_start))?;
     input.read_exact(&mut first_bytes)?;
-    let sof = scan_for_sof(&first_bytes)?;
-
+    // The stream is labelled with what the decoder emits for the first
+    // frame (layout + colour signal), as the still-image container does.
     let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
     params.media_type = MediaType::Video;
-    params.width = Some(sof.width as u32);
-    params.height = Some(sof.height as u32);
-    params.pixel_format = Some(pixel_format_for_sof(&sof));
+    crate::container::declare_shape(&mut params, &first_bytes)?;
     params.frame_rate = Some(Rational::new(DEFAULT_FRAME_RATE as i64, 1));
 
     let time_base = TimeBase::new(1, DEFAULT_FRAME_RATE as i64);
@@ -327,43 +324,6 @@ fn post_scan_marker<R: Read + ?Sized>(
     }
     buf[0] = buf[1];
     Ok(pos)
-}
-
-fn scan_for_sof(data: &[u8]) -> Result<SofInfo> {
-    if data.len() < 2 || data[0] != 0xFF || data[1] != SOI {
-        return Err(Error::invalid("MJPEG: first frame missing SOI"));
-    }
-    let body = &data[2..];
-    let mut walker = crate::jpeg::parser::MarkerWalker::new(body);
-    loop {
-        let Some(marker) = walker.next_marker()? else {
-            return Err(Error::invalid("MJPEG: SOF not found before EOF"));
-        };
-        if markers::is_sof(marker) {
-            let payload = walker.read_segment_payload()?;
-            return Ok(parse_sof(payload)?);
-        }
-        if marker == SOI || marker == EOI || markers::is_rst(marker) {
-            continue;
-        }
-        let _ = walker.read_segment_payload()?;
-    }
-}
-
-fn pixel_format_for_sof(sof: &SofInfo) -> PixelFormat {
-    match sof.components.len() {
-        1 => PixelFormat::Gray8,
-        3 => {
-            let y = sof.components[0];
-            match (y.h_factor, y.v_factor) {
-                (2, 2) => PixelFormat::Yuv420P,
-                (2, 1) => PixelFormat::Yuv422P,
-                (1, 1) => PixelFormat::Yuv444P,
-                _ => PixelFormat::Yuv420P,
-            }
-        }
-        _ => PixelFormat::Yuv420P,
-    }
 }
 
 /// Lazy `(pts, byte_offset)` index. Always sorted by pts; entries are

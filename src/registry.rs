@@ -267,6 +267,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder)
             .encoder(make_encoder)
+            .encoder_options::<MjpegEncoderOptions>()
             .tags([
                 // AVI FourCC claims — all unambiguous MJPEG variants.
                 CodecTag::fourcc(b"MJPG"),

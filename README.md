@@ -934,11 +934,21 @@ whose tables were never sent in-band, nor cached from an earlier frame,
 
 ### Codec / container IDs
 
-- Codec: `"mjpeg"`. Decoder output / encoder input pixel formats:
-  `Yuv444P`, `Yuv422P`, `Yuv420P`, plus `Gray8` on the decode side.
+- Codec: `"mjpeg"`. Decoder output: the native layouts of the
+  *Supported layouts* table (`YuvJ444P` / `YuvJ422P` / `YuvJ420P` /
+  `Yuv411P`, `Rgb24`, `Gray8`, `Cmyk`, the 12-bit `*12Le` and the
+  lossless `Gray10Le` / `Gray16Le` / `Gbrp*Le` / `Rgb48Le` carriers);
+  encoder input: the same set. The registry entry declares the
+  `MjpegEncoderOptions` schema (`encoder_options_schema("mjpeg")`:
+  `quality`, `tables`, `process`, `precision`, `restart`,
+  `abbreviated`, `predictor`, `point_transform`, `sampling`).
 - Container: `"jpeg"`, matches `.jpg` / `.jpeg` / `.jpe` / `.jfif` by
   extension and by `FF D8 FF` magic bytes. One frame per file; muxing
-  is a pass-through of the codec packet.
+  is a pass-through of the codec packet. The stream's `pixel_format`
+  and `color_signal` are exactly what the decoder emits for the file
+  (the header rules of `info` / `decode`), for every process and
+  colour case; a layout the decoder refuses leaves `pixel_format`
+  unset.
 - Container: `"mjpeg-raw"`, matches `.mjpeg` / `.mjpg` by extension.
   Raw concatenated SOI..EOI JPEG frames, one packet per frame.
   Default time base is `1/25` so frame `i` carries `pts = i`; the

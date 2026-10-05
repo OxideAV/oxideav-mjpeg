@@ -699,6 +699,23 @@ fn infer_shape(hdr: &Header) -> Result<Shape> {
     })
 }
 
+/// What a framework demuxer declares for the JPEG in `bytes`, from the
+/// header alone: `(width, height, format, color)` — the geometry
+/// (`DNL`-aware) and exactly the layout and colour description
+/// [`decode`] yields for it (one implementation: [`infer_shape`], the
+/// decoder's shaping rules). `Unsupported` for a layout the decoder
+/// refuses, so a stream is never labelled with a guess.
+pub(crate) fn stream_shape(bytes: &[u8]) -> Result<(u32, u32, PixelFormat, ColorInfo)> {
+    let hdr = scan_header(bytes, false)?;
+    let shape = infer_shape(&hdr)?;
+    Ok((
+        u32::from(hdr.frame.width),
+        hdr.height,
+        shape.format,
+        shape.color,
+    ))
+}
+
 /// Colour description for a decoded layout (see [`ColorInfo`]).
 fn color_for(format: PixelFormat) -> ColorInfo {
     if format.is_gray() {

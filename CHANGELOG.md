@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.11...v0.1.12) - 2026-10-05
+
+### Other
+
+- demuxers declare what the decoder emits (pixel_format + colour signal); registry encoder publishes its option schema
+
 ### Fixed
 
 - **The `jpeg` and `mjpeg-raw` demuxers declare what the decoder

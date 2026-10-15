@@ -193,10 +193,12 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 The registry encoder's `MjpegEncoderOptions` (`CodecOptions` keys
 `quality`, `tables`, `process` (`auto` / `sequential` / `progressive` /
 `lossless`), `precision`, `restart`, `abbreviated`, `predictor`,
-`point_transform`, `sampling`, `chroma`) is the string-bag twin of this
-record (`#[non_exhaustive]`, `new()` / `with_*`); `chroma` applies the
-`encode_rgb8` conversion to `Rgb24` frames (or keeps the luma of YCbCr
-ones) and has no plane-level field.
+`point_transform`, `sampling`, `chroma`, `adobe_transform`) is the
+string-bag twin of this record (`#[non_exhaustive]`, `new()` /
+`with_*`); `chroma` applies the `encode_rgb8` conversion to `Rgb24`
+frames (or keeps the luma of YCbCr ones) and `adobe_transform`
+(`none` / `cmyk` / `ycck`) selects the four-component signalling —
+neither has a plane-level field.
 
 `DecodeOptions` (`Default` + `with_*`):
 
@@ -441,9 +443,11 @@ faithfully (the stream carries the samples as given) and the encoder's
 (`pixel_format`, `coded_pixel_format(input)` for the knob-free case)
 plus its colour signal, exactly as the `jpeg` demuxer declares them.
 `tests/registry_matrix.rs` proves every cell (layout × 1×1 / odd /
-MCU-unaligned / aligned sizes × option sets: 355 cells, 325 of them
+MCU-unaligned / aligned sizes × option sets: 385 cells, 355 of them
 also through the black-box reference decoder with the declared
-geometry, component count and precision).
+geometry, component count and precision; plus every layout as a §B.5
+abbreviated pair decoded through `extradata` tables, and the 16-bit
+carriers at every lossless precision).
 
 | Input | Stream (empty option bag) | Decodes as |
 |---|---|---|
@@ -456,7 +460,7 @@ geometry, component count and precision).
 | `Rgb24` | RGB-coded: T.872 Adobe APP14 `transform = 0` + ids `'R' 'G' 'B'`, no colour conversion | `Rgb24` |
 | `Rgb48Le` | lossless at `P = 16`, RGB-coded | `Rgb48Le` |
 | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | lossless, planes in order, ids `1 2 3`, no colour signalling | the same label |
-| `Cmyk` | four components, no APP14 (T.872 §6.1 plain CMYK; `set_adobe_transform` for Adobe / YCCK) | `Cmyk` |
+| `Cmyk` | four components, no APP14 (T.872 §6.1 plain CMYK; `adobe_transform = cmyk / ycck` or `set_adobe_transform` for Adobe APP14 CMYK / YCCK) | `Cmyk` |
 | `CmykInverted` | complemented into plain CMYK | `Cmyk` |
 
 Rulings:
@@ -494,7 +498,7 @@ Rulings:
 - **One writer for every option.** Any option key routes through the
   general T.81 writer and the bytes are identical to
   `encode(&JpegImage::from_video_frame(..), &EncodeOptions)` for the
-  same request (46 requests pinned). The empty bag keeps the historical
+  same request (49 requests pinned). The empty bag keeps the historical
   per-format streams for `Gray8`, 8-bit YCbCr 4:4:4 / 4:2:2 / 4:2:0,
   `Rgb24` and `Cmyk` (same entropy-coded data, `SOF` before `DHT`;
   `tests/golden.rs` pins them) and the general writer with its defaults

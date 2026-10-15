@@ -476,6 +476,7 @@ pub fn coded_pixel_format(input: PixelFormat) -> Option<PixelFormat> {
 /// | `point_transform` | `Pt` (lossless)                        | 0            |
 /// | `sampling`        | `HxV[,HxV…]` per component; must match the pixel format | from the pixel format |
 /// | `chroma`          | `yuv444` \| `yuv422` \| `yuv420` \| `yuv411` \| `gray`: convert `Rgb24` input to that JFIF layout (T.871 §7 forward equations, as [`crate::encode_rgb8`]); `gray` keeps the luma of a YCbCr input | keep the input layout |
+/// | `adobe_transform` | `none` \| `cmyk` \| `ycck`: four-component signalling (`Cmyk` / `CmykInverted` input only) | `none` (or the `set_adobe_transform` knob) |
 ///
 /// `#[non_exhaustive]`: build with [`MjpegEncoderOptions::new`] /
 /// [`Default`] and the `with_*` setters; the fields stay readable.
@@ -496,6 +497,11 @@ pub struct MjpegEncoderOptions {
     pub sampling: String,
     /// Empty = keep the input layout; see the table above.
     pub chroma: String,
+    /// Four-component signalling: `none` (plain CMYK, no APP14),
+    /// `cmyk` (Adobe APP14 `transform = 0`, samples inverted on the
+    /// wire) or `ycck` (`transform = 2`, the frame is `Y Cb Cr K`).
+    /// Empty = the `set_adobe_transform` knob (default `none`).
+    pub adobe_transform: String,
 }
 
 impl Default for MjpegEncoderOptions {
@@ -511,6 +517,7 @@ impl Default for MjpegEncoderOptions {
             point_transform: 0,
             sampling: String::new(),
             chroma: String::new(),
+            adobe_transform: String::new(),
         }
     }
 }
@@ -581,6 +588,30 @@ impl MjpegEncoderOptions {
         self.chroma = chroma.into();
         self
     }
+
+    /// `"none"` / `"cmyk"` / `"ycck"` four-component signalling (empty =
+    /// the `set_adobe_transform` knob).
+    pub fn with_adobe_transform(mut self, adobe_transform: impl Into<String>) -> Self {
+        self.adobe_transform = adobe_transform.into();
+        self
+    }
+
+    /// The Adobe APP14 transform `adobe_transform` denotes: `None` for
+    /// an empty value, `Some(None)` for plain CMYK, `Some(Some(0))` /
+    /// `Some(Some(2))` for Adobe CMYK / YCCK.
+    pub fn adobe_transform_request(&self) -> Result<Option<Option<u8>>> {
+        Ok(Some(match self.adobe_transform.as_str() {
+            "" => return Ok(None),
+            "none" | "plain" => None,
+            "cmyk" | "0" => Some(0),
+            "ycck" | "2" => Some(2),
+            other => {
+                return Err(Error::invalid(format!(
+                    "MJPEG encoder: adobe_transform '{other}' (none / cmyk / ycck)"
+                )))
+            }
+        }))
+    }
 }
 
 impl CodecOptionsStruct for MjpegEncoderOptions {
@@ -645,6 +676,12 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             default: OptionValue::String(String::new()),
             help: "convert Rgb24 input to this JFIF YCbCr / grayscale layout (T.871 forward equations); 'gray' keeps the luma of a YCbCr input; unset = keep the input layout",
         },
+        OptionField {
+            name: "adobe_transform",
+            kind: OptionKind::Enum(&["none", "cmyk", "ycck"]),
+            default: OptionValue::String(String::new()),
+            help: "four-component signalling: none (plain CMYK, no APP14), cmyk (Adobe APP14 transform 0, inverted on the wire) or ycck (transform 2; the frame is Y Cb Cr K)",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -659,6 +696,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             "point_transform" => self.point_transform = v.as_u32()?,
             "sampling" => self.sampling = v.as_str()?.to_owned(),
             "chroma" => self.chroma = v.as_str()?.to_owned(),
+            "adobe_transform" => self.adobe_transform = v.as_str()?.to_owned(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -1141,6 +1179,14 @@ impl MjpegEncoder {
             let chroma = opts.chroma_request()?;
             enc.layout.check_chroma(chroma)?;
             enc.chroma = chroma;
+            if let Some(t) = opts.adobe_transform_request()? {
+                if enc.layout.class != Class::Cmyk {
+                    return Err(Error::unsupported(format!(
+                        "MJPEG encoder: adobe_transform applies to four-component input, not {pix_core:?}"
+                    )));
+                }
+                enc.cmyk_adobe_transform = t;
+            }
             let lossless_only = enc.layout.lossless_only && chroma.is_none();
             enc.set_encode_options(opts.to_encode_options_for(lossless_only)?)?;
         } else if enc.layout.legacy.is_none() {

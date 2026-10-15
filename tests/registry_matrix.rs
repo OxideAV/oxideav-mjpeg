@@ -23,7 +23,7 @@ use oxideav_core::{
 use oxideav_mjpeg::registry::{
     accepted_pixel_formats, coded_pixel_format, make_decoder, make_encoder, ACCEPTED_PIXEL_FORMATS,
 };
-use oxideav_mjpeg::{ChromaSubsampling, EncodeOptions, JpegImage, JpegProcess};
+use oxideav_mjpeg::{ChromaSubsampling, ColorSignalling, EncodeOptions, JpegImage, JpegProcess};
 use PixelFormat as P;
 
 /// Representative geometries: a single pixel, an odd pair, an
@@ -380,6 +380,10 @@ struct Cell {
     /// PSNR floor in dB for the DCT processes (tiny pictures at the
     /// default quality sit lowest).
     floor: f64,
+    /// Compare the decoded picture with the source (`false` for the
+    /// YCCK cell: the decoder converts `Y Cb Cr K` to ink amounts, a
+    /// different picture by design).
+    compare: bool,
 }
 
 fn cells_for(p: PixelFormat) -> Vec<Cell> {
@@ -388,6 +392,7 @@ fn cells_for(p: PixelFormat) -> Vec<Cell> {
         opts: vec![],
         lossless: is_lossless_only(p),
         floor: 27.0,
+        compare: true,
     }];
     if !is_lossless_only(p) {
         v.push(Cell {
@@ -400,12 +405,37 @@ fn cells_for(p: PixelFormat) -> Vec<Cell> {
             ],
             lossless: false,
             floor: 30.0,
+            compare: true,
         });
         v.push(Cell {
             name: "progressive q90",
             opts: vec![("quality", "90"), ("process", "progressive")],
             lossless: false,
             floor: 30.0,
+            compare: true,
+        });
+    }
+    if matches!(p, P::Cmyk | P::CmykInverted) {
+        v.push(Cell {
+            name: "adobe cmyk q90",
+            opts: vec![("quality", "90"), ("adobe_transform", "cmyk")],
+            lossless: false,
+            floor: 30.0,
+            compare: true,
+        });
+        v.push(Cell {
+            name: "adobe cmyk lossless",
+            opts: vec![("process", "lossless"), ("adobe_transform", "cmyk")],
+            lossless: true,
+            floor: f64::INFINITY,
+            compare: true,
+        });
+        v.push(Cell {
+            name: "ycck q90",
+            opts: vec![("quality", "90"), ("adobe_transform", "ycck")],
+            lossless: false,
+            floor: 30.0,
+            compare: false,
         });
     }
     if lossless_labelled(p) {
@@ -414,6 +444,7 @@ fn cells_for(p: PixelFormat) -> Vec<Cell> {
             opts: vec![("process", "lossless"), ("predictor", "4")],
             lossless: true,
             floor: f64::INFINITY,
+            compare: true,
         });
     }
     v
@@ -491,6 +522,9 @@ fn every_declared_layout_encodes_decodes_and_labels_truthfully() {
                 // Picture: exact or above the floor, every plane.
                 let peak = (1u32 << bits) - 1;
                 for i in 0..dplanes {
+                    if !cell.compare {
+                        break;
+                    }
                     let got = plane_samples(&v, label, i, w, h);
                     let want = expected_plane(p, &src, i, w, h);
                     if cell.lossless {
@@ -783,6 +817,15 @@ fn registry_options_and_the_standalone_contract_write_the_same_bytes() {
                         })
                     }
                     "restart" => o = o.with_restart_interval(v.parse().unwrap()),
+                    "adobe_transform" => {
+                        o = o.with_signalling(ColorSignalling::Cmyk {
+                            adobe_transform: match *v {
+                                "cmyk" => Some(0),
+                                "ycck" => Some(2),
+                                _ => None,
+                            },
+                        })
+                    }
                     other => panic!("{other}"),
                 }
             }
@@ -812,4 +855,112 @@ fn registry_options_and_the_standalone_contract_write_the_same_bytes() {
     }
     eprintln!("registry/contract byte identity: {pinned} requests pinned");
     assert!(pinned >= 30);
+}
+
+#[test]
+fn abbreviated_streams_for_every_declared_layout_decode_with_extradata() {
+    let (w, h) = (17u32, 11u32);
+    let mut cells = 0usize;
+    for &p in ACCEPTED_PIXEL_FORMATS {
+        let f = frame(p, w, h);
+        let src = source_planes(p, w, h);
+        let (bits, _, _, _, _) = facts(p);
+        let cp = params(p, w, h, &[("abbreviated", "true")]);
+        let mut enc = make_encoder(&cp).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            enc.send_frame(&Frame::Video(f.clone()))
+                .unwrap_or_else(|e| panic!("{p:?}: {e}"));
+            streams.push(enc.receive_packet().unwrap().data);
+        }
+        let out = enc.output_params().clone();
+        let tables = out.extradata.clone();
+        assert!(
+            tables.starts_with(&[0xFF, 0xD8]) && tables.ends_with(&[0xFF, 0xD9]),
+            "{p:?}: tables stream"
+        );
+        assert_eq!(
+            streams[0], streams[1],
+            "{p:?}: shared tables → identical frames"
+        );
+        let label = out.pixel_format.unwrap();
+        for data in &streams {
+            assert!(
+                !data.windows(2).any(|m| m == [0xFF, 0xC4]),
+                "{p:?}: frame carries DHT"
+            );
+            let mut dp = CodecParameters::video(CodecId::new("mjpeg"));
+            dp.extradata = tables.clone();
+            let mut dec = make_decoder(&dp).unwrap();
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), data.clone()))
+                .unwrap();
+            let Frame::Video(v) = dec.receive_frame().unwrap_or_else(|e| panic!("{p:?}: {e}"))
+            else {
+                panic!("video")
+            };
+            let (_, _, dplanes, _, _) = facts(label);
+            assert_eq!(v.planes.len(), dplanes, "{p:?}");
+            for i in 0..dplanes {
+                let got = plane_samples(&v, label, i, w, h);
+                let want = expected_plane(p, &src, i, w, h);
+                if is_lossless_only(p) {
+                    assert_eq!(got, want, "{p:?}: plane {i}");
+                } else {
+                    let db = psnr(&got, &want, (1u32 << bits) - 1);
+                    assert!(db >= 27.0, "{p:?}: plane {i} PSNR {db:.1} dB");
+                }
+            }
+            cells += 1;
+        }
+    }
+    eprintln!("abbreviated: {cells} frames decoded through extradata tables");
+    assert_eq!(cells, 2 * ACCEPTED_PIXEL_FORMATS.len());
+}
+
+#[test]
+fn sixteen_bit_carriers_take_any_lossless_precision_and_label_the_result() {
+    let (w, h) = (9u32, 7u32);
+    // (input, precision option, label the decoder reports)
+    for (p, precision, label) in [
+        (P::Gray16Le, "2", P::Gray16Le),
+        (P::Gray16Le, "9", P::Gray16Le),
+        (P::Gray16Le, "10", P::Gray10Le),
+        (P::Gray16Le, "12", P::Gray12Le),
+        (P::Gray16Le, "14", P::Gray16Le),
+        (P::Rgb48Le, "9", P::Rgb48Le),
+        (P::Rgb48Le, "13", P::Rgb48Le),
+        (P::Rgb48Le, "16", P::Rgb48Le),
+    ] {
+        let bits: u32 = precision.parse().unwrap();
+        // Samples in the low `precision` bits of each 16-bit word.
+        let mut f = frame(p, w, h);
+        let mask = ((1u32 << bits) - 1) as u16;
+        for pl in &mut f.planes {
+            for px in pl.data.chunks_mut(2) {
+                let v = u16::from_le_bytes([px[0], px[1]]) & mask;
+                px.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let cp = params(p, w, h, &[("precision", precision)]);
+        let (bytes, out) = encode(&cp, &f).unwrap_or_else(|e| panic!("{p:?} P={precision}: {e}"));
+        assert_eq!(out.pixel_format, Some(label), "{p:?} P={precision}");
+        let (v, stream) = decode(&bytes);
+        assert_eq!(
+            stream.pixel_format,
+            Some(label),
+            "{p:?} P={precision}: demuxer"
+        );
+        let img = oxideav_mjpeg::decode(&bytes).unwrap();
+        assert_eq!(
+            u32::from(img.precision),
+            bits,
+            "{p:?} P={precision}: precision"
+        );
+        let (_, _, dplanes, _, _) = facts(label);
+        for i in 0..dplanes {
+            let got = plane_samples(&v, label, i, w, h);
+            let want = plane_samples(&f, p, i, w, h);
+            assert_eq!(got, want, "{p:?} P={precision}: plane {i} bit-exact");
+        }
+    }
 }

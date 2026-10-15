@@ -26,18 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the first time; `Gray10Le` / `Gray12Le` / `Gray16Le` encode
   without `set_lossless(true)` (12-bit DCT; lossless for 10 / 16).
   `tests/registry_matrix.rs` proves every layout × 1×1 / odd /
-  MCU-unaligned / aligned sizes × option sets (355 cells; 325 also
+  MCU-unaligned / aligned sizes × option sets (385 cells; 355 also
   through the black-box reference decoder with the declared geometry,
-  component count and precision) and pins registry-bytes ==
-  `encode(&JpegImage, &EncodeOptions)` for 46 requests.
+  component count and precision), every layout as a §B.5 abbreviated
+  pair through `extradata` tables, the 16-bit carriers at every
+  lossless precision, and pins registry-bytes ==
+  `encode(&JpegImage, &EncodeOptions)` for 49 requests.
 - `MjpegEncoderOptions` gains `chroma` (`yuv444` / `yuv422` / `yuv420`
   / `yuv411` / `gray`): converts `Rgb24` frames to that JFIF layout
   with the T.871 §7 forward equations, byte-identical to
   `encode_rgb8`, or keeps the luma of a YCbCr frame. `process` gains
   `auto` (the default: sequential DCT, lossless on the lossless-only
   carriers). The record is `#[non_exhaustive]` with `new()` / `with_*`
-  setters; `to_encode_options_for(lossless_only)` and
-  `chroma_request()` expose the resolution.
+  setters; `to_encode_options_for(lossless_only)`, `chroma_request()`
+  and `adobe_transform_request()` expose the resolution.
+- `MjpegEncoderOptions::adobe_transform` (`none` / `cmyk` / `ycck`):
+  the four-component signalling as a string option, so Adobe APP14
+  CMYK and YCCK streams no longer need the `set_adobe_transform`
+  knob (four-component input only; refused by type elsewhere).
 
 ### Changed
 

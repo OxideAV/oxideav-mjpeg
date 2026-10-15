@@ -168,3 +168,9 @@ name = "standalone_api"
 path = "fuzz_targets/standalone_api.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "registry_encoder"
+path = "fuzz_targets/registry_encoder.rs"
+test = false
+doc = false

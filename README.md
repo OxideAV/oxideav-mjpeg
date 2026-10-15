@@ -1548,6 +1548,17 @@ org-wide reusable fuzz workflow (60-minute budget, ~4.5 min/target):
   CMYK + point-transform composition), decode-success + geometry
   oracle on the DCT processes. First 300 s foreground run: 2.08 M
   executions, no findings.
+- `registry_encoder` — the framework encoder's contract surface:
+  fuzz-chosen pixel format (declared, alias or undeclared), geometry,
+  option bag (`quality` / `process` / `chroma` / `tables` / `restart`
+  / `predictor` / `precision` / `abbreviated`) and frame bytes, with
+  planes occasionally short or missing. Oracle: no panic, every
+  refusal `Unsupported` / `InvalidData`, and an encoded stream decodes
+  through the registry decoder to the label stamped on the output
+  parameters with that label's plane count. First run: a short plane
+  panicked inside the historical 8-bit writers within seconds (fixed:
+  `send_frame` checks every plane's extent first); 10 minutes / 7.3 M
+  executions after that, no findings.
 - `jpeg_self_roundtrip` / `jpeg_progressive_self_roundtrip` —
   encode → decode round-trip with ±2 LSB YUV tolerance.
 - `libjpeg_encode_oxideav_decode` / `oxideav_encode_libjpeg_decode` —

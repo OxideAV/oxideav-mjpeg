@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `set_adobe_transform` now also updates the signalling of options
   already set with `set_encode_options`.
 
+### Fixed
+
+- A frame plane shorter than its rows panicked inside the historical
+  8-bit writers (found by the new `registry_encoder` fuzz target in
+  its first seconds); `send_frame` now checks every plane's extent
+  against the layout first and returns `InvalidData` naming the
+  layout, plane and byte counts. 10 minutes / 7.3 M runs of the target
+  found nothing else.
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.11...v0.1.12) - 2026-10-05
 
 ### Other

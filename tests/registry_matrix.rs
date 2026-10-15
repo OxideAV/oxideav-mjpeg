@@ -616,6 +616,27 @@ fn undeclared_layouts_are_refused_by_type_naming_the_layout() {
         }))
         .unwrap_err();
     assert!(matches!(err, oxideav_core::Error::InvalidData(ref m) if m.contains("YuvJ420P")));
+    // So is a plane shorter than its rows, on every path (the
+    // historical 8-bit writers indexed past a short plane before).
+    for (p, planes, short) in [
+        (P::YuvJ420P, 3, 2),
+        (P::Gray8, 1, 0),
+        (P::Rgb24, 1, 0),
+        (P::Cmyk, 1, 0),
+        (P::Gray16Le, 1, 0),
+        (P::Yuv444P12Le, 3, 1),
+        (P::Rgb48Le, 1, 0),
+    ] {
+        let mut f = frame(p, 9, 7);
+        assert_eq!(f.planes.len(), planes);
+        f.planes[short].data.pop();
+        let mut enc = make_encoder(&params(p, 9, 7, &[])).unwrap();
+        let err = enc.send_frame(&Frame::Video(f)).unwrap_err();
+        assert!(
+            matches!(err, oxideav_core::Error::InvalidData(ref m) if m.contains(&format!("{p:?}")) && m.contains("plane")),
+            "{p:?}: {err:?}"
+        );
+    }
 }
 
 #[test]

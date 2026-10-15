@@ -1297,6 +1297,50 @@ impl MjpegEncoder {
         ACCEPTED_PIXEL_FORMATS
     }
 
+    /// Every plane the input layout needs is there, with a stride of at
+    /// least its tight row and enough bytes for its rows (the last row
+    /// may be unpadded) — `InvalidData` naming the layout otherwise, so
+    /// no path indexes past a short plane.
+    fn check_frame(&self, v: &VideoFrame) -> Result<()> {
+        let l = &self.layout;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let need = if l.packed { 1 } else { l.nf };
+        if v.planes.len() < need {
+            return Err(Error::invalid(format!(
+                "MJPEG encoder: {:?} frame needs {need} plane(s), got {}",
+                l.input,
+                v.planes.len()
+            )));
+        }
+        let hm = l.sampling.iter().map(|s| s.0).max().unwrap_or(1) as usize;
+        let vm = l.sampling.iter().map(|s| s.1).max().unwrap_or(1) as usize;
+        for (c, pl) in v.planes.iter().enumerate().take(need) {
+            let (cw, ch) = if l.packed || c == 0 {
+                (w, h)
+            } else {
+                let (hi, vi) = l.sampling.get(c).copied().unwrap_or((1, 1));
+                (
+                    (w * hi as usize).div_ceil(hm),
+                    (h * vi as usize).div_ceil(vm),
+                )
+            };
+            let row = cw * if l.packed { l.nf } else { 1 } * l.bps;
+            let needed = (ch - 1)
+                .checked_mul(pl.stride)
+                .and_then(|n| n.checked_add(row))
+                .ok_or_else(|| Error::invalid("MJPEG encoder: plane size overflows usize"))?;
+            if pl.stride < row || pl.data.len() < needed {
+                return Err(Error::invalid(format!(
+                    "MJPEG encoder: {:?} plane {c} ({cw}×{ch} samples, {row}-byte rows) is {} bytes at stride {}; {needed} needed",
+                    l.input,
+                    pl.data.len(),
+                    pl.stride
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Split a frame into per-component `u16` planes at the A.1.1
     /// resolutions the input layout implies, then apply the `chroma`
     /// conversion (RGB → JFIF YCbCr / grey by the T.871 §7 forward
@@ -1741,18 +1785,7 @@ impl Encoder for MjpegEncoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         match frame {
             Frame::Video(v) => {
-                let need = if self.layout.packed {
-                    1
-                } else {
-                    self.layout.nf
-                };
-                if v.planes.len() < need {
-                    return Err(Error::invalid(format!(
-                        "MJPEG encoder: {:?} frame needs {need} plane(s), got {}",
-                        self.layout.input,
-                        v.planes.len()
-                    )));
-                }
+                self.check_frame(v)?;
                 if self.general_implied {
                     // Knobs may have moved since `from_params`.
                     let o = self.implied_options();

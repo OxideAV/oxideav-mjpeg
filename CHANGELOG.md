@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The registry encoder declares its contract.** `register_codecs`
+  publishes every input layout the encoder accepts through
+  `CodecCapabilities::accepted_pixel_formats`
+  (`registry::ACCEPTED_PIXEL_FORMATS` / `accepted_pixel_formats()`,
+  19 layouts: `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv411P` /
+  `Yuv440P`, `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le`,
+  `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le`, `Rgb24` / `Rgb48Le` /
+  `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le`, `Cmyk` / `CmykInverted`), so
+  the `oxideav-image` gateway converts to one of them instead of
+  guessing (it declared nothing before: `heic → jpg` from a grey / RGB
+  / 4:4:4 / deep source failed with "expected 3 planes").
+  `registry::coded_pixel_format(input)` says what the decoder reports
+  for each. `Yuv411P`, `Yuv440P`, the 12-bit YCbCr family, `Rgb48Le`,
+  the `Gbrp*Le` planes and `CmykInverted` encode through the registry
+  for the first time; `Gray10Le` / `Gray12Le` / `Gray16Le` encode
+  without `set_lossless(true)` (12-bit DCT; lossless for 10 / 16).
+  `tests/registry_matrix.rs` proves every layout × 1×1 / odd /
+  MCU-unaligned / aligned sizes × option sets (355 cells; 325 also
+  through the black-box reference decoder with the declared geometry,
+  component count and precision) and pins registry-bytes ==
+  `encode(&JpegImage, &EncodeOptions)` for 46 requests.
+- `MjpegEncoderOptions` gains `chroma` (`yuv444` / `yuv422` / `yuv420`
+  / `yuv411` / `gray`): converts `Rgb24` frames to that JFIF layout
+  with the T.871 §7 forward equations, byte-identical to
+  `encode_rgb8`, or keeps the luma of a YCbCr frame. `process` gains
+  `auto` (the default: sequential DCT, lossless on the lossless-only
+  carriers). The record is `#[non_exhaustive]` with `new()` / `with_*`
+  setters; `to_encode_options_for(lossless_only)` and
+  `chroma_request()` expose the resolution.
+
+### Changed
+
+- The encoder's `output_params()` carry the layout the decoder reports
+  for the stream (`YuvJ420P` for a `Yuv420P` input, `YuvJ444P` for
+  `Yuv440P`, `Cmyk` for `CmykInverted`, `Gray8` for `chroma = gray`, …)
+  and the matching colour signal, as the `jpeg` demuxer declares them
+  (it kept the caller's label before).
+- Refusals are typed and name the layout: an undeclared pixel format is
+  `Error::Unsupported` (alpha layouts say JPEG has no alpha), a frame
+  with too few planes `InvalidData` with the layout and the count, and
+  combinations the decoder would relabel or refuse (a DCT process on a
+  lossless-only carrier, lossless 4:4:4 YCbCr, lossless 12-bit
+  subsampled YCbCr, `precision` 10 / 12 / 14 on `Rgb48Le`) are refused
+  at `from_params` / `set_encode_options` instead of producing a
+  stream whose label lies.
+- `set_adobe_transform` now also updates the signalling of options
+  already set with `set_encode_options`.
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.11...v0.1.12) - 2026-10-05
 
 ### Other

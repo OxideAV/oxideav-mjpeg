@@ -717,7 +717,7 @@ pub(crate) fn stream_shape(bytes: &[u8]) -> Result<(u32, u32, PixelFormat, Color
 }
 
 /// Colour description for a decoded layout (see [`ColorInfo`]).
-fn color_for(format: PixelFormat) -> ColorInfo {
+pub(crate) fn color_for(format: PixelFormat) -> ColorInfo {
     if format.is_gray() {
         ColorInfo::gray()
     } else if format == PixelFormat::Cmyk {
@@ -881,7 +881,12 @@ fn prepare_planes(image: &JpegImage, opts: &EncodeOptions) -> Result<PreparedPla
 /// RGB-coded 4:4:4 when `ColorSignalling::Rgb` is requested, otherwise
 /// full-range YCbCr at `opts.chroma` (T.871 §7 forward equations,
 /// two-tap box filter per subsampled axis).
-fn rgb8_to_native(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<JpegImage> {
+pub(crate) fn rgb8_to_native(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    opts: &EncodeOptions,
+) -> Result<JpegImage> {
     let (w, h) = (width as usize, height as usize);
     if opts.signalling == ColorSignalling::Rgb {
         return JpegImage::from_rgb8(width, height, rgb[..w * h * 3].to_vec());

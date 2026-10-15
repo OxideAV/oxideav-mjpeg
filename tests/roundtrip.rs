@@ -958,20 +958,24 @@ fn roundtrip_gray8_trait_api_lossless_is_still_exact() {
     }
 }
 
-/// 10-bit / 12-bit / 16-bit grayscale still requires `set_lossless(true)`
-/// — the DCT path is 8-bit by spec. The trait API surfaces a clean
-/// `Unsupported` error.
+/// 10-bit grayscale has one process that carries it — lossless — so
+/// the knob-free trait path codes `SOF3` bit-exact without
+/// `set_lossless(true)`; asking for a DCT process explicitly
+/// (`process = sequential`) is the typed `Unsupported` refusal.
 #[test]
-fn roundtrip_gray10_without_lossless_is_rejected() {
+fn roundtrip_gray10_without_lossless_flag_is_lossless() {
     let w = 8u32;
     let h = 8u32;
-    // 16-bit-LE plane (2 bytes per sample).
-    let samples = vec![0u8; (w as usize) * 2 * (h as usize)];
+    // 16-bit-LE plane (2 bytes per sample), 10 significant bits.
+    let mut samples = Vec::with_capacity((w * h * 2) as usize);
+    for i in 0..(w * h) {
+        samples.extend_from_slice(&(((i * 977) % 1024) as u16).to_le_bytes());
+    }
     let frame = VideoFrame {
         pts: Some(0),
         planes: vec![VideoPlane {
             stride: (w as usize) * 2,
-            data: samples,
+            data: samples.clone(),
         }],
     };
     let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
@@ -979,11 +983,25 @@ fn roundtrip_gray10_without_lossless_is_rejected() {
     enc_params.height = Some(h);
     enc_params.pixel_format = Some(PixelFormat::Gray10Le);
     let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).expect("enc");
-    // Default = lossy attempt; that's not legal for 10-bit.
-    let err = enc.send_frame(&Frame::Video(frame)).expect_err("must fail");
+    assert_eq!(
+        enc.output_params().pixel_format,
+        Some(PixelFormat::Gray10Le)
+    );
+    enc.send_frame(&Frame::Video(frame))
+        .expect("lossless by default");
+    let pkt = enc.receive_packet().unwrap();
+    assert!(pkt.data.windows(2).any(|m| m == [0xFF, 0xC3]), "SOF3");
+    let img = oxideav_mjpeg::decode(&pkt.data).unwrap();
+    assert_eq!(PixelFormat::from(img.format), PixelFormat::Gray10Le);
+    assert_eq!(img.planes[0].data, samples);
+
+    enc_params.options = enc_params.options.set("process", "sequential");
+    let err = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params)
+        .err()
+        .expect("a DCT process cannot carry 10-bit samples");
     assert!(
-        matches!(err, oxideav_core::Error::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
+        matches!(err, oxideav_core::Error::Unsupported(ref m) if m.contains("Gray10Le")),
+        "expected Unsupported naming the layout, got {err:?}"
     );
 }
 

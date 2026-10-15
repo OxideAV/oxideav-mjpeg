@@ -112,8 +112,13 @@ if let Ok(Frame::Video(vf)) = dec.receive_frame() {
 `MjpegEncoder` knobs (`set_progressive`, `set_lossless`,
 `set_arithmetic`, `set_restart_interval`, `set_adobe_transform`,
 `set_encode_options(EncodeOptions)`) and the `MjpegEncoderOptions`
-`CodecOptions` schema. The registry `Decoder` is a thin adapter over the
-standalone `decode_with` — one implementation — and the conversions
+`CodecOptions` schema. The encoder declares every input layout it
+accepts through `CodecCapabilities::accepted_pixel_formats`
+(`registry::ACCEPTED_PIXEL_FORMATS`, 19 layouts; `coded_pixel_format`
+says what the decoder reports for each) and stamps its output
+parameters with that coded label and colour signal — see *Registry
+encoder contract* below. The registry `Decoder` is a thin adapter over
+the standalone `decode_with` — one implementation — and the conversions
 `From<JpegImage> for VideoFrame`, `From<MjpegPixelFormat> for
 PixelFormat` / `TryFrom<PixelFormat>` (1:1 by name) and
 `From<ColorInfo> for ColorSignal` connect the two layers; the frame
@@ -184,6 +189,14 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 | `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
 | `metadata` | empty | ICC / Exif / XMP blobs to embed (merged with `JpegImage::metadata`, the option winning per blob). |
 | `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
+
+The registry encoder's `MjpegEncoderOptions` (`CodecOptions` keys
+`quality`, `tables`, `process` (`auto` / `sequential` / `progressive` /
+`lossless`), `precision`, `restart`, `abbreviated`, `predictor`,
+`point_transform`, `sampling`, `chroma`) is the string-bag twin of this
+record (`#[non_exhaustive]`, `new()` / `with_*`); `chroma` applies the
+`encode_rgb8` conversion to `Rgb24` frames (or keeps the luma of YCbCr
+ones) and has no plane-level field.
 
 `DecodeOptions` (`Default` + `with_*`):
 
@@ -415,6 +428,80 @@ them. A non-zero value writes a DRI segment before SOS and cycles
 predictors at each marker. Passing `0` preserves the historical
 no-restart behaviour.
 
+### Registry encoder contract
+
+The framework encoder (`make_encoder` / `MjpegEncoder::from_params`)
+declares the input layouts it accepts through
+`CodecCapabilities::accepted_pixel_formats`
+(`registry::ACCEPTED_PIXEL_FORMATS`), so a framework caller — the
+`oxideav-image` gateway's pixel-format ladder — converts to one of them
+before encoding instead of guessing. Every declared layout is coded
+faithfully (the stream carries the samples as given) and the encoder's
+`output_params()` carry the layout the decoder reports for the stream
+(`pixel_format`, `coded_pixel_format(input)` for the knob-free case)
+plus its colour signal, exactly as the `jpeg` demuxer declares them.
+`tests/registry_matrix.rs` proves every cell (layout × 1×1 / odd /
+MCU-unaligned / aligned sizes × option sets: 355 cells, 325 of them
+also through the black-box reference decoder with the declared
+geometry, component count and precision).
+
+| Input | Stream (empty option bag) | Decodes as |
+|---|---|---|
+| `YuvJ444P` / `YuvJ422P` / `YuvJ420P` | JFIF YCbCr, luma `1×1` / `2×1` / `2×2` | the same label |
+| `Yuv411P` | JFIF YCbCr, luma `4×1` | `Yuv411P` |
+| `Yuv440P` | JFIF YCbCr, luma `1×2` | `YuvJ444P` (the decoder replicates 4:4:0 chroma onto the frame grid) |
+| `Gray8` | JFIF, one component, `SOF0` | `Gray8` |
+| `Gray12Le` / `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` | 12-bit extended sequential (`SOF1`) | the same label |
+| `Gray10Le` / `Gray16Le` | lossless (`SOF3`) at `P = 10` / `16` — the only process that carries them | the same label |
+| `Rgb24` | RGB-coded: T.872 Adobe APP14 `transform = 0` + ids `'R' 'G' 'B'`, no colour conversion | `Rgb24` |
+| `Rgb48Le` | lossless at `P = 16`, RGB-coded | `Rgb48Le` |
+| `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | lossless, planes in order, ids `1 2 3`, no colour signalling | the same label |
+| `Cmyk` | four components, no APP14 (T.872 §6.1 plain CMYK; `set_adobe_transform` for Adobe / YCCK) | `Cmyk` |
+| `CmykInverted` | complemented into plain CMYK | `Cmyk` |
+
+Rulings:
+
+- **Aliases, not declared.** The range-agnostic `Yuv444P` / `Yuv422P` /
+  `Yuv420P` labels are accepted as the same layouts (JPEG YCbCr is full
+  range by definition, T.871 §7; the encoder scales no ranges, so a
+  limited-range picture must be expanded first) and labelled `YuvJ*` on
+  output, but they are not declared: a caller converting through the
+  declaration reaches the explicit full-range label.
+- **`Rgb24` is RGB-coded.** The spec-grounded three-component RGB form
+  is T.872's Adobe APP14 `transform = 0`; the encoder also writes the
+  `'R' 'G' 'B'` component identifiers and no JFIF segment (T.871 binds
+  a three-component JFIF stream to YCbCr). The picture survives exactly
+  up to quantisation. A JFIF YCbCr stream from RGB input is one option
+  away: `chroma = yuv444 / yuv422 / yuv420 / yuv411 / gray` converts
+  with the T.871 §7 forward equations exactly as `encode_rgb8` does
+  (byte-identical), and `chroma = gray` keeps the luma of a YCbCr
+  input.
+- **Refusals are typed and name the layout.** An undeclared pixel
+  format is `Error::Unsupported` naming it (alpha layouts say so: JPEG
+  has no alpha — drop it first); a frame with too few planes is
+  `InvalidData` naming the layout and the count. Combinations the
+  decoder would relabel or refuse are refused up front: a DCT process on
+  a lossless-only carrier; the lossless process on 4:4:4 YCbCr (T.81
+  Annex H carries no colour transform, so a lossless `1×1`
+  three-component stream is the RGB-class carrier on decode — code
+  `Rgb24` / `Gbrp12Le` for an exact picture, or a subsampled layout) and
+  on 12-bit subsampled YCbCr (the decoder shapes subsampled lossless
+  scans at 8 bits); `precision` must match the layout except on the
+  16-bit carriers (`Gray16Le` / `Rgb48Le` take any lossless `2..=16`,
+  the samples in the low bits — but not `10 / 12 / 14` on `Rgb48Le`,
+  whose streams the decoder labels as the planar `Gbrp*Le` carriers:
+  hand those planes over as `Gbrp*Le`).
+- **One writer for every option.** Any option key routes through the
+  general T.81 writer and the bytes are identical to
+  `encode(&JpegImage::from_video_frame(..), &EncodeOptions)` for the
+  same request (46 requests pinned). The empty bag keeps the historical
+  per-format streams for `Gray8`, 8-bit YCbCr 4:4:4 / 4:2:2 / 4:2:0,
+  `Rgb24` and `Cmyk` (same entropy-coded data, `SOF` before `DHT`;
+  `tests/golden.rs` pins them) and the general writer with its defaults
+  everywhere else, so every declared layout encodes without options.
+  `process = auto` (the default) is sequential DCT, or lossless on the
+  lossless-only carriers.
+
 ### Progressive (SOF2) encode
 
 Toggle progressive emission via `MjpegEncoder::set_progressive(true)`
@@ -534,8 +621,11 @@ enc.send_frame(&frame)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Without `set_lossless(true)` the trait-API encoder rejects grayscale
-input rather than silently downgrading the bitstream.
+Without `set_lossless(true)` the trait-API encoder codes `Gray8` and
+`Gray12Le` with the sequential DCT (8- and 12-bit); `Gray10Le` /
+`Gray16Le` are lossless whatever the flag says — nothing else carries
+them — and asking for a DCT process on them (`process = sequential`)
+is a typed `Unsupported` refusal rather than a silent downgrade.
 
 ### Lossless arithmetic (SOF11) grayscale encode
 

@@ -688,33 +688,54 @@ fn registry_encoder_gray8_without_lossless_flag_takes_baseline() {
     assert_eq!(v.planes.len(), 1);
 }
 
-/// Higher-precision grayscale (10 / 12 / 16-bit) still requires
-/// `set_lossless(true)` — the baseline DCT path is 8-bit by spec.
+/// Higher-precision grayscale without `set_lossless(true)`: `Gray12Le`
+/// codes a 12-bit extended-sequential frame (`SOF1`) — the registry
+/// contract declares the layout, so the knob-free path must encode it —
+/// while `Gray10Le` / `Gray16Le` are lossless whatever the flag says
+/// (nothing else carries them). Every output is labelled with the
+/// layout the decoder reports.
 #[test]
-fn registry_encoder_gray12_without_lossless_flag_errors() {
+fn registry_encoder_high_precision_gray_without_lossless_flag_encodes() {
     use oxideav_core::frame::VideoPlane;
     use oxideav_core::{Encoder, VideoFrame};
 
-    let w = 8u32;
-    let h = 8u32;
-    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
-    enc_params.width = Some(w);
-    enc_params.height = Some(h);
-    enc_params.pixel_format = Some(PixelFormat::Gray12Le);
-    let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).unwrap();
-    // No set_lossless(true) — 12-bit DCT isn't a thing on this path.
-    let frame = Frame::Video(VideoFrame {
-        pts: Some(0),
-        planes: vec![VideoPlane {
-            stride: (w as usize) * 2,
-            data: vec![0u8; (w as usize) * 2 * (h as usize)],
-        }],
-    });
-    let err = enc.send_frame(&frame).unwrap_err();
-    assert!(
-        matches!(err, oxideav_core::Error::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
+    let w = 9u32;
+    let h = 7u32;
+    for (pix, bits, sof) in [
+        (PixelFormat::Gray12Le, 12u32, 0xC1u8),
+        (PixelFormat::Gray10Le, 10, 0xC3),
+        (PixelFormat::Gray16Le, 16, 0xC3),
+    ] {
+        let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+        enc_params.width = Some(w);
+        enc_params.height = Some(h);
+        enc_params.pixel_format = Some(pix);
+        let mut enc = oxideav_mjpeg::encoder::MjpegEncoder::from_params(&enc_params).unwrap();
+        assert_eq!(enc.output_params().pixel_format, Some(pix), "{pix:?}");
+        let mut data = Vec::with_capacity((w * h * 2) as usize);
+        for i in 0..(w * h) {
+            data.extend_from_slice(&(((i * 2731) % (1 << bits)) as u16).to_le_bytes());
+        }
+        let frame = Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: (w as usize) * 2,
+                data: data.clone(),
+            }],
+        });
+        enc.send_frame(&frame)
+            .unwrap_or_else(|e| panic!("{pix:?}: {e}"));
+        let pkt = enc.receive_packet().unwrap();
+        assert!(
+            pkt.data.windows(2).any(|m| m == [0xFF, sof]),
+            "{pix:?}: SOF marker {sof:#x}"
+        );
+        let img = oxideav_mjpeg::decode(&pkt.data).unwrap();
+        assert_eq!(PixelFormat::from(img.format), pix, "{pix:?}: decoded label");
+        if sof == 0xC3 {
+            assert_eq!(img.planes[0].data, data, "{pix:?}: lossless");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

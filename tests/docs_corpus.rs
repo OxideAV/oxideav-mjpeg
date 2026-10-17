@@ -16,8 +16,8 @@
 //! Per-fixture classification:
 //! * `Tier::Exact` — assert every sample matches the reference. Used by
 //!   the lossless / arithmetic / grayscale / 4:1:1 / no-JFIF fixtures
-//!   whose decode path is bit-exact against libjpeg-turbo's reference
-//!   PGM/PPM.
+//!   whose decode path is bit-exact against the corpus reference
+//!   PGM/PPM (rendered by the black-box reference decoder).
 //! * `Tier::PsnrFloor { db, exact_pct }` — assert both `total.psnr >=
 //!   db` and `total.match_pct() >= exact_pct`. Used by the lossy
 //!   baseline / progressive fixtures whose YCbCr→RGB / IDCT rounding
@@ -162,22 +162,23 @@ struct Decoded {
 ///   * 1.40200 → 91881
 ///   * 0.34414 → 22554
 ///   * 0.71414 → 46802
-///   * 1.77200 → 116130 (libjpeg-turbo uses 116130 even though the
-///     strict round of 1.772 * 65536 = 116131.84)
+///   * 1.77200 → 116130 (the corpus reference rounds this one to
+///     116130 rather than the strict 1.772 * 65536 = 116131.84;
+///     observed from the fixtures' `expected.ppm` bytes)
 ///
-/// The green expression must mirror libjpeg-turbo's `Cb_g_tab[cb] +
-/// Cr_g_tab[cr] >> SCALEBITS` exactly:
-///   * `Cb_g_tab[cb] = -22554*(cb-128) + 32768`  (ONE_HALF on Cb side)
-///   * `Cr_g_tab[cr] = -46802*(cr-128)`           (no half-bias on Cr)
-///   * `g = y + ((Cb_g_tab + Cr_g_tab) >> 16)`
+/// The green term is one rounded sum, with the half-LSB bias (32768)
+/// added once on the Cb side:
+///   * `g_cb = -22554*(cb-128) + 32768`
+///   * `g_cr = -46802*(cr-128)`
+///   * `g = y + ((g_cb + g_cr) >> 16)`
 ///
 /// Writing it as `y - ((22554*db + 46802*dr + 32768) >> 16)` is *not*
 /// equivalent — at the boundary where the inner sum lands exactly on
 /// the rounding step (e.g. db,dr push the sum to 32768), arithmetic
 /// shift on the negated form rounds toward positive infinity while
-/// the libjpeg form rounds toward negative infinity, leaving green
-/// off by 1 LSB. Reproducing libjpeg-turbo's expression keeps every
-/// pixel byte-exact with its `expected.ppm`.
+/// the single-sum form rounds toward negative infinity, leaving green
+/// off by 1 LSB. The single-sum form keeps every pixel byte-exact
+/// with the fixture's `expected.ppm`.
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
     let y_s = y as i32;
     let cbi = cb as i32 - 128;
@@ -188,11 +189,12 @@ fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
     (r, g, b)
 }
 
-/// libjpeg-turbo `h2v2_fancy_upsample` — chroma upsampling for 4:2:0.
+/// Triangle-filter chroma upsampling for 4:2:0 (the smoothing the
+/// corpus reference applies by default).
 /// Each output pixel is a 9:3:3:1 weighted blend of the four enclosing
 /// chroma samples (T.871 §9 Note 1: "a commonly used filter").
 /// Edge samples extend by replication.
-fn h2v2_fancy_upsample(
+fn upsample_h2v2_triangle(
     chroma: &[u8],
     c_w: usize,
     c_h: usize,
@@ -230,10 +232,9 @@ fn h2v2_fancy_upsample(
     out
 }
 
-/// libjpeg-turbo `h2v1_fancy_upsample` — horizontal-only fancy
-/// upsampling for 4:2:2. Triangle filter (3:1 weights) per output
+/// Horizontal-only triangle-filter upsampling for 4:2:2. Triangle filter (3:1 weights) per output
 /// position; edge replication.
-fn h2v1_fancy_upsample(
+fn upsample_h2v1_triangle(
     chroma: &[u8],
     c_w: usize,
     c_h: usize,
@@ -257,9 +258,9 @@ fn h2v1_fancy_upsample(
     out
 }
 
-/// Nearest-neighbour upsample for layouts where libjpeg-turbo doesn't
-/// apply a fancy filter (e.g. the legacy 4:1:1 path falls back to
-/// nearest-neighbour box upsampling).
+/// Nearest-neighbour upsample for layouts where the corpus reference
+/// applies no smoothing filter (observed on the 4:1:1 fixtures: box
+/// replication).
 fn nearest_upsample(chroma: &[u8], c_w: usize, c_h: usize, out_w: usize, out_h: usize) -> Vec<u8> {
     let mut out = vec![0u8; out_w * out_h];
     for oy in 0..out_h {
@@ -388,12 +389,12 @@ fn flatten_frame(
                 match fmt {
                     PixelFormat::Yuv444P => (cb_plane, cr_plane),
                     PixelFormat::Yuv422P => (
-                        h2v1_fancy_upsample(&cb_plane, cw, ch, w, h),
-                        h2v1_fancy_upsample(&cr_plane, cw, ch, w, h),
+                        upsample_h2v1_triangle(&cb_plane, cw, ch, w, h),
+                        upsample_h2v1_triangle(&cr_plane, cw, ch, w, h),
                     ),
                     PixelFormat::Yuv420P => (
-                        h2v2_fancy_upsample(&cb_plane, cw, ch, w, h),
-                        h2v2_fancy_upsample(&cr_plane, cw, ch, w, h),
+                        upsample_h2v2_triangle(&cb_plane, cw, ch, w, h),
+                        upsample_h2v2_triangle(&cr_plane, cw, ch, w, h),
                     ),
                     PixelFormat::Yuv411P => (
                         nearest_upsample(&cb_plane, cw, ch, w, h),
@@ -544,7 +545,7 @@ enum Tier {
     /// Bit-exact match required: every sample on every channel must
     /// equal the reference. Currently used by lossless / arithmetic /
     /// grayscale / 4:1:1 fixtures whose decode path produces an exact
-    /// roundtrip against the libjpeg-turbo reference PGM/PPM.
+    /// roundtrip against the corpus reference PGM/PPM.
     Exact,
     /// Lossy fixture: total PSNR must stay at or above the floor (dB)
     /// and total exact-sample percentage must stay at or above the
@@ -764,7 +765,7 @@ fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelForm
 // Per-fixture tests
 // ---------------------------------------------------------------------------
 
-// --- Tier::Exact: decode is bit-exact against the libjpeg-turbo
+// --- Tier::Exact: decode is bit-exact against the corpus
 //     reference. Lossless / SOF9 / grayscale / 4:1:1 / non-chroma
 //     fixtures land here; the assert gates against regressions that
 //     would silently degrade entropy or sample reconstruction.
@@ -782,7 +783,7 @@ fn corpus_tiny_baseline_1x1() {
 #[test]
 fn corpus_baseline_grayscale_32x32() {
     // Grayscale baseline (single component, no chroma upsample / colour
-    // conversion). Bit-exact roundtrip against the libjpeg-turbo PGM.
+    // conversion). Bit-exact roundtrip against the corpus reference PGM.
     evaluate(&CorpusCase {
         name: "baseline-grayscale-32x32",
         is_rgb_jpeg: false,
@@ -804,7 +805,8 @@ fn corpus_lossless_1986_mode() {
 fn corpus_arithmetic_coded() {
     // SOF9 — extended sequential arithmetic. Decoded via the Q-coder
     // entropy path (T.81 Annex D + F.2.4). Bit-exact against the
-    // libjpeg-turbo `cjpeg -arithmetic` reference PGM.
+    // corpus reference PGM (produced with the black-box encoder's
+    // arithmetic-coding option).
     evaluate(&CorpusCase {
         name: "arithmetic-coded",
         is_rgb_jpeg: false,
@@ -817,7 +819,7 @@ fn corpus_baseline_yuv411_32x32() {
     // 4:1:1 chroma subsampling: luma h_factor=4, v_factor=1. Decoder
     // emits the chroma planes at 1/4 horizontal resolution as
     // `PixelFormat::Yuv411P`. Bit-exact (the reference PPM was rendered
-    // by libjpeg-turbo through the same IDCT path the decoder uses).
+    // by the black-box reference decoder).
     evaluate(&CorpusCase {
         name: "baseline-yuv411-32x32",
         is_rgb_jpeg: false,
@@ -894,7 +896,7 @@ fn corpus_baseline_q1_low_quality() {
 fn corpus_baseline_q100_no_loss() {
     // q=100 — all-ones DQT. Highest possible PSNR; near-bit-exact (the
     // only loss is the YCbCr↔RGB rounding, since the ground truth was
-    // re-decoded by libjpeg-turbo itself with the same transform).
+    // re-decoded by the black-box reference decoder with the same transform).
     // Observed 2026-05-26: PSNR 56.31 dB, exact 92.51%.
     evaluate(&CorpusCase {
         name: "baseline-q100-no-loss",
@@ -909,7 +911,7 @@ fn corpus_baseline_q100_no_loss() {
 #[test]
 fn corpus_progressive_yuv420_128x128() {
     // SOF2 progressive (spectral selection + successive approximation
-    // on the libjpeg-turbo side). Decoded via the multi-scan coefficient
+    // on the producer side). Decoded via the multi-scan coefficient
     // accumulator. Observed 2026-05-26: PSNR 55.49 dB, exact 91.25%.
     evaluate(&CorpusCase {
         name: "progressive-yuv420-128x128",

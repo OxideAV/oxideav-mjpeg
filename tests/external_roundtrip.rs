@@ -21,9 +21,8 @@
 //! # libturbojpeg
 //!
 //! The libturbojpeg shim (`tjCompress2` / `tjDecompress2`) is
-//! `dlopen`'d at runtime — there is no `turbojpeg-sys`-style build
-//! dependency, no libjpeg / libjpeg-turbo source pulled into our
-//! dep tree (workspace policy bars external library source). When
+//! `dlopen`'d at runtime: the installed shared library is driven as a
+//! black-box validator and nothing is linked at build time. When
 //! the shared library isn't installed on the host the test prints
 //! a one-line skip notice and exits without failing, so this file
 //! is safe to ship as part of the standard `cargo test` matrix.
@@ -46,7 +45,7 @@ use oxideav_mjpeg::encoder::encode_jpeg_with_opts;
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
-/// libjpeg-style quality factor used on both encodes (oxideav and
+/// Quality factor (T.81 Annex K scaling, 1..=100) used on both encodes (oxideav and
 /// libturbojpeg).  q=75 is the default that both encoders are
 /// calibrated for — it is also what the fuzz harness uses, so the
 /// observed drift here is directly comparable to fuzz reports.
@@ -262,8 +261,8 @@ fn synth_smooth_rgb(width: u32, height: u32) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Convert a packed RGB buffer to a planar `Yuv444P` `VideoFrame`
-/// using BT.601 full-range coefficients (matches JFIF, libjpeg,
-/// and `oxideav-mjpeg`'s internal conversion).
+/// using the JFIF (T.871 §7) full-range BT.601 coefficients, the same
+/// conversion `oxideav-mjpeg` applies internally.
 fn rgb_to_yuv444p_frame(rgb: &[u8], width: u32, height: u32) -> VideoFrame {
     let stride = width as usize;
     let n = stride * height as usize;

@@ -30,7 +30,7 @@ use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 /// `libjpeg_encode_oxideav_decode` harness was comparing in
 /// *RGB* space after a nearest-neighbour chroma upsampler. On a
 /// 5×1 image where each chroma sample (the image is 4:2:0, so
-/// chroma is 3×1) covers a hard colour edge, libjpeg's "fancy"
+/// chroma is 3×1) covers a hard colour edge, the oracle's smoothing
 /// upsampler interpolates across columns while the harness's
 /// nearest-neighbour replicates — the resulting RGB drift was
 /// 14–25 LSB on the affected B-channel pixels, well past the

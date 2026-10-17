@@ -795,8 +795,8 @@ impl QuantTableInfo {
     }
 
     /// True when every element equals `1` — a "no quantization" table
-    /// (lossless-quality DCT, e.g. an `IJG Q=100`-style encode that
-    /// floors every divisor at 1). A quick triage predicate; callers
+    /// (lossless-quality DCT, e.g. a quality-100 encode on the Annex K
+    /// scaling, which floors every divisor at 1). A quick triage predicate; callers
     /// wanting the exact divisors read `values`.
     pub fn is_all_ones(&self) -> bool {
         self.values.iter().all(|&v| v == 1)

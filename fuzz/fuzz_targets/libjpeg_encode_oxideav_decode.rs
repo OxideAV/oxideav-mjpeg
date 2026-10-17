@@ -13,7 +13,7 @@
 //! is deliberate. The decoder is responsible for the IDCT and
 //! dequantisation; once that lands in YUV planes a conformant
 //! decoder must agree with libjpeg byte-for-byte (within ≤1 LSB
-//! IDCT slack). Choice of chroma upsampling method ("fancy"
+//! IDCT slack). Choice of chroma upsampling method (smoothing
 //! interpolation vs nearest-neighbour) is a *consumer* concern,
 //! not a decoder concern, and applying it on the harness side
 //! introduces unbounded drift on tiny images with abrupt chroma

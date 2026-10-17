@@ -1,8 +1,8 @@
 //! Runtime libjpeg-turbo interop for the cross-decode fuzz harnesses.
 //!
-//! libjpeg-turbo (`libturbojpeg`) is loaded via `dlopen` at first call —
-//! there is no `turbojpeg-sys`-style build-script dep that would pull
-//! libjpeg / libjpeg-turbo source into the workspace's cargo dep tree.
+//! The installed `libturbojpeg` shared library is loaded via `dlopen` at
+//! first call and driven as a black-box oracle; nothing is linked at
+//! build time.
 //! Each harness checks [`libjpeg::available`] up front and `return`s
 //! early when the shared library isn't installed, so fuzz binaries
 //! built on a host without libturbojpeg simply do nothing instead of
@@ -88,7 +88,7 @@ pub mod libjpeg {
     }
 
     /// Encode a packed RGB image as a JPEG via `tjCompress2`. `quality`
-    /// is libjpeg's 1..=100 scale. Returns `None` if libturbojpeg
+    /// is the oracle's 1..=100 scale (T.81 Annex K scaling). Returns `None` if libturbojpeg
     /// isn't available, the encoder couldn't be initialised, or the
     /// encode call returned a non-zero status.
     pub fn encode_rgb(rgb: &[u8], width: u32, height: u32, quality: u8) -> Option<Vec<u8>> {
@@ -182,13 +182,13 @@ pub mod libjpeg {
     /// trims padding the same way.
     ///
     /// Comparing in YUV space is what every cross-decode 4:2:0 fuzz
-    /// target *should* do: the chroma upsampling method (fancy vs
+    /// target *should* do: the chroma upsampling method (triangle smoothing vs
     /// nearest) is a consumer choice and applying it on the harness
     /// side introduces unbounded drift on tiny images with abrupt
     /// chroma transitions (e.g. a 5×1 image where each chroma sample
     /// covers a different colour). Our decoder is responsible for
     /// the IDCT + dequantisation only; once that lands in YUV planes
-    /// it should match libjpeg byte-for-byte (within ≤1 LSB IDCT
+    /// it should agree with the oracle byte-for-byte (within ≤1 LSB IDCT
     /// precision slack).
     pub fn decode_to_yuv420(data: &[u8]) -> Option<DecodedYuv420> {
         type InitFn = unsafe extern "C" fn() -> TjHandle;
@@ -441,8 +441,8 @@ pub fn rgb_to_yuv444p_frame(rgb: &[u8], width: u32, height: u32) -> VideoFrame {
             let r = rgb[p] as f32;
             let g = rgb[p + 1] as f32;
             let b = rgb[p + 2] as f32;
-            // BT.601 full-range (JFIF) — matches libjpeg / libjpeg-turbo
-            // and our own internal RGB→YCbCr conversion.
+            // BT.601 full-range (JFIF, T.871 §7) — the same conversion our
+            // own internal RGB→YCbCr path applies.
             let yy = 0.299 * r + 0.587 * g + 0.114 * b;
             let cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
             let cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
@@ -503,9 +503,9 @@ pub const SELF_TOLERANCE: i32 = 2;
 ///
 ///  1. IDCT precision differences between the two implementations
 ///     (≤ 1 LSB on YUV per JPEG conformance).
-///  2. Chroma upsampling method differences ("fancy" smoothing vs
+///  2. Chroma upsampling method differences (triangle smoothing vs
 ///     nearest-neighbour) — ≤ ~2 LSB on chroma rows in 4:2:0 mode.
-///  3. YUV→RGB rounding done by libjpeg vs by our harness → ≤ ~1
+///  3. YUV→RGB rounding done by the oracle vs by our harness → ≤ ~1
 ///     LSB per RGB component.
 ///
 /// ±5 LSB covers the worst-case sum without admitting real decoder

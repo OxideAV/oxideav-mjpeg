@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.12...v0.2.0) - 2026-10-17
+
+### Other
+
+- test-oracle comments cite T.871 and the fixture-observed rounding, not an external implementation's internals
+- `adobe_transform` option (none / cmyk / ycck) on the registry encoder; abbreviated-pair sweep over every declared layout; 16-bit carriers at every lossless precision
+- `send_frame` checks every plane's extent before any path (short planes panicked in the historical 8-bit writers); `registry_encoder` fuzz target
+- the registry encoder declares its contract — 19 accepted layouts, coded-label output params, typed refusals, chroma option, 355-cell matrix
+
 ### Added
 
 - **The registry encoder declares its contract.** `register_codecs`

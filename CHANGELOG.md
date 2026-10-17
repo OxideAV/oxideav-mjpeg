@@ -86,6 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (found by `metadata_embed` in its first minutes); the splitter now
   reads every marker other than SOI / EOI / RSTn / SOS with its
   length, as the decoder does.
+
 ## [0.1.13](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.12...v0.1.13) - 2026-10-17
 
 ### Other

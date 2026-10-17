@@ -17,37 +17,46 @@
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use oxideav_core::{ContainerRegistry, NullCodecResolver, ReadSeek};
 
 /// Generate the 10-frame raw MJPEG fixture under `OUT_DIR/testsrc_10frames.mjpeg`
 /// and return its absolute path. Returns `None` when ffmpeg is missing.
 fn generate_fixture() -> Option<PathBuf> {
-    let out = std::env::temp_dir().join("oxideav_mjpeg_seek_testsrc_10frames.mjpeg");
-    // Always regenerate so a stale half-written file from a previous
-    // run can't make the seek tests flaky.
-    let _ = std::fs::remove_file(&out);
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=rate=5:duration=2:size=160x120",
-            "-c:v",
-            "mjpeg",
-            "-f",
-            "mjpeg",
-        ])
-        .arg(&out)
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    Some(out)
+    // Generated once per test process: the tests run in parallel and
+    // each used to remove and regenerate the same file, so one test
+    // could read a half-written fixture of another (a flaky
+    // "packet after seek" failure). The path carries the process id so
+    // two test binaries never share a file either.
+    static FIXTURE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let out = std::env::temp_dir().join(format!(
+                "oxideav_mjpeg_seek_testsrc_10frames_{}.mjpeg",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&out);
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=rate=5:duration=2:size=160x120",
+                    "-c:v",
+                    "mjpeg",
+                    "-f",
+                    "mjpeg",
+                ])
+                .arg(&out)
+                .status()
+                .ok()?;
+            status.success().then_some(out)
+        })
+        .clone()
 }
 
 fn open_demuxer(bytes: Vec<u8>) -> Box<dyn oxideav_core::Demuxer> {

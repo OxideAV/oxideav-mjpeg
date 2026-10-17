@@ -399,11 +399,15 @@ fn registry_decoder_hands_out_the_same_planes() {
         let Frame::Video(vf) = dec.receive_frame().unwrap() else {
             panic!("{name}: not a video frame");
         };
-        assert_eq!(vf.planes.len(), img.planes.len(), "{name}");
-        for (a, b) in vf.planes.iter().zip(&img.planes) {
+        // The image planes are the same bytes; the registry frame also
+        // carries the picture's metadata as a blob record (its
+        // side-channel plane is not an image plane).
+        assert_eq!(vf.image_planes().len(), img.planes.len(), "{name}");
+        for (a, b) in vf.image_planes().iter().zip(&img.planes) {
             assert_eq!(a.stride, b.stride, "{name}");
             assert_eq!(a.data, b.data, "{name}");
         }
+        assert_eq!(vf.blobs(), img.metadata.to_blobs(), "{name}");
         // The pixel-format enums map 1:1 by name.
         let core: PixelFormat = (*format).into();
         assert_eq!(format!("{core:?}"), format!("{format:?}"), "{name}");

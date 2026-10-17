@@ -22,10 +22,10 @@ use std::collections::VecDeque;
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecRegistry, CodecTag, ContainerRegistry, Decoder, Encoder, Error, Frame, MediaType,
-    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, RuntimeContext, TimeBase,
-    VideoFrame,
+    parse_options, BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct,
+    CodecParameters, CodecRegistry, CodecTag, ContainerRegistry, Decoder, Encoder, Error, Frame,
+    MediaType, MetadataBlob, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result,
+    RuntimeContext, TimeBase, VideoFrame,
 };
 
 use crate::container;
@@ -36,8 +36,11 @@ use crate::encoder::{
     encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
 };
 use crate::error::MjpegError;
-use crate::image::{ColorInfo, ColorRange, JpegImage, MjpegFrame, MjpegPixelFormat, MjpegPlane};
+use crate::image::{
+    ColorInfo, ColorRange, JpegImage, Metadata, MjpegFrame, MjpegPixelFormat, MjpegPlane,
+};
 use crate::jpeg::inspect::ChromaSubsampling;
+use crate::metadata::JfifPolicy;
 use crate::mjpeg_container;
 use crate::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet};
 use crate::CODEC_ID_STR;
@@ -250,6 +253,48 @@ impl From<oxideav_core::ColorSignal> for ColorInfo {
     }
 }
 
+// ---- Metadata ⇄ framework blobs ----------------------------------------
+
+/// Media type stamped on the XMP blob (an RDF/XML packet).
+const XMP_MIME: &str = "application/rdf+xml";
+
+impl Metadata {
+    /// The framework blobs this record denotes, in the carriage
+    /// convention of [`oxideav_core::blob`]: `icc` → [`BlobKind::ICC`]
+    /// (the complete profile), `exif` → [`BlobKind::EXIF`] (the TIFF
+    /// structure from its byte-order mark, no `Exif\0\0`), `xmp` →
+    /// [`BlobKind::XMP`] (the packet, no namespace prefix; `mime`
+    /// `application/rdf+xml`). Fields left `None` produce no blob;
+    /// `gamma` has no blob form.
+    pub fn to_blobs(&self) -> Vec<MetadataBlob> {
+        let mut out = Vec::new();
+        if let Some(icc) = &self.icc {
+            out.push(MetadataBlob::new(BlobKind::ICC, icc.clone()));
+        }
+        if let Some(exif) = &self.exif {
+            out.push(MetadataBlob::new(BlobKind::EXIF, exif.clone()));
+        }
+        if let Some(xmp) = &self.xmp {
+            out.push(MetadataBlob::new(BlobKind::XMP, xmp.clone()).with_mime(XMP_MIME));
+        }
+        out
+    }
+
+    /// The record the framework blobs denote — the first blob of each
+    /// carried kind ([`BlobKind::ICC`] / [`BlobKind::EXIF`] /
+    /// [`BlobKind::XMP`]); every other kind (IPTC, cover art, custom
+    /// names) has no JPEG carriage here and is ignored.
+    pub fn from_blobs(blobs: &[MetadataBlob]) -> Metadata {
+        let first = |kind: &BlobKind| blobs.iter().find(|b| b.is(kind)).map(|b| b.data.clone());
+        Metadata {
+            icc: first(&BlobKind::ICC),
+            exif: first(&BlobKind::EXIF),
+            xmp: first(&BlobKind::XMP),
+            gamma: None,
+        }
+    }
+}
+
 // ---- CodecRegistry / ContainerRegistry entry points --------------------
 
 /// Register the JPEG / MJPEG codec (decoder + encoder) into the
@@ -368,8 +413,13 @@ impl Decoder for MjpegDecoder {
             opts = opts.with_tables(t.clone());
         }
         let img = crate::decode_with(&pkt.data, &opts)?;
+        // The frame's own marker segments ride on the frame record
+        // (Motion-JPEG frames may differ; a still's frame blobs equal
+        // the `jpeg` demuxer's stream blobs).
+        let blobs = img.metadata.to_blobs();
         let mut vf = VideoFrame::from(img);
         vf.pts = pkt.pts;
+        vf.set_blobs(blobs);
         Ok(Frame::Video(vf))
     }
 
@@ -477,7 +527,12 @@ pub fn coded_pixel_format(input: PixelFormat) -> Option<PixelFormat> {
 /// | `sampling`        | `HxV[,HxV…]` per component; must match the pixel format | from the pixel format |
 /// | `chroma`          | `yuv444` \| `yuv422` \| `yuv420` \| `yuv411` \| `gray`: convert `Rgb24` input to that JFIF layout (T.871 §7 forward equations, as [`crate::encode_rgb8`]); `gray` keeps the luma of a YCbCr input | keep the input layout |
 /// | `adobe_transform` | `none` \| `cmyk` \| `ycck`: four-component signalling (`Cmyk` / `CmykInverted` input only) | `none` (or the `set_adobe_transform` knob) |
+/// | `jfif`            | `auto` \| `always` \| `never`: the JFIF `APP0` / Exif `APP1` slot rule ([`crate::metadata`]) | `auto` (JFIF unless an Exif blob is written) |
 ///
+/// Metadata is not an option: the encoder embeds the stream's
+/// `CodecParameters::blobs` (ICC / Exif / XMP) into every frame, a
+/// frame's own blob record overriding the stream blob of the same kind
+/// — see [`MjpegEncoder::set_stream_metadata`].
 /// `#[non_exhaustive]`: build with [`MjpegEncoderOptions::new`] /
 /// [`Default`] and the `with_*` setters; the fields stay readable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +557,8 @@ pub struct MjpegEncoderOptions {
     /// wire) or `ycck` (`transform = 2`, the frame is `Y Cb Cr K`).
     /// Empty = the `set_adobe_transform` knob (default `none`).
     pub adobe_transform: String,
+    /// JFIF / Exif slot policy: `auto` (empty), `always`, `never`.
+    pub jfif: String,
 }
 
 impl Default for MjpegEncoderOptions {
@@ -518,6 +575,7 @@ impl Default for MjpegEncoderOptions {
             sampling: String::new(),
             chroma: String::new(),
             adobe_transform: String::new(),
+            jfif: String::new(),
         }
     }
 }
@@ -594,6 +652,18 @@ impl MjpegEncoderOptions {
     pub fn with_adobe_transform(mut self, adobe_transform: impl Into<String>) -> Self {
         self.adobe_transform = adobe_transform.into();
         self
+    }
+
+    /// `"auto"` / `"always"` / `"never"`: the JFIF `APP0` / Exif `APP1`
+    /// slot rule (empty = `auto`).
+    pub fn with_jfif(mut self, jfif: impl Into<String>) -> Self {
+        self.jfif = jfif.into();
+        self
+    }
+
+    /// The [`JfifPolicy`] `jfif` denotes.
+    pub fn jfif_policy(&self) -> Result<JfifPolicy> {
+        Ok(JfifPolicy::parse(&self.jfif)?)
     }
 
     /// The Adobe APP14 transform `adobe_transform` denotes: `None` for
@@ -682,6 +752,12 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             default: OptionValue::String(String::new()),
             help: "four-component signalling: none (plain CMYK, no APP14), cmyk (Adobe APP14 transform 0, inverted on the wire) or ycck (transform 2; the frame is Y Cb Cr K)",
         },
+        OptionField {
+            name: "jfif",
+            kind: OptionKind::Enum(&["auto", "always", "never"]),
+            default: OptionValue::String(String::new()),
+            help: "JFIF APP0 placement: auto (JFIF first unless an Exif blob takes the slot after SOI), always (JFIF after the Exif APP1), never",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -697,6 +773,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             "sampling" => self.sampling = v.as_str()?.to_owned(),
             "chroma" => self.chroma = v.as_str()?.to_owned(),
             "adobe_transform" => self.adobe_transform = v.as_str()?.to_owned(),
+            "jfif" => self.jfif = v.as_str()?.to_owned(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -782,6 +859,7 @@ impl MjpegEncoderOptions {
             abbreviated: self.abbreviated,
             signalling: ColorSignalling::Auto,
             sampling: parse_sampling(&self.sampling)?,
+            jfif: self.jfif_policy()?,
             ..EncodeOptions::default()
         })
     }
@@ -1105,6 +1183,11 @@ pub struct MjpegEncoder {
     /// The table set shared by every abbreviated frame (its §B.5 stream
     /// is `output_params().extradata`).
     shared_tables: Option<JpegTableSet>,
+    /// Stream-level metadata (`params.blobs`), embedded into every
+    /// frame under the frame's own blobs.
+    stream_metadata: Metadata,
+    /// JFIF / Exif slot rule for every path.
+    jfif: JfifPolicy,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -1163,6 +1246,8 @@ impl MjpegEncoder {
             general: None,
             general_implied: false,
             shared_tables: None,
+            stream_metadata: Metadata::from_blobs(&params.blobs),
+            jfif: JfifPolicy::Auto,
             time_base: params
                 .frame_rate
                 .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num)),
@@ -1187,6 +1272,7 @@ impl MjpegEncoder {
                 }
                 enc.cmyk_adobe_transform = t;
             }
+            enc.jfif = opts.jfif_policy()?;
             let lossless_only = enc.layout.lossless_only && chroma.is_none();
             enc.set_encode_options(opts.to_encode_options_for(lossless_only)?)?;
         } else if enc.layout.legacy.is_none() {
@@ -1217,7 +1303,8 @@ impl MjpegEncoder {
             .with_quality(self.quality)
             .with_restart_interval(self.restart_interval)
             // Resolved against the layout by `set_encode_options`.
-            .with_precision(0);
+            .with_precision(0)
+            .with_jfif(self.jfif);
         o.process = if self.lossless || self.layout.lossless_only {
             JpegProcess::Lossless {
                 predictor: self.lossless_predictor,
@@ -1627,6 +1714,52 @@ impl MjpegEncoder {
         self.cmyk_adobe_transform
     }
 
+    /// Replace the stream-level metadata every frame embeds (set from
+    /// `CodecParameters::blobs` by [`Self::from_params`]). Precedence
+    /// per kind, lowest first: the `metadata` of the
+    /// [`EncodeOptions`] in force ([`Self::set_encode_options`]), this
+    /// record, the frame's own blob record
+    /// ([`VideoFrame::blobs`]) — a frame blob overrides the stream
+    /// blob of the same kind. Blobs of other kinds (IPTC, cover art,
+    /// custom) have no JPEG carriage here and are ignored. Every path
+    /// (general writer, historical per-layout encoders, abbreviated
+    /// frames) embeds the same segments in the same order
+    /// ([`crate::metadata`]).
+    pub fn set_stream_metadata(&mut self, metadata: Metadata) {
+        self.stream_metadata = metadata;
+    }
+
+    /// The stream-level metadata in force.
+    pub fn stream_metadata(&self) -> &Metadata {
+        &self.stream_metadata
+    }
+
+    /// Set the JFIF `APP0` / Exif `APP1` slot rule (the `jfif` option;
+    /// default [`JfifPolicy::Auto`]).
+    pub fn set_jfif_policy(&mut self, jfif: JfifPolicy) {
+        self.jfif = jfif;
+        if let Some(o) = &mut self.general {
+            o.jfif = jfif;
+        }
+    }
+
+    /// The JFIF / Exif slot rule in force.
+    pub fn jfif_policy(&self) -> JfifPolicy {
+        self.jfif
+    }
+
+    /// The metadata frame `v` is written with: the options' record
+    /// under the stream record under the frame's blobs.
+    fn frame_metadata(&self, v: &VideoFrame) -> Metadata {
+        let base = self
+            .general
+            .as_ref()
+            .map(|o| o.metadata.clone())
+            .unwrap_or_default();
+        base.with_overrides(&self.stream_metadata)
+            .with_overrides(&Metadata::from_blobs(&v.blobs()))
+    }
+
     /// The historical per-format path for the layouts that have one
     /// (`layout.legacy`), driven by the knobs.
     fn encode_legacy(&self, pix: MjpegPixelFormat, v: &VideoFrame) -> Result<Vec<u8>> {
@@ -1838,11 +1971,36 @@ impl Encoder for MjpegEncoder {
                     self.set_encode_options(o)?;
                     self.general_implied = true;
                 }
+                let meta = self.frame_metadata(v);
+                // The historical encoders take the frame itself and
+                // count its planes: hand them the image planes only.
+                let stripped;
+                let v: &VideoFrame = if v.planes.len() > v.image_plane_count() {
+                    stripped = VideoFrame {
+                        pts: v.pts,
+                        planes: v.image_planes().to_vec(),
+                    };
+                    &stripped
+                } else {
+                    v
+                };
                 let data = match (self.general.clone(), self.layout.legacy) {
-                    (Some(opts), _) => self.encode_general(&opts, v)?,
-                    (None, Some(pix)) => self.encode_legacy(pix, v)?,
+                    (Some(mut opts), _) => {
+                        opts.metadata = meta;
+                        opts.jfif = self.jfif;
+                        self.encode_general(&opts, v)?
+                    }
+                    (None, Some(pix)) => {
+                        let data = self.encode_legacy(pix, v)?;
+                        if meta.is_empty() && self.jfif == JfifPolicy::Auto {
+                            data
+                        } else {
+                            crate::metadata::embed_metadata(&data, &meta, self.jfif)?
+                        }
+                    }
                     (None, None) => {
-                        let o = self.implied_options();
+                        let mut o = self.implied_options();
+                        o.metadata = meta;
                         self.encode_general_stateless(&o, v)?
                     }
                 };

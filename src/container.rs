@@ -24,9 +24,13 @@
 //!
 //! Caveats / notes:
 //!
-//! - EXIF / XMP / ICC data lives in APP1 / APP2 segments; those are
+//! - Exif / XMP / ICC data lives in APP1 / APP2 segments; those are
 //!   preserved as part of the packet payload because we copy the full
-//!   SOI..EOI span. No parsing is done on them here.
+//!   SOI..EOI span, and the primary picture's blobs (the ICC profile
+//!   reassembled from its chunk sequence, the Exif block, the XMP
+//!   packet — [`crate::metadata`]) are declared on the stream's
+//!   `CodecParameters::blobs`, so a consumer that never decodes still
+//!   sees them. The decoder puts the same blobs on the frame record.
 //! - We accept SOF0/1/2/3 for dimension discovery so that probing /
 //!   metadata works even if the underlying decoder can't yet decode the
 //!   bitstream (progressive JPEGs still round-trip at the container
@@ -113,6 +117,15 @@ fn open_demuxer(
 
 /// Return `(start, end_exclusive)` of the first complete SOI..EOI JPEG in
 /// `buf`. The returned span includes the SOI and EOI markers themselves.
+///
+/// Walks the stream the way the decoder does: every length-prefixed
+/// segment is skipped as a whole (an `APPn` payload may hold anything,
+/// including a complete JPEG — an Exif block's thumbnail is `SOI … EOI`
+/// inside `APP1` — or the byte pair of a marker inside an ICC chunk),
+/// and only entropy-coded data after `SOS` is scanned byte by byte
+/// (stuffed `FF 00` and `RSTn` belong to the scan). A segment whose
+/// length runs past the buffer is scanned byte by byte from its marker
+/// instead, so a damaged header still finds its `EOI` leniently.
 fn find_soi_eoi(buf: &[u8]) -> Result<(usize, usize)> {
     if buf.len() < 4 {
         return Err(Error::invalid("JPEG: file too short"));
@@ -120,10 +133,6 @@ fn find_soi_eoi(buf: &[u8]) -> Result<(usize, usize)> {
     if buf[0] != 0xFF || buf[1] != SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
     }
-    // Scan forward for an EOI marker. We use the same rules as the decoder's
-    // marker walker: `0xFF 0x00` is a stuffed literal (inside a scan), and a
-    // run of 0xFF fill bytes before a marker byte is legal. RST* markers are
-    // also part of the scan.
     let mut i = 2;
     while i + 1 < buf.len() {
         if buf[i] != 0xFF {
@@ -139,24 +148,31 @@ fn find_soi_eoi(buf: &[u8]) -> Result<(usize, usize)> {
             break;
         }
         let m = buf[j];
-        if m == 0x00 {
-            // Stuffed zero — skip and keep looking.
-            i = j + 1;
-            continue;
-        }
-        if markers::is_rst(m) {
+        if m == 0x00 || markers::is_rst(m) || m == SOI {
+            // Stuffed zero, restart marker, or a repeated SOI: no
+            // segment follows.
             i = j + 1;
             continue;
         }
         if m == EOI {
             return Ok((0, j + 1));
         }
-        // For any other marker just advance past the marker byte. Marker
-        // segments outside the scan carry a length prefix but we don't need
-        // to parse them — walking byte-by-byte still lands on the EOI
-        // eventually. The SOS scan data is handled implicitly: its stuffed
-        // 0xFF00 bytes and RST markers are filtered above.
-        i = j + 1;
+        // Length-prefixed segment (T.81 Table B.1: every marker other
+        // than SOI / EOI / RSTn / TEM (`0x01`) carries `Lp`). Skip its payload
+        // whole when the length fits; otherwise keep scanning from the
+        // marker byte.
+        let lp = if j + 2 < buf.len() {
+            u16::from_be_bytes([buf[j + 1], buf[j + 2]]) as usize
+        } else {
+            0
+        };
+        if m == 0x01 || lp < 2 || j + 1 + lp > buf.len() {
+            i = j + 1;
+            continue;
+        }
+        i = j + 1 + lp;
+        // After SOS the entropy-coded data is scanned byte by byte by
+        // the loop itself (the next iteration lands on its bytes).
     }
     Err(Error::invalid("JPEG: no EOI marker found"))
 }
@@ -193,6 +209,11 @@ fn scan_for_sof(data: &[u8]) -> Result<SofInfo> {
 /// consumer sees "unknown" rather than a guess; a header the decoder
 /// cannot parse at all is an error.
 pub(crate) fn declare_shape(params: &mut CodecParameters, data: &[u8]) -> Result<()> {
+    // The picture's metadata segments, read as the decoder reads them
+    // (lenient: a damaged ICC sequence is simply absent).
+    params.blobs = crate::metadata::read_metadata(data)
+        .map(|m| m.to_blobs())
+        .unwrap_or_default();
     match crate::api::stream_shape(data) {
         Ok((width, height, format, color)) => {
             params.width = Some(width);
@@ -339,6 +360,24 @@ mod tests {
         let jpeg = [0xFF, 0xD8, 0xFF, 0xD9, 0x00, 0x11, 0x22, 0x33];
         let (s, e) = find_soi_eoi(&jpeg).expect("span");
         assert_eq!((s, e), (0, 4));
+    }
+
+    #[test]
+    fn find_soi_eoi_skips_segment_payloads_whole() {
+        // APP1 whose payload is a complete JPEG (an Exif thumbnail):
+        // the inner EOI must not end the outer file.
+        let inner = [0xFF, 0xD8, 0xFF, 0xD9];
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x06];
+        jpeg.extend_from_slice(&inner);
+        jpeg.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x04, 0xFF, 0xD9]); // DQT payload = FF D9
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        let (s, e) = find_soi_eoi(&jpeg).expect("span");
+        assert_eq!((s, e), (0, jpeg.len()));
+        // A segment length past the end falls back to the byte scan.
+        let mut cut = vec![0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 0x01, 0xFF, 0xD9];
+        assert_eq!(find_soi_eoi(&cut).unwrap(), (0, cut.len()));
+        cut.pop();
+        assert!(find_soi_eoi(&cut).is_err());
     }
 
     #[test]

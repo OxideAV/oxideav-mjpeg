@@ -73,12 +73,15 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     f.finish()
 }
 
-/// Hash a decoded video frame: plane count, then per-plane stride, length,
-/// and payload. Captures both geometry and every output sample.
+/// Hash a decoded video frame: image-plane count, then per-plane stride,
+/// length, and payload. Captures both geometry and every output sample;
+/// side-channel records (the metadata blobs of a fixture with an
+/// embedded profile) are not part of the picture and are left out.
 fn hash_video_frame(vf: &VideoFrame) -> u64 {
     let mut f = Fnv::new();
-    f.update_u64(vf.planes.len() as u64);
-    for p in &vf.planes {
+    let planes = vf.image_planes();
+    f.update_u64(planes.len() as u64);
+    for p in planes {
         f.update_u64(p.stride as u64);
         f.update_u64(p.data.len() as u64);
         f.update(&p.data);

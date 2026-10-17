@@ -290,11 +290,15 @@ fn flatten_frame(
     let h = height as usize;
     match fmt {
         PixelFormat::Gray8 => {
-            assert_eq!(vf.planes.len(), 1, "Gray8 frame should have 1 plane");
-            let stride = vf.planes[0].stride;
+            assert_eq!(
+                vf.image_planes().len(),
+                1,
+                "Gray8 frame should have 1 plane"
+            );
+            let stride = vf.image_planes()[0].stride;
             let mut data = Vec::with_capacity(w * h);
             for y in 0..h {
-                data.extend_from_slice(&vf.planes[0].data[y * stride..y * stride + w]);
+                data.extend_from_slice(&vf.image_planes()[0].data[y * stride..y * stride + w]);
             }
             Decoded {
                 pix_fmt: fmt,
@@ -309,11 +313,15 @@ fn flatten_frame(
             // Decoder stores 12-bit samples in little-endian u16 per
             // plane element. PGM 16-bit is big-endian. Re-pack to BE,
             // sample-by-sample.
-            assert_eq!(vf.planes.len(), 1, "Gray12Le frame should have 1 plane");
-            let stride = vf.planes[0].stride; // bytes
+            assert_eq!(
+                vf.image_planes().len(),
+                1,
+                "Gray12Le frame should have 1 plane"
+            );
+            let stride = vf.image_planes()[0].stride; // bytes
             let mut data = Vec::with_capacity(w * h * 2);
             for y in 0..h {
-                let row = &vf.planes[0].data[y * stride..y * stride + w * 2];
+                let row = &vf.image_planes()[0].data[y * stride..y * stride + w * 2];
                 for x in 0..w {
                     let lo = row[x * 2];
                     let hi = row[x * 2 + 1];
@@ -337,11 +345,15 @@ fn flatten_frame(
             // JPEG), so the caller's flag is consulted purely for
             // documentation parity.
             let _ = is_rgb_jpeg;
-            assert_eq!(vf.planes.len(), 1, "Rgb24 frame should have 1 plane");
-            let stride = vf.planes[0].stride;
+            assert_eq!(
+                vf.image_planes().len(),
+                1,
+                "Rgb24 frame should have 1 plane"
+            );
+            let stride = vf.image_planes()[0].stride;
             let mut data = Vec::with_capacity(w * h * 3);
             for y in 0..h {
-                data.extend_from_slice(&vf.planes[0].data[y * stride..y * stride + w * 3]);
+                data.extend_from_slice(&vf.image_planes()[0].data[y * stride..y * stride + w * 3]);
             }
             Decoded {
                 pix_fmt: fmt,
@@ -356,7 +368,7 @@ fn flatten_frame(
         | PixelFormat::Yuv422P
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
-            assert_eq!(vf.planes.len(), 3, "YUV frame should have 3 planes");
+            assert_eq!(vf.image_planes().len(), 3, "YUV frame should have 3 planes");
             let (cw, ch) = match fmt {
                 PixelFormat::Yuv444P => (w, h),
                 PixelFormat::Yuv422P => (w.div_ceil(2), h),
@@ -364,16 +376,18 @@ fn flatten_frame(
                 PixelFormat::Yuv411P => (w.div_ceil(4), h),
                 _ => unreachable!(),
             };
-            let y_stride = vf.planes[0].stride;
+            let y_stride = vf.image_planes()[0].stride;
 
             // Repack the chroma planes into tight `c_w * c_h` buffers
             // (drop any plane stride padding) before handing them to
             // the upsamplers.
             let pack_plane = |idx: usize| -> Vec<u8> {
-                let stride = vf.planes[idx].stride;
+                let stride = vf.image_planes()[idx].stride;
                 let mut out = Vec::with_capacity(cw * ch);
                 for cy in 0..ch {
-                    out.extend_from_slice(&vf.planes[idx].data[cy * stride..cy * stride + cw]);
+                    out.extend_from_slice(
+                        &vf.image_planes()[idx].data[cy * stride..cy * stride + cw],
+                    );
                 }
                 out
             };
@@ -407,7 +421,7 @@ fn flatten_frame(
             let mut data = Vec::with_capacity(w * h * 3);
             for y in 0..h {
                 for x in 0..w {
-                    let yv = vf.planes[0].data[y * y_stride + x];
+                    let yv = vf.image_planes()[0].data[y * y_stride + x];
                     let cb = cb_full[y * w + x];
                     let cr = cr_full[y * w + x];
                     let (r, g, b) = if is_rgb_jpeg {
@@ -717,17 +731,19 @@ fn evaluate(case: &CorpusCase) {
     }
 }
 
-/// Best-effort PixelFormat inference from the VideoFrame shape. The
-/// decoder picks one of {Gray8, Gray12Le, Yuv420P, Yuv422P, Yuv444P,
-/// Cmyk, Gray*Le} but doesn't tag the frame; we re-derive it here just
-/// for human-readable logging + to drive `flatten_frame`.
+/// Best-effort PixelFormat inference from the VideoFrame shape (the
+/// image planes only — a frame with embedded metadata also carries a
+/// blob side-channel record). The decoder picks one of {Gray8,
+/// Gray12Le, Yuv420P, Yuv422P, Yuv444P, Cmyk, Gray*Le} but doesn't tag
+/// the frame; we re-derive it here just for human-readable logging + to
+/// drive `flatten_frame`.
 fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelFormat {
     let _ = h;
-    match vf.planes.len() {
+    match vf.image_planes().len() {
         1 => {
             // Stride in bytes. Gray8 → stride == width; Gray12Le →
             // stride == width * 2; packed Rgb24 → stride == width * 3.
-            let s = vf.planes[0].stride;
+            let s = vf.image_planes()[0].stride;
             if s == w {
                 PixelFormat::Gray8
             } else if s == w * 2 {
@@ -739,9 +755,9 @@ fn infer_pix_fmt(vf: &oxideav_core::VideoFrame, w: usize, h: usize) -> PixelForm
             }
         }
         3 => {
-            let cw = vf.planes[1].stride;
-            let ch = vf.planes[1].data.len() / cw.max(1);
-            let yw = vf.planes[0].stride;
+            let cw = vf.image_planes()[1].stride;
+            let ch = vf.image_planes()[1].data.len() / cw.max(1);
+            let yw = vf.image_planes()[0].stride;
             assert_eq!(yw, w, "luma stride should equal width");
             // Compare chroma-plane geometry to the three legal subsamplings.
             let (full_w, full_h) = (w, h);

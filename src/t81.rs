@@ -62,6 +62,7 @@ use crate::jpeg::dct::fdct8x8;
 use crate::jpeg::inspect::ChromaSubsampling;
 use crate::jpeg::markers;
 use crate::jpeg::zigzag::ZIGZAG;
+pub use crate::metadata::JfifPolicy;
 
 // ---------------------------------------------------------------------------
 // Annex K.1 quantisation tables (natural row-major order).
@@ -1657,12 +1658,17 @@ pub struct EncodeOptions {
     /// by the plane-level writer (use `sampling`).
     pub chroma: ChromaSubsampling,
     /// Metadata to embed: ICC profile (`APP2 "ICC_PROFILE\0"` chunks),
-    /// Exif (`APP1 "Exif\0\0"`), XMP (`APP1` with the XMP namespace).
-    /// Written after the colour-signalling segment and before the
-    /// tables. [`crate::encode`] merges the image's own
+    /// Exif (`APP1 "Exif\0\0"`), XMP (`APP1` with the XMP namespace),
+    /// in the segment order [`crate::metadata`] documents (Exif first
+    /// when present, then JFIF per `jfif`, XMP, ICC, Adobe `APP14`). [`crate::encode`] merges the image's own
     /// [`JpegImage::metadata`](crate::JpegImage::metadata) with this
     /// field (the option wins where both set the same blob).
     pub metadata: Metadata,
+    /// How a JFIF `APP0` and an Exif `APP1` share the slot after
+    /// `SOI` (see [`crate::metadata`]): `Auto` drops the JFIF segment
+    /// when an Exif block is written, `Always` keeps it after the Exif
+    /// segment, `Never` writes none.
+    pub jfif: JfifPolicy,
 }
 
 /// Historical name of [`EncodeOptions`].
@@ -1683,6 +1689,7 @@ impl Default for EncodeOptions {
             table_ids: Vec::new(),
             chroma: ChromaSubsampling::Yuv420,
             metadata: Metadata::new(),
+            jfif: JfifPolicy::Auto,
         }
     }
 }
@@ -1793,66 +1800,13 @@ impl EncodeOptions {
         self.metadata = metadata;
         self
     }
+
+    /// JFIF / Exif slot policy (default [`JfifPolicy::Auto`]).
+    pub fn with_jfif(mut self, jfif: JfifPolicy) -> Self {
+        self.jfif = jfif;
+        self
+    }
 }
-
-/// Largest APPn payload after the two length bytes (`Lp ≤ 65535`).
-const MAX_APP_PAYLOAD: usize = 65533;
-/// `APP2 "ICC_PROFILE\0"` chunk header: 12-byte identifier + sequence
-/// number + chunk count (ICC.1 Annex B.4).
-const ICC_CHUNK_HEADER: usize = 14;
-/// Profile bytes per `APP2` chunk.
-const ICC_CHUNK_DATA: usize = MAX_APP_PAYLOAD - ICC_CHUNK_HEADER;
-
-/// Append one APPn segment (`0xFF marker, Lp, payload`).
-fn write_app_segment(out: &mut Vec<u8>, marker: u8, parts: &[&[u8]]) -> Result<()> {
-    let len: usize = parts.iter().map(|p| p.len()).sum();
-    if len > MAX_APP_PAYLOAD {
-        return Err(Error::unsupported(format!(
-            "JPEG encode: APP{} payload of {len} bytes exceeds the 65533-byte segment limit",
-            marker - markers::APP0
-        )));
-    }
-    out.extend_from_slice(&[0xFF, marker, ((len + 2) >> 8) as u8, (len + 2) as u8]);
-    for p in parts {
-        out.extend_from_slice(p);
-    }
-    Ok(())
-}
-
-/// Append the metadata segments: `APP1 Exif`, `APP1 XMP`, then the
-/// `APP2 ICC_PROFILE` chunk sequence (each chunk at most 65519 profile
-/// bytes, sequence numbers from 1, total chunk count in every chunk).
-fn write_metadata_segments(out: &mut Vec<u8>, meta: &Metadata) -> Result<()> {
-    if let Some(exif) = &meta.exif {
-        write_app_segment(out, markers::APP1, &[b"Exif\0\0", exif])?;
-    }
-    if let Some(xmp) = &meta.xmp {
-        write_app_segment(out, markers::APP1, &[XMP_IDENTIFIER, xmp])?;
-    }
-    if let Some(icc) = &meta.icc {
-        let chunks = icc.chunks(ICC_CHUNK_DATA).count().max(1);
-        if chunks > 255 {
-            return Err(Error::unsupported(format!(
-                "JPEG encode: ICC profile of {} bytes needs {chunks} APP2 chunks (255 maximum)",
-                icc.len()
-            )));
-        }
-        let total = chunks as u8;
-        if icc.is_empty() {
-            write_app_segment(out, markers::APP2, &[ICC_IDENTIFIER, &[1, total]])?;
-        }
-        for (i, chunk) in icc.chunks(ICC_CHUNK_DATA).enumerate() {
-            let seq = (i + 1) as u8;
-            write_app_segment(out, markers::APP2, &[ICC_IDENTIFIER, &[seq, total], chunk])?;
-        }
-    }
-    Ok(())
-}
-
-/// `APP1` XMP identifier (`"http://ns.adobe.com/xap/1.0/\0"`).
-pub(crate) const XMP_IDENTIFIER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
-/// `APP2` ICC identifier (`"ICC_PROFILE\0"`).
-pub(crate) const ICC_IDENTIFIER: &[u8] = b"ICC_PROFILE\0";
 
 /// The output of [`EncodeOptions::encode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2085,7 +2039,6 @@ impl EncodeOptions {
             } => write_adobe_app14(&mut meta, t),
             _ => {}
         }
-        write_metadata_segments(&mut meta, &self.metadata)?;
         Ok(Prepared {
             frame,
             planes: planes.to_vec(),
@@ -2137,13 +2090,18 @@ impl EncodeOptions {
     }
 
     fn finish(&self, prep: &Prepared<'_>, tables: &JpegTableSet) -> Result<EncodedJpeg> {
-        let data = encode_frame_with_meta(
+        let mut data = encode_frame_with_meta(
             &prep.frame,
             &prep.comps(),
             tables,
             !self.abbreviated,
             &prep.meta,
         )?;
+        // The metadata segments and the JFIF / Exif slot rule come from
+        // one place for every writer in the crate.
+        if !self.metadata.is_empty() || self.jfif != JfifPolicy::Auto {
+            data = crate::metadata::embed_metadata(&data, &self.metadata, self.jfif)?;
+        }
         let tables_stream = self
             .abbreviated
             .then(|| tables.tables_stream(prep.frame.process.is_dct()));

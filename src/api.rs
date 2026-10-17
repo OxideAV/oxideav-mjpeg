@@ -16,7 +16,8 @@ use crate::image::{
 use crate::jpeg::inspect::{ChromaSubsampling, SofKind};
 use crate::jpeg::markers;
 use crate::jpeg::parser::{parse_sof, MarkerWalker, SofInfo};
-use crate::t81::{ColorSignalling, EncodeOptions, JpegProcess, ICC_IDENTIFIER, XMP_IDENTIFIER};
+use crate::metadata::{EXIF_IDENTIFIER, ICC_IDENTIFIER, XMP_IDENTIFIER};
+use crate::t81::{ColorSignalling, EncodeOptions, JpegProcess};
 
 // ---------------------------------------------------------------------------
 // probe / info
@@ -66,6 +67,14 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
         has_jfif: hdr.jfif,
         has_adobe: hdr.adobe.is_some(),
     })
+}
+
+/// The metadata segments before the first `SOS`, read leniently (the
+/// record [`decode`] fills into [`JpegImage::metadata`]). Backs
+/// [`crate::metadata::read_metadata`] and the `jpeg` demuxer's stream
+/// blobs.
+pub(crate) fn header_metadata(bytes: &[u8]) -> Result<Metadata> {
+    Ok(scan_header(bytes, false)?.metadata())
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +354,11 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                 let Some(p) = lenient_payload(&mut walker, strict)? else {
                     continue;
                 };
-                if p.len() >= 6 && &p[..6] == b"Exif\0\0" {
+                if p.len() >= EXIF_IDENTIFIER.len()
+                    && &p[..EXIF_IDENTIFIER.len()] == EXIF_IDENTIFIER
+                {
                     if exif.is_none() {
-                        exif = Some(p[6..].to_vec());
+                        exif = Some(p[EXIF_IDENTIFIER.len()..].to_vec());
                     }
                 } else if p.len() >= XMP_IDENTIFIER.len()
                     && &p[..XMP_IDENTIFIER.len()] == XMP_IDENTIFIER
@@ -796,17 +807,7 @@ fn prepare_planes(image: &JpegImage, opts: &EncodeOptions) -> Result<PreparedPla
     let mut o = opts.clone();
     o.precision = precision;
     // `metadata` from the image, overridden blob-by-blob by the option.
-    let mut meta = image.metadata.clone();
-    if opts.metadata.icc.is_some() {
-        meta.icc = opts.metadata.icc.clone();
-    }
-    if opts.metadata.exif.is_some() {
-        meta.exif = opts.metadata.exif.clone();
-    }
-    if opts.metadata.xmp.is_some() {
-        meta.xmp = opts.metadata.xmp.clone();
-    }
-    o.metadata = meta;
+    o.metadata = image.metadata.with_overrides(&opts.metadata);
 
     let auto = opts.signalling == ColorSignalling::Auto;
     let planes: Vec<Vec<u16>>;

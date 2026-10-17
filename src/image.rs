@@ -553,6 +553,19 @@ impl Metadata {
     pub fn is_empty(&self) -> bool {
         self.icc.is_none() && self.exif.is_none() && self.xmp.is_none() && self.gamma.is_none()
     }
+
+    /// `self` with every field `over` sets replaced by `over`'s value
+    /// (fields `over` leaves `None` keep `self`'s) — the precedence
+    /// rule between layers of metadata: an option over an image's own
+    /// record, a frame's blobs over the stream's.
+    pub fn with_overrides(&self, over: &Metadata) -> Metadata {
+        Metadata {
+            icc: over.icc.clone().or_else(|| self.icc.clone()),
+            exif: over.exif.clone().or_else(|| self.exif.clone()),
+            xmp: over.xmp.clone().or_else(|| self.xmp.clone()),
+            gamma: over.gamma.or(self.gamma),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -177,6 +177,7 @@ pub mod encoder;
 pub mod error;
 pub mod image;
 pub mod jpeg;
+pub mod metadata;
 pub mod rtp;
 pub mod t81;
 
@@ -209,6 +210,10 @@ pub use t81::{
     ColorSignalling, EncodeOptions, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
     JpegFrame, JpegProcess, JpegTableSet,
 };
+
+// Metadata carriage: the marker-order rule, the limits and the
+// embed / strip / read helpers every writer and reader share.
+pub use metadata::{embed_metadata, read_metadata, strip_metadata, JfifPolicy};
 
 /// Historical name of [`EncodeOptions`].
 #[deprecated(since = "0.1.10", note = "renamed to `EncodeOptions`")]

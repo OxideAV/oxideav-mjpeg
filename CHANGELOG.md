@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **JPEG metadata through the registry (core 0.1.40 blobs).** The
+  `jpeg` and `mjpeg-raw` demuxers declare the (first) picture's ICC
+  profile (`APP2 ICC_PROFILE` chunk sequence reassembled in order),
+  Exif block (`APP1 Exif\0\0` payload: the TIFF structure from its
+  byte-order mark) and XMP standard packet (`APP1` after the
+  `http://ns.adobe.com/xap/1.0/\0` namespace, `mime`
+  `application/rdf+xml`) on `CodecParameters::blobs` as
+  `BlobKind::ICC / EXIF / XMP`; the decoder puts each frame's own
+  segments on the frame record (`VideoFrame::blobs`), so Motion-JPEG
+  frames may differ and a still's frame blobs equal its stream blobs.
+  The registry encoder embeds the stream blobs into every frame, a
+  frame blob overriding the stream blob of the same kind (the
+  `EncodeOptions` metadata of a direct caller sits under both;
+  `MjpegEncoder::set_stream_metadata` / `stream_metadata`). Blobs of
+  other kinds (IPTC, cover art, custom names) have no JPEG carriage
+  here and are ignored. `Metadata::to_blobs` / `from_blobs` convert;
+  the contract record and the blobs are two views of one set of bytes
+  (`read_metadata(bytes) == decode(bytes).metadata ==
+  Metadata::from_blobs(frame.blobs())`).
+- **`oxideav_mjpeg::metadata` — one marker-order rule for every
+  writer.** `embed_metadata(jpeg, &Metadata, JfifPolicy)` rewrites a
+  stream's header (every segment before the first `SOS`): `APP1 Exif`
+  takes the slot after `SOI` when present (Exif §4.5.4 / §4.7.2.1),
+  else `APP0 JFIF` (T.871 §6.3 — both specs claim the same slot), then
+  `APP1 XMP`, the `APP2 ICC_PROFILE` chunks (≤ 65 519 profile bytes
+  each, numbered from 1, count in every chunk — ICC.1 Annex B.4), then
+  every other segment (Adobe `APP14`, `COM`, foreign `APPn`, tables,
+  frame header) in its original order; same-kind segments the stream
+  already had are replaced wherever they sat, kinds left `None` are
+  kept. `strip_metadata` removes the three kinds; `read_metadata`
+  reports what `decode` reports. The general T.81 writer, the
+  historical per-layout encoders, the arithmetic knob and abbreviated
+  frames all finish through it, so frames without blobs are
+  byte-identical to before and frames with blobs carry the same
+  segments in the same order on every path.
+- `JfifPolicy { Auto, Always, Never }` (`EncodeOptions::jfif` /
+  `with_jfif`, registry option `jfif = auto | always | never`,
+  `MjpegEncoder::set_jfif_policy`): `Auto` (default) drops the JFIF
+  segment when an Exif block takes the slot — the file is an Exif
+  file; `Always` keeps it right after the Exif `APP1` (where Exif
+  §4.5.5 Table 2 row 6 lets other `APPn` go, not where T.871 wants
+  it); `Never` writes none. Every policy decodes to the same picture
+  (this decoder reads the colour-model segments wherever they sit
+  before `SOS`).
+- Carriage limits as typed `Unsupported` refusals on every path
+  (`metadata::EXIF_MAX_BYTES` 65 527 — one `APP1`; `XMP_MAX_BYTES`
+  65 502 — the standard packet, no extended-XMP continuation is
+  written; `ICC_MAX_CHUNKS` 255 × `ICC_CHUNK_DATA` 65 519 =
+  `ICC_MAX_BYTES` 16 707 345, the ICC.1 Annex B.4 figure). The
+  16 707 345-byte profile round-trips through the registry.
+- `Metadata::with_overrides(&over)` — the per-field precedence rule
+  (an option over an image's record, a frame's blobs over the
+  stream's); `encode` uses it for its option layer.
+- `metadata_embed` fuzz target (header splitter, ICC chunk reassembly
+  with hostile sequence numbers / repeats / disagreeing counts /
+  zero-length chunks, the registry frame record); `tests/
+  metadata_blobs.rs` (demux → decode → encode → demux chain, every
+  path's segment order, override precedence, Motion-JPEG per-frame
+  blobs, the `jfif` policies, limits, muxer pass-through) and
+  `tests/metadata_contract.rs` (standalone surface, corpus profile
+  fixture, hostile sequences in lenient and strict mode).
+
+### Fixed
+
+- **The still `jpeg` demuxer cut files short at a marker pair inside a
+  segment payload.** It located `EOI` by scanning bytes, so an `APP1`
+  Exif block holding a thumbnail (a complete `SOI … EOI` inside the
+  segment — every camera file with a preview) or an ICC chunk
+  containing `FF D9` ended the packet early ("EOI before the first
+  SOS"). It now skips every length-prefixed segment whole, as the
+  decoder does, and scans byte by byte only inside the entropy-coded
+  data; a length running past the buffer falls back to the byte scan.
+- The header splitter behind `embed_metadata` read `TEM` as a bare
+  marker while the decoder reads it as a length-prefixed segment
+  (found by `metadata_embed` in its first minutes); the splitter now
+  reads every marker other than SOI / EOI / RSTn / SOS with its
+  length, as the decoder does.
 ## [0.1.13](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.12...v0.1.13) - 2026-10-17
 
 ### Other

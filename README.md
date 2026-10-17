@@ -111,8 +111,13 @@ if let Ok(Frame::Video(vf)) = dec.receive_frame() {
 `register_containers`), `make_decoder` / `make_encoder`, the
 `MjpegEncoder` knobs (`set_progressive`, `set_lossless`,
 `set_arithmetic`, `set_restart_interval`, `set_adobe_transform`,
+`set_jfif_policy`, `set_stream_metadata`,
 `set_encode_options(EncodeOptions)`) and the `MjpegEncoderOptions`
-`CodecOptions` schema. The encoder declares every input layout it
+`CodecOptions` schema. Metadata rides as core blobs: the demuxer
+declares the picture's ICC / Exif / XMP on `params.blobs`, the decoder
+puts each frame's own on `vf.blobs()`, the encoder embeds
+`params.blobs` into every frame with a frame's blobs overriding per
+kind — see *Metadata and colour*. The encoder declares every input layout it
 accepts through `CodecCapabilities::accepted_pixel_formats`
 (`registry::ACCEPTED_PIXEL_FORMATS`, 19 layouts; `coded_pixel_format`
 says what the decoder reports for each) and stamps its output
@@ -187,18 +192,20 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 | `chroma` | `Yuv420` | Layout `encode_rgb8` / `encode_rgba8` convert to (`Yuv444` / `Yuv422` / `Yuv420` / `Yuv411` / `GrayscaleOnly`). `encode(&JpegImage)` uses the image's own layout. |
 | `restart_interval` | 0 | `DRI` + `RSTm` every *n* MCUs. |
 | `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
-| `metadata` | empty | ICC / Exif / XMP blobs to embed (merged with `JpegImage::metadata`, the option winning per blob). |
+| `metadata` | empty | ICC / Exif / XMP blobs to embed (merged with `JpegImage::metadata`, the option winning per blob — `Metadata::with_overrides`). |
+| `jfif` | `Auto` | JFIF `APP0` / Exif `APP1` slot rule (`JfifPolicy::Auto` / `Always` / `Never`, see *Metadata and colour*). |
 | `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
 
 The registry encoder's `MjpegEncoderOptions` (`CodecOptions` keys
 `quality`, `tables`, `process` (`auto` / `sequential` / `progressive` /
 `lossless`), `precision`, `restart`, `abbreviated`, `predictor`,
-`point_transform`, `sampling`, `chroma`, `adobe_transform`) is the
-string-bag twin of this record (`#[non_exhaustive]`, `new()` /
+`point_transform`, `sampling`, `chroma`, `adobe_transform`, `jfif`) is
+the string-bag twin of this record (`#[non_exhaustive]`, `new()` /
 `with_*`); `chroma` applies the `encode_rgb8` conversion to `Rgb24`
 frames (or keeps the luma of YCbCr ones) and `adobe_transform`
 (`none` / `cmyk` / `ycck`) selects the four-component signalling —
-neither has a plane-level field.
+neither has a plane-level field. Metadata is not an option: the
+registry encoder embeds the stream's `CodecParameters::blobs`.
 
 `DecodeOptions` (`Default` + `with_*`):
 
@@ -214,14 +221,46 @@ Breaches are `Error::LimitExceeded`.
 
 ## Metadata and colour
 
-* `Metadata { icc, exif, xmp, gamma }` — `icc` is the `APP2
-  "ICC_PROFILE\0"` chunk sequence reassembled in order (dropped when
-  incomplete; an error in strict mode); `exif` the `APP1 "Exif\0\0"`
-  payload after the identifier (a TIFF structure); `xmp` the `APP1`
-  XMP packet after `"http://ns.adobe.com/xap/1.0/\0"`; `gamma` is
-  always `None`. `encode` writes them back as `APP1 Exif`, `APP1 XMP`
-  and `APP2` chunks (≤ 65519 profile bytes each) after the colour
-  signalling segment.
+* `Metadata { icc, exif, xmp, gamma }` — the three carried blobs,
+  one set of bytes seen from both layers: `read_metadata(bytes)` ==
+  `decode(bytes).metadata` == `Metadata::from_blobs(frame.blobs())`,
+  and `Metadata::to_blobs()` is what the `jpeg` / `mjpeg-raw`
+  demuxers put on `CodecParameters::blobs` and the registry decoder on
+  the frame record. `gamma` is always `None`.
+
+  | Blob | Segment | Identifier | Payload (the blob bytes) | Limit (typed `Unsupported`) |
+  |---|---|---|---|---|
+  | `icc` / `BlobKind::ICC` | `APP2`, one per chunk | `"ICC_PROFILE\0"`, chunk number from 1, chunk count | the profile, split in sequence order; dropped when a chunk is missing, repeated or disagrees on the count (an error in strict mode) | 65 519 bytes per chunk, 255 chunks, 16 707 345 bytes (ICC.1 Annex B.4) |
+  | `exif` / `BlobKind::EXIF` | `APP1` | `"Exif\0\0"` | the TIFF structure from its byte-order mark; the first segment wins | 65 527 bytes, one segment (Exif §4.7.2) |
+  | `xmp` / `BlobKind::XMP` (`mime` `application/rdf+xml`) | `APP1` | `"http://ns.adobe.com/xap/1.0/\0"` | the standard packet (UTF-8 RDF/XML); the first wins; extended-XMP continuation segments are neither written nor reassembled | 65 502 bytes |
+
+  JFIF `APP0` and Adobe `APP14` are not blobs — they signal the colour
+  model and the decoder interprets them. Blobs of other kinds (IPTC,
+  cover art, custom) have no JPEG carriage here and are ignored on
+  write.
+* **Marker order** (`oxideav_mjpeg::metadata`, the one rule every
+  writer finishes through — general T.81 writer, historical per-layout
+  encoders, arithmetic knob, abbreviated frames): `SOI`, then **`APP1
+  Exif` when present** (Exif §4.5.4 / §4.7.2.1: immediately after
+  `SOI`), **else `APP0 JFIF`** (T.871 §6.3: the same claim), then
+  `APP1 XMP`, the `APP2 ICC` chunks, then every other segment (Adobe
+  `APP14`, `COM`, foreign `APPn`, tables, frame header) in its original
+  order. The two carriage specs cannot both be satisfied, so
+  `JfifPolicy` decides: `Auto` (default) drops the JFIF segment when
+  Exif takes the slot — the file is an Exif file; `Always` keeps JFIF
+  right after the Exif `APP1` (Exif §4.5.5 Table 2 row 6 placement,
+  not T.871's); `Never` writes none. Every policy decodes to the same
+  picture here (the colour-model segments are read wherever they sit
+  before `SOS`); the policy only changes which outside reader
+  recognises the file by its first segment. `embed_metadata(jpeg,
+  &meta, policy)` applies the rule to any stream (same-kind segments
+  replaced wherever they sat, the picture untouched),
+  `strip_metadata` removes the three kinds.
+* **Precedence** (`Metadata::with_overrides`): per kind, a frame's
+  blobs over the stream's `params.blobs` over the `EncodeOptions`
+  metadata of a direct caller; on the contract side the option's
+  `metadata` over `JpegImage::metadata`. Motion-JPEG frames may each
+  carry their own; a still's frame blobs equal its stream blobs.
 * `ColorInfo { range, primaries, transfer, matrix }` — range plus H.273
   code points. YCbCr-coded frames report `jfif_ycbcr()` = full range,
   matrix 5 (BT.601 / sYCC, `KR = 0.299`, `KB = 0.114`), primaries 1 and
@@ -252,10 +291,12 @@ Breaches are `Error::LimitExceeded`.
   additionally caps `X × Y × Nf` at 64 M samples per frame.
 * `encode` rejects (never converts): plane count / size mismatches,
   `sampling` disagreeing with the image layout, `Gbrp*` / `Rgb48Le` /
-  `Gray10Le` / `Gray16Le` under a DCT process, APPn payloads over
-  65533 bytes, ICC profiles needing more than 255 chunks.
-* Hostile input returns `Error`, never panics — thirteen fuzz targets
-  (`fuzz/`), `standalone_api` among them, run daily.
+  `Gray10Le` / `Gray16Le` under a DCT process, an Exif block over
+  65 527 bytes, an XMP packet over 65 502 bytes, an ICC profile over
+  16 707 345 bytes (255 chunks).
+* Hostile input returns `Error`, never panics — fourteen fuzz targets
+  (`fuzz/`), `standalone_api` and `metadata_embed` among them, run
+  daily.
 * Not decoded: bare differential frames (SOF5–7 / SOF13–15) outside a
   DHP sequence; 12-bit 4-component frames (no 12-bit CMYK layout).
 
@@ -922,10 +963,13 @@ rejected with `Error::InvalidData`.
 
 ### Metadata pass-through
 
-All encoder entry points have `*_with_meta` variants that accept a
-`meta: &[u8]` byte slice of pre-serialised APP/COM segments to embed
-immediately after SOI (replacing the default JFIF APP0). Use
-`encoder::extract_app_segments(jpeg)` to harvest APP0-APP15 and COM
+The typed way is `Metadata` on `JpegImage` / `EncodeOptions` /
+`CodecParameters::blobs`, or `embed_metadata` on a finished stream
+(see *Metadata and colour*). The historical raw path remains: the
+encoder entry points have `*_with_meta` variants that accept a `meta:
+&[u8]` byte slice of pre-serialised APP/COM segments to embed
+immediately after SOI (replacing the default JFIF APP0), and
+`encoder::extract_app_segments(jpeg)` harvests APP0-APP15 and COM
 segments from an existing JPEG for pass-through to the re-encoded
 output.
 
@@ -1460,9 +1504,21 @@ Not supported (decoder returns `Error::Unsupported`):
 
 ## Fuzzing
 
-The `fuzz/` sub-crate runs thirteen cargo-fuzz harnesses against the
+The `fuzz/` sub-crate runs fourteen cargo-fuzz harnesses against the
 public encoder + decoder + RTP surface, executed daily by the
 org-wide reusable fuzz workflow (60-minute budget, ~4.5 min/target):
+
+- `metadata_embed` — the metadata marker paths: arbitrary bytes into
+  `read_metadata` / `embed_metadata` (fuzz-sized ICC / Exif / XMP
+  blobs at the limit bands, a fuzz-chosen `JfifPolicy`) /
+  `strip_metadata`, asserting embedded blobs read back, untouched kinds
+  are kept, a strip leaves none, the picture decodes to the same
+  planes and the registry decoder's frame record equals the record;
+  plus fuzz-shaped `APP2 ICC_PROFILE` chunk sequences (sequence
+  numbers, counts, zero-length chunks) in front of a valid frame
+  through `read_metadata` / `info` / lenient and strict `decode_with`.
+  First minutes found the `TEM` length disagreement with the decoder
+  (fixed); 10 minutes after: 1.81 M executions, cov 4408, no findings.
 
 - `standalone_api` — the still-image contract surface: arbitrary bytes
   into `probe` / `info` / `decode_with` (1 Mpixel cap; 4096-pixel cap

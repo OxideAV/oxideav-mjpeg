@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.13...v0.1.14) - 2026-10-17
+
+### Other
+
+- mjpeg tests: the seek fixture is generated once per process (the parallel seek tests removed and rewrote the same file under each other — flaky "packet after seek"); CHANGELOG spacing
+- README (blob carriage table, marker order and JFIF / Exif slot rule, precedence, limits, `metadata_embed`) + CHANGELOG for the metadata round
+- `metadata_embed` fuzz target (header splitter, ICC chunk reassembly, registry frame record); TEM is read as a length-prefixed segment, as the decoder reads it
+- JPEG metadata through the registry — stream blobs from the demuxer, frame blobs from the decoder, the encoder embeds `params.blobs` with frame blobs overriding per kind; the still demuxer walks segments to find EOI
+- `metadata` module — one marker-order rule for ICC / Exif / XMP, the JFIF / Exif slot policy, embed / strip / read helpers
+
 ### Added
 
 - **JPEG metadata through the registry (core 0.1.40 blobs).** The

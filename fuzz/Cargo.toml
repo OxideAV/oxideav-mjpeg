@@ -174,3 +174,18 @@ name = "registry_encoder"
 path = "fuzz_targets/registry_encoder.rs"
 test = false
 doc = false
+
+# Robustness + oracle target — the metadata marker paths
+# (`oxideav_mjpeg::metadata`): the header splitter behind
+# `embed_metadata` / `strip_metadata` over arbitrary bytes with
+# fuzz-sized ICC / Exif / XMP blobs and a fuzz-chosen JFIF policy, and
+# fuzz-shaped APP2 ICC chunk sequences (hostile sequence numbers,
+# repeats, disagreeing counts, zero-length chunks) in front of a valid
+# frame. Embedded blobs must read back, the picture must be unchanged,
+# the registry frame record must equal the record. See
+# `fuzz_targets/metadata_embed.rs`.
+[[bin]]
+name = "metadata_embed"
+path = "fuzz_targets/metadata_embed.rs"
+test = false
+doc = false

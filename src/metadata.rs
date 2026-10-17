@@ -46,11 +46,17 @@
 //! every policy decodes to the same picture; the policy only changes
 //! which outside reader recognises the file by its first segment.
 //!
+//! The rewrite covers the whole header (every segment before the first
+//! `SOS`): an Exif or ICC segment a foreign writer put after the
+//! tables is still the one replaced, and a JFIF segment that was not
+//! first is moved to its slot.
+//!
 //! Everything here builds without `oxideav-core`.
 
 use crate::error::{MjpegError as Error, Result};
 use crate::image::Metadata;
 use crate::jpeg::markers;
+use crate::jpeg::parser::MarkerWalker;
 
 /// `APP1` Exif identifier.
 pub const EXIF_IDENTIFIER: &[u8] = b"Exif\0\0";
@@ -160,49 +166,47 @@ fn classify(marker: u8, payload: &[u8]) -> Kind {
     }
 }
 
-/// Split `jpeg` into its leading `APPn` / `COM` segments and the rest
-/// (from the first marker that is neither). `SOI` must be at offset 0;
-/// a truncated segment length is an error.
-fn split_leading(jpeg: &[u8]) -> Result<(Vec<Segment<'_>>, &[u8])> {
+/// Split `jpeg` into the marker segments before the first `SOS` (the
+/// header: `APPn` / `COM` / tables / frame header, each classified)
+/// and the rest, from the `SOS` marker on (or from `EOI` / the first
+/// unparsable byte). `SOI` must be at offset 0; stray bytes between
+/// segments are skipped as the decoder skips them, and a truncated
+/// segment length is an error.
+fn split_header(jpeg: &[u8]) -> Result<(Vec<Segment<'_>>, &[u8])> {
     if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
     }
+    let body = &jpeg[2..];
+    let mut walker = MarkerWalker::new(body);
     let mut segs = Vec::new();
-    let mut pos = 2;
     loop {
-        // T.81 §B.1.1.2: any number of `FF` fill bytes may precede a
-        // marker; they belong to no segment and are not carried over.
-        let start = pos;
-        while pos < jpeg.len() && jpeg[pos] == 0xFF {
-            pos += 1;
+        let Some(marker) = walker.next_marker()? else {
+            // Nothing after the last segment: the rest is empty.
+            return Ok((segs, &[]));
+        };
+        // `pos` is just past the marker byte; the `FF` is one back.
+        let at = walker.pos - 1;
+        match marker {
+            markers::SOI => continue,
+            markers::SOS | markers::EOI => return Ok((segs, &body[at - 1..])),
+            m if markers::is_rst(m) => {
+                // No length field: kept as a two-byte segment where it
+                // was (the decoder skips it).
+                segs.push(Segment {
+                    kind: Kind::Other,
+                    bytes: &body[at - 1..at + 1],
+                });
+            }
+            m => {
+                // Every other marker — `TEM` included, as the decoder
+                // reads it — carries a length field.
+                let payload = walker.read_segment_payload()?;
+                segs.push(Segment {
+                    kind: classify(m, payload),
+                    bytes: &body[at - 1..walker.pos],
+                });
+            }
         }
-        if pos == start || pos >= jpeg.len() {
-            // Not at a marker (stray byte, or the stream ends here):
-            // everything from here on is "the rest" and is left to
-            // the decoder's lenient walker.
-            return Ok((segs, &jpeg[start..]));
-        }
-        let marker = jpeg[pos];
-        if !(markers::is_app(marker) || marker == markers::COM) {
-            return Ok((segs, &jpeg[start..]));
-        }
-        let body = pos + 1;
-        if body + 2 > jpeg.len() {
-            return Err(Error::invalid("JPEG: marker segment: truncated length"));
-        }
-        let len = u16::from_be_bytes([jpeg[body], jpeg[body + 1]]) as usize;
-        if len < 2 {
-            return Err(Error::invalid("JPEG: marker segment: length < 2"));
-        }
-        if body + len > jpeg.len() {
-            return Err(Error::invalid("JPEG: marker segment: payload truncated"));
-        }
-        let payload = &jpeg[body + 2..body + len];
-        segs.push(Segment {
-            kind: classify(marker, payload),
-            bytes: &jpeg[pos - 1..body + len],
-        });
-        pos = body + len;
     }
 }
 
@@ -267,19 +271,21 @@ fn write_icc(out: &mut Vec<u8>, icc: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite the leading marker segments of `jpeg` so that the blobs set
-/// in `meta` are embedded (replacing any segment of the same kind the
-/// stream already carried; kinds `meta` leaves `None` keep what the
-/// stream had) in the order the [module docs](self) give, with the
-/// JFIF `APP0` placed by `jfif`. Tables, frame and scans are copied
-/// untouched, so the picture is unchanged.
+/// Rewrite the header of `jpeg` (every marker segment before the first
+/// `SOS`) so that the blobs set in `meta` are embedded — replacing any
+/// segment of the same kind the stream already carried, wherever it
+/// sat; kinds `meta` leaves `None` keep what the stream had — in the
+/// order the [module docs](self) give, with the JFIF `APP0` placed by
+/// `jfif`. Every other segment (tables, frame header, Adobe `APP14`,
+/// `COM`, foreign `APPn`) follows in its original order; the scans are
+/// copied untouched, so the picture is unchanged.
 ///
-/// Errors: no `SOI` at offset 0 or a truncated leading segment
+/// Errors: no `SOI` at offset 0 or a truncated header segment
 /// (`InvalidData`); a blob over its carriage limit (`Unsupported`,
 /// naming the limit: [`EXIF_MAX_BYTES`], [`XMP_MAX_BYTES`],
 /// [`ICC_MAX_CHUNKS`]).
 pub fn embed_metadata(jpeg: &[u8], meta: &Metadata, jfif: JfifPolicy) -> Result<Vec<u8>> {
-    let (segs, rest) = split_leading(jpeg)?;
+    let (segs, rest) = split_header(jpeg)?;
     let has_exif = meta.exif.is_some() || segs.iter().any(|s| s.kind == Kind::Exif);
     let keep_jfif = match jfif {
         JfifPolicy::Auto => !has_exif,
@@ -326,12 +332,11 @@ fn meta_len(meta: &Metadata) -> usize {
         })
 }
 
-/// Remove every ICC / Exif / XMP segment from the leading marker
-/// segments of `jpeg` (colour-model segments and the picture are
-/// kept). The inverse of [`embed_metadata`] for the three carried
-/// kinds.
+/// Remove every ICC / Exif / XMP segment from the header of `jpeg`
+/// (colour-model segments and the picture are kept). The inverse of
+/// [`embed_metadata`] for the three carried kinds.
 pub fn strip_metadata(jpeg: &[u8]) -> Result<Vec<u8>> {
-    let (segs, rest) = split_leading(jpeg)?;
+    let (segs, rest) = split_header(jpeg)?;
     let mut out = Vec::with_capacity(jpeg.len());
     out.extend_from_slice(&[0xFF, markers::SOI]);
     for s in segs
@@ -380,9 +385,13 @@ mod tests {
         v
     }
 
+    /// The `APPn` / `COM` markers of the header, in order.
     fn markers_of(jpeg: &[u8]) -> Vec<u8> {
-        let (segs, _) = split_leading(jpeg).unwrap();
-        segs.iter().map(|s| s.bytes[1]).collect()
+        let (segs, _) = split_header(jpeg).unwrap();
+        segs.iter()
+            .map(|s| s.bytes[1])
+            .filter(|&m| markers::is_app(m) || m == markers::COM)
+            .collect()
     }
 
     #[test]
@@ -458,7 +467,7 @@ mod tests {
     /// The header scan needs a frame header; the skeleton has none, so
     /// re-read through the splitter instead.
     fn read_metadata_lenient(jpeg: &[u8]) -> Metadata {
-        let (segs, _) = split_leading(jpeg).unwrap();
+        let (segs, _) = split_header(jpeg).unwrap();
         let mut m = Metadata::new();
         let mut icc = Vec::new();
         for s in &segs {
@@ -485,7 +494,7 @@ mod tests {
             JfifPolicy::Auto,
         )
         .unwrap();
-        let (segs, _) = split_leading(&out).unwrap();
+        let (segs, _) = split_header(&out).unwrap();
         let icc: Vec<_> = segs.iter().filter(|s| s.kind == Kind::Icc).collect();
         assert_eq!(icc.len(), 2);
         assert_eq!(&icc[0].bytes[16..18], &[1, 2]);
@@ -566,8 +575,8 @@ mod tests {
             JfifPolicy::Auto
         )
         .is_err());
-        // A bare SOI, fill bytes, or a non-APP marker right away: the
-        // rest is copied as-is.
+        // A bare SOI, fill bytes before EOI, or stray bytes: the rest
+        // is copied from the next marker on, as the decoder reads it.
         let out = embed_metadata(&[0xFF, 0xD8], &meta, JfifPolicy::Auto).unwrap();
         assert_eq!(markers_of(&out), [markers::APP1]);
         let out = embed_metadata(
@@ -576,8 +585,84 @@ mod tests {
             JfifPolicy::Auto,
         )
         .unwrap();
-        assert!(out.ends_with(&[0xFF, 0xFF, 0xFF, 0xD9]));
+        assert!(
+            out.ends_with(&[b'x', 0xFF, 0xD9]),
+            "fill bytes collapse: {out:02X?}"
+        );
         let out = embed_metadata(&[0xFF, 0xD8, 0x00, 0x12], &meta, JfifPolicy::Auto).unwrap();
-        assert!(out.ends_with(&[0x00, 0x12]));
+        assert!(out.ends_with(b"x"), "stray bytes are skipped: {out:02X?}");
+    }
+
+    #[test]
+    fn tem_carries_a_length_as_the_decoder_reads_it() {
+        // Fuzz finding: the decoder reads `TEM` as a length-prefixed
+        // segment (lenient); splitting it as a bare two-byte marker
+        // re-exposed its "length" bytes as a segment of their own and
+        // the rewritten stream no longer decoded.
+        let mut jpeg = vec![0xFF, markers::SOI, 0xFF, 0x01, 0x00, 0x04, 0xFF, 0xD0];
+        jpeg.extend_from_slice(&[
+            0xFF,
+            markers::DQT,
+            0,
+            3,
+            0,
+            0xFF,
+            markers::SOS,
+            0,
+            2,
+            0xFF,
+            markers::EOI,
+        ]);
+        let (segs, rest) = split_header(&jpeg).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].bytes, &[0xFF, 0x01, 0x00, 0x04, 0xFF, 0xD0]);
+        assert_eq!(segs[1].bytes[1], markers::DQT);
+        assert_eq!(rest, &[0xFF, markers::SOS, 0, 2, 0xFF, markers::EOI]);
+        let out = embed_metadata(
+            &jpeg,
+            &Metadata::new().with_xmp(b"x".to_vec()),
+            JfifPolicy::Auto,
+        )
+        .unwrap();
+        assert_eq!(&out[out.len() - jpeg.len() + 2..], &jpeg[2..]);
+    }
+
+    #[test]
+    fn late_segments_anywhere_in_the_header_are_replaced_or_moved() {
+        // A metadata segment after the tables is still the one
+        // replaced, and a JFIF segment that was not first moves to its
+        // slot; the tables keep their place after the metadata block.
+        let mut late = vec![0xFF, markers::SOI, 0xFF, markers::DQT, 0, 3, 0];
+        write_app_segment(
+            &mut late,
+            markers::APP2,
+            &[ICC_IDENTIFIER, &[1, 1], &[5, 5]],
+        )
+        .unwrap();
+        write_app_segment(
+            &mut late,
+            markers::APP0,
+            &[b"JFIF\0", &[1, 1, 0, 0, 1, 0, 1, 0, 0]],
+        )
+        .unwrap();
+        late.extend_from_slice(&[0xFF, markers::SOS, 0, 2, 0xAB, 0xFF, markers::EOI]);
+        let out =
+            embed_metadata(&late, &Metadata::new().with_icc(vec![6]), JfifPolicy::Auto).unwrap();
+        assert_eq!(markers_of(&out), [markers::APP0, markers::APP2]);
+        let (segs, rest) = split_header(&out).unwrap();
+        assert_eq!(
+            segs.iter().map(|s| s.bytes[1]).collect::<Vec<_>>(),
+            [markers::APP0, markers::APP2, markers::DQT]
+        );
+        assert_eq!(rest, &[0xFF, markers::SOS, 0, 2, 0xAB, 0xFF, markers::EOI]);
+        assert_eq!(read_metadata_lenient(&out).icc, Some(vec![6]));
+        // Nothing to embed, `Never`: the JFIF segment goes, the rest
+        // keeps its order.
+        let out = embed_metadata(&late, &Metadata::new(), JfifPolicy::Never).unwrap();
+        let (segs, _) = split_header(&out).unwrap();
+        assert_eq!(
+            segs.iter().map(|s| s.bytes[1]).collect::<Vec<_>>(),
+            [markers::APP2, markers::DQT]
+        );
     }
 }

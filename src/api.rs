@@ -15,7 +15,7 @@ use crate::image::{
 };
 use crate::jpeg::inspect::{ChromaSubsampling, SofKind};
 use crate::jpeg::markers;
-use crate::jpeg::parser::{parse_sof, MarkerWalker, SofInfo};
+use crate::jpeg::parser::{MarkerWalker, SofInfo, parse_sof};
 use crate::metadata::{EXIF_IDENTIFIER, ICC_IDENTIFIER, XMP_IDENTIFIER};
 use crate::t81::{ColorSignalling, EncodeOptions, JpegProcess};
 
@@ -92,13 +92,13 @@ pub fn decode(bytes: &[u8]) -> Result<JpegImage> {
 /// tables stream. Limits are checked against the header before any
 /// sample buffer is allocated.
 pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
-    if let Some(max) = opts.max_bytes {
-        if bytes.len() as u64 > max {
-            return Err(Error::limit(format!(
-                "JPEG: input of {} bytes exceeds max_bytes = {max}",
-                bytes.len()
-            )));
-        }
+    if let Some(max) = opts.max_bytes
+        && bytes.len() as u64 > max
+    {
+        return Err(Error::limit(format!(
+            "JPEG: input of {} bytes exceeds max_bytes = {max}",
+            bytes.len()
+        )));
     }
     let hdr = scan_header(bytes, opts.strict)?;
     // Reject the layouts the decoder cannot shape before decoding.
@@ -223,7 +223,9 @@ pub fn encode_rgba8(width: u32, height: u32, rgba: &[u8], opts: &EncodeOptions) 
         )));
     }
     let rgb: Vec<u8> = rgba[..expected]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     encode_rgb8(width, height, &rgb, opts)
@@ -674,14 +676,14 @@ fn infer_shape(hdr: &Header) -> Result<Shape> {
             3 if subsampled => {
                 return Err(Error::unsupported(format!(
                     "lossless JPEG: subsampled three-component scans require precision 8, got {p}"
-                )))
+                )));
             }
             3 => rgb_lossless_format(p),
             4 if p == 8 && !subsampled => PixelFormat::Cmyk,
             4 => {
                 return Err(Error::unsupported(
                     "lossless JPEG: four-component scans require P = 8 and H_i = V_i = 1",
-                ))
+                ));
             }
             _ => return Err(Error::unsupported(format!("{nc}-component JPEG"))),
         }
@@ -696,7 +698,7 @@ fn infer_shape(hdr: &Header) -> Result<Shape> {
             (4, _) => {
                 return Err(Error::unsupported(format!(
                     "12-bit: {nc}-component JPEGs not supported"
-                )))
+                )));
             }
             (2, _) => return Err(Error::unsupported("2-component JPEG")),
             (1 | 3, _) => return Err(Error::unsupported(format!("precision {p}"))),
@@ -901,7 +903,7 @@ pub(crate) fn rgb8_to_native(
         ChromaSubsampling::Custom => {
             return Err(Error::unsupported(
                 "JPEG encode: `chroma = Custom` has no layout; use `sampling` with the plane-level writer",
-            ))
+            ));
         }
     };
     // Forward T.871 §7 (full-precision form), exact integer rounding:
@@ -1214,12 +1216,14 @@ mod tests {
             Err(Error::LimitExceeded(_))
         ));
         assert!(lim(DecodeOptions::new().with_max_pixels(Some(128))).is_ok());
-        assert!(lim(DecodeOptions::new()
-            .with_max_width(None)
-            .with_max_height(None)
-            .with_max_pixels(None)
-            .with_max_bytes(None))
-        .is_ok());
+        assert!(
+            lim(DecodeOptions::new()
+                .with_max_width(None)
+                .with_max_height(None)
+                .with_max_pixels(None)
+                .with_max_bytes(None))
+            .is_ok()
+        );
         assert!(lim(DecodeOptions::new().with_strict(true)).is_ok());
         let mut trailing = jpeg.clone();
         trailing.extend_from_slice(&[0, 0, 0]);

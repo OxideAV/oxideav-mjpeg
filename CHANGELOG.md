@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95; tests / fuzz harness load their black-box reference (libturbojpeg) through dlsym instead of libloading
+
 ### Added
 
 - **JPEG metadata through the registry (core 0.1.40 blobs).** The

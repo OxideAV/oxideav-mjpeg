@@ -59,7 +59,9 @@ fn parse_pnm(bytes: &[u8]) -> (usize, u32, u32, u32, Vec<u32>) {
     let payload = &bytes[i..];
     let samples: Vec<u32> = if maxval > 255 {
         payload
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u32::from(b[0]) << 8 | u32::from(b[1]))
             .collect()
     } else {

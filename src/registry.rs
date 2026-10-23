@@ -22,18 +22,19 @@ use std::collections::VecDeque;
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
-    parse_options, BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct,
-    CodecParameters, CodecRegistry, CodecTag, ContainerRegistry, Decoder, Encoder, Error, Frame,
-    MediaType, MetadataBlob, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result,
-    RuntimeContext, TimeBase, VideoFrame,
+    BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, CodecTag, ContainerRegistry, Decoder, Encoder, Error, Frame, MediaType,
+    MetadataBlob, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result,
+    RuntimeContext, TimeBase, VideoFrame, parse_options,
 };
 
+use crate::CODEC_ID_STR;
 use crate::container;
 use crate::encoder::{
-    encode_arith_jpeg_grayscale, encode_arith_jpeg_rgb24, encode_arith_jpeg_yuv, encode_jpeg_cmyk,
-    encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts, encode_jpeg_progressive,
-    encode_jpeg_progressive_grayscale, encode_jpeg_rgb24_with_opts, encode_jpeg_with_opts,
-    encode_lossless_jpeg_grayscale, DEFAULT_QUALITY,
+    DEFAULT_QUALITY, encode_arith_jpeg_grayscale, encode_arith_jpeg_rgb24, encode_arith_jpeg_yuv,
+    encode_jpeg_cmyk, encode_jpeg_cmyk_progressive, encode_jpeg_grayscale_with_opts,
+    encode_jpeg_progressive, encode_jpeg_progressive_grayscale, encode_jpeg_rgb24_with_opts,
+    encode_jpeg_with_opts, encode_lossless_jpeg_grayscale,
 };
 use crate::error::MjpegError;
 use crate::image::{
@@ -43,7 +44,6 @@ use crate::jpeg::inspect::ChromaSubsampling;
 use crate::metadata::JfifPolicy;
 use crate::mjpeg_container;
 use crate::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet};
-use crate::CODEC_ID_STR;
 
 // ---- Error / pixel-format / frame conversions --------------------------
 
@@ -678,7 +678,7 @@ impl MjpegEncoderOptions {
             other => {
                 return Err(Error::invalid(format!(
                     "MJPEG encoder: adobe_transform '{other}' (none / cmyk / ycck)"
-                )))
+                )));
             }
         }))
     }
@@ -877,7 +877,7 @@ impl MjpegEncoderOptions {
             other => {
                 return Err(Error::invalid(format!(
                     "MJPEG encoder: chroma '{other}' (yuv444 / yuv422 / yuv420 / yuv411 / gray)"
-                )))
+                )));
             }
         }))
     }
@@ -1693,18 +1693,19 @@ impl MjpegEncoder {
     /// Any other `Some(t)` value is rejected with `Error::InvalidData`
     /// (only `0` and `2` round-trip through this crate's decoder).
     pub fn set_adobe_transform(&mut self, transform: Option<u8>) -> Result<()> {
-        if let Some(t) = transform {
-            if t != 0 && t != 2 {
-                return Err(Error::invalid(
-                    "MJPEG encoder: Adobe APP14 transform must be 0 (CMYK) or 2 (YCCK)",
-                ));
-            }
+        if let Some(t) = transform
+            && t != 0
+            && t != 2
+        {
+            return Err(Error::invalid(
+                "MJPEG encoder: Adobe APP14 transform must be 0 (CMYK) or 2 (YCCK)",
+            ));
         }
         self.cmyk_adobe_transform = transform;
-        if let Some(o) = &mut self.general {
-            if let ColorSignalling::Cmyk { adobe_transform } = &mut o.signalling {
-                *adobe_transform = transform;
-            }
+        if let Some(o) = &mut self.general
+            && let ColorSignalling::Cmyk { adobe_transform } = &mut o.signalling
+        {
+            *adobe_transform = transform;
         }
         Ok(())
     }

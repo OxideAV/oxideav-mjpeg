@@ -23,7 +23,7 @@
 //!   EOI
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
-use oxideav_mjpeg::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+use oxideav_mjpeg::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 use oxideav_mjpeg::registry::make_decoder;
 
 fn push_marker(out: &mut Vec<u8>, m: u8) {
@@ -147,7 +147,7 @@ fn decode(jpeg: Vec<u8>, w: u32, h: u32) -> oxideav_core::VideoFrame {
 /// Build a two-stage arithmetic spatial-lossless hierarchical stream
 /// (SOF11 + SOF15) from `nc` full-resolution planes, reconstructing exactly.
 fn build_arith_hierarchical(full: &[Vec<u32>], w: usize, h: usize) -> Vec<u8> {
-    assert!(w % 2 == 0 && h % 2 == 0);
+    assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
     let nc = full.len();
     let lw = w / 2;
     let lh = h / 2;
@@ -175,11 +175,7 @@ fn build_arith_hierarchical(full: &[Vec<u32>], w: usize, h: usize) -> Vec<u8> {
                 .map(|i| {
                     let d = plane[i] as i32 - up[i] as i32;
                     let m = ((d % 256) + 256) % 256;
-                    if m >= 128 {
-                        m - 256
-                    } else {
-                        m
-                    }
+                    if m >= 128 { m - 256 } else { m }
                 })
                 .collect()
         })
@@ -193,7 +189,7 @@ fn build_arith_hierarchical(full: &[Vec<u32>], w: usize, h: usize) -> Vec<u8> {
     let mut out = Vec::new();
     push_marker(&mut out, 0xD8); // SOI
     push_seg(&mut out, 0xDE, &frame_body(w as u16, h as u16, nc as u8)); // DHP
-                                                                         // Stage 1: non-differential SOF11 (low-res), predictor 1.
+    // Stage 1: non-differential SOF11 (low-res), predictor 1.
     push_seg(&mut out, 0xCB, &frame_body(lw as u16, lh as u16, nc as u8));
     push_seg(&mut out, 0xDA, &sos_body(1, nc as u8));
     out.extend_from_slice(&encode_arith_lossless_scan(&low_i, lw, lh, false));

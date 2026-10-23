@@ -2,7 +2,8 @@
 name = "oxideav-mjpeg-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
+rust-version = "1.95"
 
 [package.metadata]
 cargo-fuzz = true
@@ -10,11 +11,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oxideav-core = "0.1"
-# libloading is the only libturbojpeg interop: each cross-decode harness
+# dlsym (Karpelès Lab) is the only libturbojpeg interop: each cross-decode harness
 # `dlopen`s the system-installed shared library at startup and drives it
 # as a black-box oracle (nothing is linked at build time). Harnesses
 # skip silently when libturbojpeg isn't installed (see fuzz/src/lib.rs).
-libloading = "0.8"
+dlsym = "0.0.2"
 
 [dependencies.oxideav-mjpeg]
 path = ".."

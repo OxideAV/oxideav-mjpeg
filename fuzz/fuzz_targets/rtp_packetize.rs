@@ -36,7 +36,7 @@
 //! `src/rtp.rs`, not this fuzz oracle.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mjpeg::rtp::{packetize, QMode};
+use oxideav_mjpeg::rtp::{QMode, packetize};
 
 /// Discard inputs larger than this. The packetizer copies the scan into
 /// per-fragment payload buffers; capping the input keeps each iteration

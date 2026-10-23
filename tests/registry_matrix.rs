@@ -15,16 +15,16 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use PixelFormat as P;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecId, CodecOptions, CodecParameters, Frame, Packet, PixelFormat, RuntimeContext, TimeBase,
     VideoFrame,
 };
 use oxideav_mjpeg::registry::{
-    accepted_pixel_formats, coded_pixel_format, make_decoder, make_encoder, ACCEPTED_PIXEL_FORMATS,
+    ACCEPTED_PIXEL_FORMATS, accepted_pixel_formats, coded_pixel_format, make_decoder, make_encoder,
 };
 use oxideav_mjpeg::{ChromaSubsampling, ColorSignalling, EncodeOptions, JpegImage, JpegProcess};
-use PixelFormat as P;
 
 /// Representative geometries: a single pixel, an odd pair, an
 /// MCU-unaligned size with odd chroma extents, and an aligned one.
@@ -555,7 +555,9 @@ fn every_declared_layout_encodes_decodes_and_labels_truthfully() {
             }
         }
     }
-    eprintln!("registry encoder matrix: {cells} cells proved, {black_boxed} through the black-box decoder");
+    eprintln!(
+        "registry encoder matrix: {cells} cells proved, {black_boxed} through the black-box decoder"
+    );
     assert!(cells >= 19 * SIZES.len());
 }
 

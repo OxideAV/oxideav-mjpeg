@@ -17,18 +17,17 @@ use crate::image::{JpegImage, MjpegPixelFormat as PixelFormat, Plane as VideoPla
 pub use crate::registry::make_decoder;
 
 use crate::jpeg::arith::{
-    decode_ac as arith_decode_ac, decode_ac_refine as arith_decode_ac_refine,
-    decode_dc_diff as arith_decode_dc_diff, decode_fixed_bit as arith_decode_fixed_bit,
-    decode_lossless_diff as arith_decode_lossless_diff, AcRefineStats, AcStats, ArithDecoder,
-    DcStats, LosslessStats,
+    AcRefineStats, AcStats, ArithDecoder, DcStats, LosslessStats, decode_ac as arith_decode_ac,
+    decode_ac_refine as arith_decode_ac_refine, decode_dc_diff as arith_decode_dc_diff,
+    decode_fixed_bit as arith_decode_fixed_bit, decode_lossless_diff as arith_decode_lossless_diff,
 };
 use crate::jpeg::dct::idct8x8;
-use crate::jpeg::huffman::{parse_dht, HuffTable};
+use crate::jpeg::huffman::{HuffTable, parse_dht};
 use crate::jpeg::markers::{self, *};
 use crate::jpeg::parser::{
-    parse_dac, parse_dnl, parse_dri, parse_sof, parse_sos, MarkerWalker, SofInfo, SosInfo,
+    MarkerWalker, SofInfo, SosInfo, parse_dac, parse_dnl, parse_dri, parse_sof, parse_sos,
 };
-use crate::jpeg::quant::{parse_dqt, QuantTable};
+use crate::jpeg::quant::{QuantTable, parse_dqt};
 use crate::jpeg::zigzag::ZIGZAG;
 
 // ---- Decoding state ------------------------------------------------------
@@ -410,10 +409,10 @@ pub(crate) fn resolve_dnl_height(data: &[u8]) -> Result<Option<u16>> {
 /// `height == 0`, but applying it unconditionally to a `height == 0` SOF
 /// keeps the call-sites uniform.
 fn apply_dnl_height(sof: &mut SofInfo, dnl_height: Option<u16>) {
-    if sof.height == 0 {
-        if let Some(nl) = dnl_height {
-            sof.height = nl;
-        }
+    if sof.height == 0
+        && let Some(nl) = dnl_height
+    {
+        sof.height = nl;
     }
 }
 
@@ -1363,7 +1362,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
         for mx in 0..mcus_x {
             if state.restart_interval != 0
                 && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
+                && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 // Expect a restart marker before this MCU.
                 // Drain bits until the reader hits one. If we already consumed
@@ -1797,7 +1796,7 @@ fn decode_sequential_scan_accum_diff(
         for mx in 0..scan_mcus_x {
             if state.restart_interval != 0
                 && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
+                && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 br.bits = 0;
                 br.nbits = 0;
@@ -1964,11 +1963,10 @@ fn decode_arith_scan_diff(
                     .position(|fc| fc.id == sc.id)
                     .map(|j| j == i)
                     .unwrap_or(false)
-            }) {
-                if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                    s.l = cond.l;
-                    s.u = cond.u;
-                }
+            }) && let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref()
+            {
+                s.l = cond.l;
+                s.u = cond.u;
             }
             s
         })
@@ -1982,10 +1980,9 @@ fn decode_arith_scan_diff(
                     .position(|fc| fc.id == sc.id)
                     .map(|j| j == i)
                     .unwrap_or(false)
-            }) {
-                if let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref() {
-                    s.kx = cond.kx;
-                }
+            }) && let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref()
+            {
+                s.kx = cond.kx;
             }
             s
         })
@@ -2014,7 +2011,7 @@ fn decode_arith_scan_diff(
             // Restart-interval boundary?
             if state.restart_interval != 0
                 && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
+                && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 // The decoder may already have consumed the RSTn during a
                 // Byte_in (decoder.marker() is set), or we may need to
@@ -2242,10 +2239,10 @@ fn decode_progressive_arith_scan_diff(
         })
         .collect();
     let mut ac_stats = AcStats::new();
-    if let Some(sc) = sos.components.first() {
-        if let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref() {
-            ac_stats.kx = cond.kx;
-        }
+    if let Some(sc) = sos.components.first()
+        && let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref()
+    {
+        ac_stats.kx = cond.kx;
     }
     let mut ac_refine_stats = AcRefineStats::new();
 
@@ -2267,7 +2264,7 @@ fn decode_progressive_arith_scan_diff(
         for mx in 0..scan_mcus_x {
             if state.restart_interval != 0
                 && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
+                && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 // Advance past the RSTn marker and re-Initdec there.
                 // Statistics + DC predictors reset per F.1.4.4.1.5.
@@ -2522,7 +2519,7 @@ fn decode_progressive_scan_diff(
         for mx in 0..scan_mcus_x {
             if state.restart_interval != 0
                 && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
+                && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 br.bits = 0;
                 br.nbits = 0;
@@ -2742,11 +2739,7 @@ fn prog_decode_ac_refine(
             } else if s == 1 {
                 // A new nonzero: read the sign bit.
                 let sign_bit = br.get_bits(1)?;
-                if sign_bit == 0 {
-                    m1
-                } else {
-                    p1
-                }
+                if sign_bit == 0 { m1 } else { p1 }
             } else {
                 return Err(Error::invalid("progressive AC refine: bad s"));
             };
@@ -3532,7 +3525,7 @@ fn decode_lossless_scan_planes(
     // The closure borrows `samples` mutably through an index so the same
     // body serves both the flat (all-1×1) and MCU-ordered paths.
     macro_rules! decode_one {
-        ($ci:expr, $cx:expr, $cy:expr) => {{
+        ($ci:expr_2021, $cx:expr_2021, $cy:expr_2021) => {{
             let ci = $ci;
             let cx = $cx;
             let cy = $cy;
@@ -3632,7 +3625,7 @@ fn decode_lossless_scan_planes(
             for x in 0..width {
                 if state.restart_interval != 0
                     && mcus_since_restart != 0
-                    && mcus_since_restart % state.restart_interval as u32 == 0
+                    && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
                 {
                     consume_restart!();
                     if first_sample[0] {
@@ -3655,7 +3648,7 @@ fn decode_lossless_scan_planes(
             for mx in 0..mcus_x {
                 if state.restart_interval != 0
                     && mcus_since_restart != 0
-                    && mcus_since_restart % state.restart_interval as u32 == 0
+                    && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
                 {
                     consume_restart!();
                     if first_sample[0] {
@@ -5305,7 +5298,7 @@ fn decode_lossless_arith_scan_planes(
         for x in 0..width {
             if state.restart_interval != 0
                 && samples_since_restart != 0
-                && samples_since_restart % state.restart_interval as u32 == 0
+                && samples_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
                     Error::invalid("lossless arith: missing restart marker mid-scan")
@@ -5448,7 +5441,7 @@ fn decode_lossless_arith_scan_subsampled(
         for mx in 0..mcus_x {
             if state.restart_interval != 0
                 && mcus_since_restart != 0
-                && mcus_since_restart % state.restart_interval as u32 == 0
+                && mcus_since_restart.is_multiple_of(state.restart_interval as u32)
             {
                 scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
                     Error::invalid("lossless arith: missing restart marker mid-scan")
@@ -5710,7 +5703,7 @@ mod prog_tests {
         let c = ac.encode[0x01];
         bw.put(c.code as u32, c.len as u32);
         bw.put(1, 1); // coefficient value = +1
-                      // EOB (r=0, s=0) → symbol 0x00.
+        // EOB (r=0, s=0) → symbol 0x00.
         let c0 = ac.encode[0x00];
         bw.put(c0.code as u32, c0.len as u32);
         let buf = bw.finish();
@@ -6689,7 +6682,7 @@ mod precision_12_tests {
 
 #[cfg(all(test, feature = "registry"))]
 mod lossless_tests {
-    use super::{decode_planes, Error};
+    use super::{Error, decode_planes};
     use crate::encoder::encode_lossless_grayscale_jpeg_8bit;
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -6761,7 +6754,7 @@ mod lossless_tests {
         restart_interval: u16,
         dac_lu: Option<(u8, u8)>,
     ) -> Vec<u8> {
-        use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+        use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
         let nc = planes.len();
         let mut out = vec![0xFF, 0xD8]; // SOI
         if let Some((l, u)) = dac_lu {
@@ -6810,7 +6803,7 @@ mod lossless_tests {
             for x in 0..width {
                 if restart_interval != 0
                     && since_restart != 0
-                    && since_restart % restart_interval as u32 == 0
+                    && since_restart.is_multiple_of(restart_interval as u32)
                 {
                     // Flush the entropy segment, append RSTn, restart the
                     // coder + statistics + conditioning + prediction
@@ -7083,7 +7076,7 @@ mod lossless_tests {
 #[cfg(test)]
 mod sof10_tests {
     use super::decode_planes;
-    use crate::jpeg::arith::{encode_magnitude, AcStats, ArithEncoder, Context, DcStats};
+    use crate::jpeg::arith::{AcStats, ArithEncoder, Context, DcStats, encode_magnitude};
     use crate::jpeg::dct::idct8x8;
     use crate::jpeg::zigzag::ZIGZAG;
 
@@ -7285,9 +7278,9 @@ mod sof10_tests {
     ) -> Vec<u8> {
         let nc = comps.len();
         let mut out = vec![0xFF, 0xD8]; // SOI
-                                        // DQT: table 0, Pq = 0, all values 1 (identity dequantise).
+        // DQT: table 0, Pq = 0, all values 1 (identity dequantise).
         let mut dqt = vec![0u8];
-        dqt.extend(std::iter::repeat(1u8).take(64));
+        dqt.extend(std::iter::repeat_n(1u8, 64));
         put_seg(&mut out, 0xDB, &dqt);
         if let Some(kx) = kx_dac {
             // DAC entry: Tc = 1 (AC), Tb = 0, Cs = Kx (T.81 §B.2.4.3).
@@ -7340,7 +7333,7 @@ mod sof10_tests {
                 for mx in 0..sm_x {
                     if restart_interval != 0
                         && since_restart != 0
-                        && since_restart % restart_interval as u32 == 0
+                        && since_restart.is_multiple_of(restart_interval as u32)
                     {
                         out.extend_from_slice(&std::mem::take(&mut enc).finish());
                         out.extend_from_slice(&[0xFF, 0xD0 + rst]);
@@ -7923,7 +7916,7 @@ mod sof10_tests {
         let blocks = gen_blocks(blocks_x * 2, 0x9A9A0001, 180, 50, 10);
         let mut out = vec![0xFF, 0xD8]; // SOI
         let mut dqt = vec![0u8];
-        dqt.extend(std::iter::repeat(1u8).take(64));
+        dqt.extend(std::iter::repeat_n(1u8, 64));
         put_seg(&mut out, 0xDB, &dqt);
         put_seg(&mut out, 0xDE, &dhp_gray_body(w, h)); // DHP
         append_hier_gray_dct_frame(&mut out, 0xC9, w, h, &blocks, blocks_x, false, false);
@@ -7948,7 +7941,7 @@ mod sof10_tests {
         let diff = gen_blocks(blocks_x * 2, 0x1313BB02, 6, 4, 5);
         let mut out = vec![0xFF, 0xD8];
         let mut dqt = vec![0u8];
-        dqt.extend(std::iter::repeat(1u8).take(64));
+        dqt.extend(std::iter::repeat_n(1u8, 64));
         put_seg(&mut out, 0xDB, &dqt);
         put_seg(&mut out, 0xDE, &dhp_gray_body(w, h));
         append_hier_gray_dct_frame(&mut out, 0xC9, w, h, &base, blocks_x, false, false);
@@ -8021,7 +8014,7 @@ mod sof10_tests {
         let diff = gen_blocks(blocks_x * 2, 0x1414BB02, 6, 4, 5);
         let mut out = vec![0xFF, 0xD8];
         let mut dqt = vec![0u8];
-        dqt.extend(std::iter::repeat(1u8).take(64));
+        dqt.extend(std::iter::repeat_n(1u8, 64));
         put_seg(&mut out, 0xDB, &dqt);
         put_seg(&mut out, 0xDE, &dhp_gray_body(w, h));
         append_hier_gray_dct_frame(&mut out, 0xCA, w, h, &base, blocks_x, false, true);
@@ -8089,7 +8082,7 @@ mod sof10_tests {
         let (w, h) = (8usize, 8usize);
         let mut out = vec![0xFF, 0xD8];
         let mut dqt = vec![0u8];
-        dqt.extend(std::iter::repeat(1u8).take(64));
+        dqt.extend(std::iter::repeat_n(1u8, 64));
         put_seg(&mut out, 0xDB, &dqt);
         put_seg(&mut out, 0xDE, &dhp_gray_body(w, h));
         // Minimal Huffman SOF0 + DHT + a single all-zero block scan.
@@ -8099,7 +8092,7 @@ mod sof10_tests {
         sof.push(1);
         sof.extend_from_slice(&[1, 0x11, 0]);
         put_seg(&mut out, 0xC0, &sof); // SOF0
-                                       // DHT: DC table 0 + AC table 0, single code 0-length-1 for value 0.
+        // DHT: DC table 0 + AC table 0, single code 0-length-1 for value 0.
         let dht_dc = [
             0x00, // Tc=0, Th=0
             1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // one 1-bit code

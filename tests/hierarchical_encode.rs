@@ -1092,7 +1092,7 @@ fn inspector_classifies_hierarchical_encoder_output_by_first_stage() {
     // DHP-introduced stream it reports the *first-stage* frame kind — the
     // non-differential SOF that opens the pyramid. Verify each progression
     // family inspects cleanly with the expected first-stage classification.
-    use oxideav_mjpeg::{inspect_jpeg, SofKind};
+    use oxideav_mjpeg::{SofKind, inspect_jpeg};
     let (w, h) = (16usize, 16usize);
     let img = mk_plane(w, h, 8, 0x1257);
     let bytes = plane_to_bytes(&img, 8);

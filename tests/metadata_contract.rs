@@ -7,8 +7,8 @@
 
 use oxideav_mjpeg::metadata::{ICC_CHUNK_DATA, ICC_IDENTIFIER};
 use oxideav_mjpeg::{
-    embed_metadata, read_metadata, strip_metadata, DecodeOptions, EncodeOptions, JfifPolicy,
-    JpegImage, Metadata, PixelFormat, Plane,
+    DecodeOptions, EncodeOptions, JfifPolicy, JpegImage, Metadata, PixelFormat, Plane,
+    embed_metadata, read_metadata, strip_metadata,
 };
 
 fn gray(w: u32, h: u32) -> JpegImage {

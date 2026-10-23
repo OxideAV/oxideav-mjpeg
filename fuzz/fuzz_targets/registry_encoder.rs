@@ -11,13 +11,13 @@
 //! stamped on its output parameters, with the plane count that label
 //! implies (the symmetric check of the contract).
 
+use PixelFormat as P;
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecId, CodecOptions, CodecParameters, Error, Frame, Packet, PixelFormat, TimeBase, VideoFrame,
 };
 use oxideav_mjpeg::registry::{coded_pixel_format, make_decoder, make_encoder};
-use PixelFormat as P;
 
 /// Declared layouts, the range-agnostic aliases, and layouts the
 /// encoder must refuse by type.

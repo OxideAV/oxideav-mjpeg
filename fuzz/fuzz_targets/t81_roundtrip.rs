@@ -27,8 +27,8 @@
 //! on every component.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mjpeg::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess};
 use oxideav_mjpeg::DecodeOptions;
+use oxideav_mjpeg::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess};
 
 const MAX_PIXELS: usize = 512;
 

@@ -12,7 +12,7 @@ use oxideav_core::{
     CodecId, CodecOptions, CodecParameters, ColorSignal, Frame, PixelFormat, RuntimeContext,
     VideoFrame, VideoPlane,
 };
-use oxideav_mjpeg::{decode, JpegImage};
+use oxideav_mjpeg::{JpegImage, decode};
 
 fn context() -> RuntimeContext {
     let mut ctx = RuntimeContext::new();

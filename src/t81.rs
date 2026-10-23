@@ -1192,7 +1192,7 @@ impl Restarts {
     /// Call before coding the next unit; returns true when an `RSTm`
     /// was emitted (the caller resets its predictions).
     fn before_unit(&mut self, sink: &mut Sink<'_>) -> bool {
-        let boundary = self.ri > 0 && self.done > 0 && self.done % self.ri == 0;
+        let boundary = self.ri > 0 && self.done > 0 && self.done.is_multiple_of(self.ri);
         if boundary {
             sink.restart(self.m);
             self.m = (self.m + 1) & 7;
@@ -1290,7 +1290,7 @@ fn code_lossless(
         (comps[0].width, comps[0].height)
     };
     let ri = frame.restart_interval as usize;
-    if ri > 0 && ri % mcus_x != 0 {
+    if ri > 0 && !ri.is_multiple_of(mcus_x) {
         return Err(Error::invalid(format!(
             "JPEG encode: lossless restart interval {ri} is not a multiple of the {mcus_x} MCUs per MCU-row (T.81 Table B.7)"
         )));
@@ -1325,11 +1325,7 @@ fn code_lossless(
                         let at = |xx: usize, yy: usize| g.grid[yy * g.w_pad + xx];
                         let cur = at(x, y);
                         let px = if y == first_row[ci] {
-                            if x == 0 {
-                                initial
-                            } else {
-                                at(x - 1, y)
-                            }
+                            if x == 0 { initial } else { at(x - 1, y) }
                         } else if x == 0 {
                             at(x, y - 1)
                         } else {
@@ -2011,11 +2007,7 @@ impl EncodeOptions {
             .map(|i| {
                 let (h, v) = sampling[i];
                 let (quant_id, huff_id) = if self.table_ids.is_empty() {
-                    if i == 0 {
-                        (0, 0)
-                    } else {
-                        (1, 1)
-                    }
+                    if i == 0 { (0, 0) } else { (1, 1) }
                 } else {
                     self.table_ids[i]
                 };

@@ -68,7 +68,7 @@
 #[cfg(feature = "registry")]
 mod registry_benches {
 
-    use criterion::{black_box, criterion_group, Criterion, Throughput};
+    use criterion::{Criterion, Throughput, black_box, criterion_group};
 
     use oxideav_core::frame::VideoPlane;
     use oxideav_core::{

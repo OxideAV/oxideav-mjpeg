@@ -27,7 +27,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
-use oxideav_mjpeg_fuzz::{assert_plane_within, libjpeg, rgb_image_from_fuzz_input, YUV_TOLERANCE};
+use oxideav_mjpeg_fuzz::{YUV_TOLERANCE, assert_plane_within, libjpeg, rgb_image_from_fuzz_input};
 
 fuzz_target!(|data: &[u8]| {
     if !libjpeg::available() {

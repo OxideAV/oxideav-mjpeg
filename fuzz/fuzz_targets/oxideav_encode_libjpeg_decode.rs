@@ -13,7 +13,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame};
 use oxideav_mjpeg::encoder::encode_jpeg;
 use oxideav_mjpeg_fuzz::{
-    assert_within, libjpeg, rgb_image_from_fuzz_input, rgb_to_yuv444p_frame, CROSS_TOLERANCE,
+    CROSS_TOLERANCE, assert_within, libjpeg, rgb_image_from_fuzz_input, rgb_to_yuv444p_frame,
 };
 
 fuzz_target!(|data: &[u8]| {

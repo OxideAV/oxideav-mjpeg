@@ -58,7 +58,7 @@ use crate::image::{MjpegFrame as VideoFrame, MjpegPixelFormat as PixelFormat};
 // integration tests) that import `oxideav_mjpeg::encoder::make_encoder`
 // or `oxideav_mjpeg::encoder::MjpegEncoder` keep compiling.
 #[cfg(feature = "registry")]
-pub use crate::registry::{make_encoder, MjpegEncoder};
+pub use crate::registry::{MjpegEncoder, make_encoder};
 
 use crate::jpeg::dct::{fdct8x8, idct8x8};
 use crate::jpeg::huffman::{
@@ -66,7 +66,7 @@ use crate::jpeg::huffman::{
     STD_AC_LUMA_VALS, STD_DC_CHROMA_BITS, STD_DC_CHROMA_VALS, STD_DC_LUMA_BITS, STD_DC_LUMA_VALS,
 };
 use crate::jpeg::markers;
-use crate::jpeg::quant::{scale_for_quality, DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50};
+use crate::jpeg::quant::{DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50, scale_for_quality};
 use crate::jpeg::zigzag::ZIGZAG;
 
 /// Quality factor 1..=100, scaled against the Annex K Q=50 base tables.
@@ -123,7 +123,7 @@ pub fn extract_app_segments(jpeg: &[u8]) -> Vec<u8> {
         }
         let marker = jpeg[p];
         p += 1; // now points at length MSB
-                // SOI/EOI/RST have no length.
+        // SOI/EOI/RST have no length.
         if marker == markers::SOI || marker == markers::EOI || markers::is_rst(marker) {
             pos = p;
             continue;
@@ -196,7 +196,7 @@ pub fn encode_jpeg_with_meta(
         _ => {
             return Err(Error::unsupported(
                 "MJPEG encoder: unsupported pixel format",
-            ))
+            ));
         }
     };
     if frame.planes.len() != 3 {
@@ -344,7 +344,7 @@ fn encode_jpeg_progressive_inner(
         _ => {
             return Err(Error::unsupported(
                 "MJPEG progressive encoder: unsupported pixel format",
-            ))
+            ));
         }
     };
     if frame.planes.len() != 3 {
@@ -1110,7 +1110,7 @@ fn emit_ac_refine_block(
     //
     // We track which positions have been newly set by previous events.
     let mut decoder_nonzero = [false; 64]; // tracks decoder's view of the band
-                                           // Pre-populate with positions that were nonzero in the first pass.
+    // Pre-populate with positions that were nonzero in the first pass.
     for k in ss..=se {
         let v = block[ZIGZAG[k]];
         if v.unsigned_abs() >> 1 != 0 {
@@ -1234,7 +1234,7 @@ fn write_sof0(out: &mut Vec<u8>, width: u16, height: u16, h: u8, v: u8) {
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
     payload.push(3); // components
-                     // Y
+    // Y
     payload.push(1);
     payload.push((h << 4) | v);
     payload.push(0);
@@ -1603,7 +1603,7 @@ pub(crate) fn encode_jpeg_non_interleaved(
         _ => {
             return Err(Error::unsupported(
                 "non-interleaved helper: unsupported format",
-            ))
+            ));
         }
     };
     if frame.planes.len() != 3 {
@@ -2199,12 +2199,13 @@ pub fn encode_jpeg_cmyk(
     quality: u8,
     adobe_transform: Option<u8>,
 ) -> Result<Vec<u8>> {
-    if let Some(t) = adobe_transform {
-        if t != 0 && t != 2 {
-            return Err(Error::invalid(
-                "encode_jpeg_cmyk: adobe_transform must be 0 (CMYK) or 2 (YCCK)",
-            ));
-        }
+    if let Some(t) = adobe_transform
+        && t != 0
+        && t != 2
+    {
+        return Err(Error::invalid(
+            "encode_jpeg_cmyk: adobe_transform must be 0 (CMYK) or 2 (YCCK)",
+        ));
     }
     let planes = unpack_cmyk(width, height, packed, stride)?;
     let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
@@ -2232,12 +2233,13 @@ pub fn encode_jpeg_cmyk_progressive(
     quality: u8,
     adobe_transform: Option<u8>,
 ) -> Result<Vec<u8>> {
-    if let Some(t) = adobe_transform {
-        if t != 0 && t != 2 {
-            return Err(Error::invalid(
-                "encode_jpeg_cmyk_progressive: adobe_transform must be 0 (CMYK) or 2 (YCCK)",
-            ));
-        }
+    if let Some(t) = adobe_transform
+        && t != 0
+        && t != 2
+    {
+        return Err(Error::invalid(
+            "encode_jpeg_cmyk_progressive: adobe_transform must be 0 (CMYK) or 2 (YCCK)",
+        ));
     }
     let planes = unpack_cmyk(width, height, packed, stride)?;
     let refs: [&[u8]; 4] = [&planes[0], &planes[1], &planes[2], &planes[3]];
@@ -2814,11 +2816,11 @@ fn write_sof0_rgb24_8bit(out: &mut Vec<u8>, width: u16, height: u16) {
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
     payload.push(3); // Nf = 3
-                     // R
+    // R
     payload.push(b'R');
     payload.push(0x11); // H=1 V=1
     payload.push(0); // qt = 0
-                     // G
+    // G
     payload.push(b'G');
     payload.push(0x11);
     payload.push(0);
@@ -3097,8 +3099,8 @@ fn write_sof1_yuv_12bit(out: &mut Vec<u8>, width: u16, height: u16, h_factor: u8
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
     payload.push(3); // Nf = 3 components
-                     // Y component (id=1) carries the variable sampling factor; chroma is
-                     // always H=V=1.
+    // Y component (id=1) carries the variable sampling factor; chroma is
+    // always H=V=1.
     payload.push(1);
     payload.push((h_factor << 4) | v_factor);
     payload.push(0); // qt = 0 (luma)
@@ -3808,7 +3810,7 @@ pub fn encode_arith_jpeg_grayscale(
     quality: u8,
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
 
     let w = width as usize;
     let h = height as usize;
@@ -3924,7 +3926,7 @@ pub fn encode_arith_jpeg_progressive_grayscale(
     quality: u8,
 ) -> Result<Vec<u8>> {
     use crate::jpeg::arith::{
-        encode_ac as arith_encode_ac, encode_dc_diff, AcStats, ArithEncoder, DcStats,
+        AcStats, ArithEncoder, DcStats, encode_ac as arith_encode_ac, encode_dc_diff,
     };
 
     let w = width as usize;
@@ -4038,7 +4040,7 @@ pub fn encode_arith_jpeg_yuv(
     quality: u8,
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
 
     let width = width as usize;
     let height = height as usize;
@@ -4049,7 +4051,7 @@ pub fn encode_arith_jpeg_yuv(
         _ => {
             return Err(Error::unsupported(
                 "arith-DCT YUV encoder: unsupported pixel format",
-            ))
+            ));
         }
     };
     if frame.planes.len() != 3 {
@@ -4237,7 +4239,7 @@ pub fn encode_arith_jpeg_rgb24(
     quality: u8,
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
 
     let w = width as usize;
     let h = height as usize;
@@ -4385,7 +4387,7 @@ pub fn encode_lossless_arith_jpeg_grayscale_with_opts(
     restart_interval: u16,
     point_transform: u8,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+    use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 
     if !(2..=16).contains(&precision) {
         return Err(Error::unsupported(format!(
@@ -4639,7 +4641,7 @@ pub fn encode_lossless_arith_jpeg_rgb_with_opts(
     restart_interval: u16,
     point_transform: u8,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+    use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 
     if !(2..=16).contains(&precision) {
         return Err(Error::unsupported(format!(
@@ -4931,7 +4933,7 @@ pub fn encode_lossless_arith_jpeg_cmyk_with_opts(
     restart_interval: u16,
     point_transform: u8,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+    use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 
     if !(1..=7).contains(&predictor) {
         return Err(Error::invalid(format!(
@@ -5478,7 +5480,7 @@ pub fn encode_lossless_jpeg_yuv_with_opts(
     let vf = v_factor as usize;
     let cw = w.div_ceil(hf); // chroma width
     let ch = h.div_ceil(vf); // chroma height
-                             // Bounds: each supplied plane must hold its (sub)sampled extent.
+    // Bounds: each supplied plane must hold its (sub)sampled extent.
     if y_stride < w || y_plane.len() < y_stride * h {
         return Err(Error::invalid("lossless YUV encoder: Y plane too small"));
     }
@@ -5691,7 +5693,7 @@ pub fn encode_lossless_arith_jpeg_yuv_with_opts(
     restart_interval: u16,
     point_transform: u8,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+    use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 
     if !(1..=7).contains(&predictor) {
         return Err(Error::invalid(format!(
@@ -6345,7 +6347,7 @@ fn write_sof_hier_frame(
 /// T.81 §J.1.1.1 does not standardise it; only the ×2 *upsampling* filter
 /// is normative (§J.1.1.2).
 fn hier_downsample_2x2(plane: &[u32], w: usize, h: usize) -> Vec<u32> {
-    debug_assert!(w % 2 == 0 && h % 2 == 0);
+    debug_assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
     let lw = w / 2;
     let lh = h / 2;
     let mut out = vec![0u32; lw * lh];
@@ -6455,7 +6457,7 @@ fn hier_check_geometry(w: usize, h: usize, levels: u8) -> Result<()> {
         ));
     }
     let factor = 1usize << (levels - 1);
-    if w % factor != 0 || h % factor != 0 {
+    if !w.is_multiple_of(factor) || !h.is_multiple_of(factor) {
         return Err(Error::invalid(format!(
             "hierarchical encoder: {w}x{h} is not divisible by 2^(levels-1) = {factor}; \
              every stage must be exactly half the next (T.81 §J.1.1.2 EXP expansion is exact ×2)"
@@ -6627,7 +6629,7 @@ fn hier_write_lossless_arith_scan(
     differential: bool,
     precision: u8,
 ) -> Result<()> {
-    use crate::jpeg::arith::{encode_lossless_diff, ArithEncoder, LosslessStats};
+    use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 
     let nc = planes.len();
     let mut stats: Vec<LosslessStats> = (0..nc).map(|_| LosslessStats::new()).collect();
@@ -6671,11 +6673,7 @@ fn hier_write_lossless_arith_scan(
                     // Modulo-2^16 difference reduced to the canonical
                     // -32768..=32767 representative (§H.1.2.1 / §H.1.2.2).
                     let dm = (actual.wrapping_sub(pred) & 0xFFFF) as i32;
-                    if dm >= 0x8000 {
-                        dm - 0x1_0000
-                    } else {
-                        dm
-                    }
+                    if dm >= 0x8000 { dm - 0x1_0000 } else { dm }
                 };
                 let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                 let db = prev_diff[ci][x];
@@ -7630,7 +7628,7 @@ fn hier_encode_dct_frame_arith(
     quant: &[u16; 64],
     differential: bool,
 ) -> Vec<Vec<u32>> {
-    use crate::jpeg::arith::{encode_block as arith_encode_block, AcStats, ArithEncoder, DcStats};
+    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
 
     let nc = planes_i32.len();
     write_sof_hier_frame(
@@ -8121,7 +8119,7 @@ fn hier_encode_prog_frame_arith(
     differential: bool,
 ) -> Vec<Vec<u32>> {
     use crate::jpeg::arith::{
-        encode_ac as arith_encode_ac, encode_dc_diff, AcStats, ArithEncoder, DcStats,
+        AcStats, ArithEncoder, DcStats, encode_ac as arith_encode_ac, encode_dc_diff,
     };
 
     let nc = planes_i32.len();

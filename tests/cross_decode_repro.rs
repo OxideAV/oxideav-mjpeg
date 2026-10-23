@@ -167,7 +167,7 @@ fn assert_plane_within(
 // ---------------------------------------------------------------------------
 
 mod libjpeg {
-    use libloading::{Library, Symbol};
+    use dlsym::Library;
     use std::os::raw::{c_int, c_uchar, c_ulong};
     use std::sync::OnceLock;
 
@@ -185,12 +185,15 @@ mod libjpeg {
 
     type TjHandle = *mut std::ffi::c_void;
 
+    // The `Library` lives in a `'static` `OnceLock` and is never closed, so
+    // the raw function pointers detached below with `Symbol::into_inner`
+    // can never dangle.
     fn lib() -> Option<&'static Library> {
         static LIB: OnceLock<Option<Library>> = OnceLock::new();
         LIB.get_or_init(|| {
             for name in CANDIDATES {
                 // SAFETY: libturbojpeg is well-behaved at load time.
-                if let Ok(l) = unsafe { Library::new(name) } {
+                if let Ok(l) = unsafe { Library::open(name) } {
                     return Some(l);
                 }
             }
@@ -227,10 +230,10 @@ mod libjpeg {
             return None;
         }
         unsafe {
-            let init: Symbol<InitFn> = l.get(b"tjInitCompress").ok()?;
-            let destroy: Symbol<DestroyFn> = l.get(b"tjDestroy").ok()?;
-            let free: Symbol<FreeFn> = l.get(b"tjFree").ok()?;
-            let compress: Symbol<CompressFn> = l.get(b"tjCompress2").ok()?;
+            let init: InitFn = l.get::<InitFn>(c"tjInitCompress").ok()?.into_inner();
+            let destroy: DestroyFn = l.get::<DestroyFn>(c"tjDestroy").ok()?.into_inner();
+            let free: FreeFn = l.get::<FreeFn>(c"tjFree").ok()?.into_inner();
+            let compress: CompressFn = l.get::<CompressFn>(c"tjCompress2").ok()?.into_inner();
             let handle = init();
             if handle.is_null() {
                 return None;
@@ -294,11 +297,15 @@ mod libjpeg {
 
         let l = lib()?;
         unsafe {
-            let init: Symbol<InitFn> = l.get(b"tjInitDecompress").ok()?;
-            let destroy: Symbol<DestroyFn> = l.get(b"tjDestroy").ok()?;
-            let dec: Symbol<DecYuvPlanesFn> = l.get(b"tjDecompressToYUVPlanes").ok()?;
-            let plane_w: Symbol<PlaneWidthFn> = l.get(b"tjPlaneWidth").ok()?;
-            let plane_h: Symbol<PlaneHeightFn> = l.get(b"tjPlaneHeight").ok()?;
+            let init: InitFn = l.get::<InitFn>(c"tjInitDecompress").ok()?.into_inner();
+            let destroy: DestroyFn = l.get::<DestroyFn>(c"tjDestroy").ok()?.into_inner();
+            let dec: DecYuvPlanesFn = l
+                .get::<DecYuvPlanesFn>(c"tjDecompressToYUVPlanes")
+                .ok()?
+                .into_inner();
+            let plane_w: PlaneWidthFn = l.get::<PlaneWidthFn>(c"tjPlaneWidth").ok()?.into_inner();
+            let plane_h: PlaneHeightFn =
+                l.get::<PlaneHeightFn>(c"tjPlaneHeight").ok()?.into_inner();
 
             let handle = init();
             if handle.is_null() {

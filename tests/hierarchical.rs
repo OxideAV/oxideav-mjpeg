@@ -254,7 +254,7 @@ fn decode(jpeg: Vec<u8>, w: u32, h: u32) -> oxideav_core::VideoFrame {
 /// Build a complete two-stage spatial-lossless hierarchical stream from a
 /// full-resolution image, reconstructing exactly on decode.
 fn build_hierarchical(full: &[u32], w: usize, h: usize) -> Vec<u8> {
-    assert!(w % 2 == 0 && h % 2 == 0);
+    assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
     let lw = w / 2;
     let lh = h / 2;
     // Low-resolution reference: simple decimation (take the top-left sample
@@ -401,7 +401,7 @@ fn encode_diff_scan_nc(diffs: &[Vec<i32>], w: usize, h: usize) -> Vec<u8> {
 /// component bit-exactly. Component IDs 1, 2, 3 map to R, G, B on the
 /// `Rgb24` decode shape (P = 8); no Adobe APP14 is emitted.
 fn build_hierarchical_nc(full: &[Vec<u32>], w: usize, h: usize) -> Vec<u8> {
-    assert!(w % 2 == 0 && h % 2 == 0);
+    assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
     let nc = full.len();
     let lw = w / 2;
     let lh = h / 2;
@@ -428,11 +428,7 @@ fn build_hierarchical_nc(full: &[Vec<u32>], w: usize, h: usize) -> Vec<u8> {
         let d: Vec<i32> = (0..w * h)
             .map(|i| {
                 let raw = (((full[c][i] as i32 - up[c][i] as i32) % 256) + 256) % 256;
-                if raw >= 128 {
-                    raw - 256
-                } else {
-                    raw
-                }
+                if raw >= 128 { raw - 256 } else { raw }
             })
             .collect();
         diffs.push(d);
@@ -593,11 +589,7 @@ fn spatial_hierarchical_horizontal_only_expansion() {
     let diff: Vec<i32> = (0..w * h)
         .map(|i| {
             let raw = (((full[i] as i32 - up[i] as i32) % 256) + 256) % 256;
-            if raw >= 128 {
-                raw - 256
-            } else {
-                raw
-            }
+            if raw >= 128 { raw - 256 } else { raw }
         })
         .collect();
 

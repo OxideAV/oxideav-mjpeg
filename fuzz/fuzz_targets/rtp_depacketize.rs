@@ -43,7 +43,7 @@
 //! cross-frame table cache all get exercised in a single run.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mjpeg::rtp::{parse_main_header, parse_restart_header, JpegDepacketizer, Progress};
+use oxideav_mjpeg::rtp::{JpegDepacketizer, Progress, parse_main_header, parse_restart_header};
 
 /// Discard inputs larger than this. The depacketizer copies each
 /// fragment's scan bytes into a per-frame buffer keyed on the

@@ -339,7 +339,7 @@ fn yuv_planar_to_rgb(frame: &VideoFrame, width: u32, height: u32) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 mod libjpeg {
-    use libloading::{Library, Symbol};
+    use dlsym::Library;
     use std::os::raw::{c_int, c_uchar, c_ulong};
     use std::sync::OnceLock;
 
@@ -365,6 +365,9 @@ mod libjpeg {
 
     type TjHandle = *mut std::ffi::c_void;
 
+    // The `Library` lives in a `'static` `OnceLock` and is never closed, so
+    // the raw function pointers detached below with `Symbol::into_inner`
+    // can never dangle.
     fn lib() -> Option<&'static Library> {
         static LIB: OnceLock<Option<Library>> = OnceLock::new();
         LIB.get_or_init(|| {
@@ -372,7 +375,7 @@ mod libjpeg {
                 // SAFETY: `Library::new` is documented as unsafe
                 // because the loaded library may run code at load
                 // time. Acceptable for test tooling.
-                if let Ok(l) = unsafe { Library::new(name) } {
+                if let Ok(l) = unsafe { Library::open(name) } {
                     return Some(l);
                 }
             }
@@ -413,10 +416,10 @@ mod libjpeg {
             return None;
         }
         unsafe {
-            let init: Symbol<InitFn> = l.get(b"tjInitCompress").ok()?;
-            let destroy: Symbol<DestroyFn> = l.get(b"tjDestroy").ok()?;
-            let free: Symbol<FreeFn> = l.get(b"tjFree").ok()?;
-            let compress: Symbol<CompressFn> = l.get(b"tjCompress2").ok()?;
+            let init: InitFn = l.get::<InitFn>(c"tjInitCompress").ok()?.into_inner();
+            let destroy: DestroyFn = l.get::<DestroyFn>(c"tjDestroy").ok()?.into_inner();
+            let free: FreeFn = l.get::<FreeFn>(c"tjFree").ok()?.into_inner();
+            let compress: CompressFn = l.get::<CompressFn>(c"tjCompress2").ok()?.into_inner();
 
             let handle = init();
             if handle.is_null() {
@@ -486,10 +489,11 @@ mod libjpeg {
 
         let l = lib()?;
         unsafe {
-            let init: Symbol<InitFn> = l.get(b"tjInitDecompress").ok()?;
-            let destroy: Symbol<DestroyFn> = l.get(b"tjDestroy").ok()?;
-            let header: Symbol<HeaderFn> = l.get(b"tjDecompressHeader2").ok()?;
-            let decompress: Symbol<DecompressFn> = l.get(b"tjDecompress2").ok()?;
+            let init: InitFn = l.get::<InitFn>(c"tjInitDecompress").ok()?.into_inner();
+            let destroy: DestroyFn = l.get::<DestroyFn>(c"tjDestroy").ok()?.into_inner();
+            let header: HeaderFn = l.get::<HeaderFn>(c"tjDecompressHeader2").ok()?.into_inner();
+            let decompress: DecompressFn =
+                l.get::<DecompressFn>(c"tjDecompress2").ok()?.into_inner();
 
             let handle = init();
             if handle.is_null() {

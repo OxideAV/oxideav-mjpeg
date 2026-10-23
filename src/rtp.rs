@@ -39,7 +39,7 @@ use crate::jpeg::huffman::{
     STD_DC_CHROMA_VALS, STD_DC_LUMA_BITS, STD_DC_LUMA_VALS,
 };
 use crate::jpeg::markers;
-use crate::jpeg::quant::{scale_for_quality, DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50};
+use crate::jpeg::quant::{DEFAULT_CHROMA_Q50, DEFAULT_LUMA_Q50, scale_for_quality};
 use crate::jpeg::zigzag::ZIGZAG;
 
 /// Length in bytes of the RFC 2435 §3.1 main JPEG header.
@@ -207,7 +207,7 @@ fn write_sof0(out: &mut Vec<u8>, width: u16, height: u16, luma_h: u8, luma_v: u8
     out.extend_from_slice(&height.to_be_bytes());
     out.extend_from_slice(&width.to_be_bytes());
     out.push(3); // components
-                 // Y: id 1, sampling luma_h x luma_v, quant table 0.
+    // Y: id 1, sampling luma_h x luma_v, quant table 0.
     out.push(1);
     out.push((luma_h << 4) | luma_v);
     out.push(0);
@@ -399,10 +399,10 @@ impl JpegDepacketizer {
             // them so later frames may omit them (Length = 0). A new static
             // Q replaces any previously cached pair; Q = 255 (dynamic) never
             // touches the cache.
-            if let Some(qp) = qp {
-                if (128..=254).contains(&main.q) {
-                    self.cached_tables = Some((main.q, qp));
-                }
+            if let Some(qp) = qp
+                && (128..=254).contains(&main.q)
+            {
+                self.cached_tables = Some((main.q, qp));
             }
             qp
         } else {
@@ -781,9 +781,11 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
                 base_type = Some(match (yh, yv) {
                     (2, 1) => 0,
                     (2, 2) => 1,
-                    _ => return Err(Error::unsupported(
-                        "RTP/JPEG packetize: luma sampling must be 2x1 (type 0) or 2x2 (type 1)",
-                    )),
+                    _ => {
+                        return Err(Error::unsupported(
+                            "RTP/JPEG packetize: luma sampling must be 2x1 (type 0) or 2x2 (type 1)",
+                        ));
+                    }
                 });
                 pos = body + len - 2;
             }
@@ -1413,7 +1415,7 @@ mod tests {
         p.push(50); // Q
         p.push(8); // width 64
         p.push(8); // height 64
-                   // Restart Marker header: DRI=4, F=L=1, count=0x3FFF.
+        // Restart Marker header: DRI=4, F=L=1, count=0x3FFF.
         p.extend_from_slice(&4u16.to_be_bytes());
         p.extend_from_slice(&0xFFFFu16.to_be_bytes());
         p.extend_from_slice(&[0xAA, 0xBB]); // scan

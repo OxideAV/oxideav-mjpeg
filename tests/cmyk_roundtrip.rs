@@ -26,7 +26,7 @@ use oxideav_mjpeg::encoder::{
     encode_jpeg_cmyk, encode_jpeg_cmyk_1111, encode_jpeg_cmyk_progressive,
     encode_jpeg_progressive_cmyk_1111,
 };
-use oxideav_mjpeg::registry::{make_decoder, MjpegEncoder};
+use oxideav_mjpeg::registry::{MjpegEncoder, make_decoder};
 
 /// PSNR across two equal-length byte buffers treated as 8-bit samples.
 fn psnr(a: &[u8], b: &[u8]) -> f64 {

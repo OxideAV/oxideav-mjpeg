@@ -21,7 +21,7 @@ use oxideav_core::{PixelFormat, VideoFrame};
 use oxideav_mjpeg::encoder::{
     encode_jpeg, encode_jpeg_grayscale, encode_jpeg_progressive, encode_lossless_jpeg_grayscale,
 };
-use oxideav_mjpeg::{inspect_jpeg, ChromaSubsampling, ColorHint, JpegInfo, SofKind};
+use oxideav_mjpeg::{ChromaSubsampling, ColorHint, JpegInfo, SofKind, inspect_jpeg};
 
 /// xorshift32 PRNG — matches the shape used by other tests in this
 /// crate so fixture content stays reproducible.

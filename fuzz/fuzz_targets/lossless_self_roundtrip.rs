@@ -57,11 +57,7 @@ fuzz_target!(|data: &[u8]| {
         // 3-component output shaping is packed at P = 8 (Rgb24) and
         // P = 16 (Rgb48Le); the planar mid-precision shapes are pinned
         // by the integration suite instead.
-        if data[2] & 1 == 0 {
-            8
-        } else {
-            16
-        }
+        if data[2] & 1 == 0 { 8 } else { 16 }
     } else {
         2 + data[2] % 15
     };

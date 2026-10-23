@@ -47,7 +47,7 @@ use oxideav_core::{
 use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 
 use crate::jpeg::markers::{self, EOI, SOI};
-use crate::jpeg::parser::{parse_sof, SofInfo};
+use crate::jpeg::parser::{SofInfo, parse_sof};
 
 /// Register the still-image JPEG container under the name `jpeg`.
 pub fn register(reg: &mut ContainerRegistry) {

@@ -660,11 +660,7 @@ impl DcStats {
         if abs <= lower {
             0
         } else if abs <= upper {
-            if da > 0 {
-                4
-            } else {
-                8
-            }
+            if da > 0 { 4 } else { 8 }
         } else if da > 0 {
             12
         } else {
@@ -816,11 +812,7 @@ impl LosslessStats {
         if abs <= lower {
             0
         } else if abs <= upper {
-            if d > 0 {
-                1
-            } else {
-                2
-            }
+            if d > 0 { 1 } else { 2 }
         } else if d > 0 {
             3
         } else {
@@ -838,11 +830,7 @@ impl LosslessStats {
     /// `X1_Context(Db)` — magnitude-set base: 100 when Db is zero /
     /// small (either sign), 129 when Db is large (§H.1.2.3.2).
     fn x1(&self, db: i32) -> usize {
-        if self.classify(db) <= 2 {
-            100
-        } else {
-            129
-        }
+        if self.classify(db) <= 2 { 100 } else { 129 }
     }
 }
 
@@ -1495,7 +1483,7 @@ mod tests {
     #[test]
     fn lossless_context_bases() {
         let st = LosslessStats::new(); // L = 0, U = 1
-                                       // Default bounds: zero = {0}, small = |d| <= 2, large = |d| > 2.
+        // Default bounds: zero = {0}, small = |d| <= 2, large = |d| > 2.
         assert_eq!(st.classify(0), 0);
         assert_eq!(st.classify(1), 1);
         assert_eq!(st.classify(2), 1);

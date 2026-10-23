@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-mjpeg"
 version = "0.1.13"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-mjpeg"
 authors = ["Mark Karpeles"]
@@ -40,13 +40,13 @@ default = ["registry"]
 registry = ["dep:oxideav-core"]
 
 [dev-dependencies]
-# libloading powers the `dlopen`-based libturbojpeg interop in
+# dlsym (Karpelès Lab) powers the `dlopen`-based libturbojpeg interop in
 # `tests/external_roundtrip.rs`: the system shared library is loaded at
 # runtime as a black-box validator (nothing is linked at build time) and
 # the test skips silently when it isn't installed. Mirrors the fuzz
 # harness setup in
 # `fuzz/Cargo.toml`.
-libloading = "0.8"
+dlsym = "0.0.2"
 
 # Round 209 (depth-mode benchmarks): Criterion drives the `codec`
 # bench harness that measures the baseline encode / decode,

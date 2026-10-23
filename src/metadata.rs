@@ -121,7 +121,7 @@ impl JfifPolicy {
             other => {
                 return Err(Error::invalid(format!(
                     "JPEG: jfif policy '{other}' (auto / always / never)"
-                )))
+                )));
             }
         })
     }
@@ -526,12 +526,14 @@ mod tests {
     #[test]
     fn exif_and_xmp_limits_are_typed_refusals() {
         let exif = vec![0u8; EXIF_MAX_BYTES];
-        assert!(embed_metadata(
-            &skeleton(),
-            &Metadata::new().with_exif(exif),
-            JfifPolicy::Auto
-        )
-        .is_ok());
+        assert!(
+            embed_metadata(
+                &skeleton(),
+                &Metadata::new().with_exif(exif),
+                JfifPolicy::Auto
+            )
+            .is_ok()
+        );
         let err = embed_metadata(
             &skeleton(),
             &Metadata::new().with_exif(vec![0u8; EXIF_MAX_BYTES + 1]),
@@ -540,12 +542,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err}");
         let xmp = vec![b' '; XMP_MAX_BYTES];
-        assert!(embed_metadata(
-            &skeleton(),
-            &Metadata::new().with_xmp(xmp),
-            JfifPolicy::Auto
-        )
-        .is_ok());
+        assert!(
+            embed_metadata(
+                &skeleton(),
+                &Metadata::new().with_xmp(xmp),
+                JfifPolicy::Auto
+            )
+            .is_ok()
+        );
         let err = embed_metadata(
             &skeleton(),
             &Metadata::new().with_xmp(vec![b' '; XMP_MAX_BYTES + 1]),
@@ -563,18 +567,22 @@ mod tests {
         let meta = Metadata::new().with_xmp(b"x".to_vec());
         assert!(embed_metadata(&[], &meta, JfifPolicy::Auto).is_err());
         assert!(embed_metadata(&[0xFF, 0xD8, 0xFF, 0xE1], &meta, JfifPolicy::Auto).is_err());
-        assert!(embed_metadata(
-            &[0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x01],
-            &meta,
-            JfifPolicy::Auto
-        )
-        .is_err());
-        assert!(embed_metadata(
-            &[0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF],
-            &meta,
-            JfifPolicy::Auto
-        )
-        .is_err());
+        assert!(
+            embed_metadata(
+                &[0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x01],
+                &meta,
+                JfifPolicy::Auto
+            )
+            .is_err()
+        );
+        assert!(
+            embed_metadata(
+                &[0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF],
+                &meta,
+                JfifPolicy::Auto
+            )
+            .is_err()
+        );
         // A bare SOI, fill bytes before EOI, or stray bytes: the rest
         // is copied from the next marker on, as the decoder reads it.
         let out = embed_metadata(&[0xFF, 0xD8], &meta, JfifPolicy::Auto).unwrap();

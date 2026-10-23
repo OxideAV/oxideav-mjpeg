@@ -1623,7 +1623,7 @@ org-wide reusable fuzz workflow (60-minute budget, ~4.5 min/target):
   encode → decode round-trip with ±2 LSB YUV tolerance.
 - `libjpeg_encode_oxideav_decode` / `oxideav_encode_libjpeg_decode` —
   cross-decode against a system JPEG library used as a black-box
-  validator, loaded via `libloading` at runtime (no `*-sys` crate in
+  validator, loaded via `dlsym` at runtime (no `*-sys` crate in
   the dep tree). The loader probes the conventional Homebrew install
   paths explicitly so macOS hosts don't run blind.
 

@@ -652,12 +652,14 @@ fn jfif_option_places_the_app0_segment() {
         reference.planes
     );
     // A bad spelling is a typed refusal.
-    assert!(make_encoder(&params(
-        PixelFormat::Gray8,
-        &[("jfif", "maybe")],
-        Vec::new()
-    ))
-    .is_err());
+    assert!(
+        make_encoder(&params(
+            PixelFormat::Gray8,
+            &[("jfif", "maybe")],
+            Vec::new()
+        ))
+        .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------

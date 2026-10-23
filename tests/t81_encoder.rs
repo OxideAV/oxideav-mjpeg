@@ -10,7 +10,7 @@ use oxideav_mjpeg::decode;
 use oxideav_mjpeg::t81::{
     ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet,
 };
-use oxideav_mjpeg::{inspect_jpeg, SofKind};
+use oxideav_mjpeg::{SofKind, inspect_jpeg};
 
 const W: u32 = 37;
 const H: u32 = 29;
@@ -411,7 +411,9 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
                             };
                             o
                         };
-                        let tag = format!("lossless P{precision} nf{nf} {sampling:?} pred{predictor} pt{pt} ri{ri}");
+                        let tag = format!(
+                            "lossless P{precision} nf{nf} {sampling:?} pred{predictor} pt{pt} ri{ri}"
+                        );
                         let out = opts
                             .encode(W, H, &refs)
                             .unwrap_or_else(|e| panic!("{tag}: {e}"));
@@ -593,7 +595,7 @@ fn validators_decode_the_general_writer_output() {
 /// `gather_stats` across two frames sharing one `JPEGTables`.
 #[test]
 fn frame_api_shares_one_table_set_across_frames() {
-    use oxideav_mjpeg::t81::{encode_frame, gather_stats, HuffStats, JpegComponent, JpegFrame};
+    use oxideav_mjpeg::t81::{HuffStats, JpegComponent, JpegFrame, encode_frame, gather_stats};
     let a = planes(1, 12, &[]);
     let b: Vec<u16> = a[0].iter().map(|&v| 4095 - v).collect();
     let frame = JpegFrame {

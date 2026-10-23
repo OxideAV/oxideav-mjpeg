@@ -30,15 +30,17 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_mjpeg::metadata::{EXIF_MAX_BYTES, ICC_IDENTIFIER, XMP_MAX_BYTES};
 use oxideav_mjpeg::{
-    embed_metadata, read_metadata, strip_metadata, DecodeOptions, EncodeOptions, JfifPolicy,
-    JpegImage, Metadata, MjpegError, PixelFormat, Plane,
+    DecodeOptions, EncodeOptions, JfifPolicy, JpegImage, Metadata, MjpegError, PixelFormat, Plane,
+    embed_metadata, read_metadata, strip_metadata,
 };
 
 const MAX_INPUT_LEN: usize = 64 * 1024;
 
 /// A blob of `len` bytes filled from a short pattern (any bytes carry).
 fn blob(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+        .collect()
 }
 
 /// Fuzz-shaped metadata: which kinds are set and how long each is,
@@ -131,7 +133,11 @@ fn arbitrary_stream(ctl: &[u8], jpeg: &[u8]) {
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), embedded.clone()))
             .expect("send");
         if let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            assert_eq!(Metadata::from_blobs(&vf.blobs()), after, "frame blobs == metadata");
+            assert_eq!(
+                Metadata::from_blobs(&vf.blobs()),
+                after,
+                "frame blobs == metadata"
+            );
         }
     }
 }

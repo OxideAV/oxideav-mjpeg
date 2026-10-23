@@ -711,7 +711,9 @@ impl JpegImage {
             )));
         }
         let rgb: Vec<u8> = data[..needed]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|px| [px[0], px[1], px[2]])
             .collect();
         Self::from_rgb8(width, height, rgb)
@@ -1104,17 +1106,19 @@ mod tests {
             vec![Plane::new(4, vec![0; 15])],
         ));
         // The last row may be unpadded; chroma planes use their own geometry.
-        assert!(JpegImage::new(
-            3,
-            2,
-            MjpegPixelFormat::Yuv420P,
-            vec![
-                Plane::new(8, vec![0; 11]),
-                Plane::new(2, vec![0; 2]),
-                Plane::new(2, vec![0; 2]),
-            ],
-        )
-        .is_ok());
+        assert!(
+            JpegImage::new(
+                3,
+                2,
+                MjpegPixelFormat::Yuv420P,
+                vec![
+                    Plane::new(8, vec![0; 11]),
+                    Plane::new(2, vec![0; 2]),
+                    Plane::new(2, vec![0; 2]),
+                ],
+            )
+            .is_ok()
+        );
         assert!(JpegImage::from_rgba8(1, 1, vec![0; 4]).is_ok());
     }
 
@@ -1138,16 +1142,18 @@ mod tests {
         assert!(frame.pts.is_none());
         let back = JpegImage::from_frame(frame, 2, 2, MjpegPixelFormat::Yuv420P).unwrap();
         assert_eq!(back.planes, img.planes);
-        assert!(JpegImage::from_frame(
-            MjpegFrame {
-                pts: None,
-                planes: vec![]
-            },
-            2,
-            2,
-            MjpegPixelFormat::Gray8
-        )
-        .is_err());
+        assert!(
+            JpegImage::from_frame(
+                MjpegFrame {
+                    pts: None,
+                    planes: vec![]
+                },
+                2,
+                2,
+                MjpegPixelFormat::Gray8
+            )
+            .is_err()
+        );
     }
 
     #[test]

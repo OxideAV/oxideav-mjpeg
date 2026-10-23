@@ -413,7 +413,7 @@ impl Demuxer for MjpegDemuxer {
         // Record a waypoint every SEEK_INDEX_INTERVAL frames. The
         // first frame (pts == 0) was already pushed at open time.
         let frame_idx = frame_pts as u64;
-        if frame_idx % SEEK_INDEX_INTERVAL == 0 {
+        if frame_idx.is_multiple_of(SEEK_INDEX_INTERVAL) {
             self.index.maybe_push(frame_pts, frame_start);
         }
 
@@ -481,7 +481,7 @@ impl Demuxer for MjpegDemuxer {
             // waypoint if this frame index is a multiple of the
             // interval; the open-demuxer call already seeds (0, 0).
             let frame_idx = cur_pts as u64;
-            if frame_idx % SEEK_INDEX_INTERVAL == 0 {
+            if frame_idx.is_multiple_of(SEEK_INDEX_INTERVAL) {
                 self.index.maybe_push(cur_pts, start);
             }
             landed_pts = cur_pts;
@@ -495,7 +495,7 @@ impl Demuxer for MjpegDemuxer {
         self.next_offset = cur_offset;
         self.input.seek(SeekFrom::Start(cur_offset))?;
         // Record this waypoint too if it lines up.
-        if (cur_pts as u64) % SEEK_INDEX_INTERVAL == 0 {
+        if (cur_pts as u64).is_multiple_of(SEEK_INDEX_INTERVAL) {
             self.index.maybe_push(cur_pts, cur_offset);
         }
         Ok(target)

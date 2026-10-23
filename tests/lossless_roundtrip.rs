@@ -1008,9 +1008,11 @@ fn lossless_encoders_reject_pt_ge_precision() {
         w, h, &samples, w as usize, 8, 1, 0, 8, // Pt == precision
     )
     .unwrap_err();
-    assert!(format!("{err:?}")
-        .to_lowercase()
-        .contains("point_transform"));
+    assert!(
+        format!("{err:?}")
+            .to_lowercase()
+            .contains("point_transform")
+    );
 
     let plane = vec![0u8; (w * h) as usize];
     let err = encode_lossless_jpeg_rgb_with_opts(
@@ -1024,9 +1026,11 @@ fn lossless_encoders_reject_pt_ge_precision() {
         9, // Pt > precision
     )
     .unwrap_err();
-    assert!(format!("{err:?}")
-        .to_lowercase()
-        .contains("point_transform"));
+    assert!(
+        format!("{err:?}")
+            .to_lowercase()
+            .contains("point_transform")
+    );
 }
 
 /// Build four decorrelated 8-bit planes (C, M, Y, K) so a cross-component

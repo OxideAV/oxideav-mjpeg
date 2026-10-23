@@ -73,18 +73,10 @@ struct Pnm {
 
 impl Pnm {
     fn channels(&self) -> usize {
-        if self.magic == 5 {
-            1
-        } else {
-            3
-        }
+        if self.magic == 5 { 1 } else { 3 }
     }
     fn bytes_per_sample(&self) -> usize {
-        if self.maxval > 255 {
-            2
-        } else {
-            1
-        }
+        if self.maxval > 255 { 2 } else { 1 }
     }
 }
 
@@ -554,7 +546,7 @@ fn compare_per_channel(got: &Decoded, want: &Pnm) -> Vec<ChannelStats> {
 
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)] // Ignored exists for forward-flexibility; some
-                    // corpus runs may not currently use it.
+// corpus runs may not currently use it.
 enum Tier {
     /// Bit-exact match required: every sample on every channel must
     /// equal the reference. Currently used by lossless / arithmetic /
@@ -698,7 +690,8 @@ fn evaluate(case: &CorpusCase) {
     match case.tier {
         Tier::Exact => {
             assert_eq!(
-                total.exact, total.n,
+                total.exact,
+                total.n,
                 "{}: Tier::Exact requires bit-exact match, got {}/{} exact (max|d|={}, PSNR={:.2} dB)",
                 case.name,
                 total.exact,

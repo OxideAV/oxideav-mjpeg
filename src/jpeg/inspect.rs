@@ -44,7 +44,7 @@
 use crate::error::{MjpegError as Error, Result};
 
 use super::markers;
-use super::parser::{parse_dri, parse_sof, MarkerWalker};
+use super::parser::{MarkerWalker, parse_dri, parse_sof};
 use super::zigzag::ZIGZAG;
 
 /// Coarse classification of the SOF marker that opened the frame.
@@ -1444,10 +1444,10 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                 // truncated, and refusing the entire stream over a
                 // bad-density JFIF would be more disruptive than
                 // useful. Only the first JFIF segment wins.
-                if jfif.is_none() {
-                    if let Ok(parsed) = parse_jfif_app0(payload) {
-                        jfif = Some(parsed);
-                    }
+                if jfif.is_none()
+                    && let Ok(parsed) = parse_jfif_app0(payload)
+                {
+                    jfif = Some(parsed);
                 }
                 continue;
             }
@@ -1458,10 +1458,10 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                 // reported as `jfxx = None`. Only the first JFXX segment
                 // wins (a stream may legally carry several extension
                 // segments; the inspector summarises the first).
-                if jfxx.is_none() {
-                    if let Ok(parsed) = parse_jfxx_app0(payload) {
-                        jfxx = Some(parsed);
-                    }
+                if jfxx.is_none()
+                    && let Ok(parsed) = parse_jfxx_app0(payload)
+                {
+                    jfxx = Some(parsed);
                 }
                 continue;
             }
@@ -1491,10 +1491,10 @@ pub fn inspect_jpeg(buf: &[u8]) -> Result<JpegInfo> {
                 // the colour hint above remains in place — the
                 // coarse signal is more tolerant by design. Only
                 // the first APP14 segment wins.
-                if adobe.is_none() {
-                    if let Ok(parsed) = parse_adobe_app14(payload) {
-                        adobe = Some(parsed);
-                    }
+                if adobe.is_none()
+                    && let Ok(parsed) = parse_adobe_app14(payload)
+                {
+                    adobe = Some(parsed);
                 }
                 continue;
             }
@@ -1563,7 +1563,9 @@ fn classify_subsampling(comps: &[InspectedComponent]) -> ChromaSubsampling {
             let hr = y.h_sampling / cb.h_sampling;
             let vr = y.v_sampling / cb.v_sampling;
             // Require exact division — non-integer ratios are unconventional.
-            if y.h_sampling % cb.h_sampling != 0 || y.v_sampling % cb.v_sampling != 0 {
+            if !y.h_sampling.is_multiple_of(cb.h_sampling)
+                || !y.v_sampling.is_multiple_of(cb.v_sampling)
+            {
                 return ChromaSubsampling::Custom;
             }
             match (hr, vr) {
@@ -2943,7 +2945,7 @@ mod tests {
     fn dqt_rejects_bad_table_id() {
         // Tq = 5 is out of the 0..=3 range.
         let mut payload = vec![0x05];
-        payload.extend(std::iter::repeat(1u8).take(64));
+        payload.extend(std::iter::repeat_n(1u8, 64));
         let extras = [(markers::DQT, &payload[..])];
         let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &extras);
         assert!(inspect_jpeg(&buf).is_err());
@@ -2953,7 +2955,7 @@ mod tests {
     fn dqt_rejects_truncated_table() {
         // Pq = 0 promises 64 bytes but only 10 follow.
         let mut payload = vec![0x00];
-        payload.extend(std::iter::repeat(1u8).take(10));
+        payload.extend(std::iter::repeat_n(1u8, 10));
         let extras = [(markers::DQT, &payload[..])];
         let buf = build_prefix(0xC0, 8, 8, 8, &[(1, 1, 1, 0)], &extras);
         assert!(inspect_jpeg(&buf).is_err());

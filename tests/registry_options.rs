@@ -9,10 +9,10 @@ use oxideav_core::{
     CodecId, CodecOptions, CodecParameters, Encoder, Frame, Packet, PixelFormat, TimeBase,
     VideoFrame,
 };
+use oxideav_mjpeg::DecodeOptions;
 use oxideav_mjpeg::encoder::MjpegEncoder;
 use oxideav_mjpeg::registry::{make_decoder, make_encoder};
 use oxideav_mjpeg::t81::{EncodeOptions, HuffmanTables, JpegProcess};
-use oxideav_mjpeg::DecodeOptions;
 
 const W: u32 = 41;
 const H: u32 = 23;
@@ -214,16 +214,20 @@ fn twelve_bit_input_takes_sof1_and_precision_must_match() {
 fn option_bag_is_strict_and_sampling_must_match_the_pixel_format() {
     assert!(make_encoder(&params(PixelFormat::Gray8, &[("bogus", "1")])).is_err());
     assert!(make_encoder(&params(PixelFormat::Gray8, &[("quality", "0")])).is_err());
-    assert!(make_encoder(&params(
-        PixelFormat::Gray8,
-        &[("process", "lossless"), ("predictor", "9")]
-    ))
-    .is_err());
-    assert!(make_encoder(&params(
-        PixelFormat::Yuv420P,
-        &[("sampling", "4x2,1x1,1x1")]
-    ))
-    .is_err());
+    assert!(
+        make_encoder(&params(
+            PixelFormat::Gray8,
+            &[("process", "lossless"), ("predictor", "9")]
+        ))
+        .is_err()
+    );
+    assert!(
+        make_encoder(&params(
+            PixelFormat::Yuv420P,
+            &[("sampling", "4x2,1x1,1x1")]
+        ))
+        .is_err()
+    );
     let (data, _) = encode_one(
         &params(PixelFormat::Yuv420P, &[("sampling", "2x2,1x1,1x1")]),
         &yuv420(),

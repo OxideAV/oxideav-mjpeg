@@ -100,7 +100,10 @@ fn encode_arith_lossless_scan(
     let nc = planes.len();
     let origin: i32 = 1 << 7; // 2^(P-1), P=8
     let mut enc = ArithEncoder::new();
-    let mut stats: Vec<LosslessStats> = (0..nc).map(|_| LosslessStats::new()).collect();
+    // `sos_body` selects `Td = 0` for every component: one statistics
+    // area shared by all of them (T.81 §B.2.3); the `Da` / `Db` contexts
+    // below stay per component.
+    let mut stats = LosslessStats::new();
     let mut prev_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w]).collect();
     let mut cur_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w]).collect();
     for y in 0..h {
@@ -122,7 +125,7 @@ fn encode_arith_lossless_scan(
                 let diff = val - pred;
                 let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                 let db = prev_diff[ci][x];
-                encode_lossless_diff(&mut enc, &mut stats[ci], da, db, diff).unwrap();
+                encode_lossless_diff(&mut enc, &mut stats, da, db, diff).unwrap();
                 cur_diff[ci][x] = diff;
             }
         }

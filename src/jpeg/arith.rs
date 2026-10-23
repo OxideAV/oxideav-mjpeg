@@ -1328,6 +1328,66 @@ pub(crate) fn encode_block(
 // Tests against the K.4 example trace (T.81 Annex K).
 // ---------------------------------------------------------------------------
 
+/// Arithmetic DC coding state of one scan, split as T.81 §B.2.3
+/// prescribes: a scan's `Td` selector "specifies both an arithmetic
+/// coding conditioning table destination and an associated statistics
+/// area", so the 49 DC bins (and the `L` / `U` conditioning) live per
+/// destination and are **shared** by every component that selects the
+/// same `Td` — while `PRED` (§F.2.4.3.1 / §F.1.1.5.1) and `Da`, the
+/// previous DC difference "of the same component" (§F.1.4.4.1.2), are
+/// per component. Coding a block binds the component's two predictors
+/// to its destination's area for the duration of the block. Used by
+/// the decoder and the encoder alike so both sides adapt identically.
+#[doc(hidden)]
+pub struct ArithDcState {
+    /// One statistics area per `Td` destination (bins + `L` / `U`).
+    pub areas: [DcStats; 4],
+    /// `PRED` per component slot.
+    pub pred: Vec<i32>,
+    /// `Da` per component slot.
+    pub prev_diff: Vec<i32>,
+}
+
+impl ArithDcState {
+    /// `slots` component slots, default conditioning (`L = 0`, `U = 1`)
+    /// on every destination.
+    pub fn new(slots: usize) -> Self {
+        Self {
+            areas: std::array::from_fn(|_| DcStats::new()),
+            pred: vec![0; slots],
+            prev_diff: vec![0; slots],
+        }
+    }
+
+    /// Install a DAC `L` / `U` pair on destination `td`.
+    pub fn set_conditioning(&mut self, td: usize, l: u8, u: u8) {
+        self.areas[td & 3].l = l;
+        self.areas[td & 3].u = u;
+    }
+
+    /// Run `f` on destination `td`'s area with component slot `ci`'s
+    /// predictors loaded, then store the predictors back.
+    pub fn with_block<R>(&mut self, td: usize, ci: usize, f: impl FnOnce(&mut DcStats) -> R) -> R {
+        let a = &mut self.areas[td & 3];
+        a.pred = self.pred[ci];
+        a.prev_diff = self.prev_diff[ci];
+        let r = f(a);
+        self.pred[ci] = a.pred;
+        self.prev_diff[ci] = a.prev_diff;
+        r
+    }
+
+    /// §F.1.4.4.1.5 / §F.2.4.4: every area and predictor back to its
+    /// initial state at a restart marker.
+    pub fn restart_reset(&mut self) {
+        for a in self.areas.iter_mut() {
+            a.restart_reset();
+        }
+        self.pred.fill(0);
+        self.prev_diff.fill(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

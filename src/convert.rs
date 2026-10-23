@@ -22,6 +22,14 @@
 //!   samples; no interpolation filter is applied (the spec leaves the
 //!   reconstruction filter to the decoder). This rule is fixed so a
 //!   given stream always yields the same RGB bytes.
+//!
+//! [`to_rgb8_with`] / [`to_rgba8_with`] take a [`ConvertOptions`]
+//! that swaps either kernel for the reference decoder's
+//! ([`ChromaUpsampling::Triangle`]: linear interpolation to the T.871
+//! §9 siting, `(3, 1)` weights per 2:1 axis with replicated edges, the
+//! rounding biases of the reference; [`YcbcrKernel::FixedPoint`]: the
+//! same §7 equations with 16-bit fixed-point coefficients). The two
+//! differ from the defaults by at most one level per sample.
 //! * **Grayscale** replicates the sample into R, G and B.
 //! * **CMYK** (plain ink amounts, `(0, 0, 0, 0)` = white — the decoder
 //!   has already undone the Adobe APP14 complement and the YCCK
@@ -38,30 +46,45 @@
 //!
 //! Alpha is always `255`: JPEG has no alpha channel.
 
-use crate::image::{JpegImage, MjpegPixelFormat as F};
+use crate::image::{
+    ChromaUpsampling, ConvertOptions, JpegImage, MjpegPixelFormat as F, YcbcrKernel,
+};
 
 /// Convert `img` to tightly packed 8-bit RGB (`3 × width × height`
 /// bytes). See the module docs for the kernels.
 pub fn to_rgb8(img: &JpegImage) -> Vec<u8> {
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let mut out = vec![0u8; w * h * 3];
-    fill_rgb(img, &mut out, 3);
-    out
+    to_rgb8_with(img, &ConvertOptions::default())
 }
 
 /// Convert `img` to tightly packed 8-bit RGBA with opaque alpha
 /// (`4 × width × height` bytes).
 pub fn to_rgba8(img: &JpegImage) -> Vec<u8> {
+    to_rgba8_with(img, &ConvertOptions::default())
+}
+
+/// [`to_rgb8`] with explicit conversion knobs (see
+/// [`ConvertOptions`]): the chroma reconstruction filter and the
+/// YCbCr → RGB arithmetic. Only the 8-bit planar YCbCr layouts are
+/// affected; every other layout converts as [`to_rgb8`] does.
+pub fn to_rgb8_with(img: &JpegImage, opts: &ConvertOptions) -> Vec<u8> {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let mut out = vec![0u8; w * h * 3];
+    fill_rgb(img, &mut out, 3, opts);
+    out
+}
+
+/// [`to_rgba8`] with explicit conversion knobs.
+pub fn to_rgba8_with(img: &JpegImage, opts: &ConvertOptions) -> Vec<u8> {
     let w = img.width as usize;
     let h = img.height as usize;
     let mut out = vec![255u8; w * h * 4];
-    fill_rgb(img, &mut out, 4);
+    fill_rgb(img, &mut out, 4, opts);
     out
 }
 
 /// Fill the R, G, B bytes of every `bpp`-byte pixel of `out`.
-fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize) {
+fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) {
     let w = img.width as usize;
     let h = img.height as usize;
     if w == 0 || h == 0 || img.planes.is_empty() {
@@ -150,6 +173,13 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize) {
             let bps = img.format.bytes_per_sample();
             let (dh, dv) = img.format.chroma_divisors();
             let (py, pcb, pcr) = (&img.planes[0], &img.planes[1], &img.planes[2]);
+            if bps == 1
+                && (opts.upsampling != ChromaUpsampling::Nearest
+                    || opts.ycbcr != YcbcrKernel::Exact)
+            {
+                fill_rgb_ycbcr8(img, out, bpp, opts);
+                return;
+            }
             for y in 0..h {
                 let cy = y / dv;
                 for x in 0..w {
@@ -166,6 +196,166 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize) {
             }
         }
     }
+}
+
+/// The 8-bit planar YCbCr conversion with a non-default
+/// [`ConvertOptions`]: chroma is reconstructed to full resolution per
+/// `opts.upsampling` (into two scratch planes), then every pixel goes
+/// through the selected YCbCr → RGB kernel.
+fn fill_rgb_ycbcr8(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let (dh, dv) = img.format.chroma_divisors();
+    let (py, pcb, pcr) = (&img.planes[0], &img.planes[1], &img.planes[2]);
+    let cw = w.div_ceil(dh);
+    let ch = h.div_ceil(dv);
+    let cb = upsample_chroma8(&pcb.data, pcb.stride, cw, ch, w, h, dh, dv, opts.upsampling);
+    let cr = upsample_chroma8(&pcr.data, pcr.stride, cw, ch, w, h, dh, dv, opts.upsampling);
+    for y in 0..h {
+        for x in 0..w {
+            let yy = sample(py, 1, x, y);
+            let (cbv, crv) = (cb[y * w + x] as u32, cr[y * w + x] as u32);
+            let (r, g, b) = match opts.ycbcr {
+                YcbcrKernel::FixedPoint => ycbcr_to_rgb8_fixed(yy, cbv, crv),
+                _ => ycbcr_to_rgb8(yy, cbv, crv, 255),
+            };
+            let o = (y * w + x) * bpp;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+        }
+    }
+}
+
+/// Reconstruct one `cw × ch` 8-bit chroma grid (`stride` samples per
+/// row) to `w × h` with the given divisors `(dh, dv)` and filter.
+/// Samples outside the grid are the nearest edge sample
+/// (replication); a short buffer reads as `0`. Shared with the
+/// decoder, which resamples the layouts without a planar pixel format
+/// (4:4:0, mixed factors) to 4:4:4 itself.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn upsample_chroma8(
+    data: &[u8],
+    stride: usize,
+    cw: usize,
+    ch: usize,
+    w: usize,
+    h: usize,
+    dh: usize,
+    dv: usize,
+    filter: ChromaUpsampling,
+) -> Vec<u8> {
+    let at = |x: usize, y: usize| {
+        data.get(y.min(ch.saturating_sub(1)) * stride + x.min(cw.saturating_sub(1)))
+            .copied()
+            .unwrap_or(0) as u32
+    };
+    let mut out = vec![0u8; w * h];
+    // The triangle filter serves the 2:1 axes only, and — as the
+    // reference decoder does — filters horizontally only once the
+    // chroma plane is at least three samples wide; narrower planes
+    // replicate (the vertical-only 1×2 case has no such gate).
+    let triangle = filter == ChromaUpsampling::Triangle
+        && (dh == 2 || dh == 1)
+        && (dv == 2 || dv == 1)
+        && (dh == 1 || cw > 2);
+    if !triangle || (dh == 1 && dv == 1) || cw == 0 || ch == 0 {
+        for y in 0..h {
+            for x in 0..w {
+                out[y * w + x] = at(x / dh, y / dv) as u8;
+            }
+        }
+        return out;
+    }
+    // Triangle filter: linear interpolation to the T.871 §9 siting
+    // (chroma centred between its luma samples), i.e. weights (3, 1)
+    // per 2:1 axis — the luma sample on the near side of chroma `i`
+    // takes `3·c[i] + c[i∓1]`. Edge samples are replicated. The
+    // rounding biases are the reference decoder's (see
+    // `tests/libjpeg_compat.rs`).
+    let left = |i: usize| i.saturating_sub(1);
+    match (dh, dv) {
+        (2, 1) => {
+            // h2v1: (3·c[i] + c[i−1] + 1) >> 2 and (3·c[i] + c[i+1] + 2) >> 2.
+            for y in 0..h {
+                for x in 0..w {
+                    let i = x / 2;
+                    let c = at(i, y);
+                    let v = if x % 2 == 0 {
+                        (3 * c + at(left(i), y) + 1) >> 2
+                    } else {
+                        (3 * c + at(i + 1, y) + 2) >> 2
+                    };
+                    out[y * w + x] = v as u8;
+                }
+            }
+        }
+        (1, 2) => {
+            // h1v2: the same filter down the columns.
+            for y in 0..h {
+                let j = y / 2;
+                for x in 0..w {
+                    let c = at(x, j);
+                    let v = if y % 2 == 0 {
+                        (3 * c + at(x, left(j)) + 1) >> 2
+                    } else {
+                        (3 * c + at(x, j + 1) + 2) >> 2
+                    };
+                    out[y * w + x] = v as u8;
+                }
+            }
+        }
+        _ => {
+            // h2v2: vertical (3, 1) sums first (exact, scale 4), then
+            // the horizontal (3, 1) filter on those sums (scale 16):
+            // (3·s[i] + s[i−1] + 8) >> 4 and (3·s[i] + s[i+1] + 7) >> 4.
+            let mut colsum = vec![0u32; cw];
+            for y in 0..h {
+                let j = y / 2;
+                let other = if y % 2 == 0 { left(j) } else { j + 1 };
+                for (i, cs) in colsum.iter_mut().enumerate() {
+                    *cs = 3 * at(i, j) + at(i, other);
+                }
+                let s = |i: usize| colsum[i.min(cw - 1)];
+                for x in 0..w {
+                    let i = x / 2;
+                    let v = if x % 2 == 0 {
+                        (3 * s(i) + s(left(i)) + 8) >> 4
+                    } else {
+                        (3 * s(i) + s(i + 1) + 7) >> 4
+                    };
+                    out[y * w + x] = v as u8;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// T.871 §7 inverse relationship with 16-bit fixed-point coefficients
+/// ([`YcbcrKernel::FixedPoint`]): `c₁₆ = round(c · 2^16)`, one
+/// `+ 2^15` rounding term per channel, arithmetic shift, clamp.
+///
+/// ```text
+/// R = Y + ((91881 cr + 32768) >> 16)
+/// G = Y + ((−22554 cb − 46802 cr + 32768) >> 16)
+/// B = Y + ((116130 cb + 32768) >> 16)
+/// ```
+///
+/// with `cb = CB − 128`, `cr = CR − 128`.
+pub(crate) fn ycbcr_to_rgb8_fixed(y: u32, cb: u32, cr: u32) -> (u8, u8, u8) {
+    let y = y as i32;
+    let cb = cb as i32 - 128;
+    let cr = cr as i32 - 128;
+    let r = y + ((91881 * cr + 32768) >> 16);
+    let g = y + ((-22554 * cb - 46802 * cr + 32768) >> 16);
+    let b = y + ((116130 * cb + 32768) >> 16);
+    (
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    )
 }
 
 /// `2^P − 1` for the frame's sample precision, clamped to the carrier

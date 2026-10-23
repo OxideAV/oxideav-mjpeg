@@ -311,7 +311,7 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "baseline_rgb24_64x64_q75",
-        0x4f077d7971eb7490,
+        0xb77520017a0979e2,
         0xadbaacb18a10e44a,
     ),
     (
@@ -331,7 +331,7 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "arith_yuv420_128x128_q75",
-        0x1a32df2072bccf6c,
+        0xc3b76ef5062375e9,
         0x864ab298a0b5b2d2,
     ),
     (
@@ -341,7 +341,7 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "arith_rgb24_64x64_q75",
-        0x0507a91012e698a5,
+        0x20baddedd5747301,
         0xadbaacb18a10e44a,
     ),
     (

@@ -10,8 +10,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - edition 2024, MSRV 1.95; tests / fuzz harness load their black-box reference (libturbojpeg) through dlsym instead of libloading
+- **Planar layout by sampling ratio.** A three-component frame whose two
+  chroma components share one pair of sampling factors dividing luma's
+  decodes to the planar layout of the *ratio* (`Y 2×2 / C 1×2` — the way
+  ffmpeg signals 4:2:2 — is now `Yuv422P` with coded-resolution chroma,
+  not nearest-upsampled `Yuv444P`). Pixel values are unchanged; the
+  chroma planes are simply no longer resampled.
+- **Arithmetic coding: statistics areas live per table destination
+  (T.81 §B.2.3).** The decoder shared bins per *component*; a stream in
+  which several components select the same `Td` / `Ta` (every
+  `cjpeg -arithmetic` colour JPEG: `Cb` and `Cr` both use destination 1)
+  decoded to noise. Bins now sit per destination with `PRED` / `Da` per
+  component (`jpeg::arith::ArithDcState`), in the sequential, progressive
+  and lossless arithmetic decoders. The in-tree arithmetic **encoders**
+  (`encode_arith_jpeg_yuv`, `encode_arith_jpeg_rgb24`, the
+  multi-component lossless and hierarchical arithmetic writers) had the
+  mirror defect and produced streams only this crate could read; they
+  now adapt per destination too. `cjpeg` / `djpeg` / libturbojpeg agree
+  byte for byte with the decoder on 1 100+ streams (fixtures +
+  `tests/libjpeg_compat.rs`).
+- **RGB JPEGs carry no JFIF APP0.** `encode_jpeg_rgb24` /
+  `encode_arith_jpeg_rgb24` wrote a JFIF segment next to the Adobe
+  `transform = 0` marker; T.871 §6.2 fixes the JFIF colour space to
+  YCbCr, so libjpeg-based readers converted the R/G/B planes as YCbCr
+  (the picture came out with the wrong colours everywhere). The Adobe
+  APP14 alone now signals R/G/B, as the `baseline-rgb-32x32` corpus
+  fixture does. Golden byte hashes of the three affected encoders are
+  re-recorded; their decoded pictures are unchanged.
 
 ### Added
+
+- **libjpeg-compatible decode** (#19). `DecodeOptions::libjpeg_compatible()`
+  / `with_libjpeg_compat()` reproduces the reference decoder's default
+  output (`djpeg`, libturbojpeg, ImageMagick) bit-exactly, through three
+  independent, individually selectable knobs — default behaviour is
+  unchanged:
+  - `DecodeOptions::idct` (`IdctMethod::Float` | `Integer`): an accurate
+    integer IDCT — the T.81 §A.3.3 transform in its separable even/odd
+    factorisation with 13-bit fixed-point constants, two extra fraction
+    bits between the column and row passes, round-half-up descaling
+    (`jpeg::dct::idct8x8_int`). Pass order and rounding were fixed by
+    black-box comparison against `djpeg`; the float kernel is within ±1
+    of it everywhere.
+  - `ConvertOptions::upsampling` (`ChromaUpsampling::Nearest` |
+    `Triangle`): linear interpolation to the T.871 §9 chroma siting —
+    the `(3, 1)` triangle filter per 2:1 axis with replicated edges, for
+    4:2:2 (`+1` / `+2` biases, `>> 2`), 4:2:0 (vertical sums first, then
+    `+8` / `+7`, `>> 4`) and 4:4:0; horizontal filtering only once the
+    chroma plane is at least three samples wide, replication for every
+    other ratio (4:1:1, 4×2, …) — exactly the reference's choices.
+    Layouts without a planar pixel format (4:4:0, mixed factors) are
+    reconstructed by the decoder itself with the same filter.
+  - `ConvertOptions::ycbcr` (`YcbcrKernel::Exact` | `FixedPoint`): the
+    T.871 §7 inverse equations with 16-bit fixed-point coefficients
+    (`91881`, `22554`, `46802`, `116130`), one `+ 2^15` rounding term
+    per channel and an arithmetic shift.
+  - Entry points: `decode_rgb8_with` / `decode_rgba8_with(bytes,
+    &DecodeOptions)`, `JpegImage::to_rgb8_with` / `to_rgba8_with(&ConvertOptions)`;
+    `ConvertOptions::libjpeg_compatible()` for planes decoded elsewhere.
+  - `tests/libjpeg_compat.rs`: 17 committed `cjpeg` / `ffmpeg` streams
+    with `djpeg`'s output (every subsampling incl. 4:4:0 and 2-/3-wide
+    chroma, progressive, restart, arithmetic), the 14 lossy
+    `docs/image/jpeg/fixtures/` pictures, and a 162-case libturbojpeg
+    (`tjCompress2` → `tjDecompress2` default flags) cross-check through
+    dlsym — all byte-exact. Out of scope for the compat contract: 12-bit
+    frames (the integer kernel is 8-bit), lossless and hierarchical
+    frames (unchanged, bit-exact already).
 
 - **JPEG metadata through the registry (core 0.1.40 blobs).** The
   `jpeg` and `mjpeg-raw` demuxers declare the (first) picture's ICC

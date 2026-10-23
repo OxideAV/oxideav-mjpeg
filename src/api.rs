@@ -127,7 +127,13 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
     }
     // The same limits are re-checked on every frame header inside the
     // decoder (hierarchical sequences carry several).
-    let mut img = crate::decoder::decode_planes_limited(opts.tables.as_deref(), bytes, limits)?;
+    let mut img = crate::decoder::decode_planes_limited(
+        opts.tables.as_deref(),
+        bytes,
+        limits,
+        opts.idct,
+        opts.convert.upsampling,
+    )?;
     // Every YCbCr JPEG is full range (T.871 §7, T.872 §6.1): label the
     // 8-bit planar layouts `YuvJ*` whether or not a JFIF segment is
     // present.
@@ -148,6 +154,30 @@ pub fn decode_rgb8(bytes: &[u8]) -> Result<RgbImage> {
 pub fn decode_rgba8(bytes: &[u8]) -> Result<RgbaImage> {
     let img = decode(bytes)?;
     Ok(RgbaImage::new(img.width, img.height, img.to_rgba8()))
+}
+
+/// [`decode_rgb8`] with explicit options: the limits, strictness,
+/// tables and IDCT kernel of [`decode_with`], then the conversion
+/// knobs of [`DecodeOptions::convert`]. With
+/// [`DecodeOptions::libjpeg_compatible`] the bytes are those of the
+/// reference decoder's default RGB output.
+pub fn decode_rgb8_with(bytes: &[u8], opts: &DecodeOptions) -> Result<RgbImage> {
+    let img = decode_with(bytes, opts)?;
+    Ok(RgbImage::new(
+        img.width,
+        img.height,
+        img.to_rgb8_with(&opts.convert),
+    ))
+}
+
+/// [`decode_rgba8`] with explicit options (see [`decode_rgb8_with`]).
+pub fn decode_rgba8_with(bytes: &[u8], opts: &DecodeOptions) -> Result<RgbaImage> {
+    let img = decode_with(bytes, opts)?;
+    Ok(RgbaImage::new(
+        img.width,
+        img.height,
+        img.to_rgba8_with(&opts.convert),
+    ))
 }
 
 /// Read `r` to its end and [`decode`] the bytes.
@@ -563,10 +593,17 @@ fn yuv_layout(frame: &SofInfo, twelve_bit: bool) -> PixelFormat {
         .map(|c| c.v_factor)
         .max()
         .unwrap_or(1);
-    let chroma_unit = cb.h_factor == 1 && cb.v_factor == 1 && cr.h_factor == 1 && cr.v_factor == 1;
+    // The layout is the luma-to-chroma sampling *ratio* (`Y 2×2 / C 1×2`
+    // is 4:2:2 just like `Y 2×1 / C 1×1`) — the decoder's `yuv_layout`
+    // rule.
+    let chroma_same = cb.h_factor == cr.h_factor && cb.v_factor == cr.v_factor;
     let luma_max = y.h_factor == h_max && y.v_factor == v_max;
-    if chroma_unit && luma_max {
-        match (y.h_factor, y.v_factor, twelve_bit) {
+    let chroma_divides = cb.h_factor > 0
+        && cb.v_factor > 0
+        && h_max.is_multiple_of(cb.h_factor)
+        && v_max.is_multiple_of(cb.v_factor);
+    if chroma_same && luma_max && chroma_divides {
+        match (h_max / cb.h_factor, v_max / cb.v_factor, twelve_bit) {
             (1, 1, false) => return PixelFormat::Yuv444P,
             (2, 1, false) => return PixelFormat::Yuv422P,
             (2, 2, false) => return PixelFormat::Yuv420P,

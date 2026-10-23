@@ -16,12 +16,14 @@ use crate::image::{JpegImage, MjpegPixelFormat as PixelFormat, Plane as VideoPla
 #[cfg(feature = "registry")]
 pub use crate::registry::make_decoder;
 
+use crate::image::{ChromaUpsampling, IdctMethod};
 use crate::jpeg::arith::{
-    AcRefineStats, AcStats, ArithDecoder, DcStats, LosslessStats, decode_ac as arith_decode_ac,
-    decode_ac_refine as arith_decode_ac_refine, decode_dc_diff as arith_decode_dc_diff,
-    decode_fixed_bit as arith_decode_fixed_bit, decode_lossless_diff as arith_decode_lossless_diff,
+    AcRefineStats, AcStats, ArithDcState, ArithDecoder, DcStats, LosslessStats,
+    decode_ac as arith_decode_ac, decode_ac_refine as arith_decode_ac_refine,
+    decode_dc_diff as arith_decode_dc_diff, decode_fixed_bit as arith_decode_fixed_bit,
+    decode_lossless_diff as arith_decode_lossless_diff,
 };
-use crate::jpeg::dct::idct8x8;
+use crate::jpeg::dct::{idct8x8, idct8x8_int};
 use crate::jpeg::huffman::{HuffTable, parse_dht};
 use crate::jpeg::markers::{self, *};
 use crate::jpeg::parser::{
@@ -76,6 +78,11 @@ struct JpegState {
     arith_ac: [Option<ArithAcConditioning>; 4],
     /// Caller-supplied geometry limits, checked on every frame header.
     limits: DecodeLimits,
+    /// The 8-bit IDCT kernel ([`crate::DecodeOptions::idct`]).
+    idct: IdctMethod,
+    /// The chroma reconstruction filter for the layouts the decoder
+    /// resamples to 4:4:4 itself ([`crate::ConvertOptions::upsampling`]).
+    upsampling: ChromaUpsampling,
 }
 
 /// Container holding both the conditioning parameters (L, U) and the live
@@ -107,6 +114,8 @@ impl JpegState {
             arithmetic: false,
             progressive_arith: false,
             limits: DecodeLimits::default(),
+            idct: IdctMethod::Float,
+            upsampling: ChromaUpsampling::Nearest,
             arith_dc: Default::default(),
             arith_ac: Default::default(),
         }
@@ -446,9 +455,13 @@ pub(crate) fn decode_planes_limited(
     tables: Option<&[u8]>,
     data: &[u8],
     limits: DecodeLimits,
+    idct: IdctMethod,
+    upsampling: ChromaUpsampling,
 ) -> Result<JpegImage> {
     let mut state = JpegState::new();
     state.limits = limits;
+    state.idct = idct;
+    state.upsampling = upsampling;
     if let Some(t) = tables {
         load_table_stream(&mut state, t)?;
     }
@@ -1212,7 +1225,12 @@ fn render_block_8bit(
     stride: usize,
     dst_x0: usize,
     dst_y0: usize,
+    idct: IdctMethod,
 ) {
+    if idct == IdctMethod::Integer {
+        render_block_8bit_int(block, qtf, buf, stride, dst_x0, dst_y0);
+        return;
+    }
     let mut fblock = [0.0f32; 64];
     for k in 0..64 {
         fblock[k] = block[k] as f32 * qtf[k];
@@ -1230,6 +1248,32 @@ fn render_block_8bit(
             } else {
                 v.round() as u8
             };
+        }
+    }
+}
+
+/// [`render_block_8bit`] with the accurate integer IDCT
+/// ([`IdctMethod::Integer`]): dequantise in `i64`-safe integer
+/// arithmetic (`qtf` holds exact integers, see `quant_to_f32`),
+/// [`idct8x8_int`], `+ 128` level shift, clamp to `0..=255`
+/// (T.81 §F.2.1.5).
+#[inline]
+fn render_block_8bit_int(
+    block: &[i32; 64],
+    qtf: &[f32; 64],
+    buf: &mut [u8],
+    stride: usize,
+    dst_x0: usize,
+    dst_y0: usize,
+) {
+    // A T.81 quantiser is ≤ 65535 and a coefficient ≤ 32767 in
+    // magnitude: the product fits i32 (the IDCT widens to i64 itself).
+    let deq: [i32; 64] = std::array::from_fn(|k| block[k].wrapping_mul(qtf[k] as i32));
+    let out = idct8x8_int(&deq);
+    for j in 0..8 {
+        let dst = &mut buf[(dst_y0 + j) * stride + dst_x0..][..8];
+        for (o, &v) in dst.iter_mut().zip(&out[j * 8..j * 8 + 8]) {
+            *o = (v + 128).clamp(0, 255) as u8;
         }
     }
 }
@@ -1430,6 +1474,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                             comp_stride[*sof_idx],
                             dst_x0,
                             dst_y0,
+                            state.idct,
                         );
                     }
                 }
@@ -1478,14 +1523,14 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
             let layout = yuv_layout(sof, width, height, false);
-            planes.extend(shape_yuv_planes(
+            planes.extend(shape_yuv_planes_8bit(
                 sof,
                 &comp_buf,
                 &comp_stride,
                 width,
                 height,
                 layout,
-                emit_plane_8bit,
+                state.upsampling,
             ));
         }
         _ => unreachable!(),
@@ -1505,9 +1550,12 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
 /// `PixelFormat`, the rest are resampled to 4:4:4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum YuvLayout {
-    /// Luma carries `(Hmax, Vmax)`, both chroma components are `1×1`, and
-    /// the ratio has a planar pixel format: the chroma planes are emitted
-    /// at their coded resolution `c_w × c_h`.
+    /// Luma carries `(Hmax, Vmax)`, both chroma components share one
+    /// pair of factors that divides luma's, and the ratio
+    /// `(Hmax / Hc, Vmax / Vc)` has a planar pixel format: the chroma
+    /// planes are emitted at their coded resolution `c_w × c_h` (T.81
+    /// §A.1.1, `⌈X · Hc / Hmax⌉ × ⌈Y · Vc / Vmax⌉`). `Y 2×1, C 1×1`
+    /// and `Y 2×2, C 1×2` are both 4:2:2 — only the ratio matters.
     Native {
         format: PixelFormat,
         c_w: usize,
@@ -1537,27 +1585,32 @@ fn yuv_layout(sof: &SofInfo, width: usize, height: usize, twelve_bit: bool) -> Y
     let cr = sof.components[2];
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
     let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
-    let chroma_unit = cb.h_factor == 1 && cb.v_factor == 1 && cr.h_factor == 1 && cr.v_factor == 1;
+    let chroma_same = cb.h_factor == cr.h_factor && cb.v_factor == cr.v_factor;
     let luma_max = y.h_factor == h_max && y.v_factor == v_max;
-    let native = if chroma_unit && luma_max {
-        match (y.h_factor, y.v_factor, twelve_bit) {
-            (1, 1, false) => Some(PixelFormat::Yuv444P),
-            (2, 1, false) => Some(PixelFormat::Yuv422P),
-            (2, 2, false) => Some(PixelFormat::Yuv420P),
-            (4, 1, false) => Some(PixelFormat::Yuv411P),
-            (1, 1, true) => Some(PixelFormat::Yuv444P12Le),
-            (2, 1, true) => Some(PixelFormat::Yuv422P12Le),
-            (2, 2, true) => Some(PixelFormat::Yuv420P12Le),
+    let chroma_divides = cb.h_factor > 0
+        && cb.v_factor > 0
+        && h_max.is_multiple_of(cb.h_factor)
+        && v_max.is_multiple_of(cb.v_factor);
+    let native = if chroma_same && luma_max && chroma_divides {
+        let ratio = (h_max / cb.h_factor, v_max / cb.v_factor);
+        match (ratio.0, ratio.1, twelve_bit) {
+            (1, 1, false) => Some((PixelFormat::Yuv444P, ratio)),
+            (2, 1, false) => Some((PixelFormat::Yuv422P, ratio)),
+            (2, 2, false) => Some((PixelFormat::Yuv420P, ratio)),
+            (4, 1, false) => Some((PixelFormat::Yuv411P, ratio)),
+            (1, 1, true) => Some((PixelFormat::Yuv444P12Le, ratio)),
+            (2, 1, true) => Some((PixelFormat::Yuv422P12Le, ratio)),
+            (2, 2, true) => Some((PixelFormat::Yuv420P12Le, ratio)),
             _ => None,
         }
     } else {
         None
     };
     match native {
-        Some(format) => YuvLayout::Native {
+        Some((format, (rh, rv))) => YuvLayout::Native {
             format,
-            c_w: width.div_ceil(h_max as usize),
-            c_h: height.div_ceil(v_max as usize),
+            c_w: width.div_ceil(rh as usize),
+            c_h: height.div_ceil(rv as usize),
         },
         None => YuvLayout::Upsampled444 {
             format: if twelve_bit {
@@ -1618,6 +1671,71 @@ fn emit_plane_8bit(src: &[u8], src_stride: usize, w: usize, h: usize) -> VideoPl
         data[y * w..(y + 1) * w].copy_from_slice(&src[y * src_stride..y * src_stride + w]);
     }
     VideoPlane { stride: w, data }
+}
+
+/// [`shape_yuv_planes`] for 8-bit frames with the
+/// [`ChromaUpsampling::Triangle`] filter requested: the layouts that
+/// have no planar pixel format (4:4:0, mixed chroma factors, …) are
+/// resampled to 4:4:4 per component with the same filter
+/// [`crate::convert::upsample_chroma8`] applies to native planes — the
+/// triangle filter on each 2:1 axis whose ratio is integral, replication
+/// otherwise. Native layouts are untouched (their chroma stays coded).
+fn shape_yuv_planes_8bit(
+    sof: &SofInfo,
+    comp: &[Vec<u8>],
+    stride: &[usize],
+    width: usize,
+    height: usize,
+    layout: YuvLayout,
+    upsampling: ChromaUpsampling,
+) -> Vec<VideoPlane> {
+    if upsampling != ChromaUpsampling::Triangle || !matches!(layout, YuvLayout::Upsampled444 { .. })
+    {
+        return shape_yuv_planes(sof, comp, stride, width, height, layout, emit_plane_8bit);
+    }
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    (0..3)
+        .map(|ci| {
+            let hi = (sof.components[ci].h_factor as usize).max(1);
+            let vi = (sof.components[ci].v_factor as usize).max(1);
+            // T.81 §A.1.1 component dimensions.
+            let cw = (width * hi).div_ceil(h_max);
+            let ch = (height * vi).div_ceil(v_max);
+            if hi == h_max && vi == v_max {
+                return emit_plane_8bit(&comp[ci], stride[ci], width, height);
+            }
+            if !h_max.is_multiple_of(hi) || !v_max.is_multiple_of(vi) {
+                // Non-integral ratio: replicate as `shape_yuv_planes` does.
+                let mut full = vec![0u8; width * height];
+                for y in 0..height {
+                    let row = &comp[ci][(y * vi / v_max) * stride[ci]..];
+                    for (x, d) in full[y * width..(y + 1) * width].iter_mut().enumerate() {
+                        *d = row[x * hi / h_max];
+                    }
+                }
+                return VideoPlane {
+                    stride: width,
+                    data: full,
+                };
+            }
+            let data = crate::convert::upsample_chroma8(
+                &comp[ci],
+                stride[ci],
+                cw,
+                ch,
+                width,
+                height,
+                h_max / hi,
+                v_max / vi,
+                upsampling,
+            );
+            VideoPlane {
+                stride: width,
+                data,
+            }
+        })
+        .collect()
 }
 
 /// True when a 3-component baseline / sequential SOF should be decoded as
@@ -1944,49 +2062,25 @@ fn decode_arith_scan_diff(
 
     let interleaved = sos.components.len() == sof.components.len();
 
-    // Per-component DC + AC statistics areas. These are SHARED across all
-    // blocks of a component within this scan and reset only at RSTn (per
-    // §F.2.4 / F.1.4.4 initial-conditions text).
+    // Statistics areas per table destination (T.81 §B.2.3 — components
+    // selecting the same `Td` / `Ta` share one area), predictors per
+    // component; all reset only at RSTn (§F.2.4 / §F.1.4.4).
     let n_comp = sof.components.len();
-    let mut dc_stats: Vec<DcStats> = (0..n_comp)
-        .map(|i| {
-            let mut s = DcStats::new();
-            // Resolve DAC conditioning override for this component's DC
-            // table destination (sos.components[?].dc_table). For an
-            // interleaved scan the same DC destination may be shared across
-            // SOS components; we simply look up the SOS component matching
-            // this SOF index. If no SOS entry is present (i.e. component
-            // not part of this scan), defaults stay.
-            if let Some(sc) = sos.components.iter().find(|sc| {
-                sof.components
-                    .iter()
-                    .position(|fc| fc.id == sc.id)
-                    .map(|j| j == i)
-                    .unwrap_or(false)
-            }) && let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref()
-            {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
-        .collect();
-    let mut ac_stats: Vec<AcStats> = (0..n_comp)
-        .map(|i| {
-            let mut s = AcStats::new();
-            if let Some(sc) = sos.components.iter().find(|sc| {
-                sof.components
-                    .iter()
-                    .position(|fc| fc.id == sc.id)
-                    .map(|j| j == i)
-                    .unwrap_or(false)
-            }) && let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref()
-            {
-                s.kx = cond.kx;
-            }
-            s
-        })
-        .collect();
+    let mut dc_state = ArithDcState::new(n_comp);
+    let mut ac_areas: [AcStats; 4] = std::array::from_fn(|_| AcStats::new());
+    for td in 0..4 {
+        if let Some(cond) = state.arith_dc[td].as_ref() {
+            dc_state.set_conditioning(td, cond.l, cond.u);
+        }
+        if let Some(cond) = state.arith_ac[td].as_ref() {
+            ac_areas[td].kx = cond.kx;
+        }
+    }
+    // `(Td, Ta)` per SOF component slot, from this scan's selectors.
+    let mut comp_tables = vec![(0usize, 0usize); n_comp];
+    for (sc, &sof_idx) in sos.components.iter().zip(sos_map.iter()) {
+        comp_tables[sof_idx] = (sc.dc_table as usize & 3, sc.ac_table as usize & 3);
+    }
 
     // The arithmetic decoder owns its byte source (with 0xFF 0x00 unstuff
     // and marker trapping baked in). When we hit a restart boundary, we
@@ -2023,10 +2117,8 @@ fn decode_arith_scan_diff(
                 scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
                     Error::invalid("arithmetic scan: missing restart marker mid-scan")
                 })?;
-                for s in dc_stats.iter_mut() {
-                    s.restart_reset();
-                }
-                for s in ac_stats.iter_mut() {
+                dc_state.restart_reset();
+                for s in ac_areas.iter_mut() {
                     s.restart_reset();
                 }
                 decoder = ArithDecoder::new(&scan[scan_pos..]);
@@ -2045,14 +2137,17 @@ fn decode_arith_scan_diff(
                             // coefficient directly — zero the prediction state
                             // before each block so no inter-block carry happens.
                             if differential {
-                                dc_stats[sof_idx].pred = 0;
+                                dc_state.pred[sof_idx] = 0;
                             }
-                            decode_arith_block(
-                                &mut decoder,
-                                &mut dc_stats[sof_idx],
-                                &mut ac_stats[sof_idx],
-                                &mut coefs[sof_idx][bi],
-                            )?;
+                            let (td, ta) = comp_tables[sof_idx];
+                            dc_state.with_block(td, sof_idx, |dcs| {
+                                decode_arith_block(
+                                    &mut decoder,
+                                    dcs,
+                                    &mut ac_areas[ta],
+                                    &mut coefs[sof_idx][bi],
+                                )
+                            })?;
                         }
                     }
                 }
@@ -2062,14 +2157,17 @@ fn decode_arith_scan_diff(
                 let blocks_x = mcus_x * c.h_factor as usize;
                 let bi = my * blocks_x + mx;
                 if differential {
-                    dc_stats[sof_idx].pred = 0;
+                    dc_state.pred[sof_idx] = 0;
                 }
-                decode_arith_block(
-                    &mut decoder,
-                    &mut dc_stats[sof_idx],
-                    &mut ac_stats[sof_idx],
-                    &mut coefs[sof_idx][bi],
-                )?;
+                let (td, ta) = comp_tables[sof_idx];
+                dc_state.with_block(td, sof_idx, |dcs| {
+                    decode_arith_block(
+                        &mut decoder,
+                        dcs,
+                        &mut ac_areas[ta],
+                        &mut coefs[sof_idx][bi],
+                    )
+                })?;
             }
             mcus_since_restart += 1;
         }
@@ -2221,22 +2319,22 @@ fn decode_progressive_arith_scan_diff(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Per-SOS-component statistics areas, re-initialised at scan start and
-    // every restart. DC conditioning (L, U) and AC conditioning (Kx) come
-    // from the DAC destinations named by this scan's Tdj / Taj selectors.
+    // DC statistics areas per `Td` destination (shared by the SOS
+    // components selecting it, T.81 §B.2.3), predictors per SOS
+    // component; re-initialised at scan start and every restart. AC
+    // conditioning (Kx) comes from this (single-component) scan's `Ta`.
     // Refinement scans track their own bins (DC refinement none at all —
     // the fixed estimate is stateless).
-    let mut dc_stats: Vec<DcStats> = sos
+    let mut dc_state = ArithDcState::new(sos.components.len());
+    for td in 0..4 {
+        if let Some(cond) = state.arith_dc[td].as_ref() {
+            dc_state.set_conditioning(td, cond.l, cond.u);
+        }
+    }
+    let sos_td: Vec<usize> = sos
         .components
         .iter()
-        .map(|sc| {
-            let mut s = DcStats::new();
-            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
+        .map(|sc| sc.dc_table as usize & 3)
         .collect();
     let mut ac_stats = AcStats::new();
     if let Some(sc) = sos.components.first()
@@ -2271,9 +2369,7 @@ fn decode_progressive_arith_scan_diff(
                 scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
                     Error::invalid("progressive arith: missing restart marker mid-scan")
                 })?;
-                for s in dc_stats.iter_mut() {
-                    s.restart_reset();
-                }
+                dc_state.restart_reset();
                 ac_stats.restart_reset();
                 ac_refine_stats.restart_reset();
                 decoder = ArithDecoder::new(&scan[scan_pos..]);
@@ -2293,15 +2389,17 @@ fn decode_progressive_arith_scan_diff(
                                 // pass decodes the DC directly; zero the
                                 // prediction state before each block.
                                 if differential && sos.ah == 0 {
-                                    dc_stats[sidx].pred = 0;
+                                    dc_state.pred[sidx] = 0;
                                 }
-                                prog_arith_decode_dc(
-                                    &mut decoder,
-                                    &mut dc_stats[sidx],
-                                    &mut coefs[sof_idx][bi],
-                                    sos.ah,
-                                    sos.al,
-                                )?;
+                                dc_state.with_block(sos_td[sidx], sidx, |dcs| {
+                                    prog_arith_decode_dc(
+                                        &mut decoder,
+                                        dcs,
+                                        &mut coefs[sof_idx][bi],
+                                        sos.ah,
+                                        sos.al,
+                                    )
+                                })?;
                             }
                         }
                     }
@@ -2311,15 +2409,17 @@ fn decode_progressive_arith_scan_diff(
                     let blocks_x = mcus_x * c.h_factor as usize;
                     let bi = my * blocks_x + mx;
                     if differential && sos.ah == 0 {
-                        dc_stats[0].pred = 0;
+                        dc_state.pred[0] = 0;
                     }
-                    prog_arith_decode_dc(
-                        &mut decoder,
-                        &mut dc_stats[0],
-                        &mut coefs[sof_idx][bi],
-                        sos.ah,
-                        sos.al,
-                    )?;
+                    dc_state.with_block(sos_td[0], 0, |dcs| {
+                        prog_arith_decode_dc(
+                            &mut decoder,
+                            dcs,
+                            &mut coefs[sof_idx][bi],
+                            sos.ah,
+                            sos.al,
+                        )
+                    })?;
                 }
             } else {
                 let sof_idx = sos_map[0];
@@ -2881,7 +2981,7 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
-                render_block_8bit(block, &qtf, buf, stride, bx * 8, by * 8);
+                render_block_8bit(block, &qtf, buf, stride, bx * 8, by * 8, state.idct);
             }
         }
     }
@@ -2922,14 +3022,14 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
             let layout = yuv_layout(sof, width, height, false);
-            planes.extend(shape_yuv_planes(
+            planes.extend(shape_yuv_planes_8bit(
                 sof,
                 &comp_buf,
                 &comp_stride,
                 width,
                 height,
                 layout,
-                emit_plane_8bit,
+                state.upsampling,
             ));
         }
         PixelFormat::Cmyk => {
@@ -5258,17 +5358,22 @@ fn decode_lossless_arith_scan_planes(
     // One statistics area per scan component (§H.1.2.3.2), with the L / U
     // conditioning bounds taken from the DAC DC-conditioning entry the
     // component's Td selector points at (§H.1.2.3.3; defaults L=0, U=1).
-    let mut stats: Vec<LosslessStats> = sos
+    // One statistics area per `Td` destination, shared by the scan
+    // components selecting it (T.81 §B.2.3), with the `L` / `U`
+    // conditioning of that DAC destination; `sos_td[ci]` maps a scan
+    // component to its area.
+    let mut stats: [LosslessStats; 4] = std::array::from_fn(|td| {
+        let mut s = LosslessStats::new();
+        if let Some(cond) = state.arith_dc[td].as_ref() {
+            s.l = cond.l;
+            s.u = cond.u;
+        }
+        s
+    });
+    let sos_td: Vec<usize> = sos
         .components
         .iter()
-        .map(|sc| {
-            let mut s = LosslessStats::new();
-            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
+        .map(|sc| sc.dc_table as usize & 3)
         .collect();
 
     // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
@@ -5351,7 +5456,8 @@ fn decode_lossless_arith_scan_planes(
 
                 let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                 let db = prev_diff[ci][x];
-                let diff = arith_decode_lossless_diff(&mut decoder, &mut stats[ci], da, db)?;
+                let diff =
+                    arith_decode_lossless_diff(&mut decoder, &mut stats[sos_td[ci]], da, db)?;
                 cur_diff[ci][x] = diff;
 
                 let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
@@ -5400,17 +5506,22 @@ fn decode_lossless_arith_scan_subsampled(
 
     // One statistics area per scan component (§H.1.2.3.2); the DAC L / U
     // conditioning bounds default to (0, 1) when no DAC segment is present.
-    let mut stats: Vec<LosslessStats> = sos
+    // One statistics area per `Td` destination, shared by the scan
+    // components selecting it (T.81 §B.2.3), with the `L` / `U`
+    // conditioning of that DAC destination; `sos_td[ci]` maps a scan
+    // component to its area.
+    let mut stats: [LosslessStats; 4] = std::array::from_fn(|td| {
+        let mut s = LosslessStats::new();
+        if let Some(cond) = state.arith_dc[td].as_ref() {
+            s.l = cond.l;
+            s.u = cond.u;
+        }
+        s
+    });
+    let sos_td: Vec<usize> = sos
         .components
         .iter()
-        .map(|sc| {
-            let mut s = LosslessStats::new();
-            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
+        .map(|sc| sc.dc_table as usize & 3)
         .collect();
 
     let sample_bits = 8u32 - pt;
@@ -5494,8 +5605,12 @@ fn decode_lossless_arith_scan_subsampled(
                         let dg = &diff_grid[ci];
                         let da = if gx == 0 { 0 } else { dg[gy * gw + gx - 1] };
                         let db = if gy == 0 { 0 } else { dg[(gy - 1) * gw + gx] };
-                        let diff =
-                            arith_decode_lossless_diff(&mut decoder, &mut stats[ci], da, db)?;
+                        let diff = arith_decode_lossless_diff(
+                            &mut decoder,
+                            &mut stats[sos_td[ci]],
+                            da,
+                            db,
+                        )?;
                         diff_grid[ci][gy * gw + gx] = diff;
 
                         let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
@@ -6784,14 +6899,10 @@ mod lossless_tests {
         let sample_bits = (precision - pt) as u32;
         let origin: u32 = 1 << (sample_bits - 1);
         let (l, u) = dac_lu.unwrap_or((0, 1));
-        let mut stats: Vec<LosslessStats> = (0..nc)
-            .map(|_| {
-                let mut s = LosslessStats::new();
-                s.l = l;
-                s.u = u;
-                s
-            })
-            .collect();
+        // Every SOS entry selects `Td = 0`: one shared area (§B.2.3).
+        let mut stats = LosslessStats::new();
+        stats.l = l;
+        stats.u = u;
         let mut prev_diff = vec![vec![0i32; width]; nc];
         let mut cur_diff = vec![vec![0i32; width]; nc];
         let mut enc = ArithEncoder::new();
@@ -6811,9 +6922,7 @@ mod lossless_tests {
                     out.extend_from_slice(&std::mem::take(&mut enc).finish());
                     out.extend_from_slice(&[0xFF, 0xD0 + rst]);
                     rst = (rst + 1) % 8;
-                    for s in stats.iter_mut() {
-                        s.reset();
-                    }
+                    stats.reset();
                     for r in prev_diff.iter_mut() {
                         r.fill(0);
                     }
@@ -6853,7 +6962,7 @@ mod lossless_tests {
                     let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
                     let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                     let db = prev_diff[ci][x];
-                    encode_lossless_diff(&mut enc, &mut stats[ci], da, db, dm).unwrap();
+                    encode_lossless_diff(&mut enc, &mut stats, da, db, dm).unwrap();
                     cur_diff[ci][x] = dm;
                 }
                 reset_pred = false;
@@ -7076,7 +7185,9 @@ mod lossless_tests {
 #[cfg(test)]
 mod sof10_tests {
     use super::decode_planes;
-    use crate::jpeg::arith::{AcStats, ArithEncoder, Context, DcStats, encode_magnitude};
+    use crate::jpeg::arith::{
+        AcStats, ArithDcState, ArithEncoder, Context, DcStats, encode_magnitude,
+    };
     use crate::jpeg::dct::idct8x8;
     use crate::jpeg::zigzag::ZIGZAG;
 
@@ -7321,7 +7432,9 @@ mod sof10_tests {
                 (mcus_x * h as usize, mcus_y * v as usize)
             };
 
-            let mut dc_stats: Vec<DcStats> = (0..scomps.len()).map(|_| DcStats::new()).collect();
+            // Every SOS entry above selects `Td = 0`: one shared DC
+            // statistics area, predictors per scan component (§B.2.3).
+            let mut dc_state = ArithDcState::new(scomps.len());
             let mut ac = AcStats::new();
             ac.kx = kx;
             let mut refine_bins = [Context::default(); 189];
@@ -7338,9 +7451,7 @@ mod sof10_tests {
                         out.extend_from_slice(&std::mem::take(&mut enc).finish());
                         out.extend_from_slice(&[0xFF, 0xD0 + rst]);
                         rst = (rst + 1) % 8;
-                        for s in dc_stats.iter_mut() {
-                            *s = DcStats::new();
-                        }
+                        dc_state.restart_reset();
                         ac.reset();
                         refine_bins = [Context::default(); 189];
                     }
@@ -7354,24 +7465,16 @@ mod sof10_tests {
                                         let bi = (my * v as usize + by) * blocks_x
                                             + mx * h as usize
                                             + bx;
-                                        encode_dc_unit(
-                                            &mut enc,
-                                            &mut dc_stats[sidx],
-                                            blocks[ci][bi][0],
-                                            *ah,
-                                            *al,
-                                        );
+                                        dc_state.with_block(0, sidx, |d| {
+                                            encode_dc_unit(&mut enc, d, blocks[ci][bi][0], *ah, *al)
+                                        });
                                     }
                                 }
                             } else {
                                 let bi = my * blocks_x + mx;
-                                encode_dc_unit(
-                                    &mut enc,
-                                    &mut dc_stats[sidx],
-                                    blocks[ci][bi][0],
-                                    *ah,
-                                    *al,
-                                );
+                                dc_state.with_block(0, sidx, |d| {
+                                    encode_dc_unit(&mut enc, d, blocks[ci][bi][0], *ah, *al)
+                                });
                             }
                         }
                     } else {

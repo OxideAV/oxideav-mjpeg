@@ -794,6 +794,18 @@ impl JpegImage {
         crate::convert::to_rgba8(self)
     }
 
+    /// [`Self::to_rgb8`] with explicit chroma-upsampling and YCbCr
+    /// arithmetic choices; `ConvertOptions::default()` gives the same
+    /// bytes as [`Self::to_rgb8`].
+    pub fn to_rgb8_with(&self, opts: &ConvertOptions) -> Vec<u8> {
+        crate::convert::to_rgb8_with(self, opts)
+    }
+
+    /// [`Self::to_rgba8`] with explicit conversion choices.
+    pub fn to_rgba8_with(&self, opts: &ConvertOptions) -> Vec<u8> {
+        crate::convert::to_rgba8_with(self, opts)
+    }
+
     /// Rebuild an image from a Motion-JPEG video frame plus the
     /// geometry the stream's parameters carry. Fails when the plane
     /// count or geometry does not match `format` (see [`Self::new`]).
@@ -936,6 +948,102 @@ pub struct ImageInfo {
 // Decode options
 // ---------------------------------------------------------------------------
 
+/// The 8-bit inverse DCT kernel a decode uses
+/// ([`DecodeOptions::idct`]).
+///
+/// Both kernels evaluate the T.81 §A.3.3 IDCT; they differ in
+/// arithmetic and therefore in the last bit of a few samples per
+/// block (never by more than 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IdctMethod {
+    /// The `f32` two-pass matrix IDCT with `round()` at the end — the
+    /// crate's historical kernel and the default.
+    #[default]
+    Float,
+    /// The accurate integer IDCT: separable even / odd factorisation
+    /// with 13-bit fixed-point constants, two extra fraction bits kept
+    /// between passes, round-half-up descaling — bit-exact with the
+    /// reference decoder's default integer IDCT
+    /// ([`crate::jpeg::dct::idct8x8_int`]).
+    Integer,
+}
+
+/// How [`JpegImage::to_rgb8_with`] reconstructs subsampled chroma
+/// ([`ConvertOptions::upsampling`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChromaUpsampling {
+    /// Sample replication: pixel `(x, y)` reads chroma `(x / h, y / v)`
+    /// — the default.
+    #[default]
+    Nearest,
+    /// Linear interpolation to the T.871 §9 sample siting (chroma
+    /// centred between its luma samples): the `(3/4, 1/4)` triangle
+    /// filter per 2:1 axis, with edge samples replicated, for the
+    /// 2×1, 2×2 (and 1×2) layouts; other ratios replicate. Bit-exact
+    /// with the reference decoder's default ("fancy") upsampling.
+    Triangle,
+}
+
+/// The YCbCr → RGB arithmetic of [`JpegImage::to_rgb8_with`]
+/// ([`ConvertOptions::ycbcr`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum YcbcrKernel {
+    /// The T.871 §7 inverse equations in exact rational arithmetic with
+    /// one rounding — the default.
+    #[default]
+    Exact,
+    /// The same equations with each coefficient as a 16-bit fixed-point
+    /// integer (`round(c · 2^16)`: `1.402 → 91881`, `0.34414 → 22554`,
+    /// `0.71414 → 46802`, `1.772 → 116130`), one `+ 2^15` rounding term
+    /// per output channel and an arithmetic shift — bit-exact with the
+    /// reference decoder.
+    FixedPoint,
+}
+
+/// Knobs of the native-layout → RGB conversion
+/// ([`JpegImage::to_rgb8_with`] / [`JpegImage::to_rgba8_with`]).
+/// `ConvertOptions::default()` reproduces [`JpegImage::to_rgb8`];
+/// [`ConvertOptions::libjpeg_compatible`] reproduces the reference
+/// decoder's default RGB output for a given set of planes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConvertOptions {
+    /// Chroma reconstruction filter (default [`ChromaUpsampling::Nearest`]).
+    pub upsampling: ChromaUpsampling,
+    /// YCbCr → RGB arithmetic (default [`YcbcrKernel::Exact`]).
+    pub ycbcr: YcbcrKernel,
+}
+
+impl ConvertOptions {
+    /// The defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`ChromaUpsampling::Triangle`] + [`YcbcrKernel::FixedPoint`].
+    pub fn libjpeg_compatible() -> Self {
+        Self {
+            upsampling: ChromaUpsampling::Triangle,
+            ycbcr: YcbcrKernel::FixedPoint,
+        }
+    }
+
+    /// Select the chroma reconstruction filter.
+    pub fn with_upsampling(mut self, upsampling: ChromaUpsampling) -> Self {
+        self.upsampling = upsampling;
+        self
+    }
+
+    /// Select the YCbCr → RGB arithmetic.
+    pub fn with_ycbcr(mut self, ycbcr: YcbcrKernel) -> Self {
+        self.ycbcr = ycbcr;
+        self
+    }
+}
+
 /// Limits and strictness for [`crate::decode_with`].
 ///
 /// Limits are checked against the frame header **before** any sample
@@ -963,6 +1071,14 @@ pub struct DecodeOptions {
     /// `JPEGTables` carriage. `None` (default) decodes interchange
     /// streams only.
     pub tables: Option<Vec<u8>>,
+    /// The 8-bit inverse DCT kernel (default [`IdctMethod::Float`]).
+    /// The 12-bit, lossless and hierarchical paths ignore it.
+    pub idct: IdctMethod,
+    /// The RGB conversion knobs used by [`crate::decode_rgb8_with`] /
+    /// [`crate::decode_rgba8_with`] (default [`ConvertOptions::new`]);
+    /// [`crate::decode_with`] returns native planes and does not
+    /// consult them.
+    pub convert: ConvertOptions,
 }
 
 impl Default for DecodeOptions {
@@ -974,6 +1090,8 @@ impl Default for DecodeOptions {
             max_bytes: None,
             strict: false,
             tables: None,
+            idct: IdctMethod::Float,
+            convert: ConvertOptions::default(),
         }
     }
 }
@@ -1018,6 +1136,34 @@ impl DecodeOptions {
     pub fn with_tables(mut self, tables: Vec<u8>) -> Self {
         self.tables = Some(tables);
         self
+    }
+
+    /// Select the 8-bit inverse DCT kernel.
+    pub fn with_idct(mut self, idct: IdctMethod) -> Self {
+        self.idct = idct;
+        self
+    }
+
+    /// Set the RGB conversion knobs ([`crate::decode_rgb8_with`]).
+    pub fn with_convert(mut self, convert: ConvertOptions) -> Self {
+        self.convert = convert;
+        self
+    }
+
+    /// Reproduce the reference decoder's (libjpeg / libjpeg-turbo
+    /// `djpeg`) default output bit-exactly: [`IdctMethod::Integer`]
+    /// plus [`ConvertOptions::libjpeg_compatible`] (triangle chroma
+    /// upsampling, 16-bit fixed-point YCbCr → RGB). Limits and
+    /// strictness are left as they are.
+    pub fn with_libjpeg_compat(mut self) -> Self {
+        self.idct = IdctMethod::Integer;
+        self.convert = ConvertOptions::libjpeg_compatible();
+        self
+    }
+
+    /// `DecodeOptions::new().with_libjpeg_compat()`.
+    pub fn libjpeg_compatible() -> Self {
+        Self::new().with_libjpeg_compat()
     }
 }
 

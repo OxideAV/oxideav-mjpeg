@@ -216,8 +216,47 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `max_bytes` | `None` | Input length cap; `None` = unlimited. |
 | `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
 | `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
+| `idct` | `IdctMethod::Float` | 8-bit inverse DCT kernel: the `f32` matrix IDCT, or `Integer` — the accurate 13-bit fixed-point IDCT (see below). |
+| `convert` | `ConvertOptions::new()` | RGB conversion knobs used by `decode_rgb8_with` / `decode_rgba8_with`: `upsampling` (`ChromaUpsampling::Nearest` / `Triangle`) and `ycbcr` (`YcbcrKernel::Exact` / `FixedPoint`). `decode_with` returns native planes; `JpegImage::to_rgb8_with(&ConvertOptions)` applies the same knobs to them. |
 
 Breaches are `Error::LimitExceeded`.
+
+**libjpeg-compatible decode.** `DecodeOptions::libjpeg_compatible()`
+(or `.with_libjpeg_compat()`) selects `IdctMethod::Integer` +
+`ChromaUpsampling::Triangle` + `YcbcrKernel::FixedPoint` and
+reproduces the reference decoder's default output (`djpeg`,
+libturbojpeg's `tjDecompress2` without `TJFLAG_FAST*`, ImageMagick)
+**byte for byte** on 8-bit DCT frames — every sampling layout
+(4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 / 4:4:0 / grey, ffmpeg's `Y 2×2 /
+C 1×2` 4:2:2 included), baseline, progressive, restart intervals,
+arithmetic coding, any size. The three knobs are independent and
+derived from the standard, with only their rounding fixed by
+black-box comparison:
+
+* `IdctMethod::Integer` — the T.81 §A.3.3 IDCT as two 1-D passes in
+  the even / odd factorisation, every `√2·cos(kπ/16)` product a
+  13-bit fixed-point constant, two extra fraction bits kept between
+  the column and row passes, round-half-up descaling, `+ 128` and
+  clamp (§F.2.1.5). Within ±1 of the float kernel everywhere.
+* `ChromaUpsampling::Triangle` — linear interpolation to the T.871
+  §9 siting (chroma centred between its luma samples): weights
+  `(3, 1)` per 2:1 axis, edges replicated; 4:2:2 `(3c + c′ + 1) >> 2`
+  / `(3c + c″ + 2) >> 2`, 4:2:0 vertical `3·c + c′` sums then
+  `(3s + s′ + 8) >> 4` / `(3s + s″ + 7) >> 4`, 4:4:0 the 4:2:2
+  filter down the columns. Horizontal filtering only once the chroma
+  plane is at least three samples wide; every other ratio replicates.
+  The decoder applies the same filter itself to layouts without a
+  planar pixel format (4:4:0, mixed factors).
+* `YcbcrKernel::FixedPoint` — T.871 §7 inverse with
+  `round(c · 2^16)` coefficients (`91881`, `22554`, `46802`,
+  `116130`), one `+ 2^15` per channel, arithmetic shift, clamp.
+
+`tests/libjpeg_compat.rs` holds the proof: 17 committed `cjpeg` /
+`ffmpeg` streams next to `djpeg`'s output, the 14 lossy
+`docs/image/jpeg/fixtures/` pictures and a 162-case libturbojpeg
+round trip (dlsym, skipped when the library is absent). Not covered:
+12-bit frames (the integer kernel is 8-bit), lossless and
+hierarchical frames (bit-exact already, nothing to reconcile).
 
 ## Metadata and colour
 
@@ -277,8 +316,10 @@ Breaches are `Error::LimitExceeded`.
   arithmetic (`Round(x) = ⌊x + 0.5⌋`, one rounding, clamped); chroma
   **nearest-neighbour replication** (`(x / h, y / v)` — T.871 §9 sites
   chroma centred between luma samples but leaves the reconstruction
-  filter to the decoder; this crate applies none, so a stream always
-  yields the same bytes); grayscale replicated; CMYK by `R = Round((255
+  filter to the decoder; the default applies none, so a stream always
+  yields the same bytes; `to_rgb8_with(&ConvertOptions)` selects the
+  triangle filter and the fixed-point kernel of the reference decoder,
+  see *Options*); grayscale replicated; CMYK by `R = Round((255
   − C)(255 − K) / 255)` (a documented convention, not a spec formula);
   deep samples rescaled by `Round(v · 255 / (2^P − 1))` with the
   frame's `precision`; `Gbrp*` re-ordered to R, G, B. Grayscale, RGB
@@ -1217,6 +1258,11 @@ Decoder:
   §G.1.3.3 model (Figures G.10 / G.11, Table G.2 — 189 statistics
   bins, end-of-band decision bypassed below the prior scan's EOBx).
   Restart intervals re-seed coder + statistics + DC prediction.
+  Statistics areas sit per `Td` / `Ta` destination (§B.2.3 — the
+  components that select one destination share its bins, as `cjpeg`'s
+  `Cb` / `Cr` do), `PRED` / `Da` per component, in the sequential,
+  progressive and lossless Q-coder paths alike; `cjpeg -arithmetic`
+  colour streams decode byte-exact (`tests/libjpeg_compat.rs`).
   `P = 8` and `P = 12`, 4-component CMYK / YCCK at `P = 8` — same
   output shaping as SOF2 via the shared coefficient accumulator.
 - **Non-interleaved sequential scans** (SOF0/SOF1 with one SOS per
@@ -1268,13 +1314,18 @@ Decoder:
   inverted) un-inverts on decode; transform=2 (YCCK) converts back to
   CMYK via BT.601 YCbCr→RGB→CMY and K inversion; no APP14 → plain
   ("regular", C=0 = no ink) pass-through.
-- **Every T.81 §A.1.1 sampling layout.** Luma at `1×1` / `2×1` / `2×2`
-  / `4×1` over `1×1` chroma decodes to the native planar `Yuv444P` /
-  `Yuv422P` / `Yuv420P` / `Yuv411P` (`…P12Le` at `P = 12`); every other
-  legal combination (`4×2` or `1×2` luma, mixed chroma factors, chroma
-  oversampled relative to luma, …) is resampled onto the frame grid by
-  nearest-neighbour replication and emitted as 4:4:4. Verified within
-  ±1 of `djpeg -nosmooth` (`tests/fixtures/sampling/`).
+- **Every T.81 §A.1.1 sampling layout.** A luma-to-chroma sampling
+  *ratio* of `1:1` / `2:1` / `2×2` / `4:1` (both chroma components
+  sharing one pair of factors that divides luma's — `Y 2×1 / C 1×1`
+  and ffmpeg's `Y 2×2 / C 1×2` are both 4:2:2) decodes to the native
+  planar `Yuv444P` / `Yuv422P` / `Yuv420P` / `Yuv411P` (`…P12Le` at
+  `P = 12`) with coded-resolution chroma; every other legal combination
+  (`4×2` or `1×2` luma, mixed chroma factors, chroma oversampled
+  relative to luma, …) is resampled onto the frame grid by
+  nearest-neighbour replication (the reference's triangle filter under
+  `DecodeOptions::libjpeg_compatible()`) and emitted as 4:4:4. Verified
+  within ±1 of `djpeg -nosmooth` (`tests/fixtures/sampling/`) and
+  byte-exact against `djpeg` in compat mode (`tests/libjpeg_compat.rs`).
 - **Non-interleaved scans** (one `SOS` per component, sequential or
   progressive) cover the component's own `ceil(xi / 8) × ceil(yi / 8)`
   block extent (§A.2.2 / §A.2.4), not the MCU-padded grid.

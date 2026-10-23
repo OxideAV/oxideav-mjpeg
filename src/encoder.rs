@@ -2733,9 +2733,11 @@ pub fn encode_jpeg_rgb24_with_meta(
     // APP14 pair entirely (so callers passing their own APP14 don't
     // end up with two of them).
     if meta.is_empty() {
-        write_jfif_app0(&mut out);
         // Adobe APP14 transform = 0 → "three components are R/G/B"
-        // (matching the `baseline-rgb-32x32` clean-room fixture).
+        // (matching the `baseline-rgb-32x32` clean-room fixture). No
+        // JFIF APP0: T.871 §6.2 fixes the JFIF colour space to YCbCr
+        // (or a lone Y), and readers that see an APP0 convert R/G/B
+        // as YCbCr.
         write_adobe_app14(&mut out, 0);
     } else {
         out.extend_from_slice(meta);
@@ -4040,7 +4042,9 @@ pub fn encode_arith_jpeg_yuv(
     quality: u8,
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
+    use crate::jpeg::arith::{
+        AcStats, ArithDcState, ArithEncoder, encode_block as arith_encode_block,
+    };
 
     let width = width as usize;
     let height = height as usize;
@@ -4092,10 +4096,13 @@ pub fn encode_arith_jpeg_yuv(
         _ => unreachable!(),
     };
 
-    // Per-component statistics: index 0 = luma, 1 = Cb, 2 = Cr. The decoder
-    // keeps DC/AC stats per SOF component too, so they stay in lockstep.
-    let mut dc = [DcStats::new(), DcStats::new(), DcStats::new()];
-    let mut ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+    // Statistics areas per table destination (T.81 §B.2.3): `write_sos`
+    // selects `Td = Ta = 0` for luma and `1` for both chroma components,
+    // so Cb and Cr share one DC area and one AC area; `PRED` / `Da`
+    // stay per component (slots 0 = Y, 1 = Cb, 2 = Cr).
+    let mut dc = ArithDcState::new(3);
+    let mut ac = [AcStats::new(), AcStats::new()];
+    let table_of = |ci: usize| usize::from(ci != 0);
     let mut enc = ArithEncoder::new();
 
     let ri = restart_interval as usize;
@@ -4105,8 +4112,8 @@ pub fn encode_arith_jpeg_yuv(
 
     // Encode one block from `plane` at (x0, y0) under component `ci`.
     let encode_one = |enc: &mut ArithEncoder,
-                      dc: &mut [DcStats; 3],
-                      ac: &mut [AcStats; 3],
+                      dc: &mut ArithDcState,
+                      ac: &mut [AcStats; 2],
                       plane: &[u8],
                       stride: usize,
                       pw: usize,
@@ -4127,7 +4134,8 @@ pub fn encode_arith_jpeg_yuv(
                 -((-v + 0.5) as i32)
             };
         }
-        arith_encode_block(enc, &mut dc[ci], &mut ac[ci], &zz);
+        let t = table_of(ci);
+        dc.with_block(t, ci, |d| arith_encode_block(enc, d, &mut ac[t], &zz));
     };
 
     for my in 0..mcus_y {
@@ -4189,8 +4197,8 @@ pub fn encode_arith_jpeg_yuv(
                 out.push(0xFF);
                 out.push(markers::RST0 + (rst_counter & 0x07));
                 rst_counter = rst_counter.wrapping_add(1);
-                dc = [DcStats::new(), DcStats::new(), DcStats::new()];
-                ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+                dc.restart_reset();
+                ac = [AcStats::new(), AcStats::new()];
                 mcus_since_restart = 0;
             }
         }
@@ -4239,7 +4247,9 @@ pub fn encode_arith_jpeg_rgb24(
     quality: u8,
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
-    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
+    use crate::jpeg::arith::{
+        AcStats, ArithDcState, ArithEncoder, encode_block as arith_encode_block,
+    };
 
     let w = width as usize;
     let h = height as usize;
@@ -4265,7 +4275,9 @@ pub fn encode_arith_jpeg_rgb24(
     let mut out: Vec<u8> = Vec::with_capacity(16_384);
     out.push(0xFF);
     out.push(markers::SOI);
-    write_jfif_app0(&mut out);
+    // No JFIF APP0: T.871 §6.2 fixes the JFIF colour space to YCbCr
+    // (or a lone Y), and readers that see an APP0 convert R/G/B as
+    // YCbCr. The Adobe APP14 alone signals the R/G/B components.
     write_adobe_app14(&mut out, 0); // transform = 0 → R/G/B
     write_dqt(&mut out, 0, &luma_q);
     write_sof9_rgb24_8bit(&mut out, w as u16, h as u16);
@@ -4282,8 +4294,11 @@ pub fn encode_arith_jpeg_rgb24(
     let mut mcus_since_restart: usize = 0;
     let mut mcu_index: usize = 0;
 
-    let mut dc = [DcStats::new(), DcStats::new(), DcStats::new()];
-    let mut ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+    // `write_sos_rgb24_8bit` selects `Td = Ta = 0` for all three
+    // components: one DC statistics area and one AC area shared by R, G
+    // and B (T.81 §B.2.3), predictors per component.
+    let mut dc = ArithDcState::new(3);
+    let mut ac = AcStats::new();
     let mut enc = ArithEncoder::new();
 
     for my in 0..mcus_y {
@@ -4301,7 +4316,7 @@ pub fn encode_arith_jpeg_rgb24(
                         -((-v + 0.5) as i32)
                     };
                 }
-                arith_encode_block(&mut enc, &mut dc[ch], &mut ac[ch], &zz);
+                dc.with_block(0, ch, |d| arith_encode_block(&mut enc, d, &mut ac, &zz));
             }
 
             mcu_index += 1;
@@ -4311,8 +4326,8 @@ pub fn encode_arith_jpeg_rgb24(
                 out.push(0xFF);
                 out.push(markers::RST0 + (rst_counter & 0x07));
                 rst_counter = rst_counter.wrapping_add(1);
-                dc = [DcStats::new(), DcStats::new(), DcStats::new()];
-                ac = [AcStats::new(), AcStats::new(), AcStats::new()];
+                dc.restart_reset();
+                ac = AcStats::new();
                 mcus_since_restart = 0;
             }
         }
@@ -4746,11 +4761,10 @@ pub fn encode_lossless_arith_jpeg_rgb_with_opts(
     // up, `cur_diff[c][x]` one column left in the current row (§H.1.2.3.2).
     let mut prev_diff: [Vec<i32>; 3] = [vec![0i32; w], vec![0i32; w], vec![0i32; w]];
     let mut cur_diff: [Vec<i32>; 3] = [vec![0i32; w], vec![0i32; w], vec![0i32; w]];
-    let mut stats: [LosslessStats; 3] = [
-        LosslessStats::new(),
-        LosslessStats::new(),
-        LosslessStats::new(),
-    ];
+    // `write_sos_lossless_multi` selects `Td = 0` for every component:
+    // one statistics area shared by all of them (T.81 §B.2.3); the
+    // `Da` / `Db` contexts stay per component (`prev_diff` / `cur_diff`).
+    let mut stats = LosslessStats::new();
     let mut enc = ArithEncoder::new();
 
     let ri = restart_interval as u32;
@@ -4775,9 +4789,7 @@ pub fn encode_lossless_arith_jpeg_rgb_with_opts(
                 out.push(markers::RST0 + (rst_counter & 0x07));
                 rst_counter = rst_counter.wrapping_add(1);
                 mcus_since_restart = 0;
-                for s in stats.iter_mut() {
-                    s.reset();
-                }
+                stats.reset();
                 for r in prev_diff.iter_mut() {
                     r.fill(0);
                 }
@@ -4825,7 +4837,7 @@ pub fn encode_lossless_arith_jpeg_rgb_with_opts(
                 let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
                 let da = if x == 0 { 0 } else { cur_diff[c][x - 1] };
                 let db = prev_diff[c][x];
-                encode_lossless_diff(&mut enc, &mut stats[c], da, db, dm)?;
+                encode_lossless_diff(&mut enc, &mut stats, da, db, dm)?;
                 cur_diff[c][x] = dm;
             }
 
@@ -5024,12 +5036,10 @@ pub fn encode_lossless_arith_jpeg_cmyk_with_opts(
     // up, `cur_diff[c][x]` one column left in the current row (§H.1.2.3.2).
     let mut prev_diff: [Vec<i32>; 4] = [vec![0i32; w], vec![0i32; w], vec![0i32; w], vec![0i32; w]];
     let mut cur_diff: [Vec<i32>; 4] = [vec![0i32; w], vec![0i32; w], vec![0i32; w], vec![0i32; w]];
-    let mut stats: [LosslessStats; 4] = [
-        LosslessStats::new(),
-        LosslessStats::new(),
-        LosslessStats::new(),
-        LosslessStats::new(),
-    ];
+    // `write_sos_lossless_multi` selects `Td = 0` for every component:
+    // one statistics area shared by all of them (T.81 §B.2.3); the
+    // `Da` / `Db` contexts stay per component (`prev_diff` / `cur_diff`).
+    let mut stats = LosslessStats::new();
     let mut enc = ArithEncoder::new();
 
     let ri = restart_interval as u32;
@@ -5050,9 +5060,7 @@ pub fn encode_lossless_arith_jpeg_cmyk_with_opts(
                 out.push(markers::RST0 + (rst_counter & 0x07));
                 rst_counter = rst_counter.wrapping_add(1);
                 mcus_since_restart = 0;
-                for s in stats.iter_mut() {
-                    s.reset();
-                }
+                stats.reset();
                 for r in prev_diff.iter_mut() {
                     r.fill(0);
                 }
@@ -5100,7 +5108,7 @@ pub fn encode_lossless_arith_jpeg_cmyk_with_opts(
                 let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
                 let da = if x == 0 { 0 } else { cur_diff[c][x - 1] };
                 let db = prev_diff[c][x];
-                encode_lossless_diff(&mut enc, &mut stats[c], da, db, dm)?;
+                encode_lossless_diff(&mut enc, &mut stats, da, db, dm)?;
                 cur_diff[c][x] = dm;
             }
 
@@ -5810,11 +5818,10 @@ pub fn encode_lossless_arith_jpeg_yuv_with_opts(
         vec![0i32; grids[1].len()],
         vec![0i32; grids[2].len()],
     ];
-    let mut stats: [LosslessStats; 3] = [
-        LosslessStats::new(),
-        LosslessStats::new(),
-        LosslessStats::new(),
-    ];
+    // `write_sos_lossless_multi` selects `Td = 0` for every component:
+    // one statistics area shared by all of them (T.81 §B.2.3); the
+    // `Da` / `Db` contexts stay per component (`prev_diff` / `cur_diff`).
+    let mut stats = LosslessStats::new();
     let mut enc = ArithEncoder::new();
 
     let ri = restart_interval as u32;
@@ -5839,9 +5846,7 @@ pub fn encode_lossless_arith_jpeg_yuv_with_opts(
                 out.push(markers::RST0 + (rst_counter & 0x07));
                 rst_counter = rst_counter.wrapping_add(1);
                 mcus_since_restart = 0;
-                for s in stats.iter_mut() {
-                    s.reset();
-                }
+                stats.reset();
                 for g in diff_grid.iter_mut() {
                     g.fill(0);
                 }
@@ -5890,7 +5895,7 @@ pub fn encode_lossless_arith_jpeg_yuv_with_opts(
                         let dg = &diff_grid[c];
                         let da = if gx == 0 { 0 } else { dg[gy * gw + gx - 1] };
                         let db = if gy == 0 { 0 } else { dg[(gy - 1) * gw + gx] };
-                        encode_lossless_diff(&mut enc, &mut stats[c], da, db, dm)?;
+                        encode_lossless_diff(&mut enc, &mut stats, da, db, dm)?;
                         diff_grid[c][gy * gw + gx] = dm;
                     }
                 }
@@ -6632,7 +6637,10 @@ fn hier_write_lossless_arith_scan(
     use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
 
     let nc = planes.len();
-    let mut stats: Vec<LosslessStats> = (0..nc).map(|_| LosslessStats::new()).collect();
+    // `write_sos_lossless_multi` selects `Td = 0` for every component:
+    // one statistics area shared by all of them (T.81 §B.2.3); the
+    // `Da` / `Db` contexts stay per component (`prev_diff` / `cur_diff`).
+    let mut stats = LosslessStats::new();
     let mut prev_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w]).collect();
     let mut cur_diff: Vec<Vec<i32>> = (0..nc).map(|_| vec![0i32; w]).collect();
     let mut enc = ArithEncoder::new();
@@ -6677,7 +6685,7 @@ fn hier_write_lossless_arith_scan(
                 };
                 let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                 let db = prev_diff[ci][x];
-                encode_lossless_diff(&mut enc, &mut stats[ci], da, db, coded)?;
+                encode_lossless_diff(&mut enc, &mut stats, da, db, coded)?;
                 cur_diff[ci][x] = coded;
             }
         }
@@ -7628,7 +7636,9 @@ fn hier_encode_dct_frame_arith(
     quant: &[u16; 64],
     differential: bool,
 ) -> Vec<Vec<u32>> {
-    use crate::jpeg::arith::{AcStats, ArithEncoder, DcStats, encode_block as arith_encode_block};
+    use crate::jpeg::arith::{
+        AcStats, ArithDcState, ArithEncoder, encode_block as arith_encode_block,
+    };
 
     let nc = planes_i32.len();
     write_sof_hier_frame(
@@ -7652,8 +7662,11 @@ fn hier_encode_dct_frame_arith(
     let mut recon_padded: Vec<Vec<f32>> = (0..nc).map(|_| vec![0.0f32; comp_w * comp_h]).collect();
 
     let mut enc = ArithEncoder::new();
-    let mut dc_stats: Vec<DcStats> = (0..nc).map(|_| DcStats::new()).collect();
-    let mut ac_stats: Vec<AcStats> = (0..nc).map(|_| AcStats::new()).collect();
+    // `write_sos_hier_dct` selects `Td = Ta = 0` for every component: one
+    // DC area and one AC area shared by all (T.81 §B.2.3), `PRED` / `Da`
+    // per component.
+    let mut dc_state = ArithDcState::new(nc);
+    let mut ac_stats = AcStats::new();
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
             for ci in 0..nc {
@@ -7666,9 +7679,11 @@ fn hier_encode_dct_frame_arith(
                 if differential {
                     // §J.2.3.1: code the DC directly — no inter-block
                     // prediction carry.
-                    dc_stats[ci].pred = 0;
+                    dc_state.pred[ci] = 0;
                 }
-                arith_encode_block(&mut enc, &mut dc_stats[ci], &mut ac_stats[ci], &zz);
+                dc_state.with_block(0, ci, |d| {
+                    arith_encode_block(&mut enc, d, &mut ac_stats, &zz)
+                });
                 let r = hier_dct_recon_block(&q, quant);
                 for j in 0..8 {
                     for i in 0..8 {
@@ -8119,7 +8134,7 @@ fn hier_encode_prog_frame_arith(
     differential: bool,
 ) -> Vec<Vec<u32>> {
     use crate::jpeg::arith::{
-        AcStats, ArithEncoder, DcStats, encode_ac as arith_encode_ac, encode_dc_diff,
+        AcStats, ArithDcState, ArithEncoder, encode_ac as arith_encode_ac, encode_dc_diff,
     };
 
     let nc = planes_i32.len();
@@ -8144,17 +8159,19 @@ fn hier_encode_prog_frame_arith(
     write_sos_hier_prog_dc(out, nc as u8);
     {
         let mut enc = ArithEncoder::new();
-        let mut dc_stats: Vec<DcStats> = (0..nc).map(|_| DcStats::new()).collect();
+        // `write_sos_hier_prog_dc` selects `Td = 0` for every component:
+        // one shared DC area (T.81 §B.2.3), `PRED` / `Da` per component.
+        let mut dc_state = ArithDcState::new(nc);
         for bi in 0..blocks_x * blocks_y {
             for ci in 0..nc {
                 let dc = blocks[ci][bi][0];
                 if differential {
                     // §J.2.3.1: DC coded directly — no inter-block carry.
-                    dc_stats[ci].pred = 0;
+                    dc_state.pred[ci] = 0;
                 }
-                let diff = dc - dc_stats[ci].pred;
-                encode_dc_diff(&mut enc, &mut dc_stats[ci], diff);
-                dc_stats[ci].pred = dc;
+                let diff = dc - dc_state.pred[ci];
+                dc_state.with_block(0, ci, |d| encode_dc_diff(&mut enc, d, diff));
+                dc_state.pred[ci] = dc;
             }
         }
         out.extend_from_slice(&enc.finish());

@@ -1,0 +1,7 @@
+# Fixture binaries: never line-ending-converted on checkout (small PPMs have
+# no NUL byte in their first 8 KiB, so git's text heuristic would otherwise
+# rewrite them on Windows).
+*.jpg binary
+*.jpeg binary
+*.ppm binary
+*.pgm binary

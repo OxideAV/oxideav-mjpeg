@@ -597,8 +597,14 @@ impl Default for ArithEncoder {
 ///   * 14 X1..X15 magnitude bins starting at index 20,
 ///   * 14 M2..M15 magnitude-bit bins starting at index 21+13 = 34.
 ///
-/// The DC-context-base S0 is computed from the previous-block DC difference
-/// `Da` (see `dc_context`).
+/// One area exists per **table destination** `Td` (T.81 §B.2.3: "the
+/// entropy coding table destination selector specifies both an arithmetic
+/// coding conditioning table destination and an associated statistics
+/// area"), so scan components that name the same `Td` — the usual
+/// `Y → 0, Cb → 1, Cr → 1` layout — share one area. The per-component
+/// prediction state (`Pred` and the previous difference `Da`, F.1.4.4.1.2:
+/// "the difference value coded for the previous DCT block of the same
+/// component") lives in [`DcPredictor`].
 #[derive(Clone, Debug)]
 pub struct DcStats {
     pub bins: [Context; 49],
@@ -606,12 +612,6 @@ pub struct DcStats {
     pub l: u8,
     /// Conditioning upper bound — see DAC marker, default U=1.
     pub u: u8,
-    /// `Prev` — the DC difference from the previous block of this component
-    /// (zero at scan start and after each restart per F.1.4.4.1.5).
-    pub prev_diff: i32,
-    /// `Pred` — the DC value from the previous block. Distinct from
-    /// `prev_diff` because predictions accumulate.
-    pub pred: i32,
 }
 
 impl DcStats {
@@ -620,36 +620,25 @@ impl DcStats {
             bins: [Context::default(); 49],
             l: 0,
             u: 1,
-            prev_diff: 0,
-            pred: 0,
         }
     }
 
-    /// Reset learning + DC predictor (called at scan start and at each RSTn).
+    /// Re-initialise every bin (scan start and each RSTn, F.1.4.4.1.5 /
+    /// F.2.4.4). The L / U conditioning bounds are kept.
     pub fn reset(&mut self) {
         for b in self.bins.iter_mut() {
             *b = Context::default();
         }
-        self.prev_diff = 0;
-        self.pred = 0;
     }
 
-    /// Reset only the per-restart predictor state (DC predictor + Da). Stats
-    /// are also reset per spec at restart points.
+    /// Alias of [`DcStats::reset`] kept for the restart call sites.
     pub fn restart_reset(&mut self) {
-        // Per F.2.4.4 + F.1.4.4.1.5, statistics are also re-initialised at
-        // restart, matching the encoder's Initdec call.
-        for b in self.bins.iter_mut() {
-            *b = Context::default();
-        }
-        self.prev_diff = 0;
-        self.pred = 0;
+        self.reset();
     }
 
-    /// DC_Context(Da): map the previous-block difference to a base bin
-    /// (0, 4, 8, 12, 16 for zero/small+/small-/large+/large-).
-    pub fn dc_context(&self) -> usize {
-        let da = self.prev_diff;
+    /// DC_Context(Da): map the component's previous-block difference `da`
+    /// to a base bin (0, 4, 8, 12, 16 for zero/small+/small-/large+/large-).
+    pub fn dc_context(&self, da: i32) -> usize {
         let lower = if self.l == 0 {
             0
         } else {
@@ -666,6 +655,32 @@ impl DcStats {
         } else {
             16
         }
+    }
+}
+
+/// Per-component DC prediction state of the arithmetic DCT models: the
+/// running prediction `Pred` (F.1.1.5.1) and `Da`, the difference coded
+/// for the previous block of the same component (F.1.4.4.1.2). Zeroed at
+/// scan start and after every restart marker (F.1.4.4.1.5). Distinct from
+/// the statistics area, which is bound to the table destination and may
+/// be shared by several components.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DcPredictor {
+    /// `Pred` — the DC value of the previous block of this component.
+    pub pred: i32,
+    /// `Da` — the DC difference coded for the previous block of this
+    /// component.
+    pub prev_diff: i32,
+}
+
+impl DcPredictor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Zero both `Pred` and `Da`.
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -952,14 +967,19 @@ fn decode_magnitude(
 }
 
 /// Decode one DC difference for one block. Returns the signed difference
-/// to ADD to the predictor (caller updates `pred`).
-pub fn decode_dc_diff(d: &mut ArithDecoder<'_>, dc: &mut DcStats) -> Result<i32> {
+/// to ADD to the predictor (caller updates `pr.pred`); `pr.prev_diff` is
+/// updated to the decoded difference (the next block's `Da`).
+pub fn decode_dc_diff(
+    d: &mut ArithDecoder<'_>,
+    dc: &mut DcStats,
+    pr: &mut DcPredictor,
+) -> Result<i32> {
     // S0 = base bin from Da classification.
-    let s0 = dc.dc_context();
+    let s0 = dc.dc_context(pr.prev_diff);
     let zero = d.decode(&mut dc.bins[s0]);
     if zero == 0 {
         // DIFF = 0; Da updates to 0.
-        dc.prev_diff = 0;
+        pr.prev_diff = 0;
         return Ok(0);
     }
     // DIFF != 0 → decode sign + magnitude.
@@ -969,7 +989,7 @@ pub fn decode_dc_diff(d: &mut ArithDecoder<'_>, dc: &mut DcStats) -> Result<i32>
     let mag = decode_magnitude(d, &mut dc.bins, sx_first, 20, true, false)?;
     let v = mag + 1;
     let signed = if sign != 0 { -v } else { v };
-    dc.prev_diff = signed;
+    pr.prev_diff = signed;
     Ok(signed)
 }
 
@@ -1212,16 +1232,22 @@ pub(crate) fn encode_magnitude(
 
 /// Encoder-side §F.1.4.1 DC difference for the sequential / progressive
 /// DCT arithmetic models — the exact mirror of [`decode_dc_diff`]. Codes the
-/// difference `diff = V − Pred` using the DC statistics area `dc`, updates
-/// `dc.prev_diff` (the `Da` conditioning input for the next block) and
-/// returns. The caller owns the `dc.pred` accumulation. `|diff|` must fit the
-/// 15-bit magnitude tree (enforced by the SOF9/SOF10 emit paths, whose
-/// 8-/12-bit samples bound the DC range).
-pub(crate) fn encode_dc_diff(e: &mut ArithEncoder, dc: &mut DcStats, diff: i32) {
-    let s0 = dc.dc_context();
+/// difference `diff = V − Pred` using the DC statistics area `dc` of the
+/// component's table destination, updates `pr.prev_diff` (the `Da`
+/// conditioning input for the component's next block) and returns. The
+/// caller owns the `pr.pred` accumulation. `|diff|` must fit the 15-bit
+/// magnitude tree (enforced by the SOF9/SOF10 emit paths, whose 8-/12-bit
+/// samples bound the DC range).
+pub(crate) fn encode_dc_diff(
+    e: &mut ArithEncoder,
+    dc: &mut DcStats,
+    pr: &mut DcPredictor,
+    diff: i32,
+) {
+    let s0 = dc.dc_context(pr.prev_diff);
     if diff == 0 {
         e.code_bit(&mut dc.bins[s0], 0);
-        dc.prev_diff = 0;
+        pr.prev_diff = 0;
         return;
     }
     e.code_bit(&mut dc.bins[s0], 1);
@@ -1230,7 +1256,7 @@ pub(crate) fn encode_dc_diff(e: &mut ArithEncoder, dc: &mut DcStats, diff: i32) 
     let sx = s0 + 2 + sign as usize;
     // X1 base for DC is bin 20 (Table F.4); M-bins shadow X-bins at +14.
     encode_magnitude(e, &mut dc.bins, sx, 20, diff.unsigned_abs() - 1);
-    dc.prev_diff = diff;
+    pr.prev_diff = diff;
 }
 
 /// Encoder-side AC magnitude with the Table F.5 bin layout (SP = SN = X1 =
@@ -1307,20 +1333,22 @@ pub(crate) fn encode_ac(
     }
 }
 
-/// Encode one DCT block (DC diff + AC zigzag) using the Q-coder and the
-/// per-component DC/AC statistics areas — encoder mirror of
+/// Encode one DCT block (DC diff + AC zigzag) using the Q-coder, the DC /
+/// AC statistics areas of the component's table destinations and the
+/// component's prediction state — encoder mirror of
 /// [`super::super::decoder::decode_arith_block`]. `block` holds the
-/// coefficients in zigzag-index order. The caller carries `dc.pred` across
+/// coefficients in zigzag-index order. The caller carries `pr.pred` across
 /// blocks (zeroing it per block yields the §J.2.3.1 differential model).
 pub(crate) fn encode_block(
     e: &mut ArithEncoder,
     dc: &mut DcStats,
     ac: &mut AcStats,
+    pr: &mut DcPredictor,
     block: &[i32; 64],
 ) {
-    let diff = block[0] - dc.pred;
-    encode_dc_diff(e, dc, diff);
-    dc.pred = block[0];
+    let diff = block[0] - pr.pred;
+    encode_dc_diff(e, dc, pr, diff);
+    pr.pred = block[0];
     encode_ac(e, ac, block, 1, 63);
 }
 
@@ -1562,8 +1590,9 @@ mod tests {
         let mut e = ArithEncoder::new();
         let mut dc_e = DcStats::new();
         let mut ac_e = AcStats::new();
+        let mut pr_e = DcPredictor::new();
         for b in &zz_blocks {
-            encode_block(&mut e, &mut dc_e, &mut ac_e, b);
+            encode_block(&mut e, &mut dc_e, &mut ac_e, &mut pr_e, b);
         }
         let coded = e.finish();
 
@@ -1572,15 +1601,16 @@ mod tests {
         let mut d = ArithDecoder::new(&coded);
         let mut dc_d = DcStats::new();
         let mut ac_d = AcStats::new();
+        let mut pr_d = DcPredictor::new();
         for (bi, zz) in zz_blocks.iter().enumerate() {
             let mut want = [0i32; 64];
             for k in 0..64 {
                 want[ZIGZAG[k]] = zz[k];
             }
             let mut got = [0i32; 64];
-            let diff = decode_dc_diff(&mut d, &mut dc_d).unwrap();
-            dc_d.pred = dc_d.pred.wrapping_add(diff);
-            got[0] = dc_d.pred;
+            let diff = decode_dc_diff(&mut d, &mut dc_d, &mut pr_d).unwrap();
+            pr_d.pred = pr_d.pred.wrapping_add(diff);
+            got[0] = pr_d.pred;
             decode_ac(&mut d, &mut ac_d, &mut got, 1, 63).unwrap();
             assert_eq!(got, want, "block {bi} coefficient mismatch");
         }

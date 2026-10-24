@@ -17,15 +17,17 @@ use crate::image::{JpegImage, MjpegPixelFormat as PixelFormat, Plane as VideoPla
 pub use crate::registry::make_decoder;
 
 use crate::jpeg::arith::{
-    AcRefineStats, AcStats, ArithDecoder, DcStats, LosslessStats, decode_ac as arith_decode_ac,
-    decode_ac_refine as arith_decode_ac_refine, decode_dc_diff as arith_decode_dc_diff,
-    decode_fixed_bit as arith_decode_fixed_bit, decode_lossless_diff as arith_decode_lossless_diff,
+    AcRefineStats, AcStats, ArithDecoder, DcPredictor, DcStats, LosslessStats,
+    decode_ac as arith_decode_ac, decode_ac_refine as arith_decode_ac_refine,
+    decode_dc_diff as arith_decode_dc_diff, decode_fixed_bit as arith_decode_fixed_bit,
+    decode_lossless_diff as arith_decode_lossless_diff,
 };
 use crate::jpeg::dct::idct8x8;
 use crate::jpeg::huffman::{HuffTable, parse_dht};
 use crate::jpeg::markers::{self, *};
 use crate::jpeg::parser::{
-    MarkerWalker, SofInfo, SosInfo, parse_dac, parse_dnl, parse_dri, parse_sof, parse_sos,
+    MarkerWalker, SofInfo, SosComponent, SosInfo, parse_dac, parse_dnl, parse_dri, parse_sof,
+    parse_sos,
 };
 use crate::jpeg::quant::{QuantTable, parse_dqt};
 use crate::jpeg::zigzag::ZIGZAG;
@@ -1944,49 +1946,18 @@ fn decode_arith_scan_diff(
 
     let interleaved = sos.components.len() == sof.components.len();
 
-    // Per-component DC + AC statistics areas. These are SHARED across all
-    // blocks of a component within this scan and reset only at RSTn (per
-    // §F.2.4 / F.1.4.4 initial-conditions text).
+    // Statistics areas are bound to the table destinations the scan's
+    // Td / Ta selectors name (T.81 §B.2.3: the selector "specifies both an
+    // arithmetic coding conditioning table destination and an associated
+    // statistics area"), so components sharing a destination — the usual
+    // `Cb → 1, Cr → 1` — share the area. They are reset only at RSTn
+    // (F.1.4.4.1.5 / F.2.4.4). The DC prediction (`Pred`, `Da`) is per
+    // component (F.1.4.4.1.2).
     let n_comp = sof.components.len();
-    let mut dc_stats: Vec<DcStats> = (0..n_comp)
-        .map(|i| {
-            let mut s = DcStats::new();
-            // Resolve DAC conditioning override for this component's DC
-            // table destination (sos.components[?].dc_table). For an
-            // interleaved scan the same DC destination may be shared across
-            // SOS components; we simply look up the SOS component matching
-            // this SOF index. If no SOS entry is present (i.e. component
-            // not part of this scan), defaults stay.
-            if let Some(sc) = sos.components.iter().find(|sc| {
-                sof.components
-                    .iter()
-                    .position(|fc| fc.id == sc.id)
-                    .map(|j| j == i)
-                    .unwrap_or(false)
-            }) && let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref()
-            {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
-        .collect();
-    let mut ac_stats: Vec<AcStats> = (0..n_comp)
-        .map(|i| {
-            let mut s = AcStats::new();
-            if let Some(sc) = sos.components.iter().find(|sc| {
-                sof.components
-                    .iter()
-                    .position(|fc| fc.id == sc.id)
-                    .map(|j| j == i)
-                    .unwrap_or(false)
-            }) && let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref()
-            {
-                s.kx = cond.kx;
-            }
-            s
-        })
-        .collect();
+    let mut dc_areas = arith_dc_areas(state);
+    let mut ac_areas = arith_ac_areas(state);
+    let (dc_dest, ac_dest) = arith_destinations(sof, sos);
+    let mut preds = vec![DcPredictor::new(); n_comp];
 
     // The arithmetic decoder owns its byte source (with 0xFF 0x00 unstuff
     // and marker trapping baked in). When we hit a restart boundary, we
@@ -2023,11 +1994,14 @@ fn decode_arith_scan_diff(
                 scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
                     Error::invalid("arithmetic scan: missing restart marker mid-scan")
                 })?;
-                for s in dc_stats.iter_mut() {
-                    s.restart_reset();
+                for a in dc_areas.iter_mut() {
+                    a.reset();
                 }
-                for s in ac_stats.iter_mut() {
-                    s.restart_reset();
+                for a in ac_areas.iter_mut() {
+                    a.reset();
+                }
+                for p in preds.iter_mut() {
+                    p.reset();
                 }
                 decoder = ArithDecoder::new(&scan[scan_pos..]);
             }
@@ -2045,12 +2019,13 @@ fn decode_arith_scan_diff(
                             // coefficient directly — zero the prediction state
                             // before each block so no inter-block carry happens.
                             if differential {
-                                dc_stats[sof_idx].pred = 0;
+                                preds[sof_idx].pred = 0;
                             }
                             decode_arith_block(
                                 &mut decoder,
-                                &mut dc_stats[sof_idx],
-                                &mut ac_stats[sof_idx],
+                                &mut dc_areas[dc_dest[sof_idx]],
+                                &mut ac_areas[ac_dest[sof_idx]],
+                                &mut preds[sof_idx],
                                 &mut coefs[sof_idx][bi],
                             )?;
                         }
@@ -2062,12 +2037,13 @@ fn decode_arith_scan_diff(
                 let blocks_x = mcus_x * c.h_factor as usize;
                 let bi = my * blocks_x + mx;
                 if differential {
-                    dc_stats[sof_idx].pred = 0;
+                    preds[sof_idx].pred = 0;
                 }
                 decode_arith_block(
                     &mut decoder,
-                    &mut dc_stats[sof_idx],
-                    &mut ac_stats[sof_idx],
+                    &mut dc_areas[dc_dest[sof_idx]],
+                    &mut ac_areas[ac_dest[sof_idx]],
+                    &mut preds[sof_idx],
                     &mut coefs[sof_idx][bi],
                 )?;
             }
@@ -2077,24 +2053,83 @@ fn decode_arith_scan_diff(
     Ok(())
 }
 
-/// Decode one DCT block (DC diff + AC zigzag) using the arithmetic Q-coder
-/// and the per-component DC/AC statistics areas. Writes natural-order
-/// dequant-input coefficients into `block`.
+/// Decode one DCT block (DC diff + AC zigzag) using the arithmetic Q-coder,
+/// the DC / AC statistics areas of the component's table destinations and
+/// the component's prediction state. Writes natural-order dequant-input
+/// coefficients into `block`.
 fn decode_arith_block(
     d: &mut ArithDecoder<'_>,
     dc: &mut DcStats,
     ac: &mut AcStats,
+    pr: &mut DcPredictor,
     block: &mut [i32; 64],
 ) -> Result<()> {
     // Zero-fill — the AC band may exit early via EOB.
     for v in block.iter_mut() {
         *v = 0;
     }
-    let diff = arith_decode_dc_diff(d, dc)?;
-    dc.pred = dc.pred.wrapping_add(diff);
-    block[0] = dc.pred;
+    let diff = arith_decode_dc_diff(d, dc, pr)?;
+    pr.pred = pr.pred.wrapping_add(diff);
+    block[0] = pr.pred;
     arith_decode_ac(d, ac, block, 1, 63)?;
     Ok(())
+}
+
+/// The four DC statistics areas of a scan, one per table destination,
+/// carrying the DAC `L` / `U` conditioning bounds of each destination
+/// (defaults `L = 0`, `U = 1`).
+fn arith_dc_areas(state: &JpegState) -> [DcStats; 4] {
+    std::array::from_fn(|tb| {
+        let mut s = DcStats::new();
+        if let Some(cond) = state.arith_dc[tb].as_ref() {
+            s.l = cond.l;
+            s.u = cond.u;
+        }
+        s
+    })
+}
+
+/// The four AC statistics areas of a scan, one per table destination,
+/// carrying the DAC `Kx` conditioning threshold (default 5).
+fn arith_ac_areas(state: &JpegState) -> [AcStats; 4] {
+    std::array::from_fn(|tb| {
+        let mut s = AcStats::new();
+        if let Some(cond) = state.arith_ac[tb].as_ref() {
+            s.kx = cond.kx;
+        }
+        s
+    })
+}
+
+/// The four lossless statistics areas of a scan, one per DC table
+/// destination (§H.1.2.3.3 bounds from the DAC `Tc = 0` entries).
+fn arith_lossless_areas(state: &JpegState) -> [LosslessStats; 4] {
+    std::array::from_fn(|tb| {
+        let mut s = LosslessStats::new();
+        if let Some(cond) = state.arith_dc[tb].as_ref() {
+            s.l = cond.l;
+            s.u = cond.u;
+        }
+        s
+    })
+}
+
+/// `(Td, Ta)` per **SOF** component for `sos` (validated `< 4` by
+/// `validate_sos`); components the scan does not cover get destination 0,
+/// which is never consulted for them.
+fn arith_destinations(sof: &SofInfo, sos: &SosInfo) -> (Vec<usize>, Vec<usize>) {
+    let lookup = |pick: fn(&SosComponent) -> u8| -> Vec<usize> {
+        sof.components
+            .iter()
+            .map(|fc| {
+                sos.components
+                    .iter()
+                    .find(|sc| sc.id == fc.id)
+                    .map_or(0, |sc| pick(sc) as usize)
+            })
+            .collect()
+    };
+    (lookup(|sc| sc.dc_table), lookup(|sc| sc.ac_table))
 }
 
 /// Locate the next non-stuff JPEG marker in `scan` starting at `from`.
@@ -2226,18 +2261,16 @@ fn decode_progressive_arith_scan_diff(
     // from the DAC destinations named by this scan's Tdj / Taj selectors.
     // Refinement scans track their own bins (DC refinement none at all —
     // the fixed estimate is stateless).
-    let mut dc_stats: Vec<DcStats> = sos
+    // DC areas per table destination (§B.2.3), shared by the scan
+    // components naming the same Td; the prediction state is per scan
+    // component. AC scans cover one component, so a single area suffices.
+    let mut dc_areas = arith_dc_areas(state);
+    let dc_dest: Vec<usize> = sos
         .components
         .iter()
-        .map(|sc| {
-            let mut s = DcStats::new();
-            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
+        .map(|sc| sc.dc_table as usize)
         .collect();
+    let mut preds = vec![DcPredictor::new(); sos.components.len()];
     let mut ac_stats = AcStats::new();
     if let Some(sc) = sos.components.first()
         && let Some(cond) = state.arith_ac[sc.ac_table as usize].as_ref()
@@ -2271,8 +2304,11 @@ fn decode_progressive_arith_scan_diff(
                 scan_pos = locate_next_marker_after(scan, scan_pos).ok_or_else(|| {
                     Error::invalid("progressive arith: missing restart marker mid-scan")
                 })?;
-                for s in dc_stats.iter_mut() {
-                    s.restart_reset();
+                for a in dc_areas.iter_mut() {
+                    a.reset();
+                }
+                for p in preds.iter_mut() {
+                    p.reset();
                 }
                 ac_stats.restart_reset();
                 ac_refine_stats.restart_reset();
@@ -2293,11 +2329,12 @@ fn decode_progressive_arith_scan_diff(
                                 // pass decodes the DC directly; zero the
                                 // prediction state before each block.
                                 if differential && sos.ah == 0 {
-                                    dc_stats[sidx].pred = 0;
+                                    preds[sidx].pred = 0;
                                 }
                                 prog_arith_decode_dc(
                                     &mut decoder,
-                                    &mut dc_stats[sidx],
+                                    &mut dc_areas[dc_dest[sidx]],
+                                    &mut preds[sidx],
                                     &mut coefs[sof_idx][bi],
                                     sos.ah,
                                     sos.al,
@@ -2311,11 +2348,12 @@ fn decode_progressive_arith_scan_diff(
                     let blocks_x = mcus_x * c.h_factor as usize;
                     let bi = my * blocks_x + mx;
                     if differential && sos.ah == 0 {
-                        dc_stats[0].pred = 0;
+                        preds[0].pred = 0;
                     }
                     prog_arith_decode_dc(
                         &mut decoder,
-                        &mut dc_stats[0],
+                        &mut dc_areas[dc_dest[0]],
+                        &mut preds[0],
                         &mut coefs[sof_idx][bi],
                         sos.ah,
                         sos.al,
@@ -2365,14 +2403,15 @@ fn decode_progressive_arith_scan_diff(
 fn prog_arith_decode_dc(
     d: &mut ArithDecoder<'_>,
     dc: &mut DcStats,
+    pr: &mut DcPredictor,
     block: &mut [i32; 64],
     ah: u8,
     al: u8,
 ) -> Result<()> {
     if ah == 0 {
-        let diff = arith_decode_dc_diff(d, dc)?;
-        dc.pred = dc.pred.wrapping_add(diff);
-        block[0] = dc.pred << al;
+        let diff = arith_decode_dc_diff(d, dc, pr)?;
+        pr.pred = pr.pred.wrapping_add(diff);
+        block[0] = pr.pred << al;
     } else {
         let bit = arith_decode_fixed_bit(d) as i32;
         block[0] |= bit << al;
@@ -5255,20 +5294,15 @@ fn decode_lossless_arith_scan_planes(
     let height = sof.height as usize;
     let nc = sos.components.len();
 
-    // One statistics area per scan component (§H.1.2.3.2), with the L / U
-    // conditioning bounds taken from the DAC DC-conditioning entry the
-    // component's Td selector points at (§H.1.2.3.3; defaults L=0, U=1).
-    let mut stats: Vec<LosslessStats> = sos
+    // Statistics areas are bound to the DC table destinations (§B.2.3):
+    // scan components naming the same Td share one area (`dest[ci]`), and
+    // the L / U conditioning bounds come from the DAC entry of that
+    // destination (§H.1.2.3.3; defaults L=0, U=1).
+    let mut stats = arith_lossless_areas(state);
+    let dest: Vec<usize> = sos
         .components
         .iter()
-        .map(|sc| {
-            let mut s = LosslessStats::new();
-            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
+        .map(|sc| sc.dc_table as usize)
         .collect();
 
     // All arithmetic is on the pre-Pt-shift sample range (0..2^(P-Pt)).
@@ -5351,7 +5385,7 @@ fn decode_lossless_arith_scan_planes(
 
                 let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                 let db = prev_diff[ci][x];
-                let diff = arith_decode_lossless_diff(&mut decoder, &mut stats[ci], da, db)?;
+                let diff = arith_decode_lossless_diff(&mut decoder, &mut stats[dest[ci]], da, db)?;
                 cur_diff[ci][x] = diff;
 
                 let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
@@ -5398,19 +5432,15 @@ fn decode_lossless_arith_scan_subsampled(
 ) -> Result<JpegImage> {
     let nc = sos.components.len();
 
-    // One statistics area per scan component (§H.1.2.3.2); the DAC L / U
-    // conditioning bounds default to (0, 1) when no DAC segment is present.
-    let mut stats: Vec<LosslessStats> = sos
+    // Statistics areas are bound to the DC table destinations (§B.2.3):
+    // scan components naming the same Td share one area (`dest[ci]`), and
+    // the L / U conditioning bounds come from the DAC entry of that
+    // destination (§H.1.2.3.3; defaults L=0, U=1).
+    let mut stats = arith_lossless_areas(state);
+    let dest: Vec<usize> = sos
         .components
         .iter()
-        .map(|sc| {
-            let mut s = LosslessStats::new();
-            if let Some(cond) = state.arith_dc[sc.dc_table as usize].as_ref() {
-                s.l = cond.l;
-                s.u = cond.u;
-            }
-            s
-        })
+        .map(|sc| sc.dc_table as usize)
         .collect();
 
     let sample_bits = 8u32 - pt;
@@ -5495,7 +5525,7 @@ fn decode_lossless_arith_scan_subsampled(
                         let da = if gx == 0 { 0 } else { dg[gy * gw + gx - 1] };
                         let db = if gy == 0 { 0 } else { dg[(gy - 1) * gw + gx] };
                         let diff =
-                            arith_decode_lossless_diff(&mut decoder, &mut stats[ci], da, db)?;
+                            arith_decode_lossless_diff(&mut decoder, &mut stats[dest[ci]], da, db)?;
                         diff_grid[ci][gy * gw + gx] = diff;
 
                         let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
@@ -6784,14 +6814,11 @@ mod lossless_tests {
         let sample_bits = (precision - pt) as u32;
         let origin: u32 = 1 << (sample_bits - 1);
         let (l, u) = dac_lu.unwrap_or((0, 1));
-        let mut stats: Vec<LosslessStats> = (0..nc)
-            .map(|_| {
-                let mut s = LosslessStats::new();
-                s.l = l;
-                s.u = u;
-                s
-            })
-            .collect();
+        // Every scan component selects Td = 0 (above): one shared
+        // statistics area (T.81 §B.2.3), per-component Da / Db history.
+        let mut stats = LosslessStats::new();
+        stats.l = l;
+        stats.u = u;
         let mut prev_diff = vec![vec![0i32; width]; nc];
         let mut cur_diff = vec![vec![0i32; width]; nc];
         let mut enc = ArithEncoder::new();
@@ -6811,9 +6838,7 @@ mod lossless_tests {
                     out.extend_from_slice(&std::mem::take(&mut enc).finish());
                     out.extend_from_slice(&[0xFF, 0xD0 + rst]);
                     rst = (rst + 1) % 8;
-                    for s in stats.iter_mut() {
-                        s.reset();
-                    }
+                    stats.reset();
                     for r in prev_diff.iter_mut() {
                         r.fill(0);
                     }
@@ -6853,7 +6878,7 @@ mod lossless_tests {
                     let dm = if dm >= 0x8000 { dm - 0x10000 } else { dm };
                     let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
                     let db = prev_diff[ci][x];
-                    encode_lossless_diff(&mut enc, &mut stats[ci], da, db, dm).unwrap();
+                    encode_lossless_diff(&mut enc, &mut stats, da, db, dm).unwrap();
                     cur_diff[ci][x] = dm;
                 }
                 reset_pred = false;
@@ -7076,7 +7101,9 @@ mod lossless_tests {
 #[cfg(test)]
 mod sof10_tests {
     use super::decode_planes;
-    use crate::jpeg::arith::{AcStats, ArithEncoder, Context, DcStats, encode_magnitude};
+    use crate::jpeg::arith::{
+        AcStats, ArithEncoder, Context, DcPredictor, DcStats, encode_magnitude,
+    };
     use crate::jpeg::dct::idct8x8;
     use crate::jpeg::zigzag::ZIGZAG;
 
@@ -7097,11 +7124,11 @@ mod sof10_tests {
 
     /// Encoder-side §F.1.4.1 DC difference (mirror of
     /// `arith::decode_dc_diff`).
-    fn encode_dc_diff(e: &mut ArithEncoder, dc: &mut DcStats, diff: i32) {
-        let s0 = dc.dc_context();
+    fn encode_dc_diff(e: &mut ArithEncoder, dc: &mut DcStats, pr: &mut DcPredictor, diff: i32) {
+        let s0 = dc.dc_context(pr.prev_diff);
         if diff == 0 {
             e.code_bit(&mut dc.bins[s0], 0);
-            dc.prev_diff = 0;
+            pr.prev_diff = 0;
             return;
         }
         e.code_bit(&mut dc.bins[s0], 1);
@@ -7110,18 +7137,27 @@ mod sof10_tests {
         let sx = s0 + 2 + sign as usize;
         // X1 base for DC is bin 20 (Table F.4); M-bins shadow X-bins at +14.
         encode_magnitude(e, &mut dc.bins, sx, 20, diff.unsigned_abs() - 1);
-        dc.prev_diff = diff;
+        pr.prev_diff = diff;
     }
 
     /// DC progressive coding for one block (§G.1.3.1). `full` is the
     /// full-precision DC value; first scans code the point-transformed
-    /// difference, refinement scans code one fixed-estimate LSB.
-    fn encode_dc_unit(e: &mut ArithEncoder, dc: &mut DcStats, full: i32, ah: u8, al: u8) {
+    /// difference, refinement scans code one fixed-estimate LSB. `dc` is
+    /// the statistics area of the component's table destination, `pr` the
+    /// component's own prediction state.
+    fn encode_dc_unit(
+        e: &mut ArithEncoder,
+        dc: &mut DcStats,
+        pr: &mut DcPredictor,
+        full: i32,
+        ah: u8,
+        al: u8,
+    ) {
         if ah == 0 {
             let vt = full >> al; // DC point transform: arithmetic shift
-            let diff = vt - dc.pred;
-            encode_dc_diff(e, dc, diff);
-            dc.pred = vt;
+            let diff = vt - pr.pred;
+            encode_dc_diff(e, dc, pr, diff);
+            pr.pred = vt;
         } else {
             code_fixed_bit(e, ((full >> al) & 1) as u8);
         }
@@ -7321,7 +7357,10 @@ mod sof10_tests {
                 (mcus_x * h as usize, mcus_y * v as usize)
             };
 
-            let mut dc_stats: Vec<DcStats> = (0..scomps.len()).map(|_| DcStats::new()).collect();
+            // Every scan component selects Td = 0 (below), so one DC
+            // statistics area is shared; the prediction is per component.
+            let mut dc_area = DcStats::new();
+            let mut preds = vec![DcPredictor::new(); scomps.len()];
             let mut ac = AcStats::new();
             ac.kx = kx;
             let mut refine_bins = [Context::default(); 189];
@@ -7338,8 +7377,9 @@ mod sof10_tests {
                         out.extend_from_slice(&std::mem::take(&mut enc).finish());
                         out.extend_from_slice(&[0xFF, 0xD0 + rst]);
                         rst = (rst + 1) % 8;
-                        for s in dc_stats.iter_mut() {
-                            *s = DcStats::new();
+                        dc_area.reset();
+                        for p in preds.iter_mut() {
+                            p.reset();
                         }
                         ac.reset();
                         refine_bins = [Context::default(); 189];
@@ -7356,7 +7396,8 @@ mod sof10_tests {
                                             + bx;
                                         encode_dc_unit(
                                             &mut enc,
-                                            &mut dc_stats[sidx],
+                                            &mut dc_area,
+                                            &mut preds[sidx],
                                             blocks[ci][bi][0],
                                             *ah,
                                             *al,
@@ -7367,7 +7408,8 @@ mod sof10_tests {
                                 let bi = my * blocks_x + mx;
                                 encode_dc_unit(
                                     &mut enc,
-                                    &mut dc_stats[sidx],
+                                    &mut dc_area,
+                                    &mut preds[sidx],
                                     blocks[ci][bi][0],
                                     *ah,
                                     *al,
@@ -7797,15 +7839,16 @@ mod sof10_tests {
         e: &mut ArithEncoder,
         dc: &mut DcStats,
         ac: &mut AcStats,
+        pr: &mut DcPredictor,
         block: &[i32; 64],
         differential: bool,
     ) {
         if differential {
-            dc.pred = 0;
+            pr.pred = 0;
         }
-        let diff = block[0] - dc.pred;
-        encode_dc_diff(e, dc, diff);
-        dc.pred = block[0];
+        let diff = block[0] - pr.pred;
+        encode_dc_diff(e, dc, pr, diff);
+        pr.pred = block[0];
         encode_ac_band(e, ac, block, 1, 63);
     }
 
@@ -7844,6 +7887,7 @@ mod sof10_tests {
                 let sos = vec![1u8, 1, 0x00, ss, se, 0x00];
                 put_seg(out, 0xDA, &sos);
                 let mut dc = DcStats::new();
+                let mut pr = DcPredictor::new();
                 let mut ac = AcStats::new();
                 let mut enc = ArithEncoder::new();
                 for by in 0..blocks_y {
@@ -7851,9 +7895,9 @@ mod sof10_tests {
                         let b = &blocks[by * blocks_x + bx];
                         if ss == 0 {
                             if differential {
-                                dc.pred = 0;
+                                pr.pred = 0;
                             }
-                            encode_dc_unit(&mut enc, &mut dc, b[0], 0, 0);
+                            encode_dc_unit(&mut enc, &mut dc, &mut pr, b[0], 0, 0);
                         } else {
                             encode_ac_band(&mut enc, &mut ac, b, 1, 63);
                         }
@@ -7865,12 +7909,13 @@ mod sof10_tests {
             let sos = vec![1u8, 1, 0x00, 0, 63, 0x00];
             put_seg(out, 0xDA, &sos);
             let mut dc = DcStats::new();
+            let mut pr = DcPredictor::new();
             let mut ac = AcStats::new();
             let mut enc = ArithEncoder::new();
             for by in 0..blocks_y {
                 for bx in 0..blocks_x {
                     let b = &blocks[by * blocks_x + bx];
-                    encode_seq_arith_block(&mut enc, &mut dc, &mut ac, b, differential);
+                    encode_seq_arith_block(&mut enc, &mut dc, &mut ac, &mut pr, b, differential);
                 }
             }
             out.extend_from_slice(&enc.finish());

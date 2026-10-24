@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Arithmetic-coded colour JPEGs.** Statistics areas are now bound to
+  the `Td` / `Ta` table destination the scan names (T.81 §B.2.3), not to
+  the component, so components sharing a destination (`Cb` and `Cr` on
+  destination 1) share one area; the DC prediction and `Da` stay per
+  component (`jpeg::arith::DcPredictor`). `cjpeg -arithmetic` colour
+  files (sequential, progressive, restart intervals) used to decode to
+  noise and now decode to exactly the samples of their Huffman twin; the
+  same rule applies to the lossless arithmetic models. The arithmetic
+  encoders had the mirror defect — `djpeg` could not read their colour
+  output — and now emit the very entropy-coded segment `jpegtran
+  -arithmetic` produces from the same coefficients
+  (`tests/arith_destinations.rs`). Golden byte hashes of the arithmetic
+  YCbCr / RGB encodes re-recorded (decode-back hashes unchanged).
+- **R/G/B and CMYK encodes no longer carry a JFIF APP0.** T.871 §6.2 ties
+  JFIF to one Y or three YCbCr components, so libjpeg-family readers
+  applied the inverse colour transform to the Adobe `transform = 0`
+  R/G/B streams (wrong colours in `djpeg`). The Adobe APP14 alone now
+  signals R/G/B / CMYK / YCCK; the hierarchical lossless writer emits
+  JFIF only for grey and YCbCr-class stacks.
+
 ### Changed
 
 - edition 2024, MSRV 1.95; tests / fuzz harness load their black-box reference (libturbojpeg) through dlsym instead of libloading

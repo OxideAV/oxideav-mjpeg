@@ -283,6 +283,22 @@ fn corpus_decode_outputs_are_golden() {
 // ---------------------------------------------------------------------------
 
 /// (case name, FNV of the encoded JPEG bytes, FNV of its decode-back frame).
+///
+/// The `arith_yuv420_128x128_q75` and `arith_rgb24_64x64_q75` byte hashes
+/// were re-recorded when the arithmetic coders started binding statistics
+/// areas to the Td / Ta table destinations (T.81 §B.2.3) instead of to the
+/// component: the previous streams shared no statistics between Cb and Cr
+/// (destination 1) or between R, G and B (destination 0), so `djpeg`
+/// (libjpeg-turbo 3.2.0) decoded them to noise — the rewritten streams
+/// decode in `djpeg` to within IDCT rounding of this crate's own output.
+/// The decode-back hashes are unchanged: the same coefficients are coded.
+///
+/// `baseline_rgb24_64x64_q75`, `arith_rgb24_64x64_q75` and
+/// `baseline_cmyk_adobe0_64x64_q75` were re-recorded when the R/G/B and
+/// CMYK writers stopped emitting a JFIF APP0 next to the Adobe APP14
+/// (T.871 §6.2: JFIF means one Y or three YCbCr components, so `djpeg`
+/// read the R/G/B streams as YCbCr). Only the marker segment is gone; the
+/// decode-back hashes are unchanged.
 const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     (
         "baseline_yuv420_128x128_q75",
@@ -311,12 +327,12 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "baseline_rgb24_64x64_q75",
-        0x4f077d7971eb7490,
+        0xb77520017a0979e2,
         0xadbaacb18a10e44a,
     ),
     (
         "baseline_cmyk_adobe0_64x64_q75",
-        0x15d0d8cd11b98ab4,
+        0xfa70899ab7b50172,
         0x6aeba4ca99a080a7,
     ),
     (
@@ -331,7 +347,7 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "arith_yuv420_128x128_q75",
-        0x1a32df2072bccf6c,
+        0xc3b76ef5062375e9,
         0x864ab298a0b5b2d2,
     ),
     (
@@ -341,7 +357,7 @@ const ENCODE_GOLDENS: &[(&str, u64, u64)] = &[
     ),
     (
         "arith_rgb24_64x64_q75",
-        0x0507a91012e698a5,
+        0x20baddedd5747301,
         0xadbaacb18a10e44a,
     ),
     (

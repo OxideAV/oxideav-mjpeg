@@ -216,8 +216,39 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `max_bytes` | `None` | Input length cap; `None` = unlimited. |
 | `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
 | `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
+| `idct` | `IdctMethod::Float` | Inverse DCT of 8-bit DCT frames: `Float` (f32 cosine matrix) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
+| `upsampling` | `ChromaUpsampling::Replicate` | Chroma reconstruction: `Replicate` or `Triangular` (¾ / ¼ linear interpolation for 2:1, 1:2 and 2 × 2 ratios). Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8_with` / `decode_rgba8_with`. |
+| `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 
 Breaches are `Error::LimitExceeded`.
+
+### libjpeg-compatible output
+
+`DecodeOptions::libjpeg_compatible()` sets the three knobs to
+`AccurateInteger` / `Triangular` / `FixedPoint16`, which reproduces
+`djpeg`'s default output (libjpeg-turbo 3.2.0) bit-exactly:
+
+```rust,ignore
+let opts = oxideav_mjpeg::DecodeOptions::libjpeg_compatible();
+let rgb = oxideav_mjpeg::decode_rgb8_with(&jpeg, &opts)?;      // == djpeg -ppm
+let img = oxideav_mjpeg::decode_with(&jpeg, &opts)?;           // planes from the integer IDCT
+let rgb = img.to_rgb8_with(&opts.convert_options());           // same bytes
+```
+
+Each knob is independent (`with_idct` / `with_upsampling` /
+`with_ycbcr`; `ConvertOptions` carries the last two for
+`JpegImage::to_rgb8_with`); the defaults are unchanged
+(`decode_rgb8(b) == decode_rgb8_with(b, &DecodeOptions::new())`).
+Verified black-box with 0 differing samples over a 1 143-file corpus
+(4:4:4 / 4:2:2 / 4:2:0 / 4:4:0 / 4:1:1 / 4×2 / mixed factors / ffmpeg
+4:2:2, grey, progressive, restart intervals, arithmetic coding,
+quality 10–100, every size 1×1–9×9 plus 37×29 … 320×240), every
+`(Y, Cb, Cr)` combination of flat-block grids, and DC sweeps over
+`−1919..=2175` (the out-of-range saturation). Not covered: 12-bit
+frames (the integer IDCT applies to 8-bit DCT frames only), lossless
+frames with layouts resampled to 4:4:4 (replicated), and streams whose
+dequantised coefficients exceed 16 bits (`|S · Q| > 32767`, beyond any
+8-bit FDCT output), where `djpeg`'s results are implementation-specific.
 
 ## Metadata and colour
 
@@ -283,6 +314,9 @@ Breaches are `Error::LimitExceeded`.
   deep samples rescaled by `Round(v · 255 / (2^P − 1))` with the
   frame's `precision`; `Gbrp*` re-ordered to R, G, B. Grayscale, RGB
   and 12-bit corpus fixtures reproduce the reference PPMs bit-exactly.
+  `to_rgb8_with` / `to_rgba8_with` take a `ConvertOptions` (triangular
+  upsampling, 16-bit fixed-point YCbCr — see *libjpeg-compatible
+  output*).
 
 ## Limits
 

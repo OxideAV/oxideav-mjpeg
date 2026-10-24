@@ -1,0 +1,26 @@
+# name width height channels fnv1a64(sample bytes of `djpeg -pnm <name>`), libjpeg-turbo 3.2.0 defaults
+c411.jpg 37 29 3 7720fa508329a203
+c420.jpg 37 29 3 a2baf6ddc9d96ebe
+c420_arith.jpg 37 29 3 a2baf6ddc9d96ebe
+c420_prog.jpg 64 48 3 6c0b70e336ffce54
+c420_q10.jpg 64 48 3 a50880a8b9bea904
+c420_q100.jpg 37 29 3 13385d7786e4dee4
+c422.jpg 37 29 3 642e1a916e088b20
+c422_arithprog.jpg 37 29 3 642e1a916e088b20
+c422_rst.jpg 64 48 3 640b2b314bf0b819
+c440.jpg 37 29 3 a63011b4c53863f2
+c444.jpg 37 29 3 3d9060b0eaac8e42
+c4x2.jpg 37 29 3 2f3617ee66fa5909
+cmixed.jpg 37 29 3 0974da46698757bb
+ff420.jpg 37 29 3 96fc9328d8b8bdde
+ff422.jpg 37 29 3 d6fc2c6f97595d7d
+gray.jpg 37 29 1 0474285b83086ede
+gray_noise_prog.jpg 37 29 1 2d8f940075ebbdbd
+gray_noise_q100_444.jpg 37 29 3 def90c2f81012707
+tiny_1x2_1x5.jpg 1 5 3 208a98578006b71f
+tiny_1x2_7x2.jpg 7 2 3 853527132d67006f
+tiny_2x1_2x9.jpg 2 9 3 575a3426ff821f3b
+tiny_2x1_4x7.jpg 4 7 3 702adc527b8cca96
+tiny_2x2_1x1.jpg 1 1 3 39c48f1a55358181
+tiny_2x2_3x5.jpg 3 5 3 7c5f22545ad969e3
+tiny_2x2_9x9.jpg 9 9 3 acc251f5a6c598ff

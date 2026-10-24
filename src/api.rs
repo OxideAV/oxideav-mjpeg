@@ -127,7 +127,13 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
     }
     // The same limits are re-checked on every frame header inside the
     // decoder (hierarchical sequences carry several).
-    let mut img = crate::decoder::decode_planes_limited(opts.tables.as_deref(), bytes, limits)?;
+    let mut img = crate::decoder::decode_planes_limited(
+        opts.tables.as_deref(),
+        bytes,
+        limits,
+        opts.idct,
+        opts.upsampling,
+    )?;
     // Every YCbCr JPEG is full range (T.871 §7, T.872 §6.1): label the
     // 8-bit planar layouts `YuvJ*` whether or not a JFIF segment is
     // present.
@@ -148,6 +154,26 @@ pub fn decode_rgb8(bytes: &[u8]) -> Result<RgbImage> {
 pub fn decode_rgba8(bytes: &[u8]) -> Result<RgbaImage> {
     let img = decode(bytes)?;
     Ok(RgbaImage::new(img.width, img.height, img.to_rgba8()))
+}
+
+/// [`decode_rgb8`] with explicit options: limits, strictness and tables
+/// as for [`decode_with`], plus the reconstruction knobs —
+/// [`DecodeOptions::idct`] at decode time, [`DecodeOptions::upsampling`]
+/// and [`DecodeOptions::ycbcr`] for the conversion.
+/// `decode_rgb8_with(b, &DecodeOptions::new())` equals `decode_rgb8(b)`;
+/// [`DecodeOptions::libjpeg_compatible`] reproduces `djpeg`'s default
+/// output.
+pub fn decode_rgb8_with(bytes: &[u8], opts: &DecodeOptions) -> Result<RgbImage> {
+    let img = decode_with(bytes, opts)?;
+    let rgb = img.to_rgb8_with(&opts.convert_options());
+    Ok(RgbImage::new(img.width, img.height, rgb))
+}
+
+/// [`decode_rgba8`] with explicit options (see [`decode_rgb8_with`]).
+pub fn decode_rgba8_with(bytes: &[u8], opts: &DecodeOptions) -> Result<RgbaImage> {
+    let img = decode_with(bytes, opts)?;
+    let rgba = img.to_rgba8_with(&opts.convert_options());
+    Ok(RgbaImage::new(img.width, img.height, rgba))
 }
 
 /// Read `r` to its end and [`decode`] the bytes.

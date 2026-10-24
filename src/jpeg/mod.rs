@@ -8,6 +8,7 @@ pub mod color;
 pub mod dct;
 #[doc(hidden)]
 pub mod huffman;
+pub(crate) mod idct_int;
 pub mod inspect;
 #[doc(hidden)]
 pub mod markers;
@@ -15,5 +16,6 @@ pub mod markers;
 pub mod parser;
 #[doc(hidden)]
 pub mod quant;
+pub(crate) mod upsample;
 #[doc(hidden)]
 pub mod zigzag;

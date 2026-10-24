@@ -37,31 +37,50 @@
 //! * **Planar GBR** (`Gbrp*Le`) is re-ordered to R, G, B and rescaled.
 //!
 //! Alpha is always `255`: JPEG has no alpha channel.
+//!
+//! [`to_rgb8_with`] / [`to_rgba8_with`] select other kernels for the
+//! planar YCbCr layouts through [`ConvertOptions`]: triangular chroma
+//! upsampling (¾ / ¼ interpolation for the
+//! 2:1, 1:2 and 2 × 2 ratios) and the 16-bit fixed-point YCbCr kernel
+//! ([`ycbcr_to_rgb8_fixed16`]); both are what `djpeg` applies by default.
+//! The default options are the kernels above.
 
-use crate::image::{JpegImage, MjpegPixelFormat as F};
+use crate::image::{
+    ChromaUpsampling, ConvertOptions, JpegImage, MjpegPixelFormat as F, YcbcrKernel,
+};
 
 /// Convert `img` to tightly packed 8-bit RGB (`3 × width × height`
 /// bytes). See the module docs for the kernels.
 pub fn to_rgb8(img: &JpegImage) -> Vec<u8> {
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let mut out = vec![0u8; w * h * 3];
-    fill_rgb(img, &mut out, 3);
-    out
+    to_rgb8_with(img, &ConvertOptions::new())
 }
 
 /// Convert `img` to tightly packed 8-bit RGBA with opaque alpha
 /// (`4 × width × height` bytes).
 pub fn to_rgba8(img: &JpegImage) -> Vec<u8> {
+    to_rgba8_with(img, &ConvertOptions::new())
+}
+
+/// [`to_rgb8`] with explicit kernels.
+pub fn to_rgb8_with(img: &JpegImage, opts: &ConvertOptions) -> Vec<u8> {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let mut out = vec![0u8; w * h * 3];
+    fill_rgb(img, &mut out, 3, opts);
+    out
+}
+
+/// [`to_rgba8`] with explicit kernels.
+pub fn to_rgba8_with(img: &JpegImage, opts: &ConvertOptions) -> Vec<u8> {
     let w = img.width as usize;
     let h = img.height as usize;
     let mut out = vec![255u8; w * h * 4];
-    fill_rgb(img, &mut out, 4);
+    fill_rgb(img, &mut out, 4, opts);
     out
 }
 
 /// Fill the R, G, B bytes of every `bpp`-byte pixel of `out`.
-fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize) {
+fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) {
     let w = img.width as usize;
     let h = img.height as usize;
     if w == 0 || h == 0 || img.planes.is_empty() {
@@ -150,6 +169,10 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize) {
             let bps = img.format.bytes_per_sample();
             let (dh, dv) = img.format.chroma_divisors();
             let (py, pcb, pcr) = (&img.planes[0], &img.planes[1], &img.planes[2]);
+            if *opts != ConvertOptions::new() {
+                fill_ycbcr_with(img, out, bpp, opts, maxval);
+                return;
+            }
             for y in 0..h {
                 let cy = y / dv;
                 for x in 0..w {
@@ -248,6 +271,93 @@ fn round_div(num: i64, den: i64) -> i64 {
 #[inline]
 fn clamp8(v: i64) -> u8 {
     v.clamp(0, 255) as u8
+}
+
+/// [`fill_rgb`] for the planar YCbCr layouts under non-default
+/// [`ConvertOptions`]: chroma brought to the luma grid by the selected
+/// upsampling (falling back to replication where the triangular kernel
+/// does not apply), then the selected YCbCr kernel.
+fn fill_ycbcr_with(
+    img: &JpegImage,
+    out: &mut [u8],
+    bpp: usize,
+    opts: &ConvertOptions,
+    maxval: u32,
+) {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let bps = img.format.bytes_per_sample();
+    let (dh, dv) = img.format.chroma_divisors();
+    let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
+    let full_chroma = |p: &crate::image::Plane| -> Vec<u32> {
+        let get = |x: usize, y: usize| sample(p, bps, x, y);
+        let tri = match opts.upsampling {
+            ChromaUpsampling::Triangular => {
+                let comp = crate::jpeg::upsample::Component {
+                    width: cw,
+                    height: ch,
+                    get: &get,
+                };
+                crate::jpeg::upsample::triangular(&comp, dh, dv, w, h)
+            }
+            _ => None,
+        };
+        tri.unwrap_or_else(|| {
+            let mut o = vec![0u32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    o[y * w + x] = get(x / dh, y / dv);
+                }
+            }
+            o
+        })
+    };
+    let (cb, cr) = (full_chroma(&img.planes[1]), full_chroma(&img.planes[2]));
+    let fixed = opts.ycbcr == YcbcrKernel::FixedPoint16 && maxval == 255;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let yy = sample(&img.planes[0], bps, x, y);
+            let (r, g, b) = if fixed {
+                ycbcr_to_rgb8_fixed16(yy, cb[i], cr[i])
+            } else {
+                ycbcr_to_rgb8(yy, cb[i], cr[i], maxval)
+            };
+            let o = i * bpp;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+        }
+    }
+}
+
+/// `round(1.402 · 2^16)` — the T.871 §7 Cr → R coefficient.
+const CR_TO_R: i64 = 91_881;
+/// `round(0.114 · 1.772 / 0.587 · 2^16)` (`0.344136…`) — the full-precision
+/// T.871 §7 Cb → G coefficient (magnitude; it is subtracted).
+const CB_TO_G: i64 = 22_554;
+/// `round(0.299 · 1.402 / 0.587 · 2^16)` (`0.714136…`) — Cr → G
+/// (magnitude; subtracted).
+const CR_TO_G: i64 = 46_802;
+/// `round(1.772 · 2^16)` — the T.871 §7 Cb → B coefficient.
+const CB_TO_B: i64 = 116_130;
+/// Half of the `2^16` scale: round-half-up bias of every chroma product.
+const HALF_16: i64 = 1 << 15;
+
+/// T.871 §7 inverse relationship in 16-bit fixed point for 8-bit samples:
+/// each chroma contribution `(k · (C − 128) + 2^15) >> 16` (the two G
+/// products summed before the shift) is added to `Y`, then clamped to
+/// `0..=255`. Bit-exact with `djpeg`'s default colour conversion (observed
+/// black-box on every `(Y, Cb, Cr)` combination of the flat-block grids
+/// in the comparison corpus).
+pub(crate) fn ycbcr_to_rgb8_fixed16(y: u32, cb: u32, cr: u32) -> (u8, u8, u8) {
+    let y = y as i64;
+    let cb = cb as i64 - 128;
+    let cr = cr as i64 - 128;
+    let r = y + ((CR_TO_R * cr + HALF_16) >> 16);
+    let g = y + ((-CB_TO_G * cb - CR_TO_G * cr + HALF_16) >> 16);
+    let b = y + ((CB_TO_B * cb + HALF_16) >> 16);
+    (clamp8(r), clamp8(g), clamp8(b))
 }
 
 #[cfg(test)]

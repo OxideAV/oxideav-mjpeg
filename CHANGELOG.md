@@ -44,6 +44,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **libjpeg-compatible decode** (#19). Three independent
+  `#[non_exhaustive]` reconstruction knobs on `DecodeOptions`
+  (`idct`, `upsampling`, `ycbcr` + `with_*`) and a new
+  `ConvertOptions` (`upsampling`, `ycbcr`) for
+  `JpegImage::to_rgb8_with` / `to_rgba8_with`, plus
+  `decode_rgb8_with` / `decode_rgba8_with`:
+  - `IdctMethod::AccurateInteger` — fixed-point 8×8 IDCT derived from
+    T.81 §A.3.3 (`√8`-scaled 1-D passes, 3-product even rotation,
+    9-product odd half sharing one `k3` product; 13-bit constants, 2
+    fraction bits between the column and row passes, round-half-up
+    rounding shifts) with the out-of-range saturation observed in `djpeg`;
+  - `ChromaUpsampling::Triangular` — ¾ / ¼ linear interpolation at
+    T.871 §9 siting for 2:1, 1:2 and 2 × 2 ratios, edge replication,
+    alternating rounding biases (1 / 2 per quarter, 8 / 7 per
+    sixteenth), narrow horizontally-subsampled components replicated;
+    applied by the decoder to layouts it resamples to 4:4:4 too;
+  - `YcbcrKernel::FixedPoint16` — the T.871 §7 full-precision
+    coefficients scaled by 2^16, each product rounded half-up.
+  `DecodeOptions::libjpeg_compatible()` / `ConvertOptions::
+  libjpeg_compatible()` select all of them and reproduce `djpeg`'s
+  default output (libjpeg-turbo 3.2.0) with 0 differing samples over a
+  1 143-file black-box corpus; defaults are unchanged.
+  `tests/libjpeg_compat.rs` checks a committed 25-file oracle and,
+  when libturbojpeg is installed, compares live against
+  `tjDecompress2` on the fixtures and on 100+ streams from this
+  crate's own encoder.
+
 - **JPEG metadata through the registry (core 0.1.40 blobs).** The
   `jpeg` and `mjpeg-raw` demuxers declare the (first) picture's ICC
   profile (`APP2 ICC_PROFILE` chunk sequence reassembled in order),

@@ -8,7 +8,9 @@ use crate::error::{MjpegError as Error, Result};
 // `oxideav_core::VideoFrame` (same plane shape); the deprecated
 // `decode_jpeg` wrappers below do that conversion for callers of the
 // historical API.
-use crate::image::{JpegImage, MjpegPixelFormat as PixelFormat, Plane as VideoPlane};
+use crate::image::{
+    ChromaUpsampling, IdctMethod, JpegImage, MjpegPixelFormat as PixelFormat, Plane as VideoPlane,
+};
 
 // Re-export the framework-side `Decoder` factory at its historical
 // path so consumers (and integration tests) that import
@@ -78,6 +80,11 @@ struct JpegState {
     arith_ac: [Option<ArithAcConditioning>; 4],
     /// Caller-supplied geometry limits, checked on every frame header.
     limits: DecodeLimits,
+    /// Inverse-DCT kernel for 8-bit DCT frames ([`crate::DecodeOptions`]).
+    idct: IdctMethod,
+    /// Chroma reconstruction used when a frame is resampled to 4:4:4
+    /// (layouts without a planar format).
+    upsampling: ChromaUpsampling,
 }
 
 /// Container holding both the conditioning parameters (L, U) and the live
@@ -109,6 +116,8 @@ impl JpegState {
             arithmetic: false,
             progressive_arith: false,
             limits: DecodeLimits::default(),
+            idct: IdctMethod::default(),
+            upsampling: ChromaUpsampling::default(),
             arith_dc: Default::default(),
             arith_ac: Default::default(),
         }
@@ -448,9 +457,13 @@ pub(crate) fn decode_planes_limited(
     tables: Option<&[u8]>,
     data: &[u8],
     limits: DecodeLimits,
+    idct: IdctMethod,
+    upsampling: ChromaUpsampling,
 ) -> Result<JpegImage> {
     let mut state = JpegState::new();
     state.limits = limits;
+    state.idct = idct;
+    state.upsampling = upsampling;
     if let Some(t) = tables {
         load_table_stream(&mut state, t)?;
     }
@@ -1206,15 +1219,26 @@ fn quant_to_f32(qt: &QuantTable) -> [f32; 64] {
 /// `<= 0.0` / `>= 255.0` clamp, `round()` — so the output is bit-identical;
 /// the store loop walks 8-sample row slices so the bounds check runs once
 /// per row instead of once per sample.
+///
+/// With [`IdctMethod::AccurateInteger`] the block goes through the
+/// fixed-point transform of [`crate::jpeg::idct_int`] instead (dequantised
+/// with the integer table `qt`).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn render_block_8bit(
     block: &[i32; 64],
     qtf: &[f32; 64],
+    qt: &QuantTable,
+    idct: IdctMethod,
     buf: &mut [u8],
     stride: usize,
     dst_x0: usize,
     dst_y0: usize,
 ) {
+    if idct == IdctMethod::AccurateInteger {
+        crate::jpeg::idct_int::idct8x8_store_u8(block, &qt.values, buf, stride, dst_x0, dst_y0);
+        return;
+    }
     let mut fblock = [0.0f32; 64];
     for k in 0..64 {
         fblock[k] = block[k] as f32 * qtf[k];
@@ -1428,6 +1452,8 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                         render_block_8bit(
                             &block,
                             &quant_f32[*sof_idx],
+                            quant_tables[*sof_idx],
+                            state.idct,
                             &mut comp_buf[*sof_idx],
                             comp_stride[*sof_idx],
                             dst_x0,
@@ -1487,6 +1513,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                 width,
                 height,
                 layout,
+                state.upsampling,
                 emit_plane_8bit,
             ));
         }
@@ -1592,13 +1619,20 @@ pub(crate) fn native_yuv_format(sof: &SofInfo, twelve_bit: bool) -> Option<Pixel
 /// `comp[ci]` is component `ci`'s (MCU-padded) grid with row pitch
 /// `stride[ci]` samples; `emit(grid, pitch, w, h)` copies the top-left
 /// `w × h` window of a grid into an output plane.
-fn shape_yuv_planes<T: Copy + Default>(
+///
+/// In the `Upsampled444` case a component whose ratio to the frame grid is
+/// 2:1, 1:2 or 2 × 2 goes through the triangular kernel when `upsampling`
+/// asks for it (and the component is wide enough); everything else is
+/// replicated.
+#[allow(clippy::too_many_arguments)]
+fn shape_yuv_planes<T: Copy + Default + Into<u32> + TryFrom<u32>>(
     sof: &SofInfo,
     comp: &[Vec<T>],
     stride: &[usize],
     width: usize,
     height: usize,
     layout: YuvLayout,
+    upsampling: ChromaUpsampling,
     emit: impl Fn(&[T], usize, usize, usize) -> VideoPlane,
 ) -> Vec<VideoPlane> {
     match layout {
@@ -1614,6 +1648,31 @@ fn shape_yuv_planes<T: Copy + Default>(
                 .map(|ci| {
                     let hi = sof.components[ci].h_factor as usize;
                     let vi = sof.components[ci].v_factor as usize;
+                    if upsampling == ChromaUpsampling::Triangular
+                        && h_max.is_multiple_of(hi)
+                        && v_max.is_multiple_of(vi)
+                    {
+                        let get =
+                            |x: usize, y: usize| -> u32 { comp[ci][y * stride[ci] + x].into() };
+                        let c = crate::jpeg::upsample::Component {
+                            width: (width * hi).div_ceil(h_max),
+                            height: (height * vi).div_ceil(v_max),
+                            get: &get,
+                        };
+                        if let Some(v) = crate::jpeg::upsample::triangular(
+                            &c,
+                            h_max / hi,
+                            v_max / vi,
+                            width,
+                            height,
+                        ) {
+                            let full: Vec<T> = v
+                                .into_iter()
+                                .map(|s| T::try_from(s).unwrap_or_default())
+                                .collect();
+                            return emit(&full, width, width, height);
+                        }
+                    }
                     let mut full = vec![T::default(); width * height];
                     for y in 0..height {
                         let sy = y * vi / v_max;
@@ -2937,7 +2996,16 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
-                render_block_8bit(block, &qtf, buf, stride, bx * 8, by * 8);
+                render_block_8bit(
+                    block,
+                    &qtf,
+                    quant_tables[ci],
+                    state.idct,
+                    buf,
+                    stride,
+                    bx * 8,
+                    by * 8,
+                );
             }
         }
     }
@@ -2985,6 +3053,7 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
                 width,
                 height,
                 layout,
+                state.upsampling,
                 emit_plane_8bit,
             ));
         }
@@ -3194,6 +3263,7 @@ fn render_from_coefs_12bit(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Resul
                 width,
                 height,
                 layout,
+                state.upsampling,
                 emit_plane,
             ));
         }
@@ -5184,7 +5254,18 @@ fn shape_lossless_yuv_frame(
         }
         VideoPlane { stride: w, data }
     };
-    let planes = shape_yuv_planes(sof, samples, comp_w, width, height, layout, emit);
+    // Lossless frames keep replication for the resampled layouts (the
+    // point-transform widening happens in `emit`, after resampling).
+    let planes = shape_yuv_planes(
+        sof,
+        samples,
+        comp_w,
+        width,
+        height,
+        layout,
+        ChromaUpsampling::Replicate,
+        emit,
+    );
     Ok(JpegImage::new_unchecked(
         width as u32,
         height as u32,

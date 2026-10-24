@@ -1507,9 +1507,10 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
 /// `PixelFormat`, the rest are resampled to 4:4:4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum YuvLayout {
-    /// Luma carries `(Hmax, Vmax)`, both chroma components are `1×1`, and
-    /// the ratio has a planar pixel format: the chroma planes are emitted
-    /// at their coded resolution `c_w × c_h`.
+    /// Luma carries `(Hmax, Vmax)`, both chroma components share one
+    /// factor pair dividing it, and the luma : chroma ratio has a planar
+    /// pixel format: the chroma planes are emitted at their coded
+    /// resolution `c_w × c_h`.
     Native {
         format: PixelFormat,
         c_w: usize,
@@ -1533,33 +1534,23 @@ impl YuvLayout {
 }
 
 /// Classify the sampling layout of a three-component (non-RGB) frame.
+///
+/// The planar format is decided by the luma : chroma sampling **ratio**,
+/// not by the absolute factors: luma must carry `(Hmax, Vmax)`, both chroma
+/// components must share one `(Hc, Vc)` that divides it, and
+/// `(Hmax / Hc, Vmax / Vc)` must be a ratio with a planar format — so
+/// `Y 2×2, C 1×2` (an encoding of 4:2:2 some Motion-JPEG writers use) is
+/// `Yuv422P` exactly like `Y 2×1, C 1×1`. Chroma planes are emitted at
+/// their coded extent `⌈X · Hc / Hmax⌉ × ⌈Y · Vc / Vmax⌉` (§A.1.1).
 fn yuv_layout(sof: &SofInfo, width: usize, height: usize, twelve_bit: bool) -> YuvLayout {
-    let y = sof.components[0];
     let cb = sof.components[1];
-    let cr = sof.components[2];
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
     let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
-    let chroma_unit = cb.h_factor == 1 && cb.v_factor == 1 && cr.h_factor == 1 && cr.v_factor == 1;
-    let luma_max = y.h_factor == h_max && y.v_factor == v_max;
-    let native = if chroma_unit && luma_max {
-        match (y.h_factor, y.v_factor, twelve_bit) {
-            (1, 1, false) => Some(PixelFormat::Yuv444P),
-            (2, 1, false) => Some(PixelFormat::Yuv422P),
-            (2, 2, false) => Some(PixelFormat::Yuv420P),
-            (4, 1, false) => Some(PixelFormat::Yuv411P),
-            (1, 1, true) => Some(PixelFormat::Yuv444P12Le),
-            (2, 1, true) => Some(PixelFormat::Yuv422P12Le),
-            (2, 2, true) => Some(PixelFormat::Yuv420P12Le),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    match native {
+    match native_yuv_format(sof, twelve_bit) {
         Some(format) => YuvLayout::Native {
             format,
-            c_w: width.div_ceil(h_max as usize),
-            c_h: height.div_ceil(v_max as usize),
+            c_w: (width * cb.h_factor as usize).div_ceil(h_max as usize),
+            c_h: (height * cb.v_factor as usize).div_ceil(v_max as usize),
         },
         None => YuvLayout::Upsampled444 {
             format: if twelve_bit {
@@ -1568,6 +1559,32 @@ fn yuv_layout(sof: &SofInfo, width: usize, height: usize, twelve_bit: bool) -> Y
                 PixelFormat::Yuv444P
             },
         },
+    }
+}
+
+/// The planar format a three-component YCbCr frame decodes to natively,
+/// from the luma : chroma sampling ratio (see [`yuv_layout`]); `None` when
+/// the combination has no planar format and is resampled to 4:4:4.
+pub(crate) fn native_yuv_format(sof: &SofInfo, twelve_bit: bool) -> Option<PixelFormat> {
+    let y = sof.components[0];
+    let cb = sof.components[1];
+    let cr = sof.components[2];
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1);
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1);
+    let chroma_equal = cb.h_factor == cr.h_factor && cb.v_factor == cr.v_factor;
+    let luma_max = y.h_factor == h_max && y.v_factor == v_max;
+    if !(chroma_equal && luma_max) || h_max % cb.h_factor != 0 || v_max % cb.v_factor != 0 {
+        return None;
+    }
+    match (h_max / cb.h_factor, v_max / cb.v_factor, twelve_bit) {
+        (1, 1, false) => Some(PixelFormat::Yuv444P),
+        (2, 1, false) => Some(PixelFormat::Yuv422P),
+        (2, 2, false) => Some(PixelFormat::Yuv420P),
+        (4, 1, false) => Some(PixelFormat::Yuv411P),
+        (1, 1, true) => Some(PixelFormat::Yuv444P12Le),
+        (2, 1, true) => Some(PixelFormat::Yuv422P12Le),
+        (2, 2, true) => Some(PixelFormat::Yuv420P12Le),
+        _ => None,
     }
 }
 

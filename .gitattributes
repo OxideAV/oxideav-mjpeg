@@ -1,0 +1,12 @@
+# Test fixtures are byte-exact validator output. Small PNM files are plain
+# ASCII headers followed by sample bytes that git's text heuristic may not
+# flag as binary, so a Windows checkout with core.autocrlf would rewrite
+# their 0x0A bytes; mark every fixture type binary (no EOL conversion, no
+# textual diff / merge).
+*.jpg binary
+*.jpeg binary
+*.ppm binary
+*.pgm binary
+*.pnm binary
+*.raw binary
+*.bin binary

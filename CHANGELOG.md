@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -arithmetic` produces from the same coefficients
   (`tests/arith_destinations.rs`). Golden byte hashes of the arithmetic
   YCbCr / RGB encodes re-recorded (decode-back hashes unchanged).
+- **Planar YCbCr layout by sampling ratio.** `Y 2×2, C 1×2` — the way
+  ffmpeg codes 4:2:2 — was resampled to 4:4:4 by nearest neighbour; the
+  decoder now picks the planar format from the luma : chroma ratio (both
+  chroma components equal and dividing the luma factors), so it is
+  `YuvJ422P` like `Y 2×1, C 1×1`, with chroma planes at their coded
+  extent.
+- `.gitattributes` marks the PNM / JPEG fixtures binary so Windows
+  checkouts with `core.autocrlf` cannot rewrite the small PPM / PGM
+  oracles.
 - **R/G/B and CMYK encodes no longer carry a JFIF APP0.** T.871 §6.2 ties
   JFIF to one Y or three YCbCr components, so libjpeg-family readers
   applied the inverse colour transform to the Adobe `transform = 0`

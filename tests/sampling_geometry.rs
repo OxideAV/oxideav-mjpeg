@@ -16,6 +16,10 @@
 //! upsampling, the PSNR oracle for the chroma planes). `samp12_4x2.*`
 //! is the same at `-precision 12` (16-bit PNM oracles).
 //!
+//! `ff422.jpg` is `ffmpeg -pix_fmt yuvj422p -q:v 2` of a 37×29 frame:
+//! ffmpeg codes 4:2:2 as `Y 2×2, Cb 1×2, Cr 1×2`, and `ff422_rgb.ppm` is
+//! its `djpeg -nosmooth -ppm` oracle.
+//!
 //! Layouts: `4x2` (luma 4×2 → 4:4:4 upsampled), `1x2` (luma 1×2 →
 //! 4:4:4 upsampled), `2x2,2x1,1x2` (mixed chroma factors) and
 //! `1x1,2x2,2x2` (chroma oversampled relative to luma — legal, exotic).
@@ -252,4 +256,34 @@ fn lossless_yuv_exotic_luma_factors_roundtrip_bit_exact() {
             }
         }
     }
+}
+
+/// The planar layout follows the luma : chroma **ratio**: ffmpeg's
+/// `Y 2×2, C 1×2` 4:2:2 is `YuvJ422P` with `⌈37 / 2⌉ × 29` chroma planes,
+/// not a nearest-neighbour 4:4:4 resample — and converts to RGB within
+/// IDCT rounding of `djpeg -nosmooth`.
+#[test]
+fn ffmpeg_style_422_is_native_422() {
+    let jpeg = include_bytes!("fixtures/sampling/ff422.jpg");
+    let oracle = include_bytes!("fixtures/sampling/ff422_rgb.ppm");
+    let img = decode(jpeg).unwrap();
+    assert_eq!((img.width, img.height), (37, 29));
+    assert_eq!(img.format, oxideav_mjpeg::MjpegPixelFormat::YuvJ422P);
+    for p in &img.planes[1..] {
+        assert_eq!(p.stride, 19);
+        assert_eq!(p.rows(), 29);
+    }
+    // P6 header "P6\n37 29\n255\n".
+    let header = b"P6\n37 29\n255\n";
+    assert_eq!(&oracle[..header.len()], header);
+    let want = &oracle[header.len()..];
+    let got = img.to_rgb8();
+    assert_eq!(got.len(), want.len());
+    let worst = got
+        .iter()
+        .zip(want)
+        .map(|(&a, &b)| (a as i32 - b as i32).abs())
+        .max()
+        .unwrap();
+    assert!(worst <= 3, "max |RGB − djpeg -nosmooth| = {worst}");
 }

@@ -544,44 +544,15 @@ fn rgb_class(frame: &SofInfo, adobe: Option<u8>) -> bool {
 }
 
 /// The planar layout of a three-component YCbCr frame (T.81 §A.1.1):
-/// a native subsampled format when chroma is `1×1` under a
-/// maximal-factor luma, `4:4:4` for every other legal combination.
+/// the native subsampled format the luma : chroma ratio maps to (the
+/// decoder's own rule), `4:4:4` for every other legal combination.
 fn yuv_layout(frame: &SofInfo, twelve_bit: bool) -> PixelFormat {
     debug_assert_eq!(frame.components.len(), 3);
-    let y = frame.components[0];
-    let cb = frame.components[1];
-    let cr = frame.components[2];
-    let h_max = frame
-        .components
-        .iter()
-        .map(|c| c.h_factor)
-        .max()
-        .unwrap_or(1);
-    let v_max = frame
-        .components
-        .iter()
-        .map(|c| c.v_factor)
-        .max()
-        .unwrap_or(1);
-    let chroma_unit = cb.h_factor == 1 && cb.v_factor == 1 && cr.h_factor == 1 && cr.v_factor == 1;
-    let luma_max = y.h_factor == h_max && y.v_factor == v_max;
-    if chroma_unit && luma_max {
-        match (y.h_factor, y.v_factor, twelve_bit) {
-            (1, 1, false) => return PixelFormat::Yuv444P,
-            (2, 1, false) => return PixelFormat::Yuv422P,
-            (2, 2, false) => return PixelFormat::Yuv420P,
-            (4, 1, false) => return PixelFormat::Yuv411P,
-            (1, 1, true) => return PixelFormat::Yuv444P12Le,
-            (2, 1, true) => return PixelFormat::Yuv422P12Le,
-            (2, 2, true) => return PixelFormat::Yuv420P12Le,
-            _ => {}
-        }
-    }
-    if twelve_bit {
+    crate::decoder::native_yuv_format(frame, twelve_bit).unwrap_or(if twelve_bit {
         PixelFormat::Yuv444P12Le
     } else {
         PixelFormat::Yuv444P
-    }
+    })
 }
 
 /// Grayscale carrier for precision `p`.

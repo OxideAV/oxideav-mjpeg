@@ -3207,6 +3207,17 @@ fn render_from_coefs_12bit(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Resul
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
+                if state.idct == IdctMethod::AccurateInteger {
+                    crate::jpeg::idct_int::idct8x8_store_u16(
+                        block,
+                        &qt.values,
+                        buf,
+                        stride,
+                        bx * 8,
+                        by * 8,
+                    );
+                    continue;
+                }
                 let mut fblock = [0.0f32; 64];
                 for k in 0..64 {
                     // Multiply in f32 to avoid i32 overflow when Pq=1 (16-bit

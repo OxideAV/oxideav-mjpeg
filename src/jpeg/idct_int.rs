@@ -69,7 +69,9 @@
 //! arithmetic between the two roundings, so the result depends only on
 //! the rounded constants above and the pass order — and with this choice
 //! matches `djpeg`'s default output (libjpeg-turbo 3.2.0, observed
-//! black-box) on every 8-bit stream of the comparison corpus.
+//! black-box) on every 8-bit stream of the comparison corpus. 12-bit
+//! frames use the same constants with one fraction bit between the
+//! passes, level shift 2048 and their own range limit.
 
 /// `round(2^13 · √2 · cos(6π/16))`.
 const K6: i64 = 4433;
@@ -98,13 +100,13 @@ const DIAG_S7: i64 = 2446;
 
 /// Fraction bits of the constants.
 const CONST_FRACTION: u32 = 13;
-/// Extra fraction bits kept between the column and row passes.
+/// Extra fraction bits kept between the column and row passes (8-bit
+/// frames).
 const MID_FRACTION: u32 = 2;
-/// Rounding shift after the column pass.
-const COLUMN_SHIFT: u32 = CONST_FRACTION - MID_FRACTION;
-/// Rounding shift after the row pass: constants, mid fraction, and the `2^3`
-/// of the two `√8` pass gains.
-const ROW_SHIFT: u32 = CONST_FRACTION + MID_FRACTION + 3;
+/// Extra fraction bits kept between the passes for 12-bit frames (the
+/// wider samples leave room for one only; observed black-box: two bits
+/// differ from `djpeg` where one matches exactly).
+const MID_FRACTION_12: u32 = 1;
 
 /// One 1-D pass: `√8 · t(x) · 2^13` for the eight frequency inputs `f`
 /// (see the module docs for the factorisation).
@@ -169,9 +171,51 @@ fn limit_sample(v: i64) -> u8 {
     }
 }
 
+/// [`limit_sample`] for 12-bit frames: with `u = v mod 16384`, `u < 4096`
+/// is the sample, `4096 ≤ u < 10240` saturates to 4095 and `u ≥ 10240` to
+/// 0 (observed with DC sweeps over `−12288..=34815`).
+#[inline]
+fn limit_sample_12(v: i64) -> u16 {
+    let u = v.rem_euclid(16384);
+    if u < 4096 {
+        u as u16
+    } else if u < 10240 {
+        4095
+    } else {
+        0
+    }
+}
+
+/// Dequantise `coef` (natural order) by `quant` and inverse-transform it
+/// with `mid_bits` fraction bits kept between the passes; returns the
+/// reconstructed samples before the level shift (row-major).
+fn transform_block(coef: &[i32; 64], quant: &[u16; 64], mid_bits: u32) -> [i64; 64] {
+    let column_shift = CONST_FRACTION - mid_bits;
+    let row_shift = CONST_FRACTION + mid_bits + 3;
+    // Column pass: column u of the coefficient block → column u of `mid`.
+    let mut mid = [0i64; 64];
+    for u in 0..8 {
+        let f: [i64; 8] = std::array::from_fn(|v| coef[v * 8 + u] as i64 * quant[v * 8 + u] as i64);
+        let t = transform_1d(f);
+        for y in 0..8 {
+            mid[y * 8 + u] = round_shift(t[y], column_shift);
+        }
+    }
+    // Row pass.
+    let mut out = [0i64; 64];
+    for y in 0..8 {
+        let f: [i64; 8] = std::array::from_fn(|u| mid[y * 8 + u]);
+        let t = transform_1d(f);
+        for x in 0..8 {
+            out[y * 8 + x] = round_shift(t[x], row_shift);
+        }
+    }
+    out
+}
+
 /// Dequantise `coef` (natural order) by `quant`, inverse-transform it and
-/// store the level-shifted, clamped 8-bit samples at `(x0, y0)` of `out`
-/// (row pitch `stride`).
+/// store the level-shifted, range-limited 8-bit samples at `(x0, y0)` of
+/// `out` (row pitch `stride`).
 pub(crate) fn idct8x8_store_u8(
     coef: &[i32; 64],
     quant: &[u16; 64],
@@ -180,22 +224,31 @@ pub(crate) fn idct8x8_store_u8(
     x0: usize,
     y0: usize,
 ) {
-    // Column pass: column u of the coefficient block → column u of `mid`.
-    let mut mid = [0i64; 64];
-    for u in 0..8 {
-        let f: [i64; 8] = std::array::from_fn(|v| coef[v * 8 + u] as i64 * quant[v * 8 + u] as i64);
-        let t = transform_1d(f);
-        for y in 0..8 {
-            mid[y * 8 + u] = round_shift(t[y], COLUMN_SHIFT);
+    let t = transform_block(coef, quant, MID_FRACTION);
+    for y in 0..8 {
+        let row = &mut out[(y0 + y) * stride + x0..][..8];
+        for (o, &v) in row.iter_mut().zip(&t[y * 8..y * 8 + 8]) {
+            *o = limit_sample(v + 128);
         }
     }
-    // Row pass.
+}
+
+/// The 12-bit counterpart of [`idct8x8_store_u8`]: one fraction bit
+/// between the passes ([`MID_FRACTION_12`]), level shift 2048, range
+/// limit [`limit_sample_12`].
+pub(crate) fn idct8x8_store_u16(
+    coef: &[i32; 64],
+    quant: &[u16; 64],
+    out: &mut [u16],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+) {
+    let t = transform_block(coef, quant, MID_FRACTION_12);
     for y in 0..8 {
-        let f: [i64; 8] = std::array::from_fn(|u| mid[y * 8 + u]);
-        let t = transform_1d(f);
         let row = &mut out[(y0 + y) * stride + x0..][..8];
-        for (o, &v) in row.iter_mut().zip(t.iter()) {
-            *o = limit_sample(round_shift(v, ROW_SHIFT) + 128);
+        for (o, &v) in row.iter_mut().zip(&t[y * 8..y * 8 + 8]) {
+            *o = limit_sample_12(v + 2048);
         }
     }
 }
@@ -260,6 +313,13 @@ mod tests {
         assert_eq!(limit_sample(-896), 0);
         assert_eq!(limit_sample(-897), 255);
         assert_eq!(limit_sample(-1919), 129);
+        assert_eq!(limit_sample_12(4095), 4095);
+        assert_eq!(limit_sample_12(4096), 4095);
+        assert_eq!(limit_sample_12(10239), 4095);
+        assert_eq!(limit_sample_12(10240), 0);
+        assert_eq!(limit_sample_12(16384 + 5), 5);
+        assert_eq!(limit_sample_12(-6144), 0);
+        assert_eq!(limit_sample_12(-6145), 4095);
     }
 
     #[test]

@@ -54,7 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     T.81 §A.3.3 (`√8`-scaled 1-D passes, 3-product even rotation,
     9-product odd half sharing one `k3` product; 13-bit constants, 2
     fraction bits between the column and row passes, round-half-up
-    rounding shifts) with the out-of-range saturation observed in `djpeg`;
+    shifts) with the out-of-range saturation observed in `djpeg`;
+    12-bit frames keep one fraction bit between the passes (bit-exact
+    against `djpeg -grayscale`'s 16-bit luma);
   - `ChromaUpsampling::Triangular` — ¾ / ¼ linear interpolation at
     T.871 §9 siting for 2:1, 1:2 and 2 × 2 ratios, edge replication,
     alternating rounding biases (1 / 2 per quarter, 8 / 7 per

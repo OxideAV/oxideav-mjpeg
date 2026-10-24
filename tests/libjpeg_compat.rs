@@ -12,6 +12,8 @@
 //! `djpeg -pnm <file>` writes (default options: accurate-integer IDCT,
 //! interpolating chroma upsampling). Regenerate a line with
 //! `djpeg -pnm f.jpg | tail -c <w·h·channels> | <fnv1a64>`.
+//! `p12_*.jpg` are `cjpeg -precision 12` streams; `oracle12.txt` hashes
+//! the 16-bit luma samples of `djpeg -grayscale -pnm`.
 //!
 //! # Live oracle
 //!
@@ -97,6 +99,38 @@ fn compatible_mode_matches_the_committed_djpeg_oracle() {
         }
     }
     assert!(mismatched.is_empty(), "differs from djpeg: {mismatched:?}");
+}
+
+/// 12-bit frames: the integer IDCT (one fraction bit between the passes)
+/// reproduces `djpeg -grayscale`'s luma samples — `oracle12.txt` hashes
+/// them as 16-bit big-endian words, as the PNM carries them.
+#[test]
+fn twelve_bit_luma_matches_the_committed_djpeg_oracle() {
+    let text = std::fs::read_to_string(format!("{DIR}/oracle12.txt")).unwrap();
+    let opts = DecodeOptions::new().with_idct(IdctMethod::AccurateInteger);
+    let mut rows = 0;
+    for l in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+    {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (w, h): (usize, usize) = (f[1].parse().unwrap(), f[2].parse().unwrap());
+        let want = u64::from_str_radix(f[3], 16).unwrap();
+        let img = decode_with(&std::fs::read(format!("{DIR}/{}", f[0])).unwrap(), &opts).unwrap();
+        assert_eq!(img.precision, 12, "{}", f[0]);
+        assert_eq!((img.width as usize, img.height as usize), (w, h));
+        let p = &img.planes[0];
+        let mut be = Vec::with_capacity(w * h * 2);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * p.stride + 2 * x;
+                be.extend_from_slice(&[p.data[i + 1], p.data[i]]);
+            }
+        }
+        assert_eq!(fnv1a64(&be), want, "{}: luma differs from djpeg", f[0]);
+        rows += 1;
+    }
+    assert_eq!(rows, 3);
 }
 
 #[test]

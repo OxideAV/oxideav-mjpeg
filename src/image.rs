@@ -960,8 +960,10 @@ pub enum IdctMethod {
     /// Fixed-point transform with 13-bit constants, two passes keeping two
     /// extra fraction bits between them, round-half-up shifts, level
     /// shift and clamp — the arithmetic of `djpeg`'s default
-    /// (accurate-integer) IDCT, bit-exact on 8-bit frames. 12-bit,
-    /// lossless and hierarchical frames are unaffected.
+    /// (accurate-integer) IDCT, bit-exact on 8-bit and 12-bit
+    /// sequential / progressive frames (12-bit keeps one fraction bit
+    /// between the passes). Lossless and hierarchical frames are
+    /// unaffected.
     AccurateInteger,
 }
 

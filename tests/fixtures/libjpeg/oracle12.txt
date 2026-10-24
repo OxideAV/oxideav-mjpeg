@@ -1,0 +1,4 @@
+# 12-bit: name width height fnv1a64(16-bit big-endian luma samples of `djpeg -grayscale -pnm <name>`), libjpeg-turbo 3.2.0
+p12_420_prog.jpg 37 29 c1c54db4ffb72ce4
+p12_444_rst.jpg 37 29 7aea742d1db066ba
+p12_gray.jpg 37 29 f3be7365d4672c40

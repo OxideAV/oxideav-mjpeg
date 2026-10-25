@@ -370,6 +370,9 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         tables,
         pending: None,
         eof: false,
+        shown: None,
+        announced: None,
+        generation: 0,
     }))
 }
 
@@ -379,6 +382,38 @@ struct MjpegDecoder {
     tables: Option<Vec<u8>>,
     pending: Option<Packet>,
     eof: bool,
+    /// The output description of the frame `receive_frame` returned
+    /// last (`None` before the first one).
+    shown: Option<OutputShape>,
+    /// Before the first frame: the description the first packet's
+    /// frame header announces ([`crate::info`], header-only).
+    announced: Option<OutputShape>,
+    /// `Decoder::output_params_generation` — bumped (wrapping) when a
+    /// returned frame's shape differs from the previous one's.
+    generation: u64,
+}
+
+/// What a JPEG frame header fixes about the decoded picture: its size
+/// (T.81 `X` × `Y`, or the DNL line count), the layout the decoder
+/// emits, and the colour signal it reports. Each Motion-JPEG frame is
+/// a complete interchange stream, so any frame may change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputShape {
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    color: oxideav_core::ColorSignal,
+}
+
+impl OutputShape {
+    fn to_params(self, codec_id: &CodecId) -> CodecParameters {
+        let mut p = CodecParameters::video(codec_id.clone());
+        p.width = Some(self.width);
+        p.height = Some(self.height);
+        p.pixel_format = Some(self.pixel_format);
+        p.color_signal = self.color;
+        p
+    }
 }
 
 impl Decoder for MjpegDecoder {
@@ -391,6 +426,16 @@ impl Decoder for MjpegDecoder {
             return Err(Error::other(
                 "MJPEG decoder: receive_frame must be called before sending another packet",
             ));
+        }
+        if self.shown.is_none()
+            && let Ok(info) = crate::info(&packet.data)
+        {
+            self.announced = Some(OutputShape {
+                width: info.width,
+                height: info.height,
+                pixel_format: info.format.into(),
+                color: info.color.into(),
+            });
         }
         self.pending = Some(packet.clone());
         Ok(())
@@ -417,6 +462,20 @@ impl Decoder for MjpegDecoder {
         // (Motion-JPEG frames may differ; a still's frame blobs equal
         // the `jpeg` demuxer's stream blobs).
         let blobs = img.metadata.to_blobs();
+        let shape = OutputShape {
+            width: img.width,
+            height: img.height,
+            pixel_format: img.format.into(),
+            color: img.color.into(),
+        };
+        // The first frame resolves the description (no bump); a later
+        // frame of a different shape bumps the generation as it is
+        // returned.
+        if self.shown.is_some_and(|prev| prev != shape) {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.shown = Some(shape);
+        self.announced = None;
         let mut vf = VideoFrame::from(img);
         vf.pts = pkt.pts;
         vf.set_blobs(blobs);
@@ -426,6 +485,25 @@ impl Decoder for MjpegDecoder {
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         Ok(())
+    }
+
+    /// The decoded pictures' size, layout and colour signal: after a
+    /// frame was returned, that frame's; before, what the first sent
+    /// packet's frame header announces (the stream has no other
+    /// configuration record — an AVI `MJPG` stream states no sampling,
+    /// so this is where the layout is reported).
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.shown
+            .or(self.announced)
+            .map(|s| s.to_params(&self.codec_id))
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
 }
 

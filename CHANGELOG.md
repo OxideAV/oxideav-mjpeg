@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.13...v0.1.14) - 2026-10-25
+
+### Other
+
+- lockfile follows oxideav-core 0.1.42 (the harness failed to build against the pinned 0.1.40 once the decoder implements output_params)
+- reject sampling factors outside 1-4 (T.81 Table B.2); a zero factor panicked native_yuv_format (fuzz crash e0ba1f33)
+- registry decoder: output_params + output_params_generation (stream-level output description)
+- accurate-integer IDCT for 12-bit frames (one fraction bit between passes, observed range limit)
+- libjpeg-compatible decode ([#19](https://github.com/OxideAV/oxideav-mjpeg/pull/19)) — fixed-point IDCT, triangular chroma upsampling, 16-bit YCbCr kernel
+- planar YCbCr layout by luma : chroma ratio (ffmpeg's Y 2x2 / C 1x2 4:2:2 is YuvJ422P); .gitattributes marks fixtures binary
+- arithmetic statistics areas follow the table destination (T.81 §B.2.3); R/G/B and CMYK encodes drop the JFIF APP0
+- edition 2024, MSRV 1.95
+- mjpeg tests: the seek fixture is generated once per process (the parallel seek tests removed and rewrote the same file under each other — flaky "packet after seek"); CHANGELOG spacing
+- README (blob carriage table, marker order and JFIF / Exif slot rule, precedence, limits, `metadata_embed`) + CHANGELOG for the metadata round
+- `metadata_embed` fuzz target (header splitter, ICC chunk reassembly, registry frame record); TEM is read as a length-prefixed segment, as the decoder reads it
+- JPEG metadata through the registry — stream blobs from the demuxer, frame blobs from the decoder, the encoder embeds `params.blobs` with frame blobs overriding per kind; the still demuxer walks segments to find EOI
+- `metadata` module — one marker-order rule for ICC / Exif / XMP, the JFIF / Exif slot policy, embed / strip / read helpers
+
 ### Fixed
 
 - SOF parsing rejects component sampling factors outside 1–4 (T.81 Table B.2). A factor of 0 reached `native_yuv_format` and panicked with a division by zero (fuzz finding, `standalone_api` target).

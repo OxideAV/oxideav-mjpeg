@@ -459,3 +459,24 @@ fn registry_decoder_hands_out_the_same_planes() {
         assert_eq!(ColorInfo::from(sig), img.color);
     }
 }
+
+/// Regression for fuzz finding `crash-e0ba1f33c59aaa2433d8290e6c2187422a16b727`
+/// (Fuzz run 40183522310, `standalone_api` target): an SOF component with a
+/// sampling factor of 0 reached `native_yuv_format`, which divided the
+/// maximum factor by it — "attempt to calculate the remainder with a divisor
+/// of zero". T.81 Table B.2 allows H and V of 1–4 only, so the SOF parser
+/// now rejects anything else; every entry point must return `Err`.
+#[test]
+fn zero_sampling_factor_is_rejected_not_a_panic() {
+    let bytes: &[u8] = &[
+        0xff, 0xd8, 0x3d, 0xff, 0xca, 0x00, 0x2f, 0x08, 0x00, 0xc3, 0xa1, 0x40, 0x03, 0x52, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x0c, 0xff,
+        0xff, 0xff, 0x32, 0xc1, 0x00, 0x0f, 0xb1, 0x90, 0x00, 0x00, 0x28, 0x00, 0x79, 0x00, 0xff,
+        0xc1, 0x00, 0x0f, 0xb1, 0x00, 0x00, 0x00, 0x79, 0x00,
+    ];
+    let _ = oxideav_mjpeg::probe(bytes);
+    assert!(oxideav_mjpeg::info(bytes).is_err());
+    let opts = oxideav_mjpeg::DecodeOptions::new().with_max_pixels(Some(1 << 20));
+    assert!(oxideav_mjpeg::decode_with(bytes, &opts).is_err());
+    assert!(oxideav_mjpeg::decode_rgba8(bytes).is_err());
+}

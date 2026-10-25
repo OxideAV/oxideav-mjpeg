@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- SOF parsing rejects component sampling factors outside 1–4 (T.81 Table B.2). A factor of 0 reached `native_yuv_format` and panicked with a division by zero (fuzz finding, `standalone_api` target).
+
 ### Added
 
 - The registry decoder reports its output stream parameters (oxideav-core 0.1.42 `Decoder::output_params` / `output_params_generation`; `output_pixel_format` forwards to it): width / height (T.81 `X` × `Y`, or the DNL line count), the `pixel_format` the frame planes have (`YuvJ420P` / `YuvJ422P` / `YuvJ444P` / `Yuv411P`, `Gray8` / `Gray12Le` / `Gray16Le`, 12-bit YCbCr, `Rgb24`, `Cmyk`, the lossless carriers) and the colour signal (JFIF: full-range BT.601). An AVI `MJPG` stream states no sampling, so this is where its layout is reported: answered as soon as the first packet is sent (header-only `info` walk), then the description of the frame last returned; the generation bumps when the first frame of a new shape is returned (a sent-but-not-received packet never moves the answer). `tests/output_params.rs` pins ffmpeg-encoded `yuvj420p` / `yuvj422p` / `yuvj444p` fixtures (`tests/fixtures/output_params/gen.sh`) and the crate's own grey / 12-bit / 4:1:1 / RGB / CMYK / lossless streams against `ffprobe -show_streams` and the emitted plane shapes, plus a size / sampling switch stream.

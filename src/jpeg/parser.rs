@@ -50,10 +50,18 @@ pub fn parse_sof(payload: &[u8]) -> Result<SofInfo> {
         let id = payload[off];
         let hv = payload[off + 1];
         let qt = payload[off + 2];
+        // T.81 Table B.2: H_i and V_i are 1–4. Zero would divide the MCU
+        // geometry by zero further down; larger values have no meaning.
+        let (h, v) = (hv >> 4, hv & 0x0F);
+        if !(1..=4).contains(&h) || !(1..=4).contains(&v) {
+            return Err(Error::invalid(format!(
+                "SOF: component {id} sampling factors {h}x{v} outside 1-4 (T.81 Table B.2)"
+            )));
+        }
         components.push(SofComponent {
             id,
-            h_factor: hv >> 4,
-            v_factor: hv & 0x0F,
+            h_factor: h,
+            v_factor: v,
             qt_id: qt,
         });
     }

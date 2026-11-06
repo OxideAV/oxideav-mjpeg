@@ -10,3 +10,4 @@
 *.pnm binary
 *.raw binary
 *.bin binary
+*.mjpeg binary

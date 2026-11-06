@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - fuzz lockfile follows oxideav-core 0.1.43 (the library now names `Frame::StreamParams`).
+- `.gitattributes` marks the raw Motion-JPEG fixtures (`*.mjpeg`) binary too.
 
 ## [0.1.14](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.13...v0.1.14) - 2026-10-25
 

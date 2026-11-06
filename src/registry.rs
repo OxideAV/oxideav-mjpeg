@@ -369,6 +369,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id,
         tables,
         pending: None,
+        ready: None,
         eof: false,
         shown: None,
         announced: None,
@@ -381,15 +382,20 @@ struct MjpegDecoder {
     /// §B.5 tables-only stream shared by every packet (`extradata`).
     tables: Option<Vec<u8>>,
     pending: Option<Packet>,
+    /// A decoded frame held back behind the `Frame::StreamParams` event
+    /// announcing its new shape; the next `receive_frame` returns it.
+    ready: Option<Frame>,
     eof: bool,
-    /// The output description of the frame `receive_frame` returned
-    /// last (`None` before the first one).
+    /// The output description `receive_frame` published last — the
+    /// shape of the frame it returned last, or of the frame held in
+    /// `ready` once its event was returned (`None` before the first).
     shown: Option<OutputShape>,
     /// Before the first frame: the description the first packet's
     /// frame header announces ([`crate::info`], header-only).
     announced: Option<OutputShape>,
-    /// `Decoder::output_params_generation` — bumped (wrapping) when a
-    /// returned frame's shape differs from the previous one's.
+    /// `Decoder::output_params_generation` — bumped (wrapping) together
+    /// with each `Frame::StreamParams` event, i.e. when a decoded
+    /// frame's shape differs from the previous one's.
     generation: u64,
 }
 
@@ -422,7 +428,7 @@ impl Decoder for MjpegDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.ready.is_some() {
             return Err(Error::other(
                 "MJPEG decoder: receive_frame must be called before sending another packet",
             ));
@@ -441,7 +447,19 @@ impl Decoder for MjpegDecoder {
         Ok(())
     }
 
+    /// One packet is one picture: every Motion-JPEG frame is a complete
+    /// interchange stream whose frame header (T.81 §B.2.2: `X`, `Y`, the
+    /// component count and sampling factors) fixes the decoded shape. A
+    /// packet carrying an interlaced field pair (two interchange streams
+    /// of the same frame header, RFC 2435 §4.1 type-specific 1 / 2) is
+    /// one picture of the first field's shape, never a change between
+    /// its fields. When a frame's shape differs from the previous one's
+    /// the decoder returns `Frame::StreamParams` first (the description
+    /// and the generation have moved), then the frame.
     fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(frame) = self.ready.take() {
+            return Ok(frame);
+        }
         let Some(pkt) = self.pending.take() else {
             return if self.eof {
                 Err(Error::Eof)
@@ -468,22 +486,43 @@ impl Decoder for MjpegDecoder {
             pixel_format: img.format.into(),
             color: img.color.into(),
         };
-        // The first frame resolves the description (no bump); a later
-        // frame of a different shape bumps the generation as it is
-        // returned.
-        if self.shown.is_some_and(|prev| prev != shape) {
-            self.generation = self.generation.wrapping_add(1);
-        }
-        self.shown = Some(shape);
-        self.announced = None;
         let mut vf = VideoFrame::from(img);
         vf.pts = pkt.pts;
         vf.set_blobs(blobs);
-        Ok(Frame::Video(vf))
+        let frame = Frame::Video(vf);
+        // The first frame resolves the description (no event, no bump);
+        // a later frame of a different shape is preceded by one event,
+        // returned with the description and the generation already
+        // moved.
+        let changed = self.shown.is_some_and(|prev| prev != shape);
+        self.shown = Some(shape);
+        self.announced = None;
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+            self.ready = Some(frame);
+            return Ok(Frame::StreamParams(Box::new(
+                shape.to_params(&self.codec_id),
+            )));
+        }
+        Ok(frame)
     }
 
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
+        Ok(())
+    }
+
+    /// Drops the packet not yet decoded and a frame held behind its
+    /// event (its shape stays published: the next frame of another
+    /// shape is announced by an event under the same rule) and leaves
+    /// end-of-stream, so decoding resumes at the next packet.
+    fn reset(&mut self) -> Result<()> {
+        self.pending = None;
+        self.ready = None;
+        self.eof = false;
+        if self.shown.is_none() {
+            self.announced = None;
+        }
         Ok(())
     }
 
@@ -1258,6 +1297,10 @@ pub struct MjpegEncoder {
     /// layout without a historical path, not set by the caller: it is
     /// re-derived on every frame so the knobs keep working.
     general_implied: bool,
+    /// `general` comes from the `CodecParameters::options` bag (kept in
+    /// `output_params.options`): a mid-stream re-configuration derives
+    /// it again from the bag for the new layout.
+    general_from_bag: bool,
     /// The table set shared by every abbreviated frame (its §B.5 stream
     /// is `output_params().extradata`).
     shared_tables: Option<JpegTableSet>,
@@ -1323,6 +1366,7 @@ impl MjpegEncoder {
             cmyk_adobe_transform: None,
             general: None,
             general_implied: false,
+            general_from_bag: false,
             shared_tables: None,
             stream_metadata: Metadata::from_blobs(&params.blobs),
             jfif: JfifPolicy::Auto,
@@ -1351,8 +1395,7 @@ impl MjpegEncoder {
                 enc.cmyk_adobe_transform = t;
             }
             enc.jfif = opts.jfif_policy()?;
-            let lossless_only = enc.layout.lossless_only && chroma.is_none();
-            enc.set_encode_options(opts.to_encode_options_for(lossless_only)?)?;
+            enc.apply_option_bag(&opts)?;
         } else if enc.layout.legacy.is_none() {
             // No historical per-format path: the general writer with
             // its defaults (re-derived from the knobs on every frame).
@@ -1361,6 +1404,125 @@ impl MjpegEncoder {
             enc.general_implied = true;
         }
         Ok(Box::new(enc))
+    }
+
+    /// Route the general writer through the option bag's typed options
+    /// for the current layout.
+    fn apply_option_bag(&mut self, opts: &MjpegEncoderOptions) -> Result<()> {
+        let lossless_only = self.layout.lossless_only && self.chroma.is_none();
+        self.set_encode_options(opts.to_encode_options_for(lossless_only)?)?;
+        self.general_from_bag = true;
+        Ok(())
+    }
+
+    /// Re-configure for a mid-stream input change announced by a
+    /// `Frame::StreamParams` event: the next frame has the event's size
+    /// and pixel format (absent fields keep the current ones). MJPEG is
+    /// intra-only — every frame is a complete interchange stream — so
+    /// the writer is chosen again for the new layout exactly as
+    /// [`Self::from_params`] chooses it: the option bag is re-derived,
+    /// options set through [`Self::set_encode_options`] keep every
+    /// choice except the precision / sampling / colour signalling the
+    /// old layout implied, and the knobs (`set_progressive`, …) stay.
+    /// `output_params()` then describes the new output. Abbreviated
+    /// streams are refused (`Error::Unsupported`): their tables are
+    /// published once for the stream. On any error nothing changes.
+    fn reconfigure(&mut self, p: &CodecParameters) -> Result<()> {
+        let width = p.width.unwrap_or(self.width);
+        let height = p.height.unwrap_or(self.height);
+        let input = p.pixel_format.unwrap_or(self.layout.input);
+        if (width, height, input) == (self.width, self.height, self.layout.input) {
+            return Ok(());
+        }
+        if self.general.as_ref().is_some_and(|o| o.abbreviated) {
+            return Err(Error::unsupported(
+                "MJPEG encoder: an abbreviated stream shares one table set (output_params().extradata) and cannot change shape mid-stream",
+            ));
+        }
+        if width == 0 || height == 0 || width > 65535 || height > 65535 {
+            return Err(Error::invalid(format!(
+                "MJPEG encoder: {width}×{height} is outside T.81's 1..=65535 per axis"
+            )));
+        }
+        let layout = InputLayout::of(input)?;
+        layout.check_chroma(self.chroma)?;
+        let saved = (
+            std::mem::replace(&mut self.layout, layout),
+            self.width,
+            self.height,
+            self.general.clone(),
+            self.general_implied,
+            self.general_from_bag,
+            self.output_params.clone(),
+        );
+        let old_shape = saved.0.shape(self.chroma);
+        self.width = width;
+        self.height = height;
+        self.output_params.width = Some(width);
+        self.output_params.height = Some(height);
+        if let Err(e) = self.reselect_writer(&old_shape) {
+            (
+                self.layout,
+                self.width,
+                self.height,
+                self.general,
+                self.general_implied,
+                self.general_from_bag,
+                self.output_params,
+            ) = saved;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Choose the writer for the (new) layout; see [`Self::reconfigure`].
+    fn reselect_writer(&mut self, old_shape: &Shape) -> Result<()> {
+        if self.general_from_bag {
+            let opts = parse_options::<MjpegEncoderOptions>(&self.output_params.options)?;
+            return self.apply_option_bag(&opts);
+        }
+        match self.general.clone() {
+            Some(mut o) if !self.general_implied => {
+                // Back to "from the pixel format" where the old layout
+                // supplied the value.
+                if o.precision == old_shape.precision {
+                    o.precision = 0;
+                }
+                if o.sampling == old_shape.sampling {
+                    o.sampling.clear();
+                }
+                if o.signalling == self.auto_signalling(old_shape.class) {
+                    o.signalling = ColorSignalling::Auto;
+                }
+                self.set_encode_options(o)
+            }
+            _ if self.layout.legacy.is_none() => {
+                let o = self.implied_options();
+                self.set_encode_options(o)?;
+                self.general_implied = true;
+                Ok(())
+            }
+            _ => {
+                self.general = None;
+                self.general_implied = false;
+                let (process, precision) = (self.layout.default_process(1), self.layout.precision);
+                self.label_output(process, precision);
+                Ok(())
+            }
+        }
+    }
+
+    /// The colour signalling `ColorSignalling::Auto` resolves to for a
+    /// layout class.
+    fn auto_signalling(&self, class: Class) -> ColorSignalling {
+        match class {
+            Class::Rgb => ColorSignalling::Rgb,
+            Class::Gbr => ColorSignalling::None,
+            Class::Cmyk => ColorSignalling::Cmyk {
+                adobe_transform: self.cmyk_adobe_transform,
+            },
+            Class::Gray | Class::Ycc => ColorSignalling::Jfif,
+        }
     }
 
     /// Stamp the output parameters with what the decoder will report.
@@ -1443,14 +1605,7 @@ impl MjpegEncoder {
             )));
         }
         if opts.signalling == ColorSignalling::Auto {
-            opts.signalling = match shape.class {
-                Class::Rgb => ColorSignalling::Rgb,
-                Class::Gbr => ColorSignalling::None,
-                Class::Cmyk => ColorSignalling::Cmyk {
-                    adobe_transform: self.cmyk_adobe_transform,
-                },
-                Class::Gray | Class::Ycc => ColorSignalling::Jfif,
-            };
+            opts.signalling = self.auto_signalling(shape.class);
         }
         if opts.process.is_dct() {
             if self.layout.lossless_only && self.chroma.is_none() {
@@ -1495,6 +1650,7 @@ impl MjpegEncoder {
         self.label_output(opts.process, opts.precision);
         self.general = Some(opts);
         self.general_implied = false;
+        self.general_from_bag = false;
         Ok(())
     }
 
@@ -2090,6 +2246,9 @@ impl Encoder for MjpegEncoder {
                 self.pending.push_back(pkt);
                 Ok(())
             }
+            // A mid-stream input change: the next frame is coded at the
+            // new shape (see `MjpegEncoder::reconfigure`).
+            Frame::StreamParams(p) => self.reconfigure(p),
             _ => Err(Error::invalid("MJPEG encoder: video frames only")),
         }
     }

@@ -110,7 +110,19 @@ fn decode_all(dec: &mut dyn Decoder, packets: &[Vec<u8>]) -> Vec<(u64, CodecPara
             assert_eq!(g_before, *g);
             assert_eq!(format!("{before:?}"), format!("{prev:?}"));
         }
-        let Frame::Video(vf) = dec.receive_frame().expect("frame") else {
+        let mut f = dec.receive_frame().expect("frame");
+        if let Some(ev) = f.stream_params() {
+            // A new shape is announced in-band first (tests/stream_params.rs
+            // covers the event); here the consumer only watches the
+            // counter, which has moved with it.
+            assert_eq!(
+                format!("{ev:?}"),
+                format!("{:?}", dec.output_params().unwrap())
+            );
+            assert_ne!(dec.output_params_generation(), g_before);
+            f = dec.receive_frame().expect("frame behind the event");
+        }
+        let Frame::Video(vf) = f else {
             panic!("video only");
         };
         let p = dec.output_params().expect("described after a frame");

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Registry decoder emits the in-band `Frame::StreamParams` event (oxideav-core 0.1.43) once per mid-stream output-shape change — size, component count, sampling or colour coding of a Motion-JPEG frame — immediately before the first frame of the new shape, with `output_params()` / `output_params_generation()` already moved and the payload equal to `output_params()`. None for the first shape or a constant stream; a field-pair packet is one picture shape. `tests/stream_params.rs` pins it on a black-box ffmpeg splice (4 segments, 3 events) and hand-assembled streams.
+- Registry decoder implements `reset()`: drops the undecoded packet and a frame held behind its event and leaves end-of-stream (the default drained through `flush()` and stayed at `Eof`).
+- Registry encoder accepts `Frame::StreamParams` in `send_frame` and re-configures for the new size / input layout from the next frame (knobs and option bag kept, `output_params()` relabelled); abbreviated streams refuse it with `Error::Unsupported`; an unacceptable shape is refused with nothing changed.
+
+### Other
+
+- fuzz lockfile follows oxideav-core 0.1.43 (the library now names `Frame::StreamParams`).
+
 ## [0.1.14](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.13...v0.1.14) - 2026-10-25
 
 ### Other

@@ -142,6 +142,27 @@ JpegDepacketizer`. The historical `decoder::decode_jpeg(bytes, pts)` /
 `decode_jpeg_with_tables` and `t81::JpegEncodeOptions` names remain as
 `#[deprecated]` wrappers / alias for one release.
 
+**Mid-stream shape changes.** Every Motion-JPEG frame carries its own
+frame header, so a stream may change size, component count or sampling
+(and with them the output pixel format) at any frame. The decoder
+states the shape up front through `output_params()` (from the first
+packet's frame header) and, at each change, returns one
+`Frame::StreamParams` event immediately before the first frame of the
+new shape — `output_params()` and `output_params_generation()` have
+moved by then and the event's payload equals `output_params()`. No
+event for the first shape or for a constant stream; the same rule
+holds after `reset()` (which drops the undecoded packet and a frame
+held behind its event) and while draining after `flush()`. A packet
+carrying an interlaced field pair (two interchange streams of one
+frame header) is one picture of the first field's shape.
+`receive_arena_frame` skips the event; a consumer that only watches
+the counter skips it with `Frame::is_stream_params()`. The encoder
+accepts the event in `send_frame`: MJPEG is intra-only, so it
+re-configures for the new size / input layout from the next frame on
+(knobs and option bag kept, `output_params()` relabelled); an
+abbreviated stream refuses it with `Error::Unsupported` (its tables
+are published once in `extradata`).
+
 ## Supported layouts
 
 Decode — the layout `decode` / `info` report for a stream. Every YCbCr

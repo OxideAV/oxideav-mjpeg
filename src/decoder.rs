@@ -85,6 +85,12 @@ struct JpegState {
     /// Chroma reconstruction used when a frame is resampled to 4:4:4
     /// (layouts without a planar format).
     upsampling: ChromaUpsampling,
+    /// Collect the quantised coefficients instead of rendering
+    /// ([`read_coefficients`]): every DCT scan accumulates, EOI returns
+    /// the coefficient planes.
+    coefficients_only: bool,
+    /// Second byte of the frame's SOF marker (0 before the frame header).
+    sof_marker: u8,
 }
 
 /// Container holding both the conditioning parameters (L, U) and the live
@@ -118,6 +124,8 @@ impl JpegState {
             limits: DecodeLimits::default(),
             idct: IdctMethod::default(),
             upsampling: ChromaUpsampling::default(),
+            coefficients_only: false,
+            sof_marker: 0,
             arith_dc: Default::default(),
             arith_ac: Default::default(),
         }
@@ -470,6 +478,85 @@ pub(crate) fn decode_planes_limited(
     decode_jpeg_inner(state, data)
 }
 
+/// The quantised coefficients of one DCT-based interchange stream (the
+/// [`crate::read_coefficients`] core): every scan accumulates into the
+/// coefficient planes, nothing is dequantised or transformed. Fills
+/// geometry, tables, components, the SOF kind and the Adobe flag; the
+/// caller adds the header metadata.
+pub(crate) fn read_coefficients_raw(
+    tables: Option<&[u8]>,
+    data: &[u8],
+    limits: DecodeLimits,
+) -> Result<crate::coefficients::JpegCoefficients> {
+    let mut state = JpegState::new();
+    state.limits = limits;
+    state.coefficients_only = true;
+    if let Some(t) = tables {
+        load_table_stream(&mut state, t)?;
+    }
+    let Walked::Coefficients(state, planes) = walk_stream(state, data)? else {
+        return Err(Error::invalid("JPEG coefficients: stream rendered instead"));
+    };
+    let sof = state
+        .sof
+        .as_ref()
+        .ok_or_else(|| Error::invalid("JPEG coefficients: no frame header"))?;
+    let mut out = crate::coefficients::JpegCoefficients::new(sof.width, sof.height, sof.precision);
+    out.kind = crate::jpeg::inspect::SofKind::from_marker(state.sof_marker);
+    for (tq, q) in state.quant.iter().enumerate() {
+        out.quant_tables[tq] = q.as_ref().map(|q| q.values);
+    }
+    out.adobe_transform = state.adobe_transform;
+    for (c, blocks) in sof.components.iter().zip(planes) {
+        out.components.push(
+            crate::coefficients::CoefficientComponent::new(c.id, c.h_factor, c.v_factor, c.qt_id)
+                .with_blocks(blocks),
+        );
+    }
+    Ok(out)
+}
+
+/// Dequantise + inverse-DCT a coefficient record into the native
+/// layout ([`crate::decode_coefficients`]); the record has been
+/// validated.
+pub(crate) fn render_coefficients(
+    coefs: &crate::coefficients::JpegCoefficients,
+    idct: IdctMethod,
+    upsampling: ChromaUpsampling,
+) -> Result<JpegImage> {
+    let mut state = JpegState::new();
+    state.idct = idct;
+    state.upsampling = upsampling;
+    state.adobe_transform = coefs.adobe_transform;
+    for (tq, q) in coefs.quant_tables.iter().enumerate() {
+        state.quant[tq] = q.map(|values| QuantTable { values });
+    }
+    let sof = SofInfo {
+        precision: coefs.precision,
+        height: coefs.height,
+        width: coefs.width,
+        components: coefs
+            .components
+            .iter()
+            .map(|c| crate::jpeg::parser::SofComponent {
+                id: c.id,
+                h_factor: c.h,
+                v_factor: c.v,
+                qt_id: c.quant_id,
+            })
+            .collect(),
+    };
+    validate_sof(&sof, &state.limits)?;
+    if sof.components.len() == 4 && sof.precision != 8 {
+        return Err(Error::unsupported(
+            "JPEG coefficients: 4-component frames render only at P = 8",
+        ));
+    }
+    state.sof = Some(sof);
+    let planes: Vec<Vec<[i32; 64]>> = coefs.components.iter().map(|c| c.blocks.clone()).collect();
+    render_from_coefs(&state, &planes)
+}
+
 /// Decode one complete JPEG interchange stream (`SOI … EOI`) into a
 /// framework `VideoFrame`; `pts` is passed through.
 ///
@@ -599,7 +686,24 @@ fn load_table_stream(state: &mut JpegState, tables: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
+/// What a walk over one interchange stream produced: the rendered
+/// picture, or (in `coefficients_only` mode) the final table state and
+/// the coefficient planes.
+enum Walked {
+    Image(JpegImage),
+    Coefficients(Box<JpegState>, Vec<Vec<[i32; 64]>>),
+}
+
+fn decode_jpeg_inner(state: JpegState, data: &[u8]) -> Result<JpegImage> {
+    match walk_stream(state, data)? {
+        Walked::Image(img) => Ok(img),
+        Walked::Coefficients(..) => Err(Error::invalid(
+            "JPEG: coefficient walk in a rendering decode",
+        )),
+    }
+}
+
+fn walk_stream(mut state: JpegState, data: &[u8]) -> Result<Walked> {
     // Verify SOI.
     if data.len() < 2 || data[0] != 0xFF || data[1] != markers::SOI {
         return Err(Error::invalid("JPEG: missing SOI"));
@@ -630,7 +734,10 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                     || state.arithmetic
                     || state.progressive_arith
                 {
-                    return render_from_coefs(&state, &coef_buf);
+                    if state.coefficients_only {
+                        return Ok(Walked::Coefficients(Box::new(state), coef_buf));
+                    }
+                    return render_from_coefs(&state, &coef_buf).map(Walked::Image);
                 }
                 return Err(Error::invalid("JPEG: EOI before SOS"));
             }
@@ -666,6 +773,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof, &state.limits)?;
                 state.sof = Some(sof);
+                state.sof_marker = marker;
             }
             SOF2 => {
                 if state.sof.is_some() {
@@ -706,6 +814,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 }
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
+                state.sof_marker = marker;
                 state.progressive = true;
             }
             // SOF3 — lossless, Huffman-coded; SOF11 — lossless,
@@ -724,6 +833,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
                 state.sof = Some(sof);
+                state.sof_marker = marker;
                 state.lossless = true;
                 state.lossless_arith = marker == markers::SOF11;
             }
@@ -760,6 +870,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 }
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
+                state.sof_marker = marker;
                 state.arithmetic = true;
             }
             // SOF10 — progressive, arithmetic-coded (T.81 §G.1.3). The
@@ -789,6 +900,7 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 }
                 coef_buf = init_coef_buffers(&sof)?;
                 state.sof = Some(sof);
+                state.sof_marker = marker;
                 state.progressive_arith = true;
             }
             // DHP (T.81 §B.3.2) — Define Hierarchical Progression. Its
@@ -801,7 +913,12 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                     return Err(Error::invalid("JPEG: DHP after first SOF"));
                 }
                 let dhp_payload = walker.read_segment_payload()?;
-                return decode_hierarchical(dhp_payload, &mut walker, state);
+                if state.coefficients_only {
+                    return Err(Error::unsupported(
+                        "JPEG coefficients: hierarchical (DHP) sequences are not exposed at the coefficient level",
+                    ));
+                }
+                return decode_hierarchical(dhp_payload, &mut walker, state).map(Walked::Image);
             }
             0xC5..=0xC7 | 0xCD..=0xCF => {
                 let _ = walker.read_segment_payload();
@@ -815,10 +932,15 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 validate_sos(&sos)?;
                 let scan = walker.read_scan_data()?;
                 if state.lossless {
-                    if state.lossless_arith {
-                        return decode_lossless_arith_scan(&state, &sos, scan);
+                    if state.coefficients_only {
+                        return Err(Error::unsupported(
+                            "JPEG coefficients: a lossless (SOF3 / SOF11) frame carries no DCT coefficients",
+                        ));
                     }
-                    return decode_lossless_scan(&state, &sos, scan);
+                    if state.lossless_arith {
+                        return decode_lossless_arith_scan(&state, &sos, scan).map(Walked::Image);
+                    }
+                    return decode_lossless_scan(&state, &sos, scan).map(Walked::Image);
                 }
                 if state.progressive_arith {
                     decode_progressive_arith_scan(&state, &sos, scan, &mut coef_buf)?;
@@ -842,10 +964,11 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                     // sample buffers) lives.
                     let fast_path_ok = fully_interleaved
                         && !state.seq_accum
+                        && !state.coefficients_only
                         && sof.components.len() <= 3
                         && sof.precision == 8;
                     if fast_path_ok {
-                        return decode_scan(&state, &sos, scan);
+                        return decode_scan(&state, &sos, scan).map(Walked::Image);
                     }
                     if !state.seq_accum {
                         coef_buf = init_coef_buffers(sof)?;

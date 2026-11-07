@@ -30,6 +30,12 @@
 //! # Ok(()) }
 //! ```
 //!
+//! One level down, [`read_coefficients`] returns the quantised DCT
+//! coefficients and tables of a DCT frame ([`JpegCoefficients`]);
+//! [`decode_coefficients`] renders such a record and
+//! [`encode_coefficients`] codes one back without touching a
+//! coefficient (see [`coefficients`]).
+//!
 //! [`probe`] / [`info`] / [`decode`] / [`decode_with`] / [`decode_rgb8`]
 //! / [`decode_rgba8`] / [`decode_from`] and [`encode`] / [`encode_rgb8`]
 //! / [`encode_rgba8`] / [`encode_to`] over [`JpegImage`], [`RgbImage`],
@@ -171,6 +177,7 @@
 //! [`MjpegPixelFormat`] / [`MjpegError`] types built only on `std`.
 
 mod api;
+pub mod coefficients;
 pub mod convert;
 pub mod decoder;
 pub mod encoder;
@@ -210,6 +217,13 @@ pub use image::{
 pub use t81::{
     ColorSignalling, EncodeOptions, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
     JpegFrame, JpegProcess, JpegTableSet,
+};
+
+// Coefficient-level access (#21): read / render / write the quantised
+// DCT coefficients and tables.
+pub use coefficients::{
+    CoefficientComponent, JpegCoefficients, decode_coefficients, encode_coefficients,
+    read_coefficients, read_coefficients_with,
 };
 
 // Metadata carriage: the marker-order rule, the limits and the

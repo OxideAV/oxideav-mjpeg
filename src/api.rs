@@ -70,6 +70,13 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
     })
 }
 
+/// `(JFIF APP0 present, metadata)` of the header, read leniently — the
+/// [`crate::read_coefficients`] header facts.
+pub(crate) fn header_flags(bytes: &[u8]) -> Result<(bool, Metadata)> {
+    let hdr = scan_header(bytes, false)?;
+    Ok((hdr.jfif, hdr.metadata()))
+}
+
 /// The metadata segments before the first `SOS`, read leniently (the
 /// record [`decode`] fills into [`JpegImage::metadata`]). Backs
 /// [`crate::metadata::read_metadata`] and the `jpeg` demuxer's stream

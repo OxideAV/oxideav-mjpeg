@@ -973,6 +973,16 @@ struct Geometry {
 /// Validate the component geometry against the frame per A.1.1 and the
 /// interleave rule of B.2.3 (`Σ Hj × Vj ≤ 10` when `Ns > 1`).
 fn validate(frame: &JpegFrame, comps: &[JpegComponent<'_>]) -> Result<Geometry> {
+    validate_geometry(frame, comps, true)
+}
+
+/// [`validate`], optionally without the sample checks (the coefficient
+/// writer has no samples).
+fn validate_geometry(
+    frame: &JpegFrame,
+    comps: &[JpegComponent<'_>],
+    check_samples: bool,
+) -> Result<Geometry> {
     if comps.is_empty() || comps.len() > 4 {
         return Err(Error::invalid(format!(
             "JPEG encode: {} components (a single interleaved scan carries 1..=4)",
@@ -1045,7 +1055,7 @@ fn validate(frame: &JpegFrame, comps: &[JpegComponent<'_>]) -> Result<Geometry> 
                 c.width, c.height, frame.width, frame.height, c.h, c.v
             )));
         }
-        if c.samples.len() != c.width * c.height {
+        if check_samples && c.samples.len() != c.width * c.height {
             return Err(Error::invalid(format!(
                 "JPEG encode: component {i} carries {} samples for {}x{}",
                 c.samples.len(),
@@ -1054,7 +1064,7 @@ fn validate(frame: &JpegFrame, comps: &[JpegComponent<'_>]) -> Result<Geometry> 
             )));
         }
         let limit = 1u32 << frame.precision;
-        if c.samples.iter().any(|&s| (s as u32) >= limit) {
+        if check_samples && c.samples.iter().any(|&s| (s as u32) >= limit) {
             return Err(Error::invalid(format!(
                 "JPEG encode: component {i} has a sample outside 0..2^{}",
                 frame.precision
@@ -1653,6 +1663,30 @@ pub fn encode_frame_with_meta(
 ) -> Result<Vec<u8>> {
     let geo = validate(frame, comps)?;
     let dct = frame.process.is_dct();
+    let scan_tables = build_scan_tables(comps, tables, dct)?;
+    let blocks = if dct {
+        Some(prepare_dct(frame, comps, &geo, tables)?)
+    } else {
+        None
+    };
+    emit_frame(
+        frame,
+        comps,
+        &geo,
+        blocks.as_deref(),
+        tables,
+        &scan_tables,
+        emit_tables,
+        meta,
+    )
+}
+
+/// The code tables of every destination `comps` reference.
+fn build_scan_tables(
+    comps: &[JpegComponent<'_>],
+    tables: &JpegTableSet,
+    dct: bool,
+) -> Result<ScanTables> {
     let mut scan_tables = ScanTables {
         dc: [None, None, None, None],
         ac: [None, None, None, None],
@@ -1672,12 +1706,157 @@ pub fn encode_frame_with_meta(
             scan_tables.ac[id] = Some(HuffCodes::from_spec(spec)?);
         }
     }
-    let blocks = if dct {
-        Some(prepare_dct(frame, comps, &geo, tables)?)
-    } else {
-        None
-    };
+    Ok(scan_tables)
+}
 
+/// Entropy-code a validated coefficient record
+/// ([`crate::encode_coefficients`]): the record's quantisation tables,
+/// Annex K typical (or K.2 optimal, from a counting pass over the very
+/// blocks) Huffman tables, the given DCT process and restart interval;
+/// a JFIF `APP0` when `jfif`, the record's Adobe `APP14` flag when set,
+/// then `meta` under `policy`.
+pub(crate) fn encode_coefficient_frame(
+    coefs: &crate::coefficients::JpegCoefficients,
+    process: JpegProcess,
+    restart_interval: u16,
+    optimal: bool,
+    jfif: bool,
+    meta: &Metadata,
+    policy: JfifPolicy,
+) -> Result<Vec<u8>> {
+    let frame = JpegFrame::new(
+        coefs.width,
+        coefs.height,
+        coefs.precision,
+        process,
+        restart_interval,
+    );
+    let comps: Vec<JpegComponent<'static>> = coefs
+        .components
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let (xi, yi) = component_extent(coefs, i);
+            // §A.2.2: a single-component frame is coded non-interleaved
+            // whatever its sampling factors, so it is written as `1 × 1`
+            // (the blocks over real samples are the same).
+            let (h, v) = if coefs.components.len() == 1 {
+                (1, 1)
+            } else {
+                (c.h, c.v)
+            };
+            JpegComponent {
+                id: c.id,
+                samples: &[],
+                width: xi,
+                height: yi,
+                h,
+                v,
+                quant_id: c.quant_id,
+                huff_id: if i == 0 { 0 } else { 1 },
+            }
+        })
+        .collect();
+    let geo = validate_geometry(&frame, &comps, false)?;
+    let blocks: Vec<DctComponent> = coefs
+        .components
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let (bx_pad, _) = coefs.block_grid(i);
+            let (bx_true, by_true) = coefs.block_extent(i);
+            DctComponent {
+                blocks: c.blocks.clone(),
+                bx_pad,
+                bx_true,
+                by_true,
+            }
+        })
+        .collect();
+    let mut tables = JpegTableSet::typical(50, coefs.precision, false, comps.len());
+    tables.quant = coefs.quant_tables;
+    if optimal {
+        let mut dc: [HuffStats; 4] = Default::default();
+        let mut ac: [HuffStats; 4] = Default::default();
+        {
+            let mut sink = Sink::Count {
+                dc: &mut dc,
+                ac: &mut ac,
+            };
+            for plan in scan_plans(&frame, &comps) {
+                code_scan(&frame, &comps, &geo, Some(&blocks), &plan, &mut sink)?;
+            }
+        }
+        for t in 0..4 {
+            if !dc[t].is_empty() {
+                tables.dc[t] = Some(dc[t].to_spec());
+            }
+            if !ac[t].is_empty() {
+                tables.ac[t] = Some(ac[t].to_spec());
+            }
+        }
+    }
+    let scan_tables = build_scan_tables(&comps, &tables, true)?;
+    let mut head = Vec::new();
+    if jfif {
+        write_jfif_app0(&mut head);
+    }
+    if let Some(t) = coefs.adobe_transform {
+        write_adobe_app14(&mut head, t);
+    }
+    let mut data = emit_frame(
+        &frame,
+        &comps,
+        &geo,
+        Some(&blocks),
+        &tables,
+        &scan_tables,
+        true,
+        &head,
+    )?;
+    if !meta.is_empty() || policy != JfifPolicy::Auto {
+        data = crate::metadata::embed_metadata(&data, meta, policy)?;
+    }
+    Ok(data)
+}
+
+/// §A.1.1 component dimensions `(xi, yi)` of a coefficient record.
+fn component_extent(coefs: &crate::coefficients::JpegCoefficients, ci: usize) -> (usize, usize) {
+    let hm = coefs
+        .components
+        .iter()
+        .map(|c| c.h)
+        .max()
+        .unwrap_or(1)
+        .max(1) as usize;
+    let vm = coefs
+        .components
+        .iter()
+        .map(|c| c.v)
+        .max()
+        .unwrap_or(1)
+        .max(1) as usize;
+    let c = &coefs.components[ci];
+    (
+        (coefs.width as usize * c.h as usize).div_ceil(hm),
+        (coefs.height as usize * c.v as usize).div_ceil(vm),
+    )
+}
+
+/// The marker segments and entropy-coded segments of one frame whose
+/// blocks (DCT) or samples (lossless) are ready.
+#[allow(clippy::too_many_arguments)]
+fn emit_frame(
+    frame: &JpegFrame,
+    comps: &[JpegComponent<'_>],
+    geo: &Geometry,
+    blocks: Option<&[DctComponent]>,
+    tables: &JpegTableSet,
+    scan_tables: &ScanTables,
+    emit_tables: bool,
+    meta: &[u8],
+) -> Result<Vec<u8>> {
+    let dct = frame.process.is_dct();
     // Marker order (B.2.4 / B.2.1 allow tables anywhere before the scan
     // that uses them): DQT ahead of the frame header, which references
     // the quantisation destinations; then SOFn; then, ahead of each scan,
@@ -1732,9 +1911,9 @@ pub fn encode_frame_with_meta(
         {
             let mut sink = Sink::Emit {
                 writer: &mut writer,
-                tables: &scan_tables,
+                tables: scan_tables,
             };
-            code_scan(frame, comps, &geo, blocks.as_deref(), &plan, &mut sink)?;
+            code_scan(frame, comps, geo, blocks, &plan, &mut sink)?;
         }
         out.extend_from_slice(&writer.finish());
     }

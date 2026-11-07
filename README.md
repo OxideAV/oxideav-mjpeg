@@ -62,6 +62,8 @@ if oxideav_mjpeg::probe(&bytes) {
 | `encode_rgb8(w, h, &[u8], &opts)` | RGB → full-range YCbCr (T.871 §7), chroma box-filtered to `opts.chroma` (4:2:0 default), JFIF APP0 written. |
 | `encode_rgba8(w, h, &[u8], &opts)` | Same, **alpha dropped** — JPEG has no alpha mechanism. |
 | `encode_to<W: Write>(&img, &opts, w)` | Streaming variant of `encode`. |
+| `read_coefficients(&[u8]) -> Result<JpegCoefficients>` | The quantised DCT coefficients and quantisation tables of a DCT frame (sequential / progressive, Huffman / arithmetic, `P` = 8 / 12), entropy-decoded only: no dequantisation, no IDCT (see *Coefficient level*). `read_coefficients_with` takes `DecodeOptions` limits / tables. |
+| `decode_coefficients(&JpegCoefficients, &DecodeOptions)` / `encode_coefficients(&JpegCoefficients, &EncodeOptions)` | Render a record with this crate's dequantisation + IDCT; entropy-code one (Huffman sequential / progressive, typical or optimal tables) without touching a coefficient — a lossless transcode. |
 
 `JpegImage { width, height, format: PixelFormat, planes: Vec<Plane>,
 color: ColorInfo, metadata: Metadata, precision }` with `new` /
@@ -320,6 +322,30 @@ Not covered:
 * Lossless frames with layouts resampled to 4:4:4 (replicated).
 * Streams whose dequantised coefficients exceed 16 bits
   (`|S · Q| > 32767`, beyond any 8-bit FDCT output).
+
+## Coefficient level
+
+`read_coefficients(bytes)` stops after the entropy decoder (#21):
+`JpegCoefficients { width, height, precision, kind, quant_tables,
+components, adobe_transform, jfif, metadata }` with, per component,
+`CoefficientComponent { id, h, v, quant_id, blocks }`. `blocks` is the
+§A.2.4 MCU-padded block grid in raster order (`block_grid(ci)`;
+`block_extent(ci)` is the part over real samples), each block 64
+quantised coefficients `Sq_vu` in **natural** order (`v × 8 + u`, `[0]`
+= DC — not zig-zag); `quant_tables` use the same order. Multiply by the
+table and run any inverse DCT to get samples, or call
+`decode_coefficients` for this crate's. `encode_coefficients` codes a
+record back (`EncodeOptions::process` sequential or progressive,
+`tables` typical or optimal, `restart_interval`, `metadata`, `jfif`),
+keeping ids, sampling, tables and the Adobe flag, so coefficient-domain
+transforms work: a horizontal mirror (reverse the block columns, negate
+the odd `u`) or a transpose (swap block rows / columns, `u` / `v` and
+the tables) reproduces `jpegtran -flip horizontal` / `-transpose`
+coefficient for coefficient (`tests/coefficients.rs`). Over the 115
+fixture streams, rendering equals `decode` and every re-code reads back
+to the same coefficients; `djpeg` decodes the re-codes of the 92 8-bit ones
+byte-identically (four re-codes each). Lossless and hierarchical frames are
+`Error::Unsupported`; arithmetic coding is read but not written.
 
 ## Metadata and colour
 

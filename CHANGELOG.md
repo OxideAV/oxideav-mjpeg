@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.15...v0.2.0) - 2026-11-07
+
+### Other
+
+- read / render / write quantised DCT coefficients and tables ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- Adobe APP14 transform 0 by default, YCCK per T.872 §7, triangular 4-component upsampling ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- COM (comment) segments read, counted, written, replaced, stripped ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- DQT ahead of the frame header, DHT after it, only referenced tables ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- sequential arithmetic (SOF9) at P = 12 and with four components ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- reference-compatible decode as one switch + registry option bag, fitted-parameter notes, 87-stream djpeg oracle ([#19](https://github.com/OxideAV/oxideav-mjpeg/pull/19))
+- API hygiene: non_exhaustive option/kind enums + records, builders
+
 ### Added
 
 - Coefficient-level API (#21): `read_coefficients` / `read_coefficients_with` return a `JpegCoefficients` record of a DCT frame. It holds the quantised DCT coefficients per component on the MCU-padded block grid (natural order within a block), the quantisation tables, the SOF kind, the Adobe flag, JFIF presence and metadata. It covers sequential and progressive, Huffman and arithmetic, 8- and 12-bit, 1 to 4 components. `decode_coefficients` renders a record with this crate's dequantisation + IDCT. `encode_coefficients` entropy-codes one (Huffman sequential / progressive, typical / optimal tables, restarts) without touching a coefficient. Re-codes of every fixture read back to the same coefficients and decode to the same samples, and `djpeg` decodes them byte-identically. Coefficient-domain mirror and transpose reproduce `jpegtran -flip horizontal` / `-transpose` exactly. Lossless and hierarchical frames are refused.

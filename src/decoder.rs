@@ -85,6 +85,8 @@ struct JpegState {
     /// Chroma reconstruction used when a frame is resampled to 4:4:4
     /// (layouts without a planar format).
     upsampling: ChromaUpsampling,
+    /// Worker budget for restart-interval-parallel scans.
+    threads: usize,
     /// Collect the quantised coefficients instead of rendering
     /// ([`read_coefficients`]): every DCT scan accumulates, EOI returns
     /// the coefficient planes.
@@ -124,6 +126,7 @@ impl JpegState {
             limits: DecodeLimits::default(),
             idct: IdctMethod::default(),
             upsampling: ChromaUpsampling::default(),
+            threads: 1,
             coefficients_only: false,
             sof_marker: 0,
             arith_dc: Default::default(),
@@ -467,11 +470,13 @@ pub(crate) fn decode_planes_limited(
     limits: DecodeLimits,
     idct: IdctMethod,
     upsampling: ChromaUpsampling,
+    threads: usize,
 ) -> Result<JpegImage> {
     let mut state = JpegState::new();
     state.limits = limits;
     state.idct = idct;
     state.upsampling = upsampling;
+    state.threads = threads.max(1);
     if let Some(t) = tables {
         load_table_stream(&mut state, t)?;
     }
@@ -1075,6 +1080,8 @@ struct BitReader<'a> {
     nbits: u32,
     /// Set when we hit a restart marker while refilling.
     pub saw_rst: Option<u8>,
+    /// Set when a read ran past the real data and was padded with zeros.
+    padded: bool,
 }
 
 /// Mask of the high bit of every byte of `w` that equals `0xFF`, exact
@@ -1094,6 +1101,7 @@ impl<'a> BitReader<'a> {
             bits: 0,
             nbits: 0,
             saw_rst: None,
+            padded: false,
         }
     }
 
@@ -1172,6 +1180,7 @@ impl<'a> BitReader<'a> {
                     // a conventional tolerance at scan end. The caller is
                     // responsible for noticing `saw_rst` / EOI and stopping.
                     self.nbits = needed;
+                    self.padded = true;
                     break;
                 }
             }
@@ -1197,6 +1206,18 @@ impl<'a> BitReader<'a> {
         let v = (self.bits >> (64 - n)) as u32;
         self.bits <<= n;
         self.nbits -= n;
+        Ok(v)
+    }
+
+    /// `get_bits(1)`, with the buffered case inline.
+    #[inline(always)]
+    fn get_bit(&mut self) -> Result<u32> {
+        if self.nbits == 0 {
+            self.fill(1)?;
+        }
+        let v = (self.bits >> 63) as u32;
+        self.bits <<= 1;
+        self.nbits -= 1;
         Ok(v)
     }
 
@@ -1399,6 +1420,162 @@ fn render_block_8bit(
     }
 }
 
+/// Byte ranges of the restart intervals of an entropy-coded segment: the
+/// data before, between and after its `RSTm` markers (§B.1.1.5; a stuffed
+/// `0xFF 0x00` is data). `None` unless there are exactly `expected`
+/// intervals.
+fn restart_segments(scan: &[u8], expected: usize) -> Option<Vec<(usize, usize)>> {
+    let mut segs = Vec::with_capacity(expected);
+    let (mut start, mut i) = (0usize, 0usize);
+    while let Some(off) = scan[i..].iter().position(|&b| b == 0xFF) {
+        let at = i + off;
+        let m = *scan.get(at + 1)?;
+        if m == 0x00 {
+            i = at + 2;
+            continue;
+        }
+        if !markers::is_rst(m) || segs.len() + 1 >= expected {
+            return None;
+        }
+        segs.push((start, at));
+        start = at + 2;
+        i = start;
+    }
+    segs.push((start, scan.len()));
+    (segs.len() == expected).then_some(segs)
+}
+
+/// Decode an interleaved sequential Huffman scan with a restart interval
+/// one group of intervals per worker (T.81 §E.1.4: DC prediction and the
+/// entropy coder restart at every `RSTm`), rendering into `comp_buf`.
+/// Returns `false` — leaving `comp_buf` for the serial decoder to fill —
+/// when the markers do not delimit the frame's intervals exactly, when
+/// any interval fails to decode, or when an interval needed bits past
+/// its own data (the serial reader would have read on into the next
+/// interval): the parallel result is used only when it is the serial
+/// one.
+#[allow(clippy::too_many_arguments)]
+fn decode_scan_parallel(
+    state: &JpegState,
+    scan: &[u8],
+    sos_map: &[usize],
+    dc_tables: &[&HuffTable],
+    ac_tables: &[&HuffTable],
+    quant_f32: &[[f32; 64]],
+    quant_tables: &[&QuantTable],
+    (mcus_x, mcus_y): (usize, usize),
+    comp_buf: &mut [Vec<u8>],
+    comp_stride: &[usize],
+) -> bool {
+    let Some(sof) = state.sof.as_ref() else {
+        return false;
+    };
+    let total = mcus_x * mcus_y;
+    let ri = state.restart_interval as usize;
+    let nseg = total.div_ceil(ri);
+    if nseg < 2 {
+        return false;
+    }
+    let Some(segs) = restart_segments(scan, nseg) else {
+        return false;
+    };
+    // Blocks of one MCU, in scan order: (scan component, frame
+    // component, bx, by).
+    let layout: Vec<(usize, usize, usize, usize)> = sos_map
+        .iter()
+        .enumerate()
+        .flat_map(|(si, &ci)| {
+            let c = sof.components[ci];
+            (0..c.v_factor as usize)
+                .flat_map(move |by| (0..c.h_factor as usize).map(move |bx| (si, ci, bx, by)))
+        })
+        .collect();
+    let per_mcu = layout.len() * 64;
+    let workers = state.threads.min(nseg);
+    let per_worker = nseg.div_ceil(workers);
+    let n_comp = sof.components.len();
+    // Each worker renders its intervals' blocks, MCU after MCU, into a
+    // block-major buffer (8 × 8 samples per block, stride 8).
+    let run = |first: usize, last: usize| -> Option<Vec<u8>> {
+        let m0 = first * ri;
+        let m1 = (last * ri).min(total);
+        let mut out = vec![0u8; (m1 - m0) * per_mcu];
+        let mut block = [0i32; 64];
+        for (seg, &(a, b)) in segs.iter().enumerate().take(last).skip(first) {
+            let mut br = BitReader::new(&scan[a..b]);
+            let mut prev_dc = vec![0i32; n_comp];
+            for m in seg * ri..((seg + 1) * ri).min(total) {
+                for (bi, &(sidx, ci, _, _)) in layout.iter().enumerate() {
+                    block.fill(0);
+                    decode_block(
+                        &mut br,
+                        dc_tables[sidx],
+                        ac_tables[sidx],
+                        &mut prev_dc[ci],
+                        &mut block,
+                    )
+                    .ok()?;
+                    let base = ((m - m0) * layout.len() + bi) * 64;
+                    render_block_8bit(
+                        &block,
+                        &quant_f32[ci],
+                        quant_tables[ci],
+                        state.idct,
+                        &mut out[base..base + 64],
+                        8,
+                        0,
+                        0,
+                    );
+                }
+            }
+            if br.padded {
+                return None;
+            }
+        }
+        Some(out)
+    };
+    let results: Vec<Option<Vec<u8>>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (1..workers)
+            .map(|w| {
+                let run = &run;
+                let first = w * per_worker;
+                let last = ((w + 1) * per_worker).min(nseg);
+                sc.spawn(move || {
+                    if first < last {
+                        run(first, last)
+                    } else {
+                        Some(Vec::new())
+                    }
+                })
+            })
+            .collect();
+        let mut r = vec![run(0, per_worker.min(nseg))];
+        r.extend(handles.into_iter().map(|h| h.join().ok().flatten()));
+        r
+    });
+    if results.iter().any(Option::is_none) {
+        return false;
+    }
+    for (w, out) in results.iter().enumerate() {
+        let out = out.as_deref().unwrap_or_default();
+        let m0 = (w * per_worker * ri).min(total);
+        for (k, mcu) in out.chunks_exact(per_mcu).enumerate() {
+            let m = m0 + k;
+            let (mx, my) = (m % mcus_x, m / mcus_x);
+            for (&(_, ci, bx, by), blk) in layout.iter().zip(mcu.as_chunks::<64>().0) {
+                let c = sof.components[ci];
+                let x0 = mx * 8 * c.h_factor as usize + bx * 8;
+                let y0 = my * 8 * c.v_factor as usize + by * 8;
+                let stride = comp_stride[ci];
+                for (j, row) in blk.as_chunks::<8>().0.iter().enumerate() {
+                    comp_buf[ci][(y0 + j) * stride + x0..][..8].copy_from_slice(row);
+                }
+            }
+        }
+    }
+    true
+}
+
 fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImage> {
     let sof = state
         .sof
@@ -1518,12 +1695,27 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
     // Per-component quantisers in f32, converted once for the whole scan.
     let quant_f32: Vec<[f32; 64]> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
 
+    let parallel = state.threads > 1
+        && state.restart_interval != 0
+        && decode_scan_parallel(
+            state,
+            scan,
+            &sos_map,
+            &dc_tables,
+            &ac_tables,
+            &quant_f32,
+            &quant_tables,
+            (mcus_x, mcus_y),
+            &mut comp_buf,
+            &comp_stride,
+        );
+
     let mut br = BitReader::new(scan);
     let mut prev_dc = vec![0i32; n_comp];
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = RST0;
 
-    for my in 0..mcus_y {
+    for my in 0..if parallel { 0 } else { mcus_y } {
         for mx in 0..mcus_x {
             if state.restart_interval != 0
                 && mcus_since_restart != 0
@@ -1895,6 +2087,31 @@ fn detect_rgb_3comp(sof: &SofInfo, adobe_transform: Option<u8>) -> bool {
     ids == *b"RGB"
 }
 
+/// One combined-lookahead Huffman step: `(symbol, value)` where `value`
+/// is the symbol's `EXTEND`ed magnitude when the next code and its
+/// magnitude bits (low nibble of the symbol) are real buffered bits —
+/// all consumed — and `None` when the magnitude still has to be read.
+/// Codes the lookahead cannot settle take the canonical path, exactly as
+/// [`decode_huff`] would.
+#[inline(always)]
+fn huff_step(br: &mut BitReader<'_>, t: &HuffTable) -> Result<(u8, Option<i32>)> {
+    use crate::jpeg::huffman::{LUT_BITS, LUT_RESOLVED};
+    let e = t.lut[br.peek_bits(LUT_BITS)? as usize];
+    let code_len = (e >> 8) & 0x0F;
+    if e & LUT_RESOLVED != 0 {
+        let total = (e >> 12) & 0x1F;
+        if total <= br.nbits {
+            br.consume(total);
+            return Ok((e as u8, Some((e as i32) >> 18)));
+        }
+    }
+    if code_len != 0 && code_len <= br.nbits {
+        br.consume(code_len);
+        return Ok((e as u8, None));
+    }
+    Ok((decode_huff(br, t)?, None))
+}
+
 fn decode_block(
     br: &mut BitReader<'_>,
     dc: &HuffTable,
@@ -1902,31 +2119,8 @@ fn decode_block(
     prev_dc: &mut i32,
     out_natural: &mut [i32; 64],
 ) -> Result<()> {
-    use crate::jpeg::huffman::{LUT_BITS, LUT_RESOLVED};
-    // One combined-lookahead step: `Some((symbol, value))` when the next
-    // code (and, if resolved, its magnitude bits) are real buffered bits;
-    // the bits are consumed. `value` is `None` when the magnitude still
-    // has to be read. Codes the lookahead cannot settle take the
-    // canonical path, exactly as `decode_huff` would.
-    #[inline(always)]
-    fn step(br: &mut BitReader<'_>, t: &HuffTable) -> Result<(u8, Option<i32>)> {
-        let e = t.lut[br.peek_bits(LUT_BITS)? as usize];
-        let code_len = (e >> 8) & 0x0F;
-        if e & LUT_RESOLVED != 0 {
-            let total = (e >> 12) & 0x1F;
-            if total <= br.nbits {
-                br.consume(total);
-                return Ok((e as u8, Some((e as i32) >> 18)));
-            }
-        }
-        if code_len != 0 && code_len <= br.nbits {
-            br.consume(code_len);
-            return Ok((e as u8, None));
-        }
-        Ok((decode_huff(br, t)?, None))
-    }
     // DC.
-    let (t, v) = step(br, dc)?;
+    let (t, v) = huff_step(br, dc)?;
     let dc_diff = match v {
         Some(v) => v,
         None if t == 0 => 0,
@@ -1941,7 +2135,7 @@ fn decode_block(
     // AC: zigzag run-length decode into natural order.
     let mut k: usize = 1;
     while k < 64 {
-        let (rs, v) = step(br, ac)?;
+        let (rs, v) = huff_step(br, ac)?;
         let run = (rs >> 4) as usize;
         let size = (rs & 0x0F) as u32;
         if size == 0 {
@@ -2952,12 +3146,12 @@ fn prog_decode_dc(
     differential: bool,
 ) -> Result<()> {
     if ah == 0 {
-        let t = decode_huff(br, dc)? as u32;
-        let dc_diff = if t == 0 {
-            0
-        } else {
-            let bits = br.get_bits(t)? as i32;
-            extend(bits, t)
+        let (t, v) = huff_step(br, dc)?;
+        let t = t as u32;
+        let dc_diff = match v {
+            Some(v) => v,
+            None if t == 0 => 0,
+            None => extend(br.get_bits(t)? as i32, t),
         };
         if differential {
             // §J.2.3.1: a differential progressive (SOF6) frame decodes the
@@ -2971,7 +3165,7 @@ fn prog_decode_dc(
     } else {
         // Successive-approximation DC refinement: read 1 bit, shift into the
         // existing DC at position `Al`.
-        let bit = br.get_bits(1)? as i32;
+        let bit = br.get_bit()? as i32;
         block[0] |= bit << al;
     }
     Ok(())
@@ -2995,7 +3189,7 @@ fn prog_decode_ac_first(
     }
     let mut k = ss;
     while k <= se {
-        let rs = decode_huff(br, ac)?;
+        let (rs, v) = huff_step(br, ac)?;
         let r = (rs >> 4) as usize;
         let s = (rs & 0x0F) as u32;
         if s == 0 {
@@ -3012,8 +3206,10 @@ fn prog_decode_ac_first(
             if k > se {
                 return Err(Error::invalid("progressive AC: run out of band"));
             }
-            let bits = br.get_bits(s)? as i32;
-            let val = extend(bits, s) << al;
+            let val = match v {
+                Some(v) => v,
+                None => extend(br.get_bits(s)? as i32, s),
+            } << al;
             block[ZIGZAG[k]] = val;
             k += 1;
         }
@@ -3039,7 +3235,7 @@ fn prog_decode_ac_refine(
     let mut k = ss;
     if *eob_run == 0 {
         while k <= se {
-            let rs = decode_huff(br, ac)?;
+            let (rs, v) = huff_step(br, ac)?;
             let mut r = (rs >> 4) as usize;
             let s = (rs & 0x0F) as u32;
             let new_val: i32 = if s == 0 {
@@ -3052,9 +3248,19 @@ fn prog_decode_ac_refine(
                 // ZRL: skip 16 zero-history positions (refining any current nonzeros).
                 0
             } else if s == 1 {
-                // A new nonzero: read the sign bit.
-                let sign_bit = br.get_bits(1)?;
-                if sign_bit == 0 { m1 } else { p1 }
+                // A new nonzero: its sign bit follows the code. The
+                // lookahead's `EXTEND` of one bit is `−1` / `+1` — the
+                // same `m1` / `p1` once shifted by `Al`.
+                match v {
+                    Some(v) => v << al,
+                    None => {
+                        if br.get_bit()? == 0 {
+                            m1
+                        } else {
+                            p1
+                        }
+                    }
+                }
             } else {
                 return Err(Error::invalid("progressive AC refine: bad s"));
             };
@@ -3068,7 +3274,7 @@ fn prog_decode_ac_refine(
                 let pos = ZIGZAG[k];
                 if block[pos] != 0 {
                     // Refine existing coefficient with one additional bit.
-                    let bit = br.get_bits(1)? as i32;
+                    let bit = br.get_bit()? as i32;
                     if bit != 0 && (block[pos] & p1) == 0 {
                         if block[pos] >= 0 {
                             block[pos] += p1;
@@ -3097,7 +3303,7 @@ fn prog_decode_ac_refine(
         while k <= se {
             let pos = ZIGZAG[k];
             if block[pos] != 0 {
-                let bit = br.get_bits(1)? as i32;
+                let bit = br.get_bit()? as i32;
                 if bit != 0 && (block[pos] & p1) == 0 {
                     if block[pos] >= 0 {
                         block[pos] += p1;

@@ -436,6 +436,13 @@ impl Decoder for MjpegDecoder {
         &self.codec_id
     }
 
+    /// The thread budget becomes [`crate::DecodeOptions::threads`]:
+    /// pictures whose scan has a restart interval decode their intervals
+    /// in parallel (byte-identical to serial).
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.decode.threads = ctx.threads.max(1);
+    }
+
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if self.pending.is_some() || self.ready.is_some() {
             return Err(Error::other(

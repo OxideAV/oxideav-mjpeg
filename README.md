@@ -242,6 +242,7 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `idct` | `IdctMethod::Float` | Inverse DCT of 8- and 12-bit DCT frames: `Float` (f32 cosine matrix) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
 | `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
+| `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly. The registry decoder takes it from `Decoder::set_execution_context`. |
 
 Breaches are `Error::LimitExceeded`.
 

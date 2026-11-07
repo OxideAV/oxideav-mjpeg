@@ -1171,6 +1171,14 @@ pub struct DecodeOptions {
     /// YCbCr → RGB kernel of [`crate::decode_rgb8_with`] /
     /// [`crate::decode_rgba8_with`] (default [`YcbcrKernel::Exact`]).
     pub ycbcr: YcbcrKernel,
+    /// Worker threads for one picture (default `1`). An interleaved
+    /// sequential Huffman scan with a restart interval is decoded one
+    /// group of restart intervals per worker (T.81 §E.1.4: each interval
+    /// is entropy-coded independently); the result is byte-identical to
+    /// the single-threaded decode, which is used whenever the scan's
+    /// `RSTm` markers do not delimit exactly the intervals the frame
+    /// implies.
+    pub threads: usize,
 }
 
 impl Default for DecodeOptions {
@@ -1185,6 +1193,7 @@ impl Default for DecodeOptions {
             idct: IdctMethod::Float,
             upsampling: ChromaUpsampling::LumaGuided,
             ycbcr: YcbcrKernel::Exact,
+            threads: 1,
         }
     }
 }
@@ -1279,6 +1288,12 @@ impl DecodeOptions {
     /// Select the YCbCr → RGB kernel.
     pub fn with_ycbcr(mut self, ycbcr: YcbcrKernel) -> Self {
         self.ycbcr = ycbcr;
+        self
+    }
+
+    /// Allow up to `threads` workers per picture (`0` is taken as `1`).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 

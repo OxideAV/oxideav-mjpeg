@@ -330,3 +330,80 @@ fn trait_api_rejects_short_cmyk_stride() {
     let err = enc.send_frame(&frame).expect_err("short stride rejected");
     assert!(format!("{err:?}").contains("stride"));
 }
+
+// ---- #21: default four-component signalling --------------------------
+
+/// The Adobe APP14 transform flag of a stream, if any.
+fn adobe_flag(jpeg: &[u8]) -> Option<u8> {
+    oxideav_mjpeg::inspect_jpeg(jpeg)
+        .unwrap()
+        .adobe
+        .map(|a| match a.transform {
+            oxideav_mjpeg::AdobeColorTransform::Unknown => 0,
+            oxideav_mjpeg::AdobeColorTransform::YCbCr => 1,
+            oxideav_mjpeg::AdobeColorTransform::Ycck => 2,
+        })
+}
+
+#[test]
+fn default_cmyk_encode_writes_adobe_transform_zero() {
+    let w = 16u32;
+    let h = 16u32;
+    let planar = make_planar(w as usize, h as usize);
+    let packed = pack(w as usize, h as usize, &planar);
+
+    // Standalone API: a `Cmyk` image with default options.
+    let img = oxideav_mjpeg::JpegImage::new(
+        w,
+        h,
+        oxideav_mjpeg::MjpegPixelFormat::Cmyk,
+        vec![oxideav_mjpeg::Plane::new(w as usize * 4, packed.clone())],
+    )
+    .unwrap();
+    let out = oxideav_mjpeg::encode(&img, &oxideav_mjpeg::EncodeOptions::default()).unwrap();
+    assert_eq!(adobe_flag(&out), Some(0));
+    assert!(oxideav_mjpeg::info(&out).unwrap().has_adobe);
+    assert!(!oxideav_mjpeg::info(&out).unwrap().has_jfif);
+    let back = oxideav_mjpeg::decode(&out).unwrap();
+    let stride = back.planes[0].stride;
+    for (ci, src) in planar.iter().enumerate() {
+        let got: Vec<u8> = (0..(w * h) as usize)
+            .map(|i| back.planes[0].data[(i / w as usize) * stride + (i % w as usize) * 4 + ci])
+            .collect();
+        assert!(psnr(src, &got) >= 30.0, "component {ci}");
+    }
+
+    // The marker-less layout stays available explicitly.
+    let mut plain = oxideav_mjpeg::EncodeOptions::default();
+    plain.signalling = oxideav_mjpeg::ColorSignalling::Cmyk {
+        adobe_transform: None,
+    };
+    assert_eq!(
+        adobe_flag(&oxideav_mjpeg::encode(&img, &plain).unwrap()),
+        None
+    );
+
+    // Registry encoder: the default and the `adobe_transform` bag key.
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(PixelFormat::Cmyk);
+    let frame = Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride: w as usize * 4,
+            data: packed.clone(),
+        }],
+    });
+    use oxideav_core::Encoder;
+    let mut enc = MjpegEncoder::from_params(&params).unwrap();
+    assert_eq!(enc.adobe_transform(), Some(0));
+    enc.send_frame(&frame).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+    assert_eq!(adobe_flag(&pkt.data), Some(0));
+    assert_per_component_psnr(&decode(w, h, pkt.data), w, h, &planar, 30.0, "registry");
+    params.options = oxideav_core::CodecOptions::new().set("adobe_transform", "none");
+    let mut enc = MjpegEncoder::from_params(&params).unwrap();
+    enc.send_frame(&frame).unwrap();
+    assert_eq!(adobe_flag(&enc.receive_packet().unwrap().data), None);
+}

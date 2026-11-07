@@ -2966,7 +2966,8 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         // `Cmyk` — YCCK / Adobe-inverted pixel transforms are applied
         // during the final pack. Any component sampling layout is allowed;
         // planes at less-than-full resolution are upsampled by nearest-
-        // neighbour pixel replication.
+        // neighbour pixel replication, or by the triangular kernel when
+        // the decode options select it.
         PixelFormat::Cmyk
     } else {
         return Err(Error::unsupported("2-component JPEG"));
@@ -3085,23 +3086,64 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
                 sof.components[3].v_factor as usize,
             ];
             let transform = state.adobe_transform;
+            // A subsampled component at a 2:1 / 1:2 / 2 × 2 ratio goes
+            // through the triangular kernel when the options ask for it
+            // (as the three-component path); otherwise samples are
+            // replicated.
+            let full: Vec<Option<Vec<u32>>> = (0..4)
+                .map(|ci| {
+                    if state.upsampling != ChromaUpsampling::Triangular
+                        || (fh[ci] == h_max && fv[ci] == v_max)
+                        || !h_max.is_multiple_of(fh[ci])
+                        || !v_max.is_multiple_of(fv[ci])
+                    {
+                        return None;
+                    }
+                    let get = |x: usize, y: usize| -> u32 {
+                        comp_buf[ci][y * comp_stride[ci] + x] as u32
+                    };
+                    let c = crate::jpeg::upsample::Component {
+                        width: (width * fh[ci]).div_ceil(h_max),
+                        height: (height * fv[ci]).div_ceil(v_max),
+                        get: &get,
+                    };
+                    crate::jpeg::upsample::triangular(
+                        &c,
+                        h_max / fh[ci],
+                        v_max / fv[ci],
+                        width,
+                        height,
+                    )
+                })
+                .collect();
             for y in 0..height {
                 for x in 0..width {
                     // Component sample index: scale output pixel by h/v_max
                     // ratio to land on the correct spot in the full-MCU
-                    // sample buffer (nearest-neighbour).
+                    // sample buffer (nearest-neighbour), unless the
+                    // component was interpolated above.
                     let mut s = [0u8; 4];
                     for ci in 0..4 {
-                        let sx = x * fh[ci] / h_max;
-                        let sy = y * fv[ci] / v_max;
-                        s[ci] = comp_buf[ci][sy * comp_stride[ci] + sx];
+                        s[ci] = match &full[ci] {
+                            Some(v) => v[y * width + x] as u8,
+                            None => {
+                                let sx = x * fh[ci] / h_max;
+                                let sy = y * fv[ci] / v_max;
+                                comp_buf[ci][sy * comp_stride[ci] + sx]
+                            }
+                        };
                     }
                     let (c, m, yy, k) = match transform {
                         Some(2) => {
-                            // YCCK (Adobe). Decode YCbCr→RGB via BT.601
-                            // full-range, then C/M/Y = 255 − RGB. Adobe
-                            // stores the K component inverted alongside
-                            // YCbCr, so flip it too. Coefficients are the
+                            // YCCK (Adobe). T.872 §7: the YCC channels
+                            // are the T.871 RGB → YCbCr transform of C /
+                            // M / Y substituted for R / G / B, and K is
+                            // complemented — so YCbCr → RGB gives the
+                            // C / M / Y values directly and K is flipped
+                            // back (#21; black-box, `djpeg -pnm` renders
+                            // a YCCK stream and the `transform = 0`
+                            // stream of the same ink identically).
+                            // Coefficients are the
                             // BT.601 conversion constants in 16-bit
                             // fixed-point (1.40200 / 0.34414 / 0.71414 /
                             // 1.77200 multiplied by 65536 and rounded).
@@ -3116,12 +3158,7 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
                             let g =
                                 (y_s + ((-22554 * cb - 46802 * cr + 32768) >> 16)).clamp(0, 255);
                             let b = (y_s + ((cb * 116130 + 32768) >> 16)).clamp(0, 255);
-                            (
-                                (255 - r) as u8,
-                                (255 - g) as u8,
-                                (255 - b) as u8,
-                                255 - s[3],
-                            )
+                            (r as u8, g as u8, b as u8, 255 - s[3])
                         }
                         Some(0) => {
                             // Adobe CMYK — samples stored inverted.
@@ -5067,7 +5104,7 @@ fn shape_lossless_frame(
     // one-per-pixel. The Adobe APP14 colour-transform flag is honoured
     // identically to the lossy CMYK paths: `transform = 0` un-inverts the
     // Adobe-CMYK convention, `transform = 2` (YCCK) decodes YCbCr → RGB
-    // via BT.601 and un-inverts K, and the no-APP14 case passes the four
+    // via BT.601 (the C/M/Y ink) and un-inverts K, and the no-APP14 case passes the four
     // sample bytes through as plain "regular" CMYK. `precision = 8` was
     // enforced at SOF time so each post-`<< pt` byte fits in `u8` without
     // overflow; with `pt = 0` (the default) the shift is a no-op.
@@ -5082,15 +5119,16 @@ fn shape_lossless_frame(
             let s3 = (samples[3][i] << pt) as u8;
             let (c, m, yy, k) = match transform {
                 Some(2) => {
-                    // YCCK: BT.601 full-range YCbCr → RGB, then C/M/Y =
-                    // 255 − RGB, K inverted.
+                    // YCCK (T.872 §7): BT.601 full-range YCbCr → RGB
+                    // gives C / M / Y, K complemented — as the lossy
+                    // paths.
                     let y_s = s0 as i32;
                     let cb = s1 as i32 - 128;
                     let cr = s2 as i32 - 128;
                     let r = (y_s + ((cr * 91881 + 32768) >> 16)).clamp(0, 255);
                     let g = (y_s + ((-22554 * cb - 46802 * cr + 32768) >> 16)).clamp(0, 255);
                     let b = (y_s + ((cb * 116130 + 32768) >> 16)).clamp(0, 255);
-                    ((255 - r) as u8, (255 - g) as u8, (255 - b) as u8, 255 - s3)
+                    (r as u8, g as u8, b as u8, 255 - s3)
                 }
                 Some(0) => {
                     // Adobe CMYK: samples stored inverted.

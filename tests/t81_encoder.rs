@@ -406,6 +406,15 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
                             o.sampling = sampling.to_vec();
                             o.signalling = if nf == 3 && sampling.is_empty() {
                                 ColorSignalling::Rgb
+                            } else if nf == 4 && pt > 0 {
+                                // Auto CMYK is Adobe-inverted (#21):
+                                // `255 − v` loses its low bits to the
+                                // point transform differently from `v`,
+                                // so only the marker-less layout
+                                // round-trips as `(v >> Pt) << Pt`.
+                                ColorSignalling::Cmyk {
+                                    adobe_transform: None,
+                                }
                             } else {
                                 ColorSignalling::Auto
                             };

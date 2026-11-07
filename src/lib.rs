@@ -71,8 +71,8 @@
 //!
 //! 4-component (CMYK / Adobe YCCK) JPEGs decode to packed `Cmyk` — the
 //! decoder inspects the APP14 Adobe transform flag to choose among plain
-//! CMYK, Adobe-inverted CMYK, and Adobe YCCK (which is colour-converted
-//! back to CMYK via BT.601 full-range YCbCr→RGB→CMY plus K inversion).
+//! CMYK, Adobe-inverted CMYK, and Adobe YCCK (BT.601 full-range
+//! YCbCr→RGB gives the C/M/Y ink, K is un-inverted).
 //! The 4-component path covers both the sequential (SOF0 / SOF1) and the
 //! progressive (SOF2) scan decompositions at `P = 8`. 12-bit precision
 //! sequential JPEGs (SOF0/SOF1 with `P=12`) decode to `Gray12Le` /

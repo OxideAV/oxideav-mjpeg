@@ -1767,7 +1767,8 @@ pub enum HuffmanTables {
 #[non_exhaustive]
 pub enum ColorSignalling {
     /// One component → JFIF grayscale; three → JFIF YCbCr (ids 1/2/3);
-    /// four → plain ("regular", no APP14) CMYK.
+    /// four → Adobe CMYK (APP14 `transform = 0`, samples inverted on
+    /// the wire; `Cmyk { adobe_transform: Some(0) }`).
     #[default]
     Auto,
     /// JFIF APP0 (T.871): grayscale or YCbCr with ids 1 / 2 / 3.
@@ -2087,8 +2088,14 @@ impl EncodeOptions {
         let s = match self.signalling {
             ColorSignalling::Auto => match nf {
                 1 | 3 => ColorSignalling::Jfif,
+                // #21: Adobe APP14 `transform = 0`, all four samples
+                // complemented on the wire (T.872 §6.5.3). T.872 §6.1
+                // reads a marker-less four-component stream as plain
+                // CMYK, but `djpeg` and ImageMagick (observed
+                // black-box) read it as complemented, so only the
+                // flagged form comes back as the given ink everywhere.
                 4 => ColorSignalling::Cmyk {
-                    adobe_transform: None,
+                    adobe_transform: Some(0),
                 },
                 _ => ColorSignalling::None,
             },

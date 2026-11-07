@@ -87,3 +87,8 @@ up_2x2_3x7.jpg 3 7 3 1cc6b78cc6c0721b
 up_2x2_4x4.jpg 4 4 3 824ddf301243723c
 up_2x2_5x3.jpg 5 3 3 1969c57e8481df1c
 up_2x2_6x2.jpg 6 2 3 3282986b826aeb6c
+own_cmyk.jpg 37 29 3 09b511ee7a2d963b
+ycck_444.jpg 37 29 3 47c6cd64cc14ee29
+ycck_420.jpg 37 29 3 7cbb425829d98757
+ycck_prog.jpg 37 29 3 7cbb425829d98757
+ycck_420_arith.jpg 37 29 3 7cbb425829d98757

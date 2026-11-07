@@ -206,7 +206,7 @@ pub fn decode_from<R: Read>(mut r: R) -> Result<JpegImage> {
 /// | `Rgb24` | 3 | Adobe APP14 `transform = 0`, ids `R G B` | sequential / progressive / lossless |
 /// | `Rgb48Le` | 3 | Adobe RGB | lossless only (`P = precision`) |
 /// | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | 3 (G, B, R order kept, ids 1..3) | none | lossless only |
-/// | `Cmyk` | 4 | none (plain CMYK) | sequential / progressive / lossless |
+/// | `Cmyk` | 4 | Adobe APP14 `transform = 0` (samples inverted on the wire) | sequential / progressive / lossless |
 pub fn encode(image: &JpegImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let prepared = prepare_planes(image, opts)?;
     let refs: Vec<&[u16]> = prepared.planes.iter().map(|p| p.as_slice()).collect();

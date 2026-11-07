@@ -652,7 +652,7 @@ pub fn coded_pixel_format(input: PixelFormat) -> Option<PixelFormat> {
 /// | `point_transform` | `Pt` (lossless)                        | 0            |
 /// | `sampling`        | `HxV[,HxV…]` per component; must match the pixel format | from the pixel format |
 /// | `chroma`          | `yuv444` \| `yuv422` \| `yuv420` \| `yuv411` \| `gray`: convert `Rgb24` input to that JFIF layout (T.871 §7 forward equations, as [`crate::encode_rgb8`]); `gray` keeps the luma of a YCbCr input | keep the input layout |
-/// | `adobe_transform` | `none` \| `cmyk` \| `ycck`: four-component signalling (`Cmyk` / `CmykInverted` input only) | `none` (or the `set_adobe_transform` knob) |
+/// | `adobe_transform` | `none` \| `cmyk` \| `ycck`: four-component signalling (`Cmyk` / `CmykInverted` input only) | `cmyk` (or the `set_adobe_transform` knob) |
 /// | `jfif`            | `auto` \| `always` \| `never`: the JFIF `APP0` / Exif `APP1` slot rule ([`crate::metadata`]) | `auto` (JFIF unless an Exif blob is written) |
 ///
 /// Metadata is not an option: the encoder embeds the stream's
@@ -681,7 +681,7 @@ pub struct MjpegEncoderOptions {
     /// Four-component signalling: `none` (plain CMYK, no APP14),
     /// `cmyk` (Adobe APP14 `transform = 0`, samples inverted on the
     /// wire) or `ycck` (`transform = 2`, the frame is `Y Cb Cr K`).
-    /// Empty = the `set_adobe_transform` knob (default `none`).
+    /// Empty = the `set_adobe_transform` knob (default `cmyk`).
     pub adobe_transform: String,
     /// JFIF / Exif slot policy: `auto` (empty), `always`, `never`.
     pub jfif: String,
@@ -1148,7 +1148,8 @@ enum Class {
     /// Three 16-bit planes in order (G, B, R), ids `1 2 3`, no colour
     /// signalling, lossless only.
     Gbr,
-    /// Four components, plain CMYK unless `set_adobe_transform`.
+    /// Four components, Adobe CMYK (APP14 `transform = 0`) unless
+    /// `set_adobe_transform`.
     Cmyk,
 }
 
@@ -1498,7 +1499,7 @@ impl MjpegEncoder {
             lossless: false,
             arithmetic: false,
             lossless_predictor: 1,
-            cmyk_adobe_transform: None,
+            cmyk_adobe_transform: Some(0),
             general: None,
             general_implied: false,
             general_from_bag: false,
@@ -2050,14 +2051,15 @@ impl MjpegEncoder {
     /// (`MjpegPixelFormat::Cmyk`) input. Only honoured when the input
     /// pixel format is `Cmyk`; ignored for every other format.
     ///
-    /// * `None`     — emit no APP14 segment (the decoder treats the
-    ///   result as plain "regular" CMYK).
-    /// * `Some(0)`  — Adobe CMYK: every component is inverted on the
-    ///   wire; the decoder un-inverts on output.
+    /// * `None`     — emit no APP14 segment (this crate's decoder
+    ///   treats the result as plain "regular" CMYK; `djpeg` and
+    ///   ImageMagick read it as inverted).
+    /// * `Some(0)`  — Adobe CMYK (the default): every component is
+    ///   inverted on the wire; the decoder un-inverts on output.
     /// * `Some(2)`  — Adobe YCCK: the packed input is interpreted as
     ///   `[Y, Cb, Cr, K]`, and only the K plane is inverted on the
-    ///   wire. The decoder converts YCbCr→RGB→CMY (BT.601, full-range)
-    ///   and flips K to recover CMYK.
+    ///   wire. The decoder converts YCbCr→RGB (BT.601, full-range), the
+    ///   C/M/Y ink, and flips K to recover CMYK.
     ///
     /// Any other `Some(t)` value is rejected with `Error::InvalidData`
     /// (only `0` and `2` round-trip through this crate's decoder).

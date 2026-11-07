@@ -195,7 +195,7 @@ Encode (`encode(&JpegImage, …)`, `Auto` signalling):
 | `Rgb24` | 3 | Adobe APP14 `transform = 0`, ids `R G B` | sequential / progressive / lossless |
 | `Rgb48Le` | 3 | Adobe RGB | lossless only |
 | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | 3 (order kept, ids 1..3) | none | lossless only |
-| `Cmyk` | 4 | none (plain CMYK) | sequential / progressive / lossless |
+| `Cmyk` | 4 | Adobe APP14 `transform = 0`, samples complemented on the wire | sequential / progressive / lossless |
 
 Lossless round trips (`decode(encode(img))`) reproduce planes and
 metadata exactly for every layout above (`tests/standalone_api.rs`,
@@ -481,7 +481,8 @@ abbreviated, signalling, sampling, table_ids, chroma, metadata }`
   stream (§B.5), the TIFF Technical Note 2 `JPEGTables` carriage;
   `tables_for_planes` + `encode_with_tables` code a whole strip / tile
   sequence against one shared table set.
-- `signalling` — `Auto` (JFIF for 1 / 3 components, plain CMYK for 4),
+- `signalling` — `Auto` (JFIF for 1 / 3 components, Adobe CMYK —
+  APP14 `transform = 0` — for 4),
   `Jfif`, `Rgb` (Adobe APP14 `transform = 0` + `'R'/'G'/'B'` ids),
   `Cmyk { adobe_transform }` (`None` / `Some(0)` inverted / `Some(2)`
   YCCK), `None`.
@@ -624,7 +625,7 @@ carriers at every lossless precision).
 | `Rgb24` | RGB-coded: T.872 Adobe APP14 `transform = 0` + ids `'R' 'G' 'B'`, no colour conversion | `Rgb24` |
 | `Rgb48Le` | lossless at `P = 16`, RGB-coded | `Rgb48Le` |
 | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | lossless, planes in order, ids `1 2 3`, no colour signalling | the same label |
-| `Cmyk` | four components, no APP14 (T.872 §6.1 plain CMYK; `adobe_transform = cmyk / ycck` or `set_adobe_transform` for Adobe APP14 CMYK / YCCK) | `Cmyk` |
+| `Cmyk` | four components, Adobe APP14 `transform = 0` (T.872 §6.5.3, samples complemented; `adobe_transform = none / ycck` or `set_adobe_transform` for marker-less plain CMYK / YCCK) | `Cmyk` |
 | `CmykInverted` | complemented into plain CMYK | `Cmyk` |
 
 Rulings:
@@ -1058,7 +1059,12 @@ let prog = encode_jpeg_cmyk_progressive(width, height, &packed, width as usize *
 Adobe CMYK and inverts every sample on the wire, `Some(2)` selects
 Adobe YCCK, interpreting the packed input as `[Y, Cb, Cr, K]` and
 inverting only the K plane (the decoder un-does both transforms on
-output). The two per-plane back-end entry points
+output). The typed writer (`EncodeOptions`, `ColorSignalling::Auto`) and
+the registry encoder default to `Some(0)` (#21): T.872 §6.1 reads a
+marker-less four-component stream as plain CMYK, but `djpeg` and
+ImageMagick (black-box) read it as complemented, so only the Adobe form
+renders the same everywhere. YCCK decodes per T.872 §7: YCbCr → RGB
+gives C / M / Y, K is complemented. The two per-plane back-end entry points
 `encoder::encode_jpeg_cmyk_1111` / `encode_jpeg_progressive_cmyk_1111`
 are also `pub` for callers that already hold four separate component
 buffers.

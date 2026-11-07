@@ -15,7 +15,14 @@
 //! limit), `own_*.jpg` (this crate's encoder: 17×15 / 37×29 / 3×5 at
 //! 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 / grey, sequential / progressive /
 //! restart) and `up_*.jpg` (`cjpeg -quality 100` noise of 2 to 7 pixels
-//! at 2:1, 1:2 and 2 × 2: the chroma edge rules).
+//! at 2:1, 1:2 and 2 × 2: the chroma edge rules). Added for #21:
+//! `ycck_*.jpg` (ImageMagick `-colorspace CMYK` of a 37×29 plasma frame:
+//! Adobe APP14 `transform = 2`; `_444` at `-quality 95` 4:4:4, `_420` at
+//! `-quality 50` with its default `2×2, 1×1, 1×1, 2×2` sampling, `_prog`
+//! the same with `-interlace JPEG`, `_420_arith` its `jpegtran
+//! -arithmetic` transcode) and `own_cmyk.jpg` (this crate's default
+//! four-component encode, Adobe `transform = 0`); `djpeg -pnm` renders
+//! CMYK as RGB.
 //! `oracle.txt` lists, per file, the FNV-1a-64 hash of the sample bytes
 //! `djpeg -pnm <file>` writes (default options: accurate-integer IDCT,
 //! interpolating chroma upsampling). Regenerate a line with

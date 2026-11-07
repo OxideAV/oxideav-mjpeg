@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.14...v0.1.15) - 2026-11-06
+
+### Other
+
+- raw Motion-JPEG fixtures (*.mjpeg) are binary too
+- Frame::StreamParams at each mid-stream shape change (decoder event, reset, encoder re-configure)
+
 ### Added
 
 - Registry decoder emits the in-band `Frame::StreamParams` event (oxideav-core 0.1.43) once per mid-stream output-shape change — size, component count, sampling or colour coding of a Motion-JPEG frame — immediately before the first frame of the new shape, with `output_params()` / `output_params_generation()` already moved and the payload equal to `output_params()`. None for the first shape or a constant stream; a field-pair packet is one picture shape. `tests/stream_params.rs` pins it on a black-box ffmpeg splice (4 segments, 3 events) and hand-assembled streams.

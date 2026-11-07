@@ -245,6 +245,7 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `idct` | `IdctMethod::Float` | Inverse DCT of 8- and 12-bit DCT frames: `Float` (f32 cosine matrix) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
 | `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
+| `deblock` | `false` | Opt-in block-edge smoothing of 8-bit DCT frames (see *Deblocking*). |
 | `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly. The registry decoder takes it from `Decoder::set_execution_context`. |
 
 Breaches are `Error::LimitExceeded`.
@@ -292,6 +293,29 @@ overshoot. On the 4:2:0 daylight crop at quality 75, Catmull-Rom loses
 0.03 dB. A back-projection step on top of either kernel also lost
 (−0.2 to −0.7 dB). `ε = 16` and the clamp were picked on the same sweep (`ε` 4…64,
 window 3 × 3 vs 5 × 5).
+
+### Deblocking
+
+`DecodeOptions::with_deblock(true)` (registry decoder key `deblock`) is
+off by default. It smooths each 8 × 8 block edge of every component
+whose step is below the quantiser step of the first AC coefficient
+along that axis, and only where both sides are flat (each within half
+that step). The two samples on each side take a quarter / an eighth of
+the step. Larger steps are image content and are left alone. Measured
+on the photographic set plus the fractal (this crate's encoder, 4:2:0,
+default chroma reconstruction):
+
+| quality | off | **on** | gain on `cjpeg -progressive` input |
+|---|---|---|---|
+| 10 | 30.39 dB / 0.9120 | 30.93 / 0.9377 | +0.54 dB |
+| 30 | 35.60 / 0.9522 | 36.26 / 0.9638 | +0.62 dB |
+| 50 | 37.48 / 0.9636 | 38.04 / 0.9701 | +0.40 dB |
+| 75 | 39.84 / 0.9744 | 40.15 / 0.9768 | +0.15 dB |
+
+On the synthetic set the effect is within ±0.08 dB. On a noisy 1080p
+photograph it changes PSNR by under 0.07 dB, while SSIM drops by up to
+0.005. That is why it stays opt-in. Thresholds 0.5 × and 2 × the step
+measured within 0.04 dB of 1 ×.
 
 ### Encoder quality
 

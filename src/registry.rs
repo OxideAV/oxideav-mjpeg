@@ -943,6 +943,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
 /// |--------------------|----------------------------------------|--------------|
 /// | `reference_compat` | bool: the opt-in decode bit-exact against `djpeg`'s defaults ([`crate::DecodeOptions::with_reference_compat`]) | `false` |
 /// | `idct`             | `float` \| `integer`: [`crate::IdctMethod`] `Float` / `AccurateInteger` (overrides `reference_compat`) | from `reference_compat` |
+/// | `deblock`          | bool: [`crate::DecodeOptions::deblock`] | `false` |
 /// | `upsampling`       | `replicate` \| `triangular` \| `linear` \| `guided`: [`crate::ChromaUpsampling`] for the layouts the decoder resamples to 4:4:4 (overrides `reference_compat`) | from `reference_compat` |
 ///
 /// The registry decoder emits planar frames, so the YCbCr → RGB kernel
@@ -961,6 +962,8 @@ pub struct MjpegDecoderOptions {
     /// Empty = from `reference_compat`; else `replicate` / `triangular` /
     /// `linear` / `guided`.
     pub upsampling: String,
+    /// [`crate::DecodeOptions::deblock`].
+    pub deblock: bool,
 }
 
 impl MjpegDecoderOptions {
@@ -1000,9 +1003,17 @@ impl MjpegDecoderOptions {
         parse_options::<Self>(&own)
     }
 
+    /// Smooth block edges after reconstruction.
+    pub fn with_deblock(mut self, deblock: bool) -> Self {
+        self.deblock = deblock;
+        self
+    }
+
     /// The [`crate::DecodeOptions`] these string options denote.
     pub fn to_decode_options(&self) -> Result<crate::DecodeOptions> {
-        let mut o = crate::DecodeOptions::new().with_reference_compat(self.reference_compat);
+        let mut o = crate::DecodeOptions::new()
+            .with_reference_compat(self.reference_compat)
+            .with_deblock(self.deblock);
         match self.idct.as_str() {
             "" => {}
             "float" => o = o.with_idct(crate::IdctMethod::Float),
@@ -1049,6 +1060,12 @@ impl CodecOptionsStruct for MjpegDecoderOptions {
             default: OptionValue::String(String::new()),
             help: "chroma upsampling for layouts resampled to 4:4:4: replicate, triangular (3/4-1/4), linear (centred, every ratio) or guided (luma-guided, the default); unset = from reference_compat",
         },
+        OptionField {
+            name: "deblock",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "smooth 8x8 block edges whose step is below the first AC quantiser step (opt-in; helps at low quality)",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -1056,6 +1073,7 @@ impl CodecOptionsStruct for MjpegDecoderOptions {
             "reference_compat" => self.reference_compat = v.as_bool()?,
             "idct" => self.idct = v.as_str()?.to_owned(),
             "upsampling" => self.upsampling = v.as_str()?.to_owned(),
+            "deblock" => self.deblock = v.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())

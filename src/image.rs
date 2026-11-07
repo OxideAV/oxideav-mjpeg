@@ -1179,6 +1179,11 @@ pub struct DecodeOptions {
     /// `RSTm` markers do not delimit exactly the intervals the frame
     /// implies.
     pub threads: usize,
+    /// Smooth 8 × 8 block edges whose step is below the quantiser step
+    /// of the first AC coefficient along that axis (8-bit DCT frames;
+    /// see `crate::jpeg::deblock`). Opt-in, default `false`. It helps
+    /// most at low quality (README, *Deblocking*).
+    pub deblock: bool,
 }
 
 impl Default for DecodeOptions {
@@ -1194,6 +1199,7 @@ impl Default for DecodeOptions {
             upsampling: ChromaUpsampling::LumaGuided,
             ycbcr: YcbcrKernel::Exact,
             threads: 1,
+            deblock: false,
         }
     }
 }
@@ -1288,6 +1294,12 @@ impl DecodeOptions {
     /// Select the YCbCr → RGB kernel.
     pub fn with_ycbcr(mut self, ycbcr: YcbcrKernel) -> Self {
         self.ycbcr = ycbcr;
+        self
+    }
+
+    /// Smooth block edges after reconstruction (see the field).
+    pub fn with_deblock(mut self, deblock: bool) -> Self {
+        self.deblock = deblock;
         self
     }
 

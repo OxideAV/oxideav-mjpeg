@@ -89,6 +89,10 @@ fn option_bag_reaches_the_decoder() {
         registry_planes(&[("reference_compat", "true"), ("idct", "float")], &gray),
         registry_planes(&[], &gray)
     );
+    assert_eq!(
+        registry_planes(&[("deblock", "true")], &c440),
+        standalone_planes(&DecodeOptions::new().with_deblock(true), &c440)
+    );
 }
 
 #[test]
@@ -128,5 +132,5 @@ fn typed_options_and_schema() {
         .decoder_options_schema(&CodecId::new("mjpeg"))
         .expect("decoder schema");
     let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
-    assert_eq!(names, ["reference_compat", "idct", "upsampling"]);
+    assert_eq!(names, ["reference_compat", "idct", "upsampling", "deblock"]);
 }

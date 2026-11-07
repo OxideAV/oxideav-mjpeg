@@ -87,6 +87,8 @@ struct JpegState {
     upsampling: ChromaUpsampling,
     /// Worker budget for restart-interval-parallel scans.
     threads: usize,
+    /// Smooth block edges after rendering ([`crate::DecodeOptions::deblock`]).
+    deblock: bool,
     /// Collect the quantised coefficients instead of rendering
     /// ([`read_coefficients`]): every DCT scan accumulates, EOI returns
     /// the coefficient planes.
@@ -127,6 +129,7 @@ impl JpegState {
             idct: IdctMethod::default(),
             upsampling: ChromaUpsampling::default(),
             threads: 1,
+            deblock: false,
             coefficients_only: false,
             sof_marker: 0,
             arith_dc: Default::default(),
@@ -471,12 +474,14 @@ pub(crate) fn decode_planes_limited(
     idct: IdctMethod,
     upsampling: ChromaUpsampling,
     threads: usize,
+    deblock: bool,
 ) -> Result<JpegImage> {
     let mut state = JpegState::new();
     state.limits = limits;
     state.idct = idct;
     state.upsampling = upsampling;
     state.threads = threads.max(1);
+    state.deblock = deblock;
     if let Some(t) = tables {
         load_table_stream(&mut state, t)?;
     }
@@ -1420,6 +1425,36 @@ fn render_block_8bit(
     }
 }
 
+/// [`crate::DecodeOptions::deblock`]: smooth the block edges of every
+/// rendered 8-bit component grid (its real `⌈X · Hi / Hmax⌉ ×
+/// ⌈Y · Vi / Vmax⌉` extent), each with its own quantisation table.
+fn deblock_components(
+    state: &JpegState,
+    sof: &SofInfo,
+    quant: &[&QuantTable],
+    comp_buf: &mut [Vec<u8>],
+    comp_stride: &[usize],
+) {
+    if !state.deblock {
+        return;
+    }
+    let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
+    let v_max = sof.components.iter().map(|c| c.v_factor).max().unwrap_or(1) as usize;
+    for (ci, c) in sof.components.iter().enumerate() {
+        let w = (sof.width as usize * c.h_factor as usize).div_ceil(h_max);
+        let h = (sof.height as usize * c.v_factor as usize).div_ceil(v_max);
+        let q = &quant[ci].values;
+        crate::jpeg::deblock::deblock_u8(
+            &mut comp_buf[ci],
+            comp_stride[ci],
+            w,
+            h,
+            q[1] as f32,
+            q[8] as f32,
+        );
+    }
+}
+
 /// Byte ranges of the restart intervals of an entropy-coded segment: the
 /// data before, between and after its `RSTm` markers (§B.1.1.5; a stuffed
 /// `0xFF 0x00` is data). `None` unless there are exactly `expected`
@@ -1796,6 +1831,8 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
             mcus_since_restart += 1;
         }
     }
+
+    deblock_components(state, sof, &quant_tables, &mut comp_buf, &comp_stride);
 
     // Build output VideoFrame.
     let out_format = pix_fmt;
@@ -3416,6 +3453,7 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
             }
         }
     }
+    deblock_components(state, sof, &quant_tables, &mut comp_buf, &comp_stride);
 
     // Build output.
     let mut planes: Vec<VideoPlane> = Vec::new();

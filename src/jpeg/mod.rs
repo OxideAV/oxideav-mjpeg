@@ -6,6 +6,7 @@ pub mod arith;
 pub mod color;
 #[doc(hidden)]
 pub mod dct;
+pub(crate) mod deblock;
 #[doc(hidden)]
 pub mod huffman;
 pub(crate) mod idct_int;

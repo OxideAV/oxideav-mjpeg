@@ -811,7 +811,8 @@ impl JpegFrame {
 /// stuffing, 1-bit padding).
 struct BitWriter {
     out: Vec<u8>,
-    acc: u32,
+    /// Pending bits, right-aligned (`nbits < 32` between calls).
+    acc: u64,
     nbits: u32,
 }
 
@@ -824,32 +825,58 @@ impl BitWriter {
         }
     }
 
+    /// Append the low `size` bits of `code` (`size ≤ 32`), MSB first.
+    #[inline]
     fn put(&mut self, code: u32, size: u32) {
         if size == 0 {
             return;
         }
-        debug_assert!(size <= 24);
-        self.acc = (self.acc << size) | (code & ((1u32 << size) - 1));
+        debug_assert!(size <= 32);
+        self.acc = (self.acc << size) | (code as u64 & ((1u64 << size) - 1));
         self.nbits += size;
+        if self.nbits >= 32 {
+            // Four whole bytes; a byte-stuffing pass only when one of
+            // them is `X'FF'` (F.1.2.3).
+            self.nbits -= 32;
+            let w = (self.acc >> self.nbits) as u32;
+            self.acc &= (1u64 << self.nbits) - 1;
+            let bytes = w.to_be_bytes();
+            if bytes.contains(&0xFF) {
+                for b in bytes {
+                    self.out.push(b);
+                    if b == 0xFF {
+                        self.out.push(0x00);
+                    }
+                }
+            } else {
+                self.out.extend_from_slice(&bytes);
+            }
+        }
+    }
+
+    /// Emit the whole bytes still pending (leaving `nbits < 8`).
+    fn flush_bytes(&mut self) {
         while self.nbits >= 8 {
-            let byte = ((self.acc >> (self.nbits - 8)) & 0xFF) as u8;
-            self.out.push(byte);
-            if byte == 0xFF {
+            self.nbits -= 8;
+            let b = (self.acc >> self.nbits) as u8;
+            self.out.push(b);
+            if b == 0xFF {
                 self.out.push(0x00);
             }
-            self.nbits -= 8;
         }
-        self.acc &= (1u32 << self.nbits).wrapping_sub(1);
+        self.acc &= (1u64 << self.nbits) - 1;
     }
 
     /// F.1.2.3: pad the current byte with 1-bits (stuffing a zero
     /// after an `X'FF'` produced by the padding) — E.1.4
     /// "Prepare_for_marker".
     fn pad_to_byte(&mut self) {
+        self.flush_bytes();
         if self.nbits > 0 {
             let pad = 8 - self.nbits;
             self.put((1u32 << pad) - 1, pad);
         }
+        self.flush_bytes();
     }
 
     /// Terminate the current restart interval with `RSTm` (E.1.3).
@@ -918,8 +945,12 @@ impl Sink<'_> {
                         "JPEG encode: AC table {table} has no code for run/size {symbol:#04x}"
                     )));
                 }
-                writer.put(codes.code[symbol as usize] as u32, size as u32);
-                writer.put(extra, extra_bits);
+                // Code and additional bits in one append (≤ 16 + 15 bits).
+                let mask = (1u32 << extra_bits) - 1;
+                writer.put(
+                    ((codes.code[symbol as usize] as u32) << extra_bits) | (extra & mask),
+                    size as u32 + extra_bits,
+                );
             }
             Sink::Count { ac, .. } => ac[table as usize].count(symbol),
         }
@@ -1191,6 +1222,7 @@ fn prepare_dct(
     comps: &[JpegComponent<'_>],
     geo: &Geometry,
     tables: &JpegTableSet,
+    quantisation: Quantisation,
 ) -> Result<Vec<DctComponent>> {
     let level = 1i32 << (frame.precision - 1);
     let mcus_x = (frame.width as usize).div_ceil(8 * geo.h_max);
@@ -1204,6 +1236,26 @@ fn prepare_dct(
             ))
         })?;
         let inv_q: Vec<f32> = quant.iter().map(|&q| 1.0 / q.max(1) as f32).collect();
+        // Rate model of the rate-distortion quantiser: the Annex K typical
+        // AC table of the component's class (destination 0 luminance, the
+        // others chrominance), whatever table the frame ends up coded
+        // with, so the levels — and therefore K.2 statistics derived from
+        // them — do not depend on the table they are measured against.
+        // P = 8 only: the typical tables cannot code the larger 12-bit
+        // categories.
+        let rdo =
+            (quantisation == Quantisation::RateDistortion && frame.precision == 8).then(|| {
+                let spec = if c.huff_id == 0 {
+                    HuffSpec::k5_ac_luminance()
+                } else {
+                    HuffSpec::k6_ac_chrominance()
+                };
+                let mean = quant[1..].iter().map(|&q| q as f32).sum::<f32>() / 63.0;
+                (
+                    crate::jpeg::rdq::AcRate::new(&spec.bits, &spec.vals),
+                    crate::jpeg::rdq::LAMBDA_SCALE * mean * mean,
+                )
+            });
         let (bx_pad, by_pad) = if geo.interleaved {
             (mcus_x * c.h as usize, mcus_y * c.v as usize)
         } else {
@@ -1229,6 +1281,10 @@ fn prepare_dct(
                 for k in 0..64 {
                     // A.3.4: Sq = round(S / Q), half away from zero.
                     q[k] = (block[k] * inv_q[k]).round() as i32;
+                }
+                if let Some((rate, lambda)) = &rdo {
+                    let ratio: [f32; 64] = std::array::from_fn(|k| block[k] * inv_q[k]);
+                    crate::jpeg::rdq::quantise_ac(&ratio, &quant, rate, *lambda, &mut q);
                 }
                 blocks.push(q);
             }
@@ -1621,7 +1677,13 @@ pub fn gather_stats(
 ) -> Result<()> {
     let geo = validate(frame, comps)?;
     let dct = if frame.process.is_dct() {
-        Some(prepare_dct(frame, comps, &geo, tables)?)
+        Some(prepare_dct(
+            frame,
+            comps,
+            &geo,
+            tables,
+            Quantisation::Nearest,
+        )?)
     } else {
         None
     };
@@ -1665,7 +1727,13 @@ pub fn encode_frame_with_meta(
     let dct = frame.process.is_dct();
     let scan_tables = build_scan_tables(comps, tables, dct)?;
     let blocks = if dct {
-        Some(prepare_dct(frame, comps, &geo, tables)?)
+        Some(prepare_dct(
+            frame,
+            comps,
+            &geo,
+            tables,
+            Quantisation::Nearest,
+        )?)
     } else {
         None
     };
@@ -1679,6 +1747,65 @@ pub fn encode_frame_with_meta(
         emit_tables,
         meta,
     )
+}
+
+/// The options-level encode: quantise every block once (`quantisation`),
+/// optionally replace the Huffman tables by K.2 optimal ones derived from
+/// those very levels (`optimise`), then emit the frame (`emit` = `false`:
+/// derive the tables only). Returns the stream and the tables it uses.
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_opts(
+    frame: &JpegFrame,
+    comps: &[JpegComponent<'_>],
+    tables: &JpegTableSet,
+    optimise: bool,
+    emit: bool,
+    emit_tables: bool,
+    meta: &[u8],
+    quantisation: Quantisation,
+) -> Result<(Vec<u8>, JpegTableSet)> {
+    let geo = validate(frame, comps)?;
+    let dct = frame.process.is_dct();
+    let blocks = if dct {
+        Some(prepare_dct(frame, comps, &geo, tables, quantisation)?)
+    } else {
+        None
+    };
+    let mut t = tables.clone();
+    if optimise {
+        let mut dc: [HuffStats; 4] = Default::default();
+        let mut ac: [HuffStats; 4] = Default::default();
+        let mut sink = Sink::Count {
+            dc: &mut dc,
+            ac: &mut ac,
+        };
+        for plan in scan_plans(frame, comps) {
+            code_scan(frame, comps, &geo, blocks.as_deref(), &plan, &mut sink)?;
+        }
+        for i in 0..4 {
+            if !dc[i].is_empty() {
+                t.dc[i] = Some(dc[i].to_spec());
+            }
+            if !ac[i].is_empty() {
+                t.ac[i] = Some(ac[i].to_spec());
+            }
+        }
+    }
+    if !emit {
+        return Ok((Vec::new(), t));
+    }
+    let scan_tables = build_scan_tables(comps, &t, dct)?;
+    let data = emit_frame(
+        frame,
+        comps,
+        &geo,
+        blocks.as_deref(),
+        &t,
+        &scan_tables,
+        emit_tables,
+        meta,
+    )?;
+    Ok((data, t))
 }
 
 /// The code tables of every destination `comps` reference.
@@ -1925,6 +2052,24 @@ fn emit_frame(
 // Typed options driver.
 // ---------------------------------------------------------------------------
 
+/// How the DCT processes choose the quantised level of each coefficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Quantisation {
+    /// T.81 §A.3.4 as written: `Sq = Round(S / Q)` for every coefficient.
+    Nearest,
+    /// The DC level as §A.3.4; the AC levels of each block chosen
+    /// together to minimise squared error plus `λ ×` the bits the
+    /// sequential Huffman coding of the block takes. Each level may keep
+    /// its rounded value, move one step towards zero, or become zero,
+    /// so the decoder sees ordinary levels (any T.81 decoder reads the
+    /// stream). For the same `quality` the file is smaller and the PSNR
+    /// slightly lower; at equal PSNR the file is about 3.5 % smaller
+    /// (README, *Encoder quality*). The default.
+    #[default]
+    RateDistortion,
+}
+
 /// Which Huffman tables the frame is coded with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -1982,7 +2127,8 @@ pub enum ColorSignalling {
 pub struct EncodeOptions {
     /// Quality factor 1..=100 (DCT processes; see [`scaled_quant_table`]).
     pub quality: u8,
-    /// Typical (Annex K.3) or optimal (Annex K.2) Huffman tables.
+    /// Typical (Annex K.3) or optimal (Annex K.2, the default) Huffman
+    /// tables.
     pub tables: HuffmanTables,
     /// Sequential / progressive / lossless.
     pub process: JpegProcess,
@@ -2022,6 +2168,9 @@ pub struct EncodeOptions {
     /// when an Exif block is written, `Always` keeps it after the Exif
     /// segment, `Never` writes none.
     pub jfif: JfifPolicy,
+    /// How the DCT processes pick quantised levels (default
+    /// [`Quantisation::RateDistortion`]).
+    pub quantisation: Quantisation,
 }
 
 /// Historical name of [`EncodeOptions`].
@@ -2032,7 +2181,7 @@ impl Default for EncodeOptions {
     fn default() -> Self {
         EncodeOptions {
             quality: crate::encoder::DEFAULT_QUALITY,
-            tables: HuffmanTables::Typical,
+            tables: HuffmanTables::Optimal,
             process: JpegProcess::Sequential,
             precision: 8,
             restart_interval: 0,
@@ -2043,14 +2192,16 @@ impl Default for EncodeOptions {
             chroma: ChromaSubsampling::Yuv420,
             metadata: Metadata::new(),
             jfif: JfifPolicy::Auto,
+            quantisation: Quantisation::RateDistortion,
         }
     }
 }
 
 impl EncodeOptions {
-    /// The defaults: quality 75, typical tables, sequential, `P = 8`,
-    /// no restarts, interchange stream, automatic signalling, 4:2:0
-    /// for the RGB entry points, no metadata.
+    /// The defaults: quality 75, K.2 optimal tables, rate-distortion
+    /// levels, sequential, `P = 8`, no restarts, interchange stream,
+    /// automatic signalling, 4:2:0 for the RGB entry points, no
+    /// metadata.
     pub fn new() -> Self {
         Self::default()
     }
@@ -2157,6 +2308,12 @@ impl EncodeOptions {
     /// JFIF / Exif slot policy (default [`JfifPolicy::Auto`]).
     pub fn with_jfif(mut self, jfif: JfifPolicy) -> Self {
         self.jfif = jfif;
+        self
+    }
+
+    /// Select how quantised levels are chosen.
+    pub fn with_quantisation(mut self, quantisation: Quantisation) -> Self {
+        self.quantisation = quantisation;
         self
     }
 }
@@ -2305,14 +2462,24 @@ impl EncodeOptions {
         frame: &JpegFrame,
         comps: &[JpegComponent<'_>],
     ) -> Result<JpegTableSet> {
+        let (t, optimise) = self.base_tables(frame, comps);
+        if !optimise {
+            return Ok(t);
+        }
+        let (_, t) =
+            encode_frame_opts(frame, comps, &t, true, false, false, &[], self.quantisation)?;
+        Ok(t)
+    }
+
+    /// The typical table set for `frame`, and whether K.2 optimal tables
+    /// replace its Huffman tables (requested, or required at `P = 12` on
+    /// the DCT processes).
+    fn base_tables(&self, frame: &JpegFrame, comps: &[JpegComponent<'_>]) -> (JpegTableSet, bool) {
         let lossless = !frame.process.is_dct();
-        let mut t = JpegTableSet::typical(self.quality, frame.precision, lossless, comps.len());
+        let t = JpegTableSet::typical(self.quality, frame.precision, lossless, comps.len());
         let need_optimal =
             self.tables == HuffmanTables::Optimal || (!lossless && frame.precision > 8);
-        if need_optimal {
-            t.optimise_huffman(frame, comps)?;
-        }
-        Ok(t)
+        (t, need_optimal)
     }
 
     /// Resolve the frame description these options imply for `planes`
@@ -2440,8 +2607,21 @@ impl EncodeOptions {
     /// JPEG frame. 1, 3 or 4 planes.
     pub fn encode(&self, width: u32, height: u32, planes: &[&[u16]]) -> Result<EncodedJpeg> {
         let prep = self.prepare(width, height, planes)?;
-        let tables = self.tables_for(&prep.frame, &prep.comps())?;
-        self.finish(&prep, &tables)
+        let comps = prep.comps();
+        let (t, optimise) = self.base_tables(&prep.frame, &comps);
+        // One transform + quantisation pass serves both the statistics
+        // and the emission.
+        let (data, tables) = encode_frame_opts(
+            &prep.frame,
+            &comps,
+            &t,
+            optimise,
+            true,
+            !self.abbreviated,
+            &prep.meta,
+            self.quantisation,
+        )?;
+        self.wrap(&prep, data, &tables)
     }
 
     /// [`EncodeOptions::encode`] with a caller-supplied table set
@@ -2462,13 +2642,27 @@ impl EncodeOptions {
     }
 
     fn finish(&self, prep: &Prepared<'_>, tables: &JpegTableSet) -> Result<EncodedJpeg> {
-        let mut data = encode_frame_with_meta(
+        let (data, _) = encode_frame_opts(
             &prep.frame,
             &prep.comps(),
             tables,
+            false,
+            true,
             !self.abbreviated,
             &prep.meta,
+            self.quantisation,
         )?;
+        self.wrap(prep, data, tables)
+    }
+
+    /// Metadata and the abbreviated tables stream around an encoded frame.
+    fn wrap(
+        &self,
+        prep: &Prepared<'_>,
+        data: Vec<u8>,
+        tables: &JpegTableSet,
+    ) -> Result<EncodedJpeg> {
+        let mut data = data;
         // The metadata segments and the JFIF / Exif slot rule come from
         // one place for every writer in the crate.
         if !self.metadata.is_empty() || self.jfif != JfifPolicy::Auto {

@@ -829,6 +829,42 @@ fn parse_jpeg(jpeg: &[u8]) -> Result<JpegParts> {
                 }
                 pos = end;
             }
+            markers::DHT => {
+                // RFC 2435 §3.1.3 types 0 / 1 imply the Annex K typical
+                // tables, so the receiver rebuilds those: a stream coded
+                // with any other table would decode wrongly.
+                let len = seg_len(jpeg, pos)?;
+                let (body, end) = (pos + 2, pos + len);
+                if len < 2 || end > jpeg.len() {
+                    return Err(Error::invalid("RTP/JPEG packetize: truncated DHT"));
+                }
+                let mut i = body;
+                while i < end {
+                    let tc_th = jpeg[i];
+                    let counts = jpeg
+                        .get(i + 1..i + 17)
+                        .ok_or_else(|| Error::invalid("RTP/JPEG packetize: bad DHT entry"))?;
+                    let n: usize = counts.iter().map(|&c| c as usize).sum();
+                    let vals = jpeg
+                        .get(i + 17..i + 17 + n)
+                        .filter(|_| i + 17 + n <= end)
+                        .ok_or_else(|| Error::invalid("RTP/JPEG packetize: bad DHT entry"))?;
+                    let typical: (&[u8], &[u8]) = match tc_th {
+                        0x00 => (&STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS),
+                        0x01 => (&STD_DC_CHROMA_BITS, &STD_DC_CHROMA_VALS),
+                        0x10 => (&STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS),
+                        0x11 => (&STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS),
+                        _ => (&[], &[]),
+                    };
+                    if (counts, vals) != typical {
+                        return Err(Error::unsupported(
+                            "RTP/JPEG packetize: only the Annex K typical Huffman tables are carryable (encode with HuffmanTables::Typical)",
+                        ));
+                    }
+                    i += 17 + n;
+                }
+                pos = end;
+            }
             markers::DRI => {
                 let len = seg_len(jpeg, pos)?;
                 if len != 4 || pos + 4 > jpeg.len() {
@@ -1964,6 +2000,26 @@ mod tests {
             .unwrap();
         jpeg[sof + 1] = markers::SOF2;
         assert!(packetize(&jpeg, 1400, QMode::Quality(50)).is_err());
+    }
+
+    #[test]
+    fn packetize_carries_typical_tables_only() {
+        // The receiver rebuilds the Annex K tables: a frame coded with
+        // K.2 optimal tables is refused, the typical one is carried.
+        let (w, h) = (48u32, 32u32);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let enc = |optimal: bool| {
+            crate::encode_rgb8(
+                w,
+                h,
+                &rgb,
+                &crate::EncodeOptions::new().with_optimal_tables(optimal),
+            )
+            .unwrap()
+        };
+        assert!(packetize(&enc(false), 1400, QMode::Quality(75)).is_ok());
+        let e = packetize(&enc(true), 1400, QMode::Quality(75)).unwrap_err();
+        assert!(format!("{e}").contains("typical Huffman tables"), "{e}");
     }
 
     #[test]

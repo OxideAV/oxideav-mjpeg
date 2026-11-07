@@ -216,7 +216,7 @@ pub use image::{
 // build on): typed options plus the frame / table-set primitives.
 pub use t81::{
     ColorSignalling, EncodeOptions, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
-    JpegFrame, JpegProcess, JpegTableSet,
+    JpegFrame, JpegProcess, JpegTableSet, Quantisation,
 };
 
 // Coefficient-level access (#21): read / render / write the quantised

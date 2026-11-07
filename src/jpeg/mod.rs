@@ -16,6 +16,7 @@ pub mod markers;
 pub mod parser;
 #[doc(hidden)]
 pub mod quant;
+pub(crate) mod rdq;
 pub(crate) mod resample;
 pub(crate) mod upsample;
 #[doc(hidden)]

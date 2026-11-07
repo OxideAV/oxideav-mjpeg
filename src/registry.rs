@@ -692,6 +692,11 @@ pub struct MjpegEncoderOptions {
     pub adobe_transform: String,
     /// JFIF / Exif slot policy: `auto` (empty), `always`, `never`.
     pub jfif: String,
+    /// Level choice of the DCT processes: `nearest` (empty, the
+    /// registry default — T.81 §A.3.4 rounding) or `rd`
+    /// ([`crate::Quantisation::RateDistortion`], the standalone
+    /// default).
+    pub quantisation: String,
 }
 
 impl Default for MjpegEncoderOptions {
@@ -709,6 +714,7 @@ impl Default for MjpegEncoderOptions {
             chroma: String::new(),
             adobe_transform: String::new(),
             jfif: String::new(),
+            quantisation: String::new(),
         }
     }
 }
@@ -794,6 +800,12 @@ impl MjpegEncoderOptions {
         self
     }
 
+    /// `"nearest"` or `"rd"` (empty = nearest).
+    pub fn with_quantisation(mut self, quantisation: impl Into<String>) -> Self {
+        self.quantisation = quantisation.into();
+        self
+    }
+
     /// The [`JfifPolicy`] `jfif` denotes.
     pub fn jfif_policy(&self) -> Result<JfifPolicy> {
         Ok(JfifPolicy::parse(&self.jfif)?)
@@ -830,6 +842,12 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             kind: OptionKind::Enum(&["typical", "optimal"]),
             default: OptionValue::String(String::new()),
             help: "Huffman tables: Annex K.3 typical or Annex K.2 optimal (per-frame statistics)",
+        },
+        OptionField {
+            name: "quantisation",
+            kind: OptionKind::Enum(&["nearest", "rd"]),
+            default: OptionValue::String(String::new()),
+            help: "DCT level choice: nearest (T.81 A.3.4 rounding, default) or rd (rate-distortion optimised AC levels)",
         },
         OptionField {
             name: "process",
@@ -897,6 +915,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
         match key {
             "quality" => self.quality = v.as_u32()?,
             "tables" => self.tables = v.as_str()?.to_owned(),
+            "quantisation" => self.quantisation = v.as_str()?.to_owned(),
             "process" => self.process = v.as_str()?.to_owned(),
             "precision" => self.precision = v.as_u32()?,
             "restart" => self.restart = v.as_u32()?,
@@ -1092,6 +1111,15 @@ impl MjpegEncoderOptions {
             "optimal" => HuffmanTables::Optimal,
             other => return Err(Error::invalid(format!("MJPEG encoder: tables '{other}'"))),
         };
+        let quantisation = match self.quantisation.as_str() {
+            "nearest" | "" => crate::Quantisation::Nearest,
+            "rd" => crate::Quantisation::RateDistortion,
+            other => {
+                return Err(Error::invalid(format!(
+                    "MJPEG encoder: quantisation '{other}' (nearest / rd)"
+                )));
+            }
+        };
         let lossless = || -> Result<JpegProcess> {
             if !(1..=7).contains(&self.predictor) {
                 return Err(Error::invalid("MJPEG encoder: predictor must be in 1..=7"));
@@ -1123,6 +1151,7 @@ impl MjpegEncoderOptions {
             signalling: ColorSignalling::Auto,
             sampling: parse_sampling(&self.sampling)?,
             jfif: self.jfif_policy()?,
+            quantisation,
             ..EncodeOptions::default()
         })
     }
@@ -1686,7 +1715,11 @@ impl MjpegEncoder {
     /// The general-writer options the knobs imply for a layout without
     /// a historical path.
     fn implied_options(&self) -> EncodeOptions {
+        // The registry defaults (typical tables, §A.3.4 rounding): the
+        // stream RTP/JPEG and table-less Motion-JPEG consumers expect.
         let mut o = EncodeOptions::new()
+            .with_optimal_tables(false)
+            .with_quantisation(crate::Quantisation::Nearest)
             .with_quality(self.quality)
             .with_restart_interval(self.restart_interval)
             // Resolved against the layout by `set_encode_options`.

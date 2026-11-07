@@ -927,11 +927,16 @@ pub(crate) fn rgb8_to_native(
     //   Y  = Round(0.299 R + 0.587 G + 0.114 B)
     //   CB = Round((−0.299 R − 0.587 G + 0.886 B) / 1.772 + 128)
     //   CR = Round((0.701 R − 0.587 G − 0.114 B) / 1.402 + 128)
+    // with CB / CR evaluated on the mean over each chroma cell (T.871 §9
+    // NOTE 1's two-tap filter per subsampled axis) before the rounding.
     let mut yp = vec![0u8; w * h];
     let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
-    let mut cb_sum = vec![0u32; cw * ch];
-    let mut cr_sum = vec![0u32; cw * ch];
-    let mut cnt = vec![0u32; cw * ch];
+    // Chroma numerators `−299 R − 587 G + 886 B` (CB, over 1772) and
+    // `701 R − 587 G − 114 B` (CR, over 1402) summed exactly over each
+    // chroma cell's samples, so the two-tap box average is rounded once.
+    let mut cb_sum = vec![0i64; cw * ch];
+    let mut cr_sum = vec![0i64; cw * ch];
+    let mut cnt = vec![0i64; cw * ch];
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) * 3;
@@ -939,25 +944,26 @@ pub(crate) fn rgb8_to_native(
             let yy = round_div(299 * r + 587 * g + 114 * b, 1000);
             yp[y * w + x] = yy.clamp(0, 255) as u8;
             if format != PixelFormat::Gray8 {
-                let cb = round_div(-299 * r - 587 * g + 886 * b + 128 * 1772, 1772);
-                let cr = round_div(701 * r - 587 * g - 114 * b + 128 * 1402, 1402);
                 let ci = (y / dv) * cw + x / dh;
-                cb_sum[ci] += cb.clamp(0, 255) as u32;
-                cr_sum[ci] += cr.clamp(0, 255) as u32;
+                cb_sum[ci] += -299 * r - 587 * g + 886 * b;
+                cr_sum[ci] += 701 * r - 587 * g - 114 * b;
                 cnt[ci] += 1;
             }
         }
     }
     let mut planes = vec![Plane::new(w, yp)];
     if format != PixelFormat::Gray8 {
-        let avg = |sum: &[u32]| -> Vec<u8> {
+        let avg = |sum: &[i64], den: i64| -> Vec<u8> {
             sum.iter()
                 .zip(&cnt)
-                .map(|(&s, &n)| ((s + n / 2) / n.max(1)) as u8)
+                .map(|(&s, &n)| {
+                    let n = n.max(1);
+                    round_div(s + 128 * den * n, den * n).clamp(0, 255) as u8
+                })
                 .collect()
         };
-        planes.push(Plane::new(cw, avg(&cb_sum)));
-        planes.push(Plane::new(cw, avg(&cr_sum)));
+        planes.push(Plane::new(cw, avg(&cb_sum, 1772)));
+        planes.push(Plane::new(cw, avg(&cr_sum, 1402)));
     }
     let color = if format == PixelFormat::Gray8 {
         ColorInfo::gray()

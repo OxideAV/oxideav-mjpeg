@@ -24,7 +24,9 @@ use oxideav_core::{
 use oxideav_mjpeg::registry::{
     ACCEPTED_PIXEL_FORMATS, accepted_pixel_formats, coded_pixel_format, make_decoder, make_encoder,
 };
-use oxideav_mjpeg::{ChromaSubsampling, ColorSignalling, EncodeOptions, JpegImage, JpegProcess};
+use oxideav_mjpeg::{
+    ChromaSubsampling, ColorSignalling, EncodeOptions, JpegImage, JpegProcess, Quantisation,
+};
 
 /// Representative geometries: a single pixel, an odd pair, an
 /// MCU-unaligned size with odd chroma extents, and an aligned one.
@@ -792,7 +794,12 @@ fn chroma_option_converts_rgb_and_keeps_luma_of_ycbcr() {
             "yuv411" => ChromaSubsampling::Yuv411,
             _ => ChromaSubsampling::GrayscaleOnly,
         };
-        let o = EncodeOptions::new().with_quality(92).with_chroma(c);
+        // The registry defaults: typical tables, §A.3.4 rounding.
+        let o = EncodeOptions::new()
+            .with_optimal_tables(false)
+            .with_quantisation(Quantisation::Nearest)
+            .with_quality(92)
+            .with_chroma(c);
         let standalone = oxideav_mjpeg::encode_rgb8(w, h, &rgb.planes[0].data, &o).unwrap();
         assert_eq!(bytes, standalone, "{chroma}: registry == encode_rgb8");
     }
@@ -823,7 +830,10 @@ fn registry_options_and_the_standalone_contract_write_the_same_bytes() {
             let (via_registry, _) = encode(&cp, &f).unwrap();
             // The same request as typed options on the same image.
             let img = JpegImage::from_video_frame(&f, &cp).unwrap();
-            let mut o = EncodeOptions::new();
+            // From the registry defaults: typical tables, §A.3.4 rounding.
+            let mut o = EncodeOptions::new()
+                .with_optimal_tables(false)
+                .with_quantisation(Quantisation::Nearest);
             for (k, v) in &cell.opts {
                 match *k {
                     "quality" => o = o.with_quality(v.parse().unwrap()),

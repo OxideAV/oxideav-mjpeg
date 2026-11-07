@@ -12,7 +12,7 @@ use oxideav_core::{
 use oxideav_mjpeg::DecodeOptions;
 use oxideav_mjpeg::encoder::MjpegEncoder;
 use oxideav_mjpeg::registry::{make_decoder, make_encoder};
-use oxideav_mjpeg::t81::{EncodeOptions, HuffmanTables, JpegProcess};
+use oxideav_mjpeg::t81::{EncodeOptions, HuffmanTables, JpegProcess, Quantisation};
 
 const W: u32 = 41;
 const H: u32 = 23;
@@ -263,6 +263,8 @@ fn typed_options_on_the_concrete_encoder_match_the_string_bag() {
         o.process = JpegProcess::Progressive;
         o.tables = HuffmanTables::Optimal;
         o.restart_interval = 3;
+        // The bag leaves `quantisation` at the registry default.
+        o.quantisation = Quantisation::Nearest;
         o
     })
     .unwrap();

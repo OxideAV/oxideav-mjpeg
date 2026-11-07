@@ -211,7 +211,8 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 |---|---|---|
 | `quality` | 75 | `1..=100`, Annex K quantiser scaling (DCT processes). |
 | `process` | `Sequential` | `with_progressive(bool)`, `with_lossless(predictor)`, `with_process(JpegProcess)`. |
-| `tables` | `Typical` | Annex K.3 typical or K.2 `Optimal` (`with_optimal_tables`). |
+| `tables` | `Optimal` | Annex K.2 `Optimal` tables from the frame's own statistics (one quantisation pass feeds both the counting and the emission) or K.3 `Typical` (`with_optimal_tables(false)`; RTP/JPEG carries only these). |
+| `quantisation` | `RateDistortion` | `RateDistortion`: AC levels chosen per block for least squared error + λ · bits (see *Encoder quality*); `Nearest`: T.81 §A.3.4 rounding. |
 | `chroma` | `Yuv420` | Layout `encode_rgb8` / `encode_rgba8` convert to (`Yuv444` / `Yuv422` / `Yuv420` / `Yuv411` / `GrayscaleOnly`). `encode(&JpegImage)` uses the image's own layout. |
 | `restart_interval` | 0 | `DRI` + `RSTm` every *n* MCUs. |
 | `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
@@ -222,9 +223,11 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 The registry encoder's `MjpegEncoderOptions` (`CodecOptions` keys
 `quality`, `tables`, `process` (`auto` / `sequential` / `progressive` /
 `lossless`), `precision`, `restart`, `abbreviated`, `predictor`,
-`point_transform`, `sampling`, `chroma`, `adobe_transform`, `jfif`) is
-the string-bag twin of this record (`#[non_exhaustive]`, `new()` /
-`with_*`); `chroma` applies the `encode_rgb8` conversion to `Rgb24`
+`point_transform`, `sampling`, `chroma`, `adobe_transform`, `jfif`,
+`quantisation` (`nearest` / `rd`)) is the string-bag twin of this
+record (`#[non_exhaustive]`, `new()` / `with_*`). Its defaults stay
+`typical` tables and `nearest` levels, the streams RTP/JPEG and
+table-less Motion-JPEG consumers expect. `chroma` applies the `encode_rgb8` conversion to `Rgb24`
 frames (or keeps the luma of YCbCr ones) and `adobe_transform`
 (`none` / `cmyk` / `ycck`) selects the four-component signalling —
 neither has a plane-level field. Metadata is not an option: the
@@ -289,6 +292,56 @@ overshoot. On the 4:2:0 daylight crop at quality 75, Catmull-Rom loses
 0.03 dB. A back-projection step on top of either kernel also lost
 (−0.2 to −0.7 dB). `ε = 16` and the clamp were picked on the same sweep (`ε` 4…64,
 window 3 × 3 vs 5 × 5).
+
+### Encoder quality
+
+The still-image defaults (`EncodeOptions::new()`) are chosen by size at
+equal PSNR. The measurement is a quality 20…95 sweep over the five
+reference images of *Chroma reconstruction* (three photographs, a test
+card and a fractal), 4:2:0, decoded with this crate's defaults. The
+BD-rate (mean log-rate difference over the shared PSNR range, negative
+= smaller) is taken against the previous defaults (typical tables,
+§A.3.4 rounding, chroma rounded per sample before the box average):
+
+| Change | BD-rate (PSNR) | BD-rate (SSIM) |
+|---|---|---|
+| chroma averaged exactly, rounded once | −1.0 % | −0.4 % |
+| + K.2 optimal Huffman tables | −20.7 % | −20.6 % |
+| + rate-distortion levels (**default**) | **−24.0 %** | **−26.6 %** |
+| `cjpeg -optimize` (black-box sanity row) | −20.0 % | −21.8 % |
+
+That puts the new defaults 5.1 % below `cjpeg -optimize` at equal PSNR
+(4.7 % at equal SSIM). Mean bits per pixel / PSNR at three quality
+settings:
+
+| quality | previous | new default | `cjpeg -optimize` |
+|---|---|---|---|
+| 50 | 0.301 bpp / 36.43 dB | 0.214 / 36.12 | 0.236 / 36.45 |
+| 75 | 0.422 / 38.43 | 0.323 / 38.18 | 0.362 / 38.46 |
+| 90 | 0.647 / 40.38 | 0.553 / 40.24 | 0.604 / 40.42 |
+
+Optimal tables cost nothing in quality and are smaller at every point,
+so they are the default. They cost about 35 % more encode time, now that
+one transform pass feeds both the statistics and the emission.
+Rate-distortion levels keep each block's DC level and choose its AC
+levels by a dynamic programme over the run-length coding. Each level
+keeps its rounded value, moves one step towards zero, or becomes zero.
+The objective is `squared error + λ · bits`, with `λ = 0.0085 · mean(Q_ac)²`
+picked on the same sweep (0.005 to 0.15 tried). The rate model is the
+Annex K table of the component's class. With it a given `quality` gives
+a slightly lower PSNR in a smaller file. Uniform dead-zone rounding
+(offsets 0.1 to 0.3) reached at most −4.0 %.
+
+The chroma downsampling filter stays the T.871 §9 NOTE 1 two-tap box
+(centred siting). Wider prefilters (a 4-tap triangle, 8-tap Catmull-Rom
+and Lanczos-2) changed photographs by under ±0.03 dB. On the synthetic
+set they lost 0.9 to 3.5 dB, because they smear the colour edges the
+luma-guided decoder restores.
+
+Encode time, 1080p / 4K RGB at quality 85 (noisy photograph, ≈ 2 bpp):
+18 / 71 ms for typical tables and `Nearest` (previously 21.5 /
+83 ms), 25 / 96 ms with optimal tables (32 / 124 ms before), and 43 /
+165 ms for the new defaults.
 
 ### Reference-compatible output (bit-exact against `djpeg`)
 

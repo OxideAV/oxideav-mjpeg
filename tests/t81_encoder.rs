@@ -442,9 +442,35 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
     }
 }
 
+/// Split a stream into its marker segments (`FF xx` + payload; an `SOS`
+/// segment keeps its entropy-coded data, restart markers included).
+fn segments(jpeg: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 2;
+    while i + 2 <= jpeg.len() {
+        let m = jpeg[i + 1];
+        if m == 0xD9 {
+            break;
+        }
+        let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        let mut end = i + 2 + len;
+        if m == 0xDA {
+            while !(jpeg[end] == 0xFF
+                && jpeg[end + 1] != 0
+                && !(0xD0..=0xD7).contains(&jpeg[end + 1]))
+            {
+                end += 1;
+            }
+        }
+        out.push(jpeg[i..end].to_vec());
+        i = end;
+    }
+    out
+}
+
 /// §B.5 abbreviated pair: the tables-only stream carries exactly the
 /// segments the interchange stream would, and splicing the two yields
-/// a byte-identical interchange stream.
+/// an interchange stream with the same segments.
 #[test]
 fn abbreviated_pair_splices_into_the_interchange_stream() {
     for process in [
@@ -497,10 +523,26 @@ fn abbreviated_pair_splices_into_the_interchange_stream() {
             let mut spliced = abbr.data[..app0_end].to_vec();
             spliced.extend_from_slice(&tables[2..tables.len() - 2]);
             spliced.extend_from_slice(&abbr.data[app0_end..]);
+            // The interchange stream interleaves its tables with the
+            // frame (DQT ahead of SOFn, DHT after it, #21), so the splice
+            // is not byte-identical — but it carries exactly the same
+            // marker segments, and the frame / scan segments keep their
+            // relative order.
+            let (mut a, mut b) = (segments(&spliced), segments(&full.data));
+            let frame_part = |v: &[Vec<u8>]| -> Vec<Vec<u8>> {
+                v.iter()
+                    .filter(|s| s[1] != 0xDB && s[1] != 0xC4)
+                    .cloned()
+                    .collect()
+            };
             assert_eq!(
-                spliced, full.data,
-                "{process:?} P{precision}: splice differs"
+                frame_part(&a),
+                frame_part(&b),
+                "{process:?} P{precision}: frame segments differ"
             );
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{process:?} P{precision}: segment sets differ");
             // And the tables stream alone is a legal (image-less) stream
             // to the inspector.
             assert!(inspect_jpeg(tables).is_ok() || tables.len() > 4);
@@ -625,5 +667,74 @@ fn frame_api_shares_one_table_set_across_frames() {
         let got = decoded_components(&full, 1, 12, &[]);
         let want: Vec<u32> = s.iter().map(|&v| u32::from(v)).collect();
         assert!(psnr(&got[0], &want, 4095.0) > 34.0);
+    }
+}
+
+/// #21: the marker order of an interchange stream — every `DQT` ahead of
+/// the frame header, the `DHT` segments after it (in front of the first
+/// scan that uses each destination), `DRI` just before the first `SOS`.
+/// This is the order `cjpeg` writes (observed black-box: `SOI APP0 DQT DQT
+/// SOF0 DHT DHT DHT DHT DRI SOS EOI`, and for progressive frames a `DHT`
+/// in front of each AC scan).
+#[test]
+fn interchange_marker_order_puts_the_frame_header_before_dht() {
+    let names = |jpeg: &[u8]| -> Vec<&'static str> {
+        segments(jpeg)
+            .iter()
+            .map(|s| match s[1] {
+                0xE0 => "APP0",
+                0xDB => "DQT",
+                0xC4 => "DHT",
+                0xC0 => "SOF0",
+                0xC1 => "SOF1",
+                0xC2 => "SOF2",
+                0xC3 => "SOF3",
+                0xDD => "DRI",
+                0xDA => "SOS",
+                0xFE => "COM",
+                _ => "?",
+            })
+            .collect()
+    };
+    let src = planes(3, 8, &[(2, 2), (1, 1), (1, 1)]);
+    let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
+    let mut o = EncodeOptions::default();
+    o.sampling = vec![(2, 2), (1, 1), (1, 1)];
+    let seq = o.encode(W, H, &refs).unwrap();
+    assert_eq!(
+        names(&seq.data),
+        [
+            "APP0", "DQT", "DQT", "SOF0", "DHT", "DHT", "DHT", "DHT", "SOS"
+        ]
+    );
+    o.restart_interval = 1;
+    let rst = o.encode(W, H, &refs).unwrap();
+    assert_eq!(
+        names(&rst.data),
+        [
+            "APP0", "DQT", "DQT", "SOF0", "DHT", "DHT", "DHT", "DHT", "DRI", "SOS"
+        ]
+    );
+    o.restart_interval = 0;
+    o.process = JpegProcess::Progressive;
+    let prog = o.encode(W, H, &refs).unwrap();
+    assert_eq!(
+        names(&prog.data),
+        [
+            "APP0", "DQT", "DQT", "SOF2", "DHT", "DHT", "SOS", "DHT", "SOS", "SOS", "DHT", "SOS",
+            "SOS", "SOS", "SOS"
+        ]
+    );
+    let gray = &refs[..1];
+    let mut g = EncodeOptions::default();
+    g.process = JpegProcess::Lossless {
+        predictor: 1,
+        point_transform: 0,
+    };
+    let ll = g.encode(W, H, gray).unwrap();
+    assert_eq!(names(&ll.data), ["APP0", "SOF3", "DHT", "SOS"]);
+    // Every one of them still decodes.
+    for s in [&seq.data, &rst.data, &prog.data, &ll.data] {
+        decode(s).unwrap();
     }
 }

@@ -541,39 +541,65 @@ impl JpegTableSet {
     /// the quantisation tables and the AC tables, neither of which the
     /// lossless process references.
     pub fn write_tables(&self, out: &mut Vec<u8>, dct: bool) {
-        if dct {
-            for (tq, table) in self.quant.iter().enumerate() {
-                if let Some(q) = table {
-                    let pq: u8 = if q.iter().any(|&v| v > 255) { 1 } else { 0 };
-                    let len = 2 + 1 + 64 * (1 + pq as usize);
-                    out.extend_from_slice(&[0xFF, markers::DQT]);
-                    out.extend_from_slice(&(len as u16).to_be_bytes());
-                    out.push((pq << 4) | tq as u8);
-                    for k in 0..64 {
-                        let v = q[ZIGZAG[k]];
-                        if pq == 1 {
-                            out.extend_from_slice(&v.to_be_bytes());
-                        } else {
-                            out.push(v as u8);
-                        }
-                    }
-                }
-            }
-        }
-        for (class, tables) in [(0u8, &self.dc), (1u8, &self.ac)] {
+        self.write_quant_tables(out, dct);
+        for class in [0u8, 1u8] {
             if class == 1 && !dct {
                 continue;
             }
-            for (th, table) in tables.iter().enumerate() {
-                if let Some(h) = table {
-                    let len = 2 + h.dht_len();
-                    out.extend_from_slice(&[0xFF, markers::DHT]);
-                    out.extend_from_slice(&(len as u16).to_be_bytes());
-                    out.push((class << 4) | th as u8);
-                    out.extend_from_slice(&h.bits);
-                    out.extend_from_slice(&h.vals);
-                }
+            for th in 0..4 {
+                self.write_huffman_table(out, class, th);
             }
+        }
+    }
+
+    /// The DQT segments of [`JpegTableSet::write_tables`] alone (none
+    /// for the lossless process).
+    fn write_quant_tables(&self, out: &mut Vec<u8>, dct: bool) {
+        if dct {
+            for tq in 0..4 {
+                self.write_quant_table(out, tq);
+            }
+        }
+    }
+
+    /// One DQT segment (B.2.4.1) for destination `tq`; nothing when the
+    /// slot is empty. `Pq = 1` (16-bit entries) only when an entry
+    /// exceeds 255.
+    fn write_quant_table(&self, out: &mut Vec<u8>, tq: usize) {
+        let Some(q) = &self.quant[tq] else {
+            return;
+        };
+        let pq: u8 = if q.iter().any(|&v| v > 255) { 1 } else { 0 };
+        let len = 2 + 1 + 64 * (1 + pq as usize);
+        out.extend_from_slice(&[0xFF, markers::DQT]);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+        out.push((pq << 4) | tq as u8);
+        for k in 0..64 {
+            let v = q[ZIGZAG[k]];
+            if pq == 1 {
+                out.extend_from_slice(&v.to_be_bytes());
+            } else {
+                out.push(v as u8);
+            }
+        }
+    }
+
+    /// One DHT segment (B.2.4.2) for table class `class` (0 = DC /
+    /// lossless, 1 = AC), destination `th`; nothing when the slot is
+    /// empty.
+    fn write_huffman_table(&self, out: &mut Vec<u8>, class: u8, th: usize) {
+        let slot = if class == 0 {
+            &self.dc[th]
+        } else {
+            &self.ac[th]
+        };
+        if let Some(h) = slot {
+            let len = 2 + h.dht_len();
+            out.extend_from_slice(&[0xFF, markers::DHT]);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+            out.push((class << 4) | th as u8);
+            out.extend_from_slice(&h.bits);
+            out.extend_from_slice(&h.vals);
         }
     }
 
@@ -1599,9 +1625,11 @@ pub fn gather_stats(
     Ok(())
 }
 
-/// Encode one complete frame as a JPEG datastream: `SOI`, the table
-/// segments (only when `emit_tables`), `SOFn`, `DRI` (when a restart
-/// interval is set), one or more `SOS` + entropy-coded segments, `EOI`.
+/// Encode one complete frame as a JPEG datastream: `SOI`, the `DQT`
+/// segments (only when `emit_tables`), `SOFn`, then per scan the `DHT`
+/// segments of the destinations it is the first to use (only when
+/// `emit_tables`), `DRI` ahead of the first scan (when a restart
+/// interval is set), `SOS` + entropy-coded segment; finally `EOI`.
 /// With `emit_tables = false` the stream is a §B.5 abbreviated image
 /// segment that relies on the same [`JpegTableSet`] having been
 /// installed from a [`JpegTableSet::tables_stream`] (TIFF `JPEGTables`).
@@ -1650,23 +1678,55 @@ pub fn encode_frame_with_meta(
         None
     };
 
+    // Marker order (B.2.4 / B.2.1 allow tables anywhere before the scan
+    // that uses them): DQT ahead of the frame header, which references
+    // the quantisation destinations; then SOFn; then, ahead of each scan,
+    // the DHT segments of the destinations that scan is the first to
+    // use; DRI once, ahead of the first SOS. A sequential or lossless
+    // frame therefore reads `DQT… SOFn DHT… [DRI] SOS`, and a
+    // progressive one carries its AC tables in front of the first AC
+    // scan of each destination.
     let mut out = vec![0xFF, markers::SOI];
     out.extend_from_slice(meta);
-    if emit_tables {
-        tables.write_tables(&mut out, dct);
+    if emit_tables && dct {
+        for tq in 0..4u8 {
+            if comps.iter().any(|c| c.quant_id == tq) {
+                tables.write_quant_table(&mut out, tq as usize);
+            }
+        }
     }
     write_sof(&mut out, frame, comps, tables);
-    if frame.restart_interval > 0 {
-        write_dri(&mut out, frame.restart_interval);
-    }
     let ah_al = match frame.process {
         JpegProcess::Lossless {
             point_transform, ..
         } => point_transform & 0x0F,
         _ => 0,
     };
-    for plan in scan_plans(frame, comps) {
+    let mut emitted = [[false; 4]; 2];
+    for (si, plan) in scan_plans(frame, comps).into_iter().enumerate() {
         let scan_comps: Vec<&JpegComponent<'_>> = plan.comps.iter().map(|&i| &comps[i]).collect();
+        if emit_tables {
+            for class in [0u8, 1u8] {
+                let used = if class == 0 {
+                    plan.ss == 0 || !dct
+                } else {
+                    dct && plan.se > 0
+                };
+                if !used {
+                    continue;
+                }
+                for c in &scan_comps {
+                    let th = c.huff_id as usize;
+                    if !emitted[class as usize][th] {
+                        emitted[class as usize][th] = true;
+                        tables.write_huffman_table(&mut out, class, th);
+                    }
+                }
+            }
+        }
+        if si == 0 && frame.restart_interval > 0 {
+            write_dri(&mut out, frame.restart_interval);
+        }
         write_sos(&mut out, &scan_comps, dct, plan.ss, plan.se, ah_al);
         let mut writer = BitWriter::new();
         {
@@ -2457,7 +2517,9 @@ mod tests {
             i += 2 + len;
         }
         use markers::{DHT, DQT, SOF0, SOS};
-        assert_eq!(seen, vec![DQT, DQT, DHT, DHT, DHT, DHT, SOF0, SOS]);
+        // #21: tables the frame references only, DQT ahead of the frame
+        // header and DHT after it.
+        assert_eq!(seen, vec![DQT, SOF0, DHT, DHT, SOS]);
         // Abbreviated form drops the table segments.
         let abbr = encode_frame(&frame, &[c], &t, false).unwrap();
         assert_eq!(&abbr[2..4], &[0xFF, SOF0]);

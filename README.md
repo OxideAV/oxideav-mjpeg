@@ -438,6 +438,12 @@ let jpegtables: Vec<u8> = out.tables.unwrap(); // SOI, DQT/DHT, EOI
 # Ok::<(), oxideav_mjpeg::MjpegError>(())
 ```
 
+An interchange stream (`abbreviated = false`) writes its tables around the
+frame header: every `DQT` ahead of `SOFn`, the `DHT` segments after it
+(in front of the first scan that uses each destination), then `DRI` and
+the first `SOS` — `SOI APPn… DQT… SOFn DHT… [DRI] SOS …`. Only the
+destinations the frame references are written.
+
 `EncodeOptions { quality, tables, process, precision, restart_interval,
 abbreviated, signalling, sampling, table_ids, chroma, metadata }`
 (`#[non_exhaustive]`, `Default` + `with_*` builders; the `chroma` and
@@ -646,7 +652,7 @@ Rulings:
   `encode(&JpegImage::from_video_frame(..), &EncodeOptions)` for the
   same request (49 requests pinned). The empty bag keeps the historical
   per-format streams for `Gray8`, 8-bit YCbCr 4:4:4 / 4:2:2 / 4:2:0,
-  `Rgb24` and `Cmyk` (same entropy-coded data, `SOF` before `DHT`;
+  `Rgb24` and `Cmyk` (same entropy-coded data;
   `tests/golden.rs` pins them) and the general writer with its defaults
   everywhere else, so every declared layout encodes without options.
   `process = auto` (the default) is sequential DCT, or lossless on the

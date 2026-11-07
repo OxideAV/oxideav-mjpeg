@@ -16,6 +16,7 @@
 //! | `icc` | `APP2`, one segment per chunk | `"ICC_PROFILE\0"`, chunk number (from 1), chunk count | the profile bytes, split in order | [`ICC_CHUNK_DATA`] (65 519) bytes per chunk, [`ICC_MAX_CHUNKS`] (255) chunks, so [`ICC_MAX_BYTES`] (16 707 345) bytes — ICC.1 Annex B.4 |
 //! | `exif` | `APP1` | `"Exif\0\0"` | the TIFF-structured attribute block from its byte-order mark | [`EXIF_MAX_BYTES`] (65 527) — one segment, Exif §4.7.2 |
 //! | `xmp` | `APP1` | `"http://ns.adobe.com/xap/1.0/\0"` | the XMP packet (UTF-8 RDF/XML) | [`XMP_MAX_BYTES`] (65 502) — the standard packet; no extended-XMP continuation is written |
+//! | `comments` | `COM`, one segment per entry | — | the comment bytes verbatim (T.81 §B.2.4.5) | [`COM_MAX_BYTES`] (65 533) per segment |
 //!
 //! JFIF (`APP0 "JFIF\0"`) and the Adobe `APP14` segment are not
 //! metadata: they signal the colour model and the decoder interprets
@@ -41,7 +42,12 @@
 //! After the slot-0 segment: `APP1` XMP, the `APP2` ICC chunks in
 //! sequence order, then every other leading segment the stream already
 //! had (`APP14` Adobe, `COM`, foreign `APPn`) in its original order,
-//! then the tables and the frame. The decoder of this crate reads the
+//! then the tables and the frame. When `comments` is set its `COM`
+//! segments replace the stream's own and go after the last of those
+//! `APPn` segments, directly ahead of the tables (observed black-box,
+//! ImageMagick `-set comment` writes `SOI APP0 COM DQT …`; `wrjpgcom`
+//! inserts ahead of the frame header instead — T.81 §B.2.4 allows
+//! either, and every reader takes both). The decoder of this crate reads the
 //! colour-model segments wherever they sit before the first `SOS`, so
 //! every policy decodes to the same picture; the policy only changes
 //! which outside reader recognises the file by its first segment.
@@ -93,6 +99,9 @@ pub const EXIF_MAX_BYTES: usize = MAX_APP_PAYLOAD - EXIF_IDENTIFIER.len();
 /// segments, which this crate neither writes nor reassembles; the
 /// bound is two bytes under what the segment length alone allows).
 pub const XMP_MAX_BYTES: usize = 65502;
+/// Largest `COM` payload: `Lc ≤ 65535` with the two length bytes
+/// counted (T.81 §B.2.4.5).
+pub const COM_MAX_BYTES: usize = MAX_APP_PAYLOAD;
 
 /// How a JFIF `APP0` and an Exif `APP1` share the first slot after
 /// `SOI` (see the [module docs](self)).
@@ -145,6 +154,8 @@ enum Kind {
     Jfif,
     /// `APP0 "JFXX\0"` — travels with the JFIF segment.
     Jfxx,
+    /// `COM` (§B.2.4.5).
+    Com,
     Other,
 }
 
@@ -162,6 +173,7 @@ fn classify(marker: u8, payload: &[u8]) -> Kind {
         markers::APP1 if starts(EXIF_IDENTIFIER) => Kind::Exif,
         markers::APP1 if starts(XMP_IDENTIFIER) => Kind::Xmp,
         markers::APP2 if starts(ICC_IDENTIFIER) => Kind::Icc,
+        markers::COM => Kind::Com,
         _ => Kind::Other,
     }
 }
@@ -248,6 +260,20 @@ fn write_xmp(out: &mut Vec<u8>, xmp: &[u8]) -> Result<()> {
     write_app_segment(out, markers::APP1, &[XMP_IDENTIFIER, xmp])
 }
 
+/// Serialise one `COM` segment.
+fn write_com(out: &mut Vec<u8>, comment: &[u8]) -> Result<()> {
+    if comment.len() > COM_MAX_BYTES {
+        return Err(Error::unsupported(format!(
+            "JPEG encode: comment of {} bytes exceeds the {COM_MAX_BYTES}-byte COM segment limit (T.81 §B.2.4.5)",
+            comment.len()
+        )));
+    }
+    let len = comment.len() + 2;
+    out.extend_from_slice(&[0xFF, markers::COM, (len >> 8) as u8, len as u8]);
+    out.extend_from_slice(comment);
+    Ok(())
+}
+
 /// Serialise the `APP2 "ICC_PROFILE\0"` chunk sequence: chunks of at
 /// most [`ICC_CHUNK_DATA`] profile bytes, numbered from 1, every chunk
 /// carrying the total count (ICC.1 Annex B.4). An empty profile is
@@ -276,14 +302,17 @@ fn write_icc(out: &mut Vec<u8>, icc: &[u8]) -> Result<()> {
 /// segment of the same kind the stream already carried, wherever it
 /// sat; kinds `meta` leaves `None` keep what the stream had — in the
 /// order the [module docs](self) give, with the JFIF `APP0` placed by
-/// `jfif`. Every other segment (tables, frame header, Adobe `APP14`,
-/// `COM`, foreign `APPn`) follows in its original order; the scans are
-/// copied untouched, so the picture is unchanged.
+/// `jfif`. A non-empty `meta.comments` replaces the stream's `COM`
+/// segments (placed after the leading `APPn` segments, ahead of the
+/// tables); otherwise they stay where they were. Every other segment
+/// (tables, frame header, Adobe `APP14`, foreign `APPn`) follows in
+/// its original order; the scans are copied untouched, so the picture
+/// is unchanged.
 ///
 /// Errors: no `SOI` at offset 0 or a truncated header segment
 /// (`InvalidData`); a blob over its carriage limit (`Unsupported`,
 /// naming the limit: [`EXIF_MAX_BYTES`], [`XMP_MAX_BYTES`],
-/// [`ICC_MAX_CHUNKS`]).
+/// [`ICC_MAX_CHUNKS`], [`COM_MAX_BYTES`]).
 pub fn embed_metadata(jpeg: &[u8], meta: &Metadata, jfif: JfifPolicy) -> Result<Vec<u8>> {
     let (segs, rest) = split_header(jpeg)?;
     let has_exif = meta.exif.is_some() || segs.iter().any(|s| s.kind == Kind::Exif);
@@ -315,8 +344,31 @@ pub fn embed_metadata(jpeg: &[u8], meta: &Metadata, jfif: JfifPolicy) -> Result<
         Some(icc) => write_icc(&mut out, icc)?,
         None => existing(Kind::Icc).for_each(|s| out.extend_from_slice(s.bytes)),
     }
-    for s in existing(Kind::Other) {
-        out.extend_from_slice(s.bytes);
+    if meta.comments.is_empty() {
+        for s in segs
+            .iter()
+            .filter(|s| matches!(s.kind, Kind::Other | Kind::Com))
+        {
+            out.extend_from_slice(s.bytes);
+        }
+    } else {
+        // The new COM segments replace the stream's own, after the last
+        // leading APPn segment (ahead of the first table / frame
+        // segment); everything else keeps its order.
+        let others: Vec<&Segment<'_>> = segs.iter().filter(|s| s.kind == Kind::Other).collect();
+        let split = others
+            .iter()
+            .position(|s| !markers::is_app(s.bytes[1]))
+            .unwrap_or(others.len());
+        for s in &others[..split] {
+            out.extend_from_slice(s.bytes);
+        }
+        for c in &meta.comments {
+            write_com(&mut out, c)?;
+        }
+        for s in &others[split..] {
+            out.extend_from_slice(s.bytes);
+        }
     }
     out.extend_from_slice(rest);
     Ok(out)
@@ -330,18 +382,19 @@ fn meta_len(meta: &Metadata) -> usize {
         + meta.icc.as_ref().map_or(0, |icc| {
             icc.len() + icc.len().div_ceil(ICC_CHUNK_DATA).max(1) * (ICC_CHUNK_HEADER + 4)
         })
+        + meta.comments.iter().map(|c| c.len() + 4).sum::<usize>()
 }
 
-/// Remove every ICC / Exif / XMP segment from the header of `jpeg`
-/// (colour-model segments and the picture are kept). The inverse of
-/// [`embed_metadata`] for the three carried kinds.
+/// Remove every ICC / Exif / XMP / `COM` segment from the header of
+/// `jpeg` (colour-model segments and the picture are kept). The
+/// inverse of [`embed_metadata`] for the carried kinds.
 pub fn strip_metadata(jpeg: &[u8]) -> Result<Vec<u8>> {
     let (segs, rest) = split_header(jpeg)?;
     let mut out = Vec::with_capacity(jpeg.len());
     out.extend_from_slice(&[0xFF, markers::SOI]);
     for s in segs
         .iter()
-        .filter(|s| !matches!(s.kind, Kind::Exif | Kind::Xmp | Kind::Icc))
+        .filter(|s| !matches!(s.kind, Kind::Exif | Kind::Xmp | Kind::Icc | Kind::Com))
     {
         out.extend_from_slice(s.bytes);
     }
@@ -353,8 +406,8 @@ pub fn strip_metadata(jpeg: &[u8]) -> Result<Vec<u8>> {
 /// ([`JpegImage::metadata`](crate::JpegImage::metadata)), from the
 /// marker segments before the first `SOS` and nothing else: the ICC
 /// chunk sequence reassembled in order (`None` when a chunk is
-/// missing, repeated or disagrees on the count), the first Exif and
-/// the first XMP standard packet. Lenient like `decode`; a stream
+/// missing, repeated or disagrees on the count), the first Exif, the
+/// first XMP standard packet and every `COM` payload in order. Lenient like `decode`; a stream
 /// without a frame header is an error.
 pub fn read_metadata(jpeg: &[u8]) -> Result<Metadata> {
     crate::api::header_metadata(jpeg)

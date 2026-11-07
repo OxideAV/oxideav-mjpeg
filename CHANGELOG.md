@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `COM` (comment) segments (#21): `Metadata::comments` holds every `COM` payload before the first scan, in order, and `read_metadata` / `decode` fill it. `ImageInfo::comments` counts them. `Metadata::with_comment` / `with_comments` on `EncodeOptions::metadata` write one `COM` each (at most `metadata::COM_MAX_BYTES` = 65 533 bytes), after the `APPn` segments and ahead of the tables. `embed_metadata` replaces a stream's comments when the list is non-empty. A decoded image re-encodes with its own comments. `rdjpgcom` reads back what is written. Comments have no framework blob form.
 - Reference-compatible decode as one switch (#19): `DecodeOptions::with_reference_compat(bool)` / `is_reference_compat()` and the `ConvertOptions` twins set (or reset) the integer IDCT, triangular chroma upsampling and fixed-point YCbCr knobs together; the existing `libjpeg_compatible()` presets are now defined through it. Defaults unchanged.
 - Registry decoder option bag `MjpegDecoderOptions` (#19), declared with `CodecInfo::decoder_options`: `reference_compat` (bool), `idct` (`float` / `integer`) and `upsampling` (`replicate` / `triangular`) from `CodecParameters::options`. Keys of other schemas, such as the encoder bag an encoder's output parameters carry, are ignored. Bad values are refused.
 - `notes/reference-compat.md` (#19): every fitted parameter of the compatible mode, with the black-box experiment and mismatch table that pinned it. The IDCT `(13, 2)` choice is unique over 3 456 crafted blocks. The YCbCr constants were checked over all 65 536 `(Cb, Cr)` pairs. The upsampling biases and edge rule were fitted on noise at 2 to 64 px. The notes also measure the residual on incomplete progressive streams.
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `strip_metadata` also removes `COM` segments (#21).
 - The general writer (`t81`, behind `encode` / `encode_rgb8` / the registry encoder) writes `DQT` ahead of the frame header and the `DHT` segments after it (#21): `SOI APPn… DQT… SOFn DHT… [DRI] SOS …`, the order `cjpeg` uses. Progressive frames carry each `DHT` in front of the first scan that uses its destination, and only the table destinations the frame references are written (a grey frame no longer carries the chroma tables). Entropy-coded data is unchanged. The §B.5 tables-only stream is unchanged.
 - Triangular upsampling indexes a materialised component row by row instead of calling a per-sample closure. On 1080p 4:2:0 the compatible RGB decode drops from 30.3 ms to 22.8 ms (default: 22.1 ms). Output is unchanged.
 - Corrected the documentation of the fixed-point YCbCr G constants (`22 554`, `46 802`): they are the measured `0.344146` / `0.714142` (T.871's coefficients held to 15 bits), not the 16-bit-nearest full-precision values, which miss 59 `(Cb, Cr)` pairs.

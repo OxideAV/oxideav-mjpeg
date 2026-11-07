@@ -265,7 +265,9 @@ impl Metadata {
     /// structure from its byte-order mark, no `Exif\0\0`), `xmp` →
     /// [`BlobKind::XMP`] (the packet, no namespace prefix; `mime`
     /// `application/rdf+xml`). Fields left `None` produce no blob;
-    /// `gamma` has no blob form.
+    /// `gamma` and `comments` have no blob form (a Motion-JPEG writer
+    /// stamps a `COM` into every frame; carrying it would attach a
+    /// side-channel record to each decoded frame).
     pub fn to_blobs(&self) -> Vec<MetadataBlob> {
         let mut out = Vec::new();
         if let Some(icc) = &self.icc {
@@ -291,6 +293,7 @@ impl Metadata {
             exif: first(&BlobKind::EXIF),
             xmp: first(&BlobKind::XMP),
             gamma: None,
+            comments: Vec::new(),
         }
     }
 }

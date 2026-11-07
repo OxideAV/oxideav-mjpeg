@@ -66,6 +66,7 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
         hierarchical: hdr.hierarchical,
         has_jfif: hdr.jfif,
         has_adobe: hdr.adobe.is_some(),
+        comments: hdr.comments.len() as u32,
     })
 }
 
@@ -294,6 +295,8 @@ struct Header {
     icc_seen: bool,
     /// Reassembled profile (`None` when absent or incomplete).
     icc: Option<Vec<u8>>,
+    /// `COM` payloads, in order.
+    comments: Vec<Vec<u8>>,
 }
 
 impl Header {
@@ -303,6 +306,7 @@ impl Header {
             exif: self.exif.clone(),
             xmp: self.xmp.clone(),
             gamma: None,
+            comments: self.comments.clone(),
         }
     }
 }
@@ -326,6 +330,7 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
     let mut icc_seen = false;
     let mut icc_bad = false;
     let mut no_scan = false;
+    let mut comments: Vec<Vec<u8>> = Vec::new();
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -419,6 +424,12 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
                     }
                 }
             }
+            markers::COM => {
+                let Some(p) = lenient_payload(&mut walker, strict)? else {
+                    continue;
+                };
+                comments.push(p.to_vec());
+            }
             markers::APP14 => {
                 let Some(p) = lenient_payload(&mut walker, strict)? else {
                     continue;
@@ -497,6 +508,7 @@ fn scan_header(bytes: &[u8], strict: bool) -> Result<Header> {
         xmp,
         icc_seen,
         icc,
+        comments,
     })
 }
 

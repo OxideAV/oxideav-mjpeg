@@ -54,7 +54,7 @@ if oxideav_mjpeg::probe(&bytes) {
 | Item | What it does |
 |---|---|
 | `probe(&[u8]) -> bool` | `SOI` + marker-prefix sniff; no allocation, never panics. |
-| `info(&[u8]) -> Result<ImageInfo>` | Header walk up to the first `SOS`: `width`, `height`, `format` (the layout `decode` will produce), `precision`, `components`, `progressive` / `lossless` / `arithmetic` / `hierarchical`, `color`, `has_jfif` / `has_adobe` / `has_icc` / `has_exif` / `has_xmp`; `frames = 1`, `has_alpha = false`. |
+| `info(&[u8]) -> Result<ImageInfo>` | Header walk up to the first `SOS`: `width`, `height`, `format` (the layout `decode` will produce), `precision`, `components`, `progressive` / `lossless` / `arithmetic` / `hierarchical`, `color`, `has_jfif` / `has_adobe` / `has_icc` / `has_exif` / `has_xmp`, `comments` (the `COM` count); `frames = 1`, `has_alpha = false`. |
 | `decode(&[u8]) -> Result<JpegImage>` | Native layout, `color` + `metadata` filled. `decode_with(&[u8], &DecodeOptions)` adds limits, strict mode and a §B.5 tables stream. |
 | `decode_rgb8` / `decode_rgba8` | One call to `RgbImage { width, height, data }` / `RgbaImage` (3 / 4 bytes per pixel, alpha `255`). |
 | `decode_from<R: Read>(r)` | Reads to end, then `decode`. |
@@ -213,7 +213,7 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 | `chroma` | `Yuv420` | Layout `encode_rgb8` / `encode_rgba8` convert to (`Yuv444` / `Yuv422` / `Yuv420` / `Yuv411` / `GrayscaleOnly`). `encode(&JpegImage)` uses the image's own layout. |
 | `restart_interval` | 0 | `DRI` + `RSTm` every *n* MCUs. |
 | `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
-| `metadata` | empty | ICC / Exif / XMP blobs to embed (merged with `JpegImage::metadata`, the option winning per blob — `Metadata::with_overrides`). |
+| `metadata` | empty | ICC / Exif / XMP blobs and `COM` comments to embed (merged with `JpegImage::metadata`, the option winning per blob — `Metadata::with_overrides`). |
 | `jfif` | `Auto` | JFIF `APP0` / Exif `APP1` slot rule (`JfifPolicy::Auto` / `Always` / `Never`, see *Metadata and colour*). |
 | `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
 
@@ -323,7 +323,7 @@ Not covered:
 
 ## Metadata and colour
 
-* `Metadata { icc, exif, xmp, gamma }` — the three carried blobs,
+* `Metadata { icc, exif, xmp, gamma, comments }` — the three carried blobs,
   one set of bytes seen from both layers: `read_metadata(bytes)` ==
   `decode(bytes).metadata` == `Metadata::from_blobs(frame.blobs())`,
   and `Metadata::to_blobs()` is what the `jpeg` / `mjpeg-raw`
@@ -335,6 +335,17 @@ Not covered:
   | `icc` / `BlobKind::ICC` | `APP2`, one per chunk | `"ICC_PROFILE\0"`, chunk number from 1, chunk count | the profile, split in sequence order; dropped when a chunk is missing, repeated or disagrees on the count (an error in strict mode) | 65 519 bytes per chunk, 255 chunks, 16 707 345 bytes (ICC.1 Annex B.4) |
   | `exif` / `BlobKind::EXIF` | `APP1` | `"Exif\0\0"` | the TIFF structure from its byte-order mark; the first segment wins | 65 527 bytes, one segment (Exif §4.7.2) |
   | `xmp` / `BlobKind::XMP` (`mime` `application/rdf+xml`) | `APP1` | `"http://ns.adobe.com/xap/1.0/\0"` | the standard packet (UTF-8 RDF/XML); the first wins; extended-XMP continuation segments are neither written nor reassembled | 65 502 bytes |
+
+  `comments` (#21) is the payload of every `COM` segment (T.81
+  §B.2.4.5) before the first scan, verbatim and in order —
+  `read_metadata` / `decode(bytes).metadata` report them, `info` counts
+  them (`ImageInfo::comments`), and `Metadata::with_comment("…")` /
+  `with_comments(…)` on `EncodeOptions::metadata` writes them (one `COM`
+  each, at most 65 533 bytes, after the `APPn` segments and ahead of the
+  tables; a decoded image re-encodes with its own comments). They have
+  no framework blob form: a Motion-JPEG writer stamps a `COM` into
+  every frame, and carrying it would attach a side-channel record to
+  each decoded frame.
 
   JFIF `APP0` and Adobe `APP14` are not blobs — they signal the colour
   model and the decoder interprets them. Blobs of other kinds (IPTC,
@@ -356,8 +367,9 @@ Not covered:
   before `SOS`); the policy only changes which outside reader
   recognises the file by its first segment. `embed_metadata(jpeg,
   &meta, policy)` applies the rule to any stream (same-kind segments
-  replaced wherever they sat, the picture untouched),
-  `strip_metadata` removes the three kinds.
+  replaced wherever they sat, the picture untouched; a non-empty
+  `comments` list replaces the `COM` segments), `strip_metadata`
+  removes the three kinds and the `COM` segments.
 * **Precedence** (`Metadata::with_overrides`): per kind, a frame's
   blobs over the stream's `params.blobs` over the `EncodeOptions`
   metadata of a direct caller; on the contract side the option's

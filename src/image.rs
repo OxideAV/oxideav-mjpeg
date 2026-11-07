@@ -530,6 +530,9 @@ impl Default for ColorInfo {
 ///   the identifier: the XMP packet bytes (UTF-8 XML).
 /// * `gamma` — never set for JPEG (no gAMA-like field); present so the
 ///   shape matches the other image crates.
+/// * `comments` — the payload of every `COM` segment (T.81 §B.2.4.5)
+///   before the first scan, in stream order, verbatim (T.81 gives the
+///   bytes no character set; most writers put ASCII / UTF-8 text there).
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct Metadata {
@@ -541,6 +544,9 @@ pub struct Metadata {
     pub xmp: Option<Vec<u8>>,
     /// Display gamma; always `None` for JPEG.
     pub gamma: Option<f32>,
+    /// `COM` segment payloads, in stream order (each at most
+    /// [`crate::metadata::COM_MAX_BYTES`] bytes when written).
+    pub comments: Vec<Vec<u8>>,
 }
 
 impl Metadata {
@@ -567,13 +573,31 @@ impl Metadata {
         self
     }
 
+    /// Append one `COM` segment payload (raw bytes; a `&str` /
+    /// `String` converts as its UTF-8 bytes).
+    pub fn with_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
+        self.comments.push(comment.into());
+        self
+    }
+
+    /// Replace the `COM` segment payloads.
+    pub fn with_comments(mut self, comments: Vec<Vec<u8>>) -> Self {
+        self.comments = comments;
+        self
+    }
+
     /// `true` when no field is set.
     pub fn is_empty(&self) -> bool {
-        self.icc.is_none() && self.exif.is_none() && self.xmp.is_none() && self.gamma.is_none()
+        self.icc.is_none()
+            && self.exif.is_none()
+            && self.xmp.is_none()
+            && self.gamma.is_none()
+            && self.comments.is_empty()
     }
 
     /// `self` with every field `over` sets replaced by `over`'s value
-    /// (fields `over` leaves `None` keep `self`'s) — the precedence
+    /// (fields `over` leaves `None` keep `self`'s; a non-empty
+    /// `comments` list replaces the whole list) — the precedence
     /// rule between layers of metadata: an option over an image's own
     /// record, a frame's blobs over the stream's.
     pub fn with_overrides(&self, over: &Metadata) -> Metadata {
@@ -582,6 +606,11 @@ impl Metadata {
             exif: over.exif.clone().or_else(|| self.exif.clone()),
             xmp: over.xmp.clone().or_else(|| self.xmp.clone()),
             gamma: over.gamma.or(self.gamma),
+            comments: if over.comments.is_empty() {
+                self.comments.clone()
+            } else {
+                over.comments.clone()
+            },
         }
     }
 }
@@ -960,6 +989,8 @@ pub struct ImageInfo {
     pub has_jfif: bool,
     /// An Adobe APP14 segment is present.
     pub has_adobe: bool,
+    /// Number of `COM` (comment) segments before the first scan.
+    pub comments: u32,
 }
 
 // ---------------------------------------------------------------------------

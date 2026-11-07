@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rgb_decode` bench group: default vs reference-compatible RGB decode.
 - `Default` on `MjpegFrame`, `JpegComponent`, `EncodedJpeg` and `InspectedComponent`; full-field `JpegFrame::new`, `QuantTableInfo::new` and `JpegInfo::new`; `with_<field>` setters on every newly `#[non_exhaustive]` record.
 
+### Fixed
+
+- Sequential arithmetic-coded JPEGs (SOF9) at 12-bit precision and with four components (CMYK / YCCK) were refused as unsupported (#21). They now decode through the same Q-coder scan path as 8-bit SOF9 and the same 12-bit / CMYK render as the other DCT processes. Each new fixture decodes to the same samples as its Huffman twin (`jpegtran -arithmetic`, a lossless transcode). A wider sweep of 170 `cjpeg -arithmetic` / `jpegtran -arithmetic` streams (sequential and progressive, every sampling layout, restarts, grey / RGB / YCCK, 8- and 12-bit) finds no differences: the 8-bit ones match `djpeg` byte for byte under `DecodeOptions::libjpeg_compatible()`, and the 12-bit and 4-component ones match their Huffman twins.
+
 ### Changed
 
 - Triangular upsampling indexes a materialised component row by row instead of calling a per-sample closure. On 1080p 4:2:0 the compatible RGB decode drops from 30.3 ms to 22.8 ms (default: 22.1 ms). Output is unchanged.

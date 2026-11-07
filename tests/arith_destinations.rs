@@ -18,6 +18,14 @@
 //! carry the same quantised coefficients, so a correct decoder produces
 //! the same samples from each.
 //!
+//! The #21 pairs: `huff_p12_2x2.jpg` / `huff_p12_gray_rst.jpg` are
+//! `cjpeg -precision 12 -quality 80` (`-sample 2x2`; `-grayscale -restart
+//! 1`) of a 37×29 plasma frame, `huff_cmyk.jpg` is ImageMagick
+//! `-colorspace CMYK -quality 80` of it (Adobe APP14 `transform = 2`,
+//! YCCK); `arith_*` are `jpegtran -arithmetic` (`-restart 1` for the
+//! `_rst` files) — sequential arithmetic (SOF9) at `P = 12` and with four
+//! components.
+//!
 //! `ours_<layout>_arith.jpg` is `jpegtran -arithmetic` of this crate's
 //! own Huffman encode of the synthetic frame built below (regenerate with
 //! `OXIDEAV_MJPEG_DUMP=<dir> cargo test --test arith_destinations`, which
@@ -44,6 +52,16 @@ const PAIRS: &[(&str, &[u8], &[u8])] = &[
         fx!("huff_prog_rst.jpg"),
         fx!("arith_prog_rst.jpg"),
     ),
+    // #21: sequential arithmetic (SOF9) at P = 12 and with four
+    // components used to be refused outright.
+    ("p12_2x2", fx!("huff_p12_2x2.jpg"), fx!("arith_p12_2x2.jpg")),
+    (
+        "p12_gray_rst",
+        fx!("huff_p12_gray_rst.jpg"),
+        fx!("arith_p12_gray_rst.jpg"),
+    ),
+    ("ycck", fx!("huff_cmyk.jpg"), fx!("arith_cmyk.jpg")),
+    ("ycck_rst", fx!("huff_cmyk.jpg"), fx!("arith_cmyk_rst.jpg")),
 ];
 
 #[test]

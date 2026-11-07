@@ -741,15 +741,21 @@ fn decode_jpeg_inner(mut state: JpegState, data: &[u8]) -> Result<JpegImage> {
                 let mut sof = parse_sof(p)?;
                 apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof, &state.limits)?;
-                if sof.precision != 8 {
+                // Same frame constraints as SOF1 / SOF10: P = 8 or 12
+                // (Table B.2, processes 2 and 6), 4-component CMYK / YCCK
+                // at P = 8 (no 12-bit CMYK output format). The §F.1.4
+                // models code magnitude categories up to 2^15 (Figure
+                // F.23 X1..X15), so the 12-bit coefficient range needs no
+                // separate entropy path.
+                if sof.precision != 8 && sof.precision != 12 {
                     return Err(Error::unsupported(format!(
-                        "arithmetic JPEG: precision {} (only 8 is supported)",
+                        "arithmetic JPEG: precision {} (only 8 and 12 are supported)",
                         sof.precision
                     )));
                 }
-                if sof.components.len() > 3 {
+                if sof.components.len() == 4 && sof.precision != 8 {
                     return Err(Error::unsupported(
-                        "arithmetic JPEG: 4+ component scans not supported",
+                        "arithmetic JPEG: 4-component scans only at P = 8",
                     ));
                 }
                 coef_buf = init_coef_buffers(&sof)?;
@@ -1992,9 +1998,9 @@ fn decode_arith_scan_diff(
         .sof
         .as_ref()
         .ok_or_else(|| Error::invalid("SOS before SOF"))?;
-    if sof.precision != 8 {
+    if sof.precision != 8 && sof.precision != 12 {
         return Err(Error::unsupported(format!(
-            "arithmetic scan: precision {} (only 8 supported)",
+            "arithmetic scan: precision {} (only 8 and 12 supported)",
             sof.precision
         )));
     }

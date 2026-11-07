@@ -178,7 +178,7 @@ accepted on encode as the same layouts:
 | 1 component, `P = 8` | `Gray8` | |
 | 1 component, `P = 12` DCT; lossless `P = 10 / 12` | `Gray12Le` / `Gray10Le` | 16-bit LE storage |
 | 1 component, lossless other `P` | `Gray16Le` | sample in the low `P` bits; `JpegImage::precision` says which |
-| 3 components YCbCr, `P = 8` | `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv411P` | luma `(Hmax, Vmax)` over `1×1` chroma; every other §A.1.1 combination is replicated to 4:4:4 |
+| 3 components YCbCr, `P = 8` | `YuvJ444P` / `YuvJ422P` / `YuvJ420P` / `Yuv411P` | luma `(Hmax, Vmax)` over `1×1` chroma; every other §A.1.1 combination is resampled to 4:4:4 (`DecodeOptions::upsampling`) |
 | 3 components YCbCr, `P = 12` | `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` | |
 | 3 components RGB-coded (Adobe `transform = 0` or ids `R G B`), `P = 8` | `Rgb24` | packed |
 | 3 components lossless, `P = 10 / 12 / 14` | `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` | planes in scan order |
@@ -240,10 +240,54 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
 | `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
 | `idct` | `IdctMethod::Float` | Inverse DCT of 8- and 12-bit DCT frames: `Float` (f32 cosine matrix) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
-| `upsampling` | `ChromaUpsampling::Replicate` | Chroma reconstruction: `Replicate` or `Triangular` (¾ / ¼ linear interpolation for 2:1, 1:2 and 2 × 2 ratios). Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8_with` / `decode_rgba8_with`. |
+| `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 
 Breaches are `Error::LimitExceeded`.
+
+### Chroma reconstruction
+
+T.871 §9 sites subsampled chroma at the centre of the luma samples it
+covers and leaves the reconstruction filter to the decoder. The default,
+`ChromaUpsampling::LumaGuided`, interpolates linearly at that siting
+(every ratio, edges replicated), then adds the luma detail the
+subsampling removed. That detail is scaled by the local chroma-on-luma
+regression slope over a 3 × 3 chroma neighbourhood,
+`a = cov(Ŷ, C) / (var(Ŷ) + 16)`, where `Ŷ` is luma averaged over each
+chroma cell. The result is clamped to that neighbourhood's chroma range.
+Where chroma does not follow luma, `a ≈ 0` and the output is the linear
+interpolation. It applies to YCbCr components at an integer ratio to a
+full-resolution luma. Other components (non-integer ratios, CMYK / YCCK)
+use `Linear`.
+
+The kernel was chosen by measurement. Reference RGB images were encoded
+with this crate's encoder and with `cjpeg` at quality 50 / 75 / 90 and
+decoded with each kernel. PSNR and SSIM are measured against the
+original RGB (SSIM: 11 × 11 Gaussian window, σ = 1.5, mean of R, G, B).
+The photographic set is three 1024 × 768 / 768 × 768 crops of a 6016²
+landscape photograph, downscaled 4×. The synthetic set is test-card,
+colour-bar and fractal frames from `ffmpeg -f lavfi`. Means over
+images and qualities, this crate's encoder:
+
+| Set, layout | `Replicate` | `Triangular` (= `djpeg`) | `Linear` | **`LumaGuided`** |
+|---|---|---|---|---|
+| photo 4:2:0 | 43.50 dB / 0.9816 | 44.11 / 0.9837 | 44.24 / 0.9845 | **45.03 / 0.9854** |
+| photo 4:2:2 | 44.72 / 0.9839 | 45.02 / 0.9845 | 45.09 / 0.9849 | **45.26 / 0.9851** |
+| photo 4:1:1 | 43.49 / 0.9816 | 43.49 / 0.9816 | 44.07 / 0.9833 | **44.75 / 0.9841** |
+| synthetic 4:2:0 | **34.17** / 0.9407 | 29.28 / 0.9390 | 29.28 / 0.9397 | 33.11 / **0.9518** |
+
+`cjpeg`-encoded input ranks the same way (photo 4:2:0: 43.53 / 44.15 /
+44.28 / **45.08** dB). `LumaGuided` has the best SSIM in every cell and
+the best PSNR on photographs. Replication keeps the PSNR lead only on
+synthetic graphics whose colour edges fall on the 2-pixel chroma grid,
+where it is exact and every interpolator blurs. Sharper separable
+kernels lose to linear on JPEG chroma, because the encoder's box
+prefilter and the quantiser leave nothing for them to restore and they
+overshoot. On the 4:2:0 daylight crop at quality 75, Catmull-Rom loses
+0.17 dB to linear, Lanczos-3 loses 0.28 dB and Mitchell–Netravali loses
+0.03 dB. A back-projection step on top of either kernel also lost
+(−0.2 to −0.7 dB). `ε = 16` and the clamp were picked on the same sweep (`ε` 4…64,
+window 3 × 3 vs 5 × 5).
 
 ### Reference-compatible output (bit-exact against `djpeg`)
 
@@ -272,7 +316,7 @@ Through the registry the decoder takes the same switch in
 |---|---|---|
 | `reference_compat` | `true` / `false` | `false` |
 | `idct` | `float` / `integer` (overrides `reference_compat`) | from `reference_compat` |
-| `upsampling` | `replicate` / `triangular` (overrides `reference_compat`; used for the layouts the decoder resamples to 4:4:4) | from `reference_compat` |
+| `upsampling` | `replicate` / `triangular` / `linear` / `guided` (overrides `reference_compat`; used for the layouts the decoder resamples to 4:4:4) | from `reference_compat` |
 
 Other keys in the bag (an encoder's output parameters carry the encoder
 options) are ignored; a bad value is an error.
@@ -414,11 +458,12 @@ byte-identically (four re-codes each). Lossless and hierarchical frames are
   JPEG without an Adobe RGB flag). An embedded ICC profile takes
   precedence for colour-managed consumers.
 * `to_rgb8` / `to_rgba8` — T.871 §7 inverse equations in exact integer
-  arithmetic (`Round(x) = ⌊x + 0.5⌋`, one rounding, clamped); chroma
-  **nearest-neighbour replication** (`(x / h, y / v)` — T.871 §9 sites
-  chroma centred between luma samples but leaves the reconstruction
-  filter to the decoder; this crate applies none, so a stream always
-  yields the same bytes); grayscale replicated; CMYK by `R = Round((255
+  arithmetic (`Round(x) = ⌊x + 0.5⌋`, one rounding, clamped; the
+  interpolated chroma enters with its fraction to 1/256 of a sample);
+  chroma **luma-guided reconstruction** at the T.871 §9 centred siting
+  (*Chroma reconstruction* below; T.871 leaves the filter to the
+  decoder, and the result is deterministic — a stream always yields the
+  same bytes); grayscale replicated; CMYK by `R = Round((255
   − C)(255 − K) / 255)` (a documented convention, not a spec formula);
   deep samples rescaled by `Round(v · 255 / (2^P − 1))` with the
   frame's `precision`; `Gbrp*` re-ordered to R, G, B. Grayscale, RGB
@@ -644,7 +689,7 @@ carriers at every lossless precision).
 |---|---|---|
 | `YuvJ444P` / `YuvJ422P` / `YuvJ420P` | JFIF YCbCr, luma `1×1` / `2×1` / `2×2` | the same label |
 | `Yuv411P` | JFIF YCbCr, luma `4×1` | `Yuv411P` |
-| `Yuv440P` | JFIF YCbCr, luma `1×2` | `YuvJ444P` (the decoder replicates 4:4:0 chroma onto the frame grid) |
+| `Yuv440P` | JFIF YCbCr, luma `1×2` | `YuvJ444P` (the decoder resamples 4:4:0 chroma onto the frame grid) |
 | `Gray8` | JFIF, one component, `SOF0` | `Gray8` |
 | `Gray12Le` / `Yuv444P12Le` / `Yuv422P12Le` / `Yuv420P12Le` | 12-bit extended sequential (`SOF1`) | the same label |
 | `Gray10Le` / `Gray16Le` | lossless (`SOF3`) at `P = 10` / `16` — the only process that carries them | the same label |
@@ -1427,9 +1472,10 @@ Decoder:
   / `4×1` over `1×1` chroma decodes to the native planar `Yuv444P` /
   `Yuv422P` / `Yuv420P` / `Yuv411P` (`…P12Le` at `P = 12`); every other
   legal combination (`4×2` or `1×2` luma, mixed chroma factors, chroma
-  oversampled relative to luma, …) is resampled onto the frame grid by
-  nearest-neighbour replication and emitted as 4:4:4. Verified within
-  ±1 of `djpeg -nosmooth` (`tests/fixtures/sampling/`).
+  oversampled relative to luma, …) is resampled onto the frame grid
+  (`DecodeOptions::upsampling`; lossless frames replicate) and emitted
+  as 4:4:4. With `ChromaUpsampling::Replicate` the result is within ±1
+  of `djpeg -nosmooth` (`tests/fixtures/sampling/`).
 - **Non-interleaved scans** (one `SOS` per component, sequential or
   progressive) cover the component's own `ceil(xi / 8) × ceil(yi / 8)`
   block extent (§A.2.2 / §A.2.4), not the MCU-padded grid.

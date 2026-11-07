@@ -842,7 +842,7 @@ impl JpegImage {
 
     /// Convert to tightly packed 8-bit RGB (`3 × width` bytes per row),
     /// whatever the native layout — see [`crate::convert`] for the
-    /// kernels (T.871 §7 YCbCr→RGB, nearest-neighbour chroma
+    /// kernels (T.871 §7 YCbCr→RGB, luma-guided chroma
     /// upsampling, CMYK ink inversion, deep samples rescaled to 8 bits).
     pub fn to_rgb8(&self) -> Vec<u8> {
         crate::convert::to_rgb8(self)
@@ -1017,20 +1017,41 @@ pub enum IdctMethod {
 }
 
 /// How subsampled chroma is brought to the luma grid.
+///
+/// Every kernel but [`Self::Replicate`] honours the T.871 §9 centred
+/// siting. Measured on photographic and synthetic RGB references
+/// encoded at 4:2:0 / 4:2:2 / 4:1:1 (README, *Chroma reconstruction*),
+/// [`Self::LumaGuided`] gives the highest SSIM everywhere and the
+/// highest PSNR on photographic content, so it is the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ChromaUpsampling {
     /// Sample replication: pixel `(x, y)` reads chroma sample
-    /// `(x · Hc / Hmax, y · Vc / Vmax)` (default).
-    #[default]
+    /// `(x · Hc / Hmax, y · Vc / Vmax)` (the historical default).
     Replicate,
     /// Triangular ("linear") interpolation for the 2:1 horizontal, 2:1
     /// vertical and 2 × 2 ratios: each output sample weights its two
     /// nearest chroma samples ¾ / ¼ along every subsampled axis, honouring
     /// the T.871 §9 centred siting, with edge samples replicated and the
     /// rounding biases of `djpeg`'s default output. Other ratios fall back
-    /// to replication.
+    /// to replication. Part of the reference-compatible set
+    /// ([`DecodeOptions::libjpeg_compatible`]).
     Triangular,
+    /// Centred-siting linear interpolation for every sampling ratio
+    /// (2:1, 4:1, 4:4:0's vertical 2:1, and the non-integer ratios of
+    /// mixed layouts), edge samples replicated, no intermediate
+    /// rounding — the interpolated chroma reaches the YCbCr kernel with
+    /// its fraction. Cheaper than [`Self::LumaGuided`].
+    Linear,
+    /// [`Self::Linear`] plus the luma detail lost to subsampling, scaled
+    /// by the local chroma-on-luma regression slope and clamped to the
+    /// chroma neighbourhood's range: edges shared by luma and chroma stay
+    /// sharp, uncorrelated chroma falls back to the linear estimate
+    /// (default). Applies to YCbCr components at integer ratios to a
+    /// full-resolution luma component; anything else (non-integer
+    /// ratios, CMYK / YCCK, RGB-coded components) uses [`Self::Linear`].
+    #[default]
+    LumaGuided,
 }
 
 /// YCbCr → RGB arithmetic (T.871 §7).
@@ -1060,7 +1081,8 @@ pub struct ConvertOptions {
 }
 
 impl ConvertOptions {
-    /// The defaults: replication, exact T.871 arithmetic.
+    /// The defaults: luma-guided chroma reconstruction, exact T.871
+    /// arithmetic.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1084,7 +1106,7 @@ impl ConvertOptions {
             self.with_upsampling(ChromaUpsampling::Triangular)
                 .with_ycbcr(YcbcrKernel::FixedPoint16)
         } else {
-            self.with_upsampling(ChromaUpsampling::Replicate)
+            self.with_upsampling(ChromaUpsampling::LumaGuided)
                 .with_ycbcr(YcbcrKernel::Exact)
         }
     }
@@ -1144,7 +1166,7 @@ pub struct DecodeOptions {
     /// Chroma upsampling: used by the decoder itself when a sampling
     /// layout without a planar format is resampled to 4:4:4, and by
     /// [`crate::decode_rgb8_with`] / [`crate::decode_rgba8_with`] for the
-    /// planar subsampled layouts (default [`ChromaUpsampling::Replicate`]).
+    /// planar subsampled layouts (default [`ChromaUpsampling::LumaGuided`]).
     pub upsampling: ChromaUpsampling,
     /// YCbCr → RGB kernel of [`crate::decode_rgb8_with`] /
     /// [`crate::decode_rgba8_with`] (default [`YcbcrKernel::Exact`]).
@@ -1161,7 +1183,7 @@ impl Default for DecodeOptions {
             strict: false,
             tables: None,
             idct: IdctMethod::Float,
-            upsampling: ChromaUpsampling::Replicate,
+            upsampling: ChromaUpsampling::LumaGuided,
             ycbcr: YcbcrKernel::Exact,
         }
     }
@@ -1230,7 +1252,7 @@ impl DecodeOptions {
                 .with_ycbcr(YcbcrKernel::FixedPoint16)
         } else {
             self.with_idct(IdctMethod::Float)
-                .with_upsampling(ChromaUpsampling::Replicate)
+                .with_upsampling(ChromaUpsampling::LumaGuided)
                 .with_ycbcr(YcbcrKernel::Exact)
         }
     }

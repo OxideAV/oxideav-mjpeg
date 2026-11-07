@@ -1777,30 +1777,60 @@ fn shape_yuv_planes<T: Copy + Default + Into<u32> + TryFrom<u32>>(
                 .map(|ci| {
                     let hi = sof.components[ci].h_factor as usize;
                     let vi = sof.components[ci].v_factor as usize;
-                    if upsampling == ChromaUpsampling::Triangular
-                        && h_max.is_multiple_of(hi)
-                        && v_max.is_multiple_of(vi)
-                    {
-                        let get =
-                            |x: usize, y: usize| -> u32 { comp[ci][y * stride[ci] + x].into() };
-                        let c = crate::jpeg::upsample::Component {
-                            width: (width * hi).div_ceil(h_max),
-                            height: (height * vi).div_ceil(v_max),
-                            get: &get,
-                        };
-                        if let Some(v) = crate::jpeg::upsample::triangular(
-                            &c,
-                            h_max / hi,
-                            v_max / vi,
-                            width,
-                            height,
-                        ) {
-                            let full: Vec<T> = v
-                                .into_iter()
-                                .map(|s| T::try_from(s).unwrap_or_default())
-                                .collect();
-                            return emit(&full, width, width, height);
+                    let get = |x: usize, y: usize| -> u32 { comp[ci][y * stride[ci] + x].into() };
+                    let (cw, ch) = ((width * hi).div_ceil(h_max), (height * vi).div_ceil(v_max));
+                    let interpolated: Option<Vec<u32>> = match upsampling {
+                        _ if (hi, vi) == (h_max, v_max) => None,
+                        ChromaUpsampling::Triangular
+                            if h_max.is_multiple_of(hi) && v_max.is_multiple_of(vi) =>
+                        {
+                            let c = crate::jpeg::upsample::Component {
+                                width: cw,
+                                height: ch,
+                                get: &get,
+                            };
+                            crate::jpeg::upsample::triangular(
+                                &c,
+                                h_max / hi,
+                                v_max / vi,
+                                width,
+                                height,
+                            )
                         }
+                        ChromaUpsampling::Linear | ChromaUpsampling::LumaGuided => {
+                            let luma0 = sof.components[0].h_factor as usize == h_max
+                                && sof.components[0].v_factor as usize == v_max;
+                            let gy =
+                                |x: usize, y: usize| -> u32 { comp[0][y * stride[0] + x].into() };
+                            let guide = (upsampling == ChromaUpsampling::LumaGuided
+                                && ci > 0
+                                && luma0
+                                && h_max.is_multiple_of(hi)
+                                && v_max.is_multiple_of(vi))
+                            .then_some((
+                                &gy as &dyn Fn(usize, usize) -> u32,
+                                (h_max / hi, v_max / vi),
+                            ));
+                            Some(crate::jpeg::resample::reconstruct(
+                                &get,
+                                cw,
+                                ch,
+                                (hi, h_max),
+                                (vi, v_max),
+                                width,
+                                height,
+                                (1u32 << sof.precision.clamp(1, 16)) - 1,
+                                guide,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some(v) = interpolated {
+                        let full: Vec<T> = v
+                            .into_iter()
+                            .map(|s| T::try_from(s).unwrap_or_default())
+                            .collect();
+                        return emit(&full, width, width, height);
                     }
                     let mut full = vec![T::default(); width * height];
                     for y in 0..height {
@@ -3209,25 +3239,43 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
                 sof.components[3].v_factor as usize,
             ];
             let transform = state.adobe_transform;
-            // A subsampled component at a 2:1 / 1:2 / 2 × 2 ratio goes
-            // through the triangular kernel when the options ask for it
-            // (as the three-component path); otherwise samples are
-            // replicated.
+            // A subsampled component goes through the selected kernel:
+            // triangular at the 2:1 / 1:2 / 2 × 2 ratios, linear at every
+            // ratio for `Linear` / `LumaGuided` (no luma guide among
+            // C, M, Y, K); otherwise samples are replicated.
             let full: Vec<Option<Vec<u32>>> = (0..4)
                 .map(|ci| {
-                    if state.upsampling != ChromaUpsampling::Triangular
+                    if state.upsampling == ChromaUpsampling::Replicate
                         || (fh[ci] == h_max && fv[ci] == v_max)
-                        || !h_max.is_multiple_of(fh[ci])
-                        || !v_max.is_multiple_of(fv[ci])
                     {
                         return None;
                     }
                     let get = |x: usize, y: usize| -> u32 {
                         comp_buf[ci][y * comp_stride[ci] + x] as u32
                     };
+                    let (cw, ch) = (
+                        (width * fh[ci]).div_ceil(h_max),
+                        (height * fv[ci]).div_ceil(v_max),
+                    );
+                    if state.upsampling != ChromaUpsampling::Triangular {
+                        return Some(crate::jpeg::resample::reconstruct(
+                            &get,
+                            cw,
+                            ch,
+                            (fh[ci], h_max),
+                            (fv[ci], v_max),
+                            width,
+                            height,
+                            255,
+                            None,
+                        ));
+                    }
+                    if !h_max.is_multiple_of(fh[ci]) || !v_max.is_multiple_of(fv[ci]) {
+                        return None;
+                    }
                     let c = crate::jpeg::upsample::Component {
-                        width: (width * fh[ci]).div_ceil(h_max),
-                        height: (height * fv[ci]).div_ceil(v_max),
+                        width: cw,
+                        height: ch,
                         get: &get,
                     };
                     crate::jpeg::upsample::triangular(

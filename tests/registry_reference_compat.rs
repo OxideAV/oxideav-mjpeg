@@ -114,7 +114,9 @@ fn typed_options_and_schema() {
         .with_upsampling("replicate");
     assert_eq!(
         o.to_decode_options().unwrap(),
-        DecodeOptions::new().with_idct(IdctMethod::AccurateInteger)
+        DecodeOptions::new()
+            .with_idct(IdctMethod::AccurateInteger)
+            .with_upsampling(ChromaUpsampling::Replicate)
     );
     assert_eq!(
         MjpegDecoderOptions::default().to_decode_options().unwrap(),

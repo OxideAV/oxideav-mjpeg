@@ -24,7 +24,16 @@
 //! 4:4:4 upsampled), `2x2,2x1,1x2` (mixed chroma factors) and
 //! `1x1,2x2,2x2` (chroma oversampled relative to luma — legal, exotic).
 
-use oxideav_mjpeg::decode;
+use oxideav_mjpeg::{ChromaUpsampling, ConvertOptions, DecodeOptions, JpegImage};
+
+/// The oracle (`djpeg -nosmooth`) replicates resampled components, so
+/// these geometry checks decode with replication too.
+fn decode(jpeg: &[u8]) -> oxideav_mjpeg::Result<JpegImage> {
+    oxideav_mjpeg::decode_with(
+        jpeg,
+        &DecodeOptions::new().with_upsampling(ChromaUpsampling::Replicate),
+    )
+}
 use oxideav_mjpeg::encoder::{encode_lossless_arith_jpeg_yuv, encode_lossless_jpeg_yuv};
 
 const W: usize = 25;
@@ -277,7 +286,7 @@ fn ffmpeg_style_422_is_native_422() {
     let header = b"P6\n37 29\n255\n";
     assert_eq!(&oracle[..header.len()], header);
     let want = &oracle[header.len()..];
-    let got = img.to_rgb8();
+    let got = img.to_rgb8_with(&ConvertOptions::new().with_upsampling(ChromaUpsampling::Replicate));
     assert_eq!(got.len(), want.len());
     let worst = got
         .iter()

@@ -917,7 +917,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
 /// |--------------------|----------------------------------------|--------------|
 /// | `reference_compat` | bool: the opt-in decode bit-exact against `djpeg`'s defaults ([`crate::DecodeOptions::with_reference_compat`]) | `false` |
 /// | `idct`             | `float` \| `integer`: [`crate::IdctMethod`] `Float` / `AccurateInteger` (overrides `reference_compat`) | from `reference_compat` |
-/// | `upsampling`       | `replicate` \| `triangular`: [`crate::ChromaUpsampling`] for the layouts the decoder resamples to 4:4:4 (overrides `reference_compat`) | from `reference_compat` |
+/// | `upsampling`       | `replicate` \| `triangular` \| `linear` \| `guided`: [`crate::ChromaUpsampling`] for the layouts the decoder resamples to 4:4:4 (overrides `reference_compat`) | from `reference_compat` |
 ///
 /// The registry decoder emits planar frames, so the YCbCr → RGB kernel
 /// of `reference_compat` only matters to callers converting with
@@ -932,7 +932,8 @@ pub struct MjpegDecoderOptions {
     pub reference_compat: bool,
     /// Empty = from `reference_compat`; else `float` / `integer`.
     pub idct: String,
-    /// Empty = from `reference_compat`; else `replicate` / `triangular`.
+    /// Empty = from `reference_compat`; else `replicate` / `triangular` /
+    /// `linear` / `guided`.
     pub upsampling: String,
 }
 
@@ -954,7 +955,8 @@ impl MjpegDecoderOptions {
         self
     }
 
-    /// `"replicate"` or `"triangular"` (empty = from `reference_compat`).
+    /// `"replicate"`, `"triangular"`, `"linear"` or `"guided"` (empty =
+    /// from `reference_compat`).
     pub fn with_upsampling(mut self, upsampling: impl Into<String>) -> Self {
         self.upsampling = upsampling.into();
         self
@@ -989,9 +991,11 @@ impl MjpegDecoderOptions {
             "" => {}
             "replicate" => o = o.with_upsampling(crate::ChromaUpsampling::Replicate),
             "triangular" => o = o.with_upsampling(crate::ChromaUpsampling::Triangular),
+            "linear" => o = o.with_upsampling(crate::ChromaUpsampling::Linear),
+            "guided" => o = o.with_upsampling(crate::ChromaUpsampling::LumaGuided),
             other => {
                 return Err(Error::invalid(format!(
-                    "MJPEG decoder: upsampling '{other}' (replicate / triangular)"
+                    "MJPEG decoder: upsampling '{other}' (replicate / triangular / linear / guided)"
                 )));
             }
         }
@@ -1015,9 +1019,9 @@ impl CodecOptionsStruct for MjpegDecoderOptions {
         },
         OptionField {
             name: "upsampling",
-            kind: OptionKind::Enum(&["replicate", "triangular"]),
+            kind: OptionKind::Enum(&["replicate", "triangular", "linear", "guided"]),
             default: OptionValue::String(String::new()),
-            help: "chroma upsampling for layouts resampled to 4:4:4: replicate or triangular (3/4-1/4); unset = from reference_compat",
+            help: "chroma upsampling for layouts resampled to 4:4:4: replicate, triangular (3/4-1/4), linear (centred, every ratio) or guided (luma-guided, the default); unset = from reference_compat",
         },
     ];
 

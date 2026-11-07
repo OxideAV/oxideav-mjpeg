@@ -451,7 +451,14 @@ fn cells_for(p: PixelFormat) -> Vec<Cell> {
 }
 
 /// Expected decoded samples of plane `i` for source layout `p`.
-fn expected_plane(p: PixelFormat, src: &[Vec<u16>], i: usize, w: u32, h: u32) -> Vec<u16> {
+fn expected_plane(
+    p: PixelFormat,
+    src: &[Vec<u16>],
+    i: usize,
+    w: u32,
+    h: u32,
+    lossless: bool,
+) -> Vec<u16> {
     let (_, _, planes, channels, (dh, dv)) = facts(p);
     if planes == 1 {
         // Packed: interleave the channels (complemented ink for
@@ -468,14 +475,33 @@ fn expected_plane(p: PixelFormat, src: &[Vec<u16>], i: usize, w: u32, h: u32) ->
             }
         }
         out
-    } else if p == P::Yuv440P && i > 0 {
-        // The decoder replicates 4:4:0 chroma onto the frame grid.
+    } else if p == P::Yuv440P && i > 0 && lossless {
+        // Lossless frames replicate 4:4:0 chroma onto the frame grid.
         let (w, h) = (w as usize, h as usize);
         let cw = w.div_ceil(dh);
         let mut out = Vec::with_capacity(w * h);
         for y in 0..h {
             for x in 0..w {
                 out.push(src[i][(y / dv) * cw + x / dh]);
+            }
+        }
+        out
+    } else if p == P::Yuv440P && i > 0 {
+        // The DCT processes resample 4:4:0 chroma onto the frame grid;
+        // the default reconstruction starts from centred-siting linear
+        // interpolation (T.871 §9: chroma row `j` sits at luma row
+        // `2j + ½`), which is the reference here.
+        let (w, h) = (w as usize, h as usize);
+        let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let u = ((y as f64 + 0.5) / dv as f64 - 0.5).max(0.0);
+            let (j0, f) = (u.floor() as usize, u.fract());
+            let (j0, j1) = (j0.min(ch - 1), (j0 + 1).min(ch - 1));
+            for x in 0..w {
+                let a = src[i][j0 * cw + x / dh] as f64;
+                let b = src[i][j1 * cw + x / dh] as f64;
+                out.push((a + f * (b - a)).round() as u16);
             }
         }
         out
@@ -526,7 +552,7 @@ fn every_declared_layout_encodes_decodes_and_labels_truthfully() {
                         break;
                     }
                     let got = plane_samples(&v, label, i, w, h);
-                    let want = expected_plane(p, &src, i, w, h);
+                    let want = expected_plane(p, &src, i, w, h, cell.lossless);
                     if cell.lossless {
                         assert_eq!(got, want, "{tag}: plane {i} bit-exact");
                     } else {
@@ -741,7 +767,7 @@ fn chroma_option_converts_rgb_and_keeps_luma_of_ycbcr() {
         let img = oxideav_mjpeg::decode(&bytes).unwrap();
         let back = img.to_rgb8();
         let got: Vec<u16> = back.iter().map(|&b| u16::from(b)).collect();
-        let want = expected_plane(P::Rgb24, &src, 0, w, h);
+        let want = expected_plane(P::Rgb24, &src, 0, w, h, false);
         if label == P::Gray8 {
             // Grey: every channel is the luma; compare against Y.
             let luma: Vec<u16> = want
@@ -904,7 +930,7 @@ fn abbreviated_streams_for_every_declared_layout_decode_with_extradata() {
             assert_eq!(v.planes.len(), dplanes, "{p:?}");
             for i in 0..dplanes {
                 let got = plane_samples(&v, label, i, w, h);
-                let want = expected_plane(p, &src, i, w, h);
+                let want = expected_plane(p, &src, i, w, h, is_lossless_only(p));
                 if is_lossless_only(p) {
                     assert_eq!(got, want, "{p:?}: plane {i}");
                 } else {

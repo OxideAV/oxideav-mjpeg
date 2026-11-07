@@ -15,13 +15,14 @@
 //!   rounding step. Full range is assumed for every YCbCr layout: T.871
 //!   fixes it for JFIF and T.872 §6.1 extends the T.871 relationship to
 //!   every three-component JPEG without an Adobe RGB flag.
-//! * **Chroma upsampling** is nearest-neighbour sample replication:
-//!   pixel `(x, y)` reads chroma sample `(x / h, y / v)` for divisors
-//!   `(h, v)` — i.e. the inverse of the T.81 §A.1.1 component-dimension
-//!   expressions. T.871 §9 sites subsampled chroma centred between luma
-//!   samples; no interpolation filter is applied (the spec leaves the
-//!   reconstruction filter to the decoder). This rule is fixed so a
-//!   given stream always yields the same RGB bytes.
+//! * **Chroma upsampling** (planar subsampled layouts) is selected by
+//!   [`ConvertOptions::upsampling`]; the default
+//!   [`ChromaUpsampling::LumaGuided`] interpolates at the T.871 §9
+//!   centred siting and restores luma-correlated detail
+//!   (`crate::jpeg::resample`). The interpolated chroma enters the YCbCr
+//!   equations with its fraction (to `1/256` of a sample), so there is
+//!   still one rounding. [`ChromaUpsampling::Replicate`] reads chroma
+//!   sample `(x / h, y / v)` for divisors `(h, v)`.
 //! * **Grayscale** replicates the sample into R, G and B.
 //! * **CMYK** (plain ink amounts, `(0, 0, 0, 0)` = white — the decoder
 //!   has already undone the Adobe APP14 complement and the YCCK
@@ -39,11 +40,10 @@
 //! Alpha is always `255`: JPEG has no alpha channel.
 //!
 //! [`to_rgb8_with`] / [`to_rgba8_with`] select other kernels for the
-//! planar YCbCr layouts through [`ConvertOptions`]: triangular chroma
-//! upsampling (¾ / ¼ interpolation for the
-//! 2:1, 1:2 and 2 × 2 ratios) and the 16-bit fixed-point YCbCr kernel
+//! planar YCbCr layouts through [`ConvertOptions`], among them triangular
+//! chroma upsampling (¾ / ¼ interpolation for the 2:1, 1:2 and 2 × 2
+//! ratios) and the 16-bit fixed-point YCbCr kernel
 //! ([`ycbcr_to_rgb8_fixed16`]); both are what `djpeg` applies by default.
-//! The default options are the kernels above.
 
 use crate::image::{
     ChromaUpsampling, ConvertOptions, JpegImage, MjpegPixelFormat as F, YcbcrKernel,
@@ -169,7 +169,15 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) 
             let bps = img.format.bytes_per_sample();
             let (dh, dv) = img.format.chroma_divisors();
             let (py, pcb, pcr) = (&img.planes[0], &img.planes[1], &img.planes[2]);
-            if *opts != ConvertOptions::new() {
+            let replicate = opts.upsampling == ChromaUpsampling::Replicate || (dh, dv) == (1, 1);
+            if !replicate {
+                match opts.upsampling {
+                    ChromaUpsampling::Triangular => fill_ycbcr_with(img, out, bpp, opts, maxval),
+                    _ => fill_ycbcr_interp(img, out, bpp, opts, maxval),
+                }
+                return;
+            }
+            if opts.ycbcr != YcbcrKernel::Exact {
                 fill_ycbcr_with(img, out, bpp, opts, maxval);
                 return;
             }
@@ -329,6 +337,108 @@ fn fill_ycbcr_with(
             out[o + 2] = b;
         }
     }
+}
+
+/// The planar YCbCr layouts under [`ChromaUpsampling::Linear`] /
+/// [`ChromaUpsampling::LumaGuided`]: chroma reconstructed row by row in
+/// `f32` (`crate::jpeg::resample`) and handed to the YCbCr kernel with
+/// its fraction (to `1/256` of a sample), so the result is rounded once.
+fn fill_ycbcr_interp(
+    img: &JpegImage,
+    out: &mut [u8],
+    bpp: usize,
+    opts: &ConvertOptions,
+    maxval: u32,
+) {
+    use crate::jpeg::resample::{Guided, Linear};
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let bps = img.format.bytes_per_sample();
+    let (dh, dv) = img.format.chroma_divisors();
+    let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
+    let plane = |p: &crate::image::Plane, pw: usize, ph: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(pw * ph);
+        for y in 0..ph {
+            v.extend((0..pw).map(|x| sample(p, bps, x, y) as f32));
+        }
+        v
+    };
+    let luma = plane(&img.planes[0], w, h);
+    enum Recon {
+        Lin(Linear),
+        Guide(Guided),
+    }
+    let guided = opts.upsampling == ChromaUpsampling::LumaGuided;
+    let make = |p: &crate::image::Plane| {
+        let c = plane(p, cw, ch);
+        if guided {
+            Recon::Guide(Guided::new(&luma, c, cw, ch, dh, dv, w, h, maxval))
+        } else {
+            Recon::Lin(Linear::new(c, cw, ch, (1, dh), (1, dv), w, h))
+        }
+    };
+    let mut recon = [make(&img.planes[1]), make(&img.planes[2])];
+    let mut rows = [vec![0f32; w], vec![0f32; w]];
+    let fixed = opts.ycbcr == YcbcrKernel::FixedPoint16 && maxval == 255;
+    for y in 0..h {
+        let lrow = &luma[y * w..][..w];
+        for (r, row) in recon.iter_mut().zip(rows.iter_mut()) {
+            match r {
+                Recon::Lin(l) => l.row(y, row),
+                Recon::Guide(g) => g.row(y, lrow, row),
+            }
+        }
+        let dst = &mut out[y * w * bpp..][..w * bpp];
+        for (x, px) in dst.chunks_exact_mut(bpp).enumerate() {
+            let yy = lrow[x] as u32;
+            let (cb, cr) = (rows[0][x], rows[1][x]);
+            let (r, g, b) = if fixed {
+                let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
+                ycbcr_to_rgb8_fixed16(yy, q(cb), q(cr))
+            } else {
+                let q = |v: f32| (v * 256.0).round() as i64;
+                ycbcr_frac_to_rgb8(yy, q(cb), q(cr), maxval)
+            };
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+        }
+    }
+}
+
+/// [`ycbcr_to_rgb8`] with the chroma given in `1/256` sample units
+/// (`cb256 = round(CB · 256)`), exact, one rounding:
+///
+/// ```text
+/// R = Round(255 (256000 Y + 1402 cr'') / (256000 D))
+/// G = Round(255 (150272000 Y − 202008 cb'' − 419198 cr'') / (150272000 D))
+/// B = Round(255 (256000 Y + 1772 cb'') / (256000 D))
+/// ```
+///
+/// with `cb'' = cb256 − 256 · half`. At `D = 255` the outer `255`
+/// cancels and the denominators are constants.
+#[inline]
+pub(crate) fn ycbcr_frac_to_rgb8(y: u32, cb256: i64, cr256: i64, maxval: u32) -> (u8, u8, u8) {
+    let y = y as i64;
+    if maxval == 255 {
+        let cb = cb256 - 128 * 256;
+        let cr = cr256 - 128 * 256;
+        let r = round_div(256_000 * y + 1402 * cr, 256_000);
+        let g = round_div(150_272_000 * y - 202_008 * cb - 419_198 * cr, 150_272_000);
+        let b = round_div(256_000 * y + 1772 * cb, 256_000);
+        return (clamp8(r), clamp8(g), clamp8(b));
+    }
+    let d = maxval as i64;
+    let half = (d + 1) / 2;
+    let cb = cb256 - half * 256;
+    let cr = cr256 - half * 256;
+    let r = round_div(255 * (256_000 * y + 1402 * cr), 256_000 * d);
+    let g = round_div(
+        255 * (150_272_000 * y - 202_008 * cb - 419_198 * cr),
+        150_272_000 * d,
+    );
+    let b = round_div(255 * (256_000 * y + 1772 * cb), 256_000 * d);
+    (clamp8(r), clamp8(g), clamp8(b))
 }
 
 /// `round(1.402 · 2^16)` — the T.871 §7 Cr → R coefficient.
@@ -532,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn yuv420_upsampling_is_nearest_neighbour() {
+    fn yuv420_replicate_upsampling_is_nearest_neighbour() {
         // 3×2 picture, 4:2:0: chroma plane is 2×1. Grey luma with a
         // red-shifted Cr in the first chroma sample and neutral in the
         // second; pixels x = 0, 1 share chroma 0, pixel x = 2 reads
@@ -548,7 +658,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let rgb = to_rgb8(&img);
+        let rep = ConvertOptions::new().with_upsampling(ChromaUpsampling::Replicate);
+        let rgb = to_rgb8_with(&img, &rep);
         let px = |x: usize, y: usize| &rgb[(y * 3 + x) * 3..(y * 3 + x) * 3 + 3];
         let red = ycbcr_to_rgb8(128, 128, 200, 255);
         assert_eq!(px(0, 0), &[red.0, red.1, red.2]);
@@ -557,7 +668,56 @@ mod tests {
         assert_eq!(px(2, 1), &[128, 128, 128]);
         // The J label converts identically.
         let j = JpegImage::new(3, 2, F::YuvJ420P, img.planes.clone()).unwrap();
-        assert_eq!(to_rgb8(&j), rgb);
+        assert_eq!(to_rgb8_with(&j, &rep), rgb);
+    }
+
+    #[test]
+    fn default_upsampling_interpolates_with_centred_siting() {
+        // 4 × 1 picture, 4:2:2, flat luma: chroma samples 100 and 200
+        // sit at x = 0.5 and x = 2.5. Linear interpolation gives 100,
+        // 125, 175, 200 (edges replicated); flat luma leaves the
+        // luma-guided default on the linear estimate.
+        let img = JpegImage::new(
+            4,
+            1,
+            F::YuvJ422P,
+            vec![
+                Plane::new(4, vec![128; 4]),
+                Plane::new(2, vec![100, 200]),
+                Plane::new(2, vec![128, 128]),
+            ],
+        )
+        .unwrap();
+        let want: Vec<u8> = [100.0f32, 125.0, 175.0, 200.0]
+            .iter()
+            .flat_map(|&cb| {
+                let (r, g, b) = ycbcr_frac_to_rgb8(128, (cb * 256.0) as i64, 128 * 256, 255);
+                [r, g, b]
+            })
+            .collect();
+        assert_eq!(to_rgb8(&img), want);
+        let lin = ConvertOptions::new().with_upsampling(ChromaUpsampling::Linear);
+        assert_eq!(to_rgb8_with(&img, &lin), want);
+    }
+
+    #[test]
+    fn fractional_chroma_kernel_agrees_with_the_integer_one() {
+        for y in (0..=255u32).step_by(5) {
+            for cb in (0..=255u32).step_by(7) {
+                for cr in (0..=255u32).step_by(11) {
+                    let f = |v: u32| v as i64 * 256;
+                    assert_eq!(
+                        ycbcr_frac_to_rgb8(y, f(cb), f(cr), 255),
+                        ycbcr_to_rgb8(y, cb, cr, 255)
+                    );
+                    let g = |v: u32| v as i64 * 16 * 256;
+                    assert_eq!(
+                        ycbcr_frac_to_rgb8(y * 16, g(cb), g(cr), 4095),
+                        ycbcr_to_rgb8(y * 16, cb * 16, cr * 16, 4095)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

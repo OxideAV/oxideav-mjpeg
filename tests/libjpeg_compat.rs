@@ -215,7 +215,7 @@ fn reference_compat_switch() {
 }
 
 #[test]
-fn defaults_are_unchanged() {
+fn default_entry_points_agree_on_the_quality_defaults() {
     for row in oracle() {
         let jpeg = std::fs::read(format!("{DIR}/{}", row.name)).unwrap();
         let plain = decode_rgb8(&jpeg).unwrap();
@@ -226,7 +226,10 @@ fn defaults_are_unchanged() {
         assert_eq!(img.to_rgba8(), img.to_rgba8_with(&ConvertOptions::new()));
     }
     assert_eq!(DecodeOptions::new().idct, IdctMethod::Float);
-    assert_eq!(DecodeOptions::new().upsampling, ChromaUpsampling::Replicate);
+    assert_eq!(
+        DecodeOptions::new().upsampling,
+        ChromaUpsampling::LumaGuided
+    );
     assert_eq!(DecodeOptions::new().ycbcr, YcbcrKernel::Exact);
 }
 

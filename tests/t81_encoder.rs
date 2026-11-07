@@ -6,10 +6,10 @@
 use std::io::Write;
 use std::process::Command;
 
-use oxideav_mjpeg::decode;
 use oxideav_mjpeg::t81::{
     ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet,
 };
+use oxideav_mjpeg::{ChromaUpsampling, DecodeOptions, decode, decode_with};
 use oxideav_mjpeg::{SofKind, inspect_jpeg};
 
 const W: u32 = 37;
@@ -102,7 +102,14 @@ fn read_plane(stride: usize, data: &[u8], w: usize, h: usize, bps: usize) -> Vec
 /// (possibly subsampled chroma), packed `Rgb24` / `Rgb48Le` / `Cmyk`,
 /// planar `Gbrp*Le` (G, B, R order).
 fn decoded_components(jpeg: &[u8], nf: usize, p: u8, sampling: &[(u8, u8)]) -> Vec<Vec<u32>> {
-    let f = decode(jpeg).expect("our decoder rejects our stream");
+    // The reference below replicates resampled components, so the
+    // decoder is asked to replicate too: this test checks the writer's
+    // geometry, not the reconstruction filter.
+    let f = decode_with(
+        jpeg,
+        &DecodeOptions::new().with_upsampling(ChromaUpsampling::Replicate),
+    )
+    .expect("our decoder rejects our stream");
     let (w, h) = (W as usize, H as usize);
     // Bytes per sample from the geometry: plane 0 of a planar frame is
     // always full-width; a packed frame is `nf` samples per pixel.

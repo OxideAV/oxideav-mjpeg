@@ -7,7 +7,15 @@
 //! (libjpeg-turbo 3.2.0 `cjpeg`, `jpegtran -arithmetic`, `ffmpeg`): 4:4:4,
 //! 4:2:2, 4:2:0, 4:4:0, 4:1:1, 4×2 luma, mixed chroma factors, ffmpeg's
 //! `Y 2×2 / C 1×2` 4:2:2, grey, progressive, restart intervals, arithmetic
-//! coding, quality 10 and 100, and frames of 1×1 to 9×9 pixels.
+//! coding, quality 10 and 100, and frames of 1×1 to 9×9 pixels. Added
+//! for #19: `idct_blocks.jpg` (crafted quant-1 stream: an impulse of
+//! ±1 / 7 / −100 / 1000 at every coefficient position plus 192 random
+//! blocks — the blocks that pinned the integer IDCT), `idct_dc_sweep.jpg`
+//! (`Q00 = 16` flat blocks reconstructing to `−1792 … 2304`: the range
+//! limit), `own_*.jpg` (this crate's encoder: 17×15 / 37×29 / 3×5 at
+//! 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 / grey, sequential / progressive /
+//! restart) and `up_*.jpg` (`cjpeg -quality 100` noise of 2 to 7 pixels
+//! at 2:1, 1:2 and 2 × 2: the chroma edge rules).
 //! `oracle.txt` lists, per file, the FNV-1a-64 hash of the sample bytes
 //! `djpeg -pnm <file>` writes (default options: accurate-integer IDCT,
 //! interpolating chroma upsampling). Regenerate a line with
@@ -25,9 +33,9 @@
 //! byte; the test skips that half silently when the library is missing.
 
 use oxideav_mjpeg::{
-    ChromaUpsampling, ConvertOptions, DecodeOptions, EncodeOptions, IdctMethod, JpegImage,
-    MjpegPixelFormat, Plane, YcbcrKernel, decode, decode_rgb8, decode_rgb8_with, decode_with,
-    encode_rgb8,
+    ChromaSubsampling, ChromaUpsampling, ConvertOptions, DecodeOptions, EncodeOptions, IdctMethod,
+    JpegImage, MjpegPixelFormat, Plane, YcbcrKernel, decode, decode_rgb8, decode_rgb8_with,
+    decode_with, encode_rgb8,
 };
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/libjpeg");
@@ -86,8 +94,8 @@ fn djpeg_like(jpeg: &[u8], opts: &DecodeOptions) -> (u32, u32, Vec<u8>) {
 #[test]
 fn compatible_mode_matches_the_committed_djpeg_oracle() {
     let rows = oracle();
-    assert!(rows.len() >= 20, "oracle has {} rows", rows.len());
-    let opts = DecodeOptions::libjpeg_compatible();
+    assert!(rows.len() >= 80, "oracle has {} rows", rows.len());
+    let opts = DecodeOptions::new().with_reference_compat(true);
     let mut mismatched = Vec::new();
     for row in &rows {
         let jpeg = std::fs::read(format!("{DIR}/{}", row.name)).unwrap();
@@ -131,6 +139,72 @@ fn twelve_bit_luma_matches_the_committed_djpeg_oracle() {
         rows += 1;
     }
     assert_eq!(rows, 3);
+}
+
+/// The YCbCr → RGB kernel against `djpeg` over every `(Cb, Cr)` pair:
+/// the committed hashes are of `djpeg -pnm`'s RGB for a crafted 4:4:4
+/// stream of flat quant-1 blocks (one block per `(Cb, Cr)`, `Y = 0` and
+/// `Y = 255`; DC-only blocks reconstruct exactly, so the samples entering
+/// the conversion are known), one pixel per block, raster `(Cb, Cr)`.
+/// The chroma offsets do not depend on `Y`, so the two luma levels see
+/// every offset unclamped.
+#[test]
+fn ycbcr_kernel_matches_djpeg_over_every_chroma_pair() {
+    for (y, want) in [
+        (0u8, 0xd18c_07c5_0dde_2ed5u64),
+        (255, 0xcc35_b53c_b93b_2304),
+    ] {
+        let plane = |f: &dyn Fn(usize, usize) -> u8| {
+            Plane::new(256, (0..256 * 256).map(|i| f(i % 256, i / 256)).collect())
+        };
+        let grid = JpegImage::new(
+            256,
+            256,
+            MjpegPixelFormat::YuvJ444P,
+            vec![
+                plane(&|_, _| y),
+                plane(&|x, _| x as u8),
+                plane(&|_, yy| yy as u8),
+            ],
+        )
+        .unwrap();
+        let rgb = grid.to_rgb8_with(&ConvertOptions::new().with_reference_compat(true));
+        assert_eq!(fnv1a64(&rgb), want, "Y = {y}");
+        // The exact T.871 kernel is a different function.
+        assert_ne!(fnv1a64(&grid.to_rgb8()), want, "Y = {y}");
+    }
+}
+
+/// `with_reference_compat` is the one switch: on = the three knobs,
+/// off = the defaults; other fields are kept.
+#[test]
+fn reference_compat_switch() {
+    let on = DecodeOptions::new()
+        .with_strict(true)
+        .with_reference_compat(true);
+    assert!(on.is_reference_compat());
+    assert!(on.strict);
+    assert_eq!(
+        on.clone().with_strict(false),
+        DecodeOptions::libjpeg_compatible()
+    );
+    assert_eq!(on.convert_options(), ConvertOptions::libjpeg_compatible());
+    assert!(on.convert_options().is_reference_compat());
+    let off = on.with_reference_compat(false);
+    assert!(!off.is_reference_compat());
+    assert_eq!(off, DecodeOptions::new().with_strict(true));
+    assert!(!DecodeOptions::new().is_reference_compat());
+    assert_eq!(
+        ConvertOptions::libjpeg_compatible().with_reference_compat(false),
+        ConvertOptions::new()
+    );
+    // One knob off is not the compatible set.
+    assert!(
+        !DecodeOptions::new()
+            .with_reference_compat(true)
+            .with_idct(IdctMethod::Float)
+            .is_reference_compat()
+    );
 }
 
 #[test]
@@ -219,21 +293,19 @@ fn card(w: u32, h: u32) -> Vec<u8> {
     v
 }
 
-/// Streams from this crate's encoder covering every layout.
+/// Streams from this crate's encoder covering every RGB-input layout.
 fn own_streams() -> Vec<(String, Vec<u8>)> {
-    let samplings: [&[(u8, u8)]; 7] = [
-        &[(1, 1), (1, 1), (1, 1)],
-        &[(2, 1), (1, 1), (1, 1)],
-        &[(2, 2), (1, 1), (1, 1)],
-        &[(1, 2), (1, 1), (1, 1)],
-        &[(4, 1), (1, 1), (1, 1)],
-        &[(2, 2), (1, 2), (1, 2)],
-        &[(2, 2), (2, 1), (1, 2)],
+    let layouts = [
+        ChromaSubsampling::Yuv444,
+        ChromaSubsampling::Yuv422,
+        ChromaSubsampling::Yuv420,
+        ChromaSubsampling::Yuv411,
+        ChromaSubsampling::GrayscaleOnly,
     ];
     let mut out = Vec::new();
     for (w, h) in [(1, 1), (3, 5), (2, 9), (37, 29), (64, 48)] {
         let rgb = card(w, h);
-        for s in samplings {
+        for s in layouts {
             for (tag, opts) in [
                 ("seq", EncodeOptions::new().with_quality(85)),
                 (
@@ -247,10 +319,9 @@ fn own_streams() -> Vec<(String, Vec<u8>)> {
                         .with_restart_interval(1),
                 ),
             ] {
-                let opts = opts.with_sampling(s.to_vec());
-                if let Ok(j) = encode_rgb8(w, h, &rgb, &opts) {
-                    out.push((format!("{w}x{h} {s:?} {tag}"), j));
-                }
+                let opts = opts.with_chroma(s);
+                let j = encode_rgb8(w, h, &rgb, &opts).unwrap();
+                out.push((format!("{w}x{h} {s:?} {tag}"), j));
             }
         }
     }

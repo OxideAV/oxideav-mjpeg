@@ -236,7 +236,8 @@ pub use jpeg::inspect::{
 // dragging in `oxideav-core`.
 #[cfg(feature = "registry")]
 pub use registry::{
-    __oxideav_entry, MjpegEncoderOptions, register, register_codecs, register_containers,
+    __oxideav_entry, MjpegDecoderOptions, MjpegEncoderOptions, register, register_codecs,
+    register_containers,
 };
 
 #[cfg(all(test, feature = "registry"))]

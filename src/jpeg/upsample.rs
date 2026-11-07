@@ -54,30 +54,56 @@ pub(crate) fn triangular(
     if rh == 2 && c.width <= 2 {
         return None;
     }
-    let at = |x: usize, y: usize| (c.get)(x.min(c.width - 1), y.min(c.height - 1));
-    // Neighbour index along a 2:1 axis for output position `p`: the chroma
-    // sample on the far side of the output sample.
-    let far = |p: usize, n: usize| {
+    let (cw, ch) = (c.width, c.height);
+    // Materialise the component once; the passes below index rows.
+    let mut src = vec![0u32; cw * ch];
+    for (y, row) in src.chunks_exact_mut(cw).enumerate() {
+        for (x, v) in row.iter_mut().enumerate() {
+            *v = (c.get)(x, y);
+        }
+    }
+    // Neighbour index along a 2:1 axis for output position `p` (chroma
+    // index `n`): the chroma sample on the far side of the output sample,
+    // replicated at both ends.
+    let far = |p: usize, n: usize, len: usize| {
         if p.is_multiple_of(2) {
             n.saturating_sub(1)
         } else {
-            n + 1
+            (n + 1).min(len - 1)
         }
     };
+    let row = |y: usize| &src[y.min(ch - 1) * cw..][..cw];
     let mut out = vec![0u32; out_w * out_h];
-    for y in 0..out_h {
-        let cy = y / rv;
-        for x in 0..out_w {
-            let cx = x / rh;
-            out[y * out_w + x] = match (rh, rv) {
-                (2, 1) => (3 * at(cx, cy) + at(far(x, cx), cy) + ONE_AXIS_BIAS[x % 2]) >> 2,
-                (1, 2) => (3 * at(cx, cy) + at(cx, far(y, cy)) + ONE_AXIS_BIAS[y % 2]) >> 2,
-                _ => {
-                    let fy = far(y, cy);
-                    let column = |xx: usize| 3 * at(xx, cy) + at(xx, fy);
-                    (3 * column(cx) + column(far(x, cx)) + TWO_AXIS_BIAS[x % 2]) >> 4
+    // One row of vertical sums `3 · near + far` (2 × 2 only).
+    let mut column = vec![0u32; cw];
+    for (y, dst) in out.chunks_exact_mut(out_w).enumerate() {
+        let cy = (y / rv).min(ch - 1);
+        match (rh, rv) {
+            (2, 1) => {
+                let r = row(cy);
+                for (x, o) in dst.iter_mut().enumerate() {
+                    let cx = (x / 2).min(cw - 1);
+                    *o = (3 * r[cx] + r[far(x, cx, cw)] + ONE_AXIS_BIAS[x % 2]) >> 2;
                 }
-            };
+            }
+            (1, 2) => {
+                let (near, other) = (row(cy), row(far(y, cy, ch)));
+                let bias = ONE_AXIS_BIAS[y % 2];
+                for (x, o) in dst.iter_mut().enumerate() {
+                    let cx = x.min(cw - 1);
+                    *o = (3 * near[cx] + other[cx] + bias) >> 2;
+                }
+            }
+            _ => {
+                let (near, other) = (row(cy), row(far(y, cy, ch)));
+                for (s, (&a, &b)) in column.iter_mut().zip(near.iter().zip(other)) {
+                    *s = 3 * a + b;
+                }
+                for (x, o) in dst.iter_mut().enumerate() {
+                    let cx = (x / 2).min(cw - 1);
+                    *o = (3 * column[cx] + column[far(x, cx, cw)] + TWO_AXIS_BIAS[x % 2]) >> 4;
+                }
+            }
         }
     }
     Some(out)

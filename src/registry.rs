@@ -320,6 +320,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder)
             .encoder_options::<MjpegEncoderOptions>()
+            .decoder_options::<MjpegDecoderOptions>()
             .tags([
                 // AVI FourCC claims — all unambiguous MJPEG variants.
                 CodecTag::fourcc(b"MJPG"),
@@ -360,6 +361,7 @@ oxideav_core::register!("mjpeg", register);
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let codec_id = params.codec_id.clone();
+    let decode = MjpegDecoderOptions::from_bag(&params.options)?.to_decode_options()?;
     // A T.81 §B.5 abbreviated table-specification stream in `extradata`
     // (TIFF `JPEGTables`) is preloaded ahead of every packet, so
     // table-less abbreviated image streams decode.
@@ -367,6 +369,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         .then(|| params.extradata.clone());
     Ok(Box::new(MjpegDecoder {
         codec_id,
+        decode,
         tables,
         pending: None,
         ready: None,
@@ -379,6 +382,9 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 
 struct MjpegDecoder {
     codec_id: CodecId,
+    /// Reconstruction knobs from the option bag ([`MjpegDecoderOptions`]);
+    /// the tables stream is added per packet.
+    decode: crate::DecodeOptions,
     /// §B.5 tables-only stream shared by every packet (`extradata`).
     tables: Option<Vec<u8>>,
     pending: Option<Packet>,
@@ -471,7 +477,7 @@ impl Decoder for MjpegDecoder {
         // over the standalone `decode_with` (the §B.5 tables stream
         // travels in `DecodeOptions::tables`); the `JpegImage` becomes
         // a framework frame by `From`, `pts` passed through.
-        let mut opts = crate::DecodeOptions::new();
+        let mut opts = self.decode.clone();
         if let Some(t) = &self.tables {
             opts = opts.with_tables(t.clone());
         }
@@ -891,6 +897,132 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             "chroma" => self.chroma = v.as_str()?.to_owned(),
             "adobe_transform" => self.adobe_transform = v.as_str()?.to_owned(),
             "jfif" => self.jfif = v.as_str()?.to_owned(),
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// The `CodecOptions` schema of the registry decoder — the string-bag
+/// twin of the reconstruction knobs of [`crate::DecodeOptions`]. An
+/// empty bag is the default decode. Keys outside this schema are left to
+/// other consumers of the same `CodecParameters` (an encoder's output
+/// parameters carry the encoder bag) and ignored; a bad value for one of
+/// these keys is an error.
+///
+/// | key                | kind                                   | default      |
+/// |--------------------|----------------------------------------|--------------|
+/// | `reference_compat` | bool: the opt-in decode bit-exact against `djpeg`'s defaults ([`crate::DecodeOptions::with_reference_compat`]) | `false` |
+/// | `idct`             | `float` \| `integer`: [`crate::IdctMethod`] `Float` / `AccurateInteger` (overrides `reference_compat`) | from `reference_compat` |
+/// | `upsampling`       | `replicate` \| `triangular`: [`crate::ChromaUpsampling`] for the layouts the decoder resamples to 4:4:4 (overrides `reference_compat`) | from `reference_compat` |
+///
+/// The registry decoder emits planar frames, so the YCbCr → RGB kernel
+/// of `reference_compat` only matters to callers converting with
+/// [`crate::ConvertOptions`]; the subsampled planar layouts keep their
+/// native chroma planes.
+/// `#[non_exhaustive]`: build with [`MjpegDecoderOptions::new`] /
+/// [`Default`] and the `with_*` setters; the fields stay readable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MjpegDecoderOptions {
+    /// The reference-compatible reconstruction set.
+    pub reference_compat: bool,
+    /// Empty = from `reference_compat`; else `float` / `integer`.
+    pub idct: String,
+    /// Empty = from `reference_compat`; else `replicate` / `triangular`.
+    pub upsampling: String,
+}
+
+impl MjpegDecoderOptions {
+    /// The defaults (the table on the type).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Select the reference-compatible reconstruction set.
+    pub fn with_reference_compat(mut self, on: bool) -> Self {
+        self.reference_compat = on;
+        self
+    }
+
+    /// `"float"` or `"integer"` (empty = from `reference_compat`).
+    pub fn with_idct(mut self, idct: impl Into<String>) -> Self {
+        self.idct = idct.into();
+        self
+    }
+
+    /// `"replicate"` or `"triangular"` (empty = from `reference_compat`).
+    pub fn with_upsampling(mut self, upsampling: impl Into<String>) -> Self {
+        self.upsampling = upsampling.into();
+        self
+    }
+
+    /// Parse the keys of this schema out of `bag`, ignoring the others
+    /// (values are checked as [`parse_options`] does).
+    pub fn from_bag(bag: &oxideav_core::CodecOptions) -> Result<Self> {
+        let mut own = oxideav_core::CodecOptions::new();
+        for (k, v) in bag.iter() {
+            if Self::SCHEMA.iter().any(|f| f.name == k) {
+                own.insert(k, v);
+            }
+        }
+        parse_options::<Self>(&own)
+    }
+
+    /// The [`crate::DecodeOptions`] these string options denote.
+    pub fn to_decode_options(&self) -> Result<crate::DecodeOptions> {
+        let mut o = crate::DecodeOptions::new().with_reference_compat(self.reference_compat);
+        match self.idct.as_str() {
+            "" => {}
+            "float" => o = o.with_idct(crate::IdctMethod::Float),
+            "integer" => o = o.with_idct(crate::IdctMethod::AccurateInteger),
+            other => {
+                return Err(Error::invalid(format!(
+                    "MJPEG decoder: idct '{other}' (float / integer)"
+                )));
+            }
+        }
+        match self.upsampling.as_str() {
+            "" => {}
+            "replicate" => o = o.with_upsampling(crate::ChromaUpsampling::Replicate),
+            "triangular" => o = o.with_upsampling(crate::ChromaUpsampling::Triangular),
+            other => {
+                return Err(Error::invalid(format!(
+                    "MJPEG decoder: upsampling '{other}' (replicate / triangular)"
+                )));
+            }
+        }
+        Ok(o)
+    }
+}
+
+impl CodecOptionsStruct for MjpegDecoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "reference_compat",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "opt-in decode bit-exact against djpeg's default output: accurate-integer IDCT, triangular chroma upsampling, fixed-point YCbCr kernel",
+        },
+        OptionField {
+            name: "idct",
+            kind: OptionKind::Enum(&["float", "integer"]),
+            default: OptionValue::String(String::new()),
+            help: "inverse DCT of 8/12-bit DCT frames: float (f32 cosine matrix) or integer (13-bit fixed point); unset = from reference_compat",
+        },
+        OptionField {
+            name: "upsampling",
+            kind: OptionKind::Enum(&["replicate", "triangular"]),
+            default: OptionValue::String(String::new()),
+            help: "chroma upsampling for layouts resampled to 4:4:4: replicate or triangular (3/4-1/4); unset = from reference_compat",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
+        match key {
+            "reference_compat" => self.reference_compat = v.as_bool()?,
+            "idct" => self.idct = v.as_str()?.to_owned(),
+            "upsampling" => self.upsampling = v.as_str()?.to_owned(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())

@@ -243,14 +243,16 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 
 Breaches are `Error::LimitExceeded`.
 
-### libjpeg-compatible output
+### Reference-compatible output (bit-exact against `djpeg`)
 
-`DecodeOptions::libjpeg_compatible()` sets the three knobs to
-`AccurateInteger` / `Triangular` / `FixedPoint16`, which reproduces
-`djpeg`'s default output (libjpeg-turbo 3.2.0) bit-exactly:
+An opt-in decode that reproduces `djpeg`'s default output (3.2.0)
+sample for sample; the default decode is unchanged.
+`DecodeOptions::with_reference_compat(true)` (equivalently the
+`libjpeg_compatible()` preset) sets the three knobs to
+`AccurateInteger` / `Triangular` / `FixedPoint16`:
 
 ```rust,ignore
-let opts = oxideav_mjpeg::DecodeOptions::libjpeg_compatible();
+let opts = oxideav_mjpeg::DecodeOptions::new().with_reference_compat(true);
 let rgb = oxideav_mjpeg::decode_rgb8_with(&jpeg, &opts)?;      // == djpeg -ppm
 let img = oxideav_mjpeg::decode_with(&jpeg, &opts)?;           // planes from the integer IDCT
 let rgb = img.to_rgb8_with(&opts.convert_options());           // same bytes
@@ -258,21 +260,66 @@ let rgb = img.to_rgb8_with(&opts.convert_options());           // same bytes
 
 Each knob is independent (`with_idct` / `with_upsampling` /
 `with_ycbcr`; `ConvertOptions` carries the last two for
-`JpegImage::to_rgb8_with`); the defaults are unchanged
+`JpegImage::to_rgb8_with`, with its own `with_reference_compat`); the
+defaults are unchanged
 (`decode_rgb8(b) == decode_rgb8_with(b, &DecodeOptions::new())`).
-Verified black-box with 0 differing samples over a 1 143-file corpus
-(4:4:4 / 4:2:2 / 4:2:0 / 4:4:0 / 4:1:1 / 4×2 / mixed factors / ffmpeg
-4:2:2, grey, progressive, restart intervals, arithmetic coding,
-quality 10–100, every size 1×1–9×9 plus 37×29 … 320×240), every
-`(Y, Cb, Cr)` combination of flat-block grids, and DC sweeps over
-`−1919..=2175` (the out-of-range saturation). 12-bit DCT frames get
-the same IDCT with one fraction bit between the passes, bit-exact
-against `djpeg -grayscale`'s 16-bit luma; their RGB is this crate's
-8-bit rescale (`djpeg` writes 16-bit PNM), so it is not compared. Not
-covered: lossless frames with layouts resampled to 4:4:4
-(replicated), and streams whose
-dequantised coefficients exceed 16 bits (`|S · Q| > 32767`, beyond any
-8-bit FDCT output), where `djpeg`'s results are implementation-specific.
+Through the registry the decoder takes the same switch in
+`CodecParameters::options` (`MjpegDecoderOptions`):
+
+| key | values | default |
+|---|---|---|
+| `reference_compat` | `true` / `false` | `false` |
+| `idct` | `float` / `integer` (overrides `reference_compat`) | from `reference_compat` |
+| `upsampling` | `replicate` / `triangular` (overrides `reference_compat`; used for the layouts the decoder resamples to 4:4:4) | from `reference_compat` |
+
+Other keys in the bag (an encoder's output parameters carry the encoder
+options) are ignored; a bad value is an error.
+
+Fitted parameters (every one measured against `djpeg` as a black box;
+the experiments and their mismatch tables are in
+`notes/reference-compat.md`):
+
+* **IDCT** — the T.81 §A.3.3 transform as two 1-D passes with 13-bit
+  constants, 2 fraction bits kept between the passes (1 for 12-bit
+  frames), round-half-up shifts, and a measured range limit (clamp for
+  overshoot inside −896…1151). Only this `(13, 2)` choice matches all
+  1 408 crafted impulse blocks and 2 048 random blocks.
+* **YCbCr → RGB** — the T.871 §7 equations at `2^16`, each chroma
+  contribution rounded half-up (the two G products summed first). The
+  G coefficients are `0.344146` / `0.714142`, measured over every
+  `(Cb, Cr)` pair.
+* **Chroma upsampling** — ¾ / ¼ interpolation at T.871 §9 siting for
+  2:1, 1:2 and 2 × 2 ratios, with edge replication. The rounding bias
+  alternates by output phase: 1 / 2 (`/ 4`) on one axis, 8 / 7 (`/ 16`)
+  for 2 × 2. Components at most two samples wide are replicated, and so
+  are the other ratios.
+
+Verified with 0 differing bytes on 2 621 streams: 1 092 `cjpeg` encodes
+(4:4:4 / 4:2:2 / 4:2:0 / 4:4:0 / 4:1:1 / 4×2 / mixed factors, grey, RGB,
+restart intervals, progressive, arithmetic, q10–q100, sizes 1×1–101×67),
+1 300 of this crate's own encodes, 208 `ffmpeg` encodes, the 8-bit
+`docs/` fixtures, and crafted coefficient-level streams. 87 of them are
+committed with `djpeg`'s output hashes (`tests/fixtures/libjpeg/`). On
+1080p 4:2:0 the compatible RGB decode costs about the same as the
+default (22.8 vs 22.1 ms, Apple M5 Max, release build). The integer IDCT
+alone is faster than the float one (15.3 vs 16.4 ms for the planes).
+
+12-bit DCT frames get the same IDCT with one fraction bit between the
+passes, bit-exact against `djpeg -grayscale`'s 16-bit luma; their RGB is
+this crate's 8-bit rescale (`djpeg` writes 16-bit PNM), so it is not
+compared.
+
+Not covered:
+
+* **Incomplete progressive streams.** If the five lowest AC
+  coefficients are never fully coded (not sent, or left at `Al > 0`),
+  `djpeg` alters the reconstruction across neighbouring blocks. This mode
+  reconstructs the coded coefficients as they are, so such streams differ
+  (for example 1 394–2 788 of 3 072 samples on a 64×48 grey image; see
+  the notes).
+* Lossless frames with layouts resampled to 4:4:4 (replicated).
+* Streams whose dequantised coefficients exceed 16 bits
+  (`|S · Q| > 32767`, beyond any 8-bit FDCT output).
 
 ## Metadata and colour
 
@@ -339,7 +386,7 @@ dequantised coefficients exceed 16 bits (`|S · Q| > 32767`, beyond any
   frame's `precision`; `Gbrp*` re-ordered to R, G, B. Grayscale, RGB
   and 12-bit corpus fixtures reproduce the reference PPMs bit-exactly.
   `to_rgb8_with` / `to_rgba8_with` take a `ConvertOptions` (triangular
-  upsampling, 16-bit fixed-point YCbCr — see *libjpeg-compatible
+  upsampling, 16-bit fixed-point YCbCr — see *Reference-compatible
   output*).
 
 ## Limits

@@ -1010,9 +1010,11 @@ pub enum YcbcrKernel {
     /// one rounding (default).
     #[default]
     Exact,
-    /// The T.871 §7 coefficients scaled by `2^16` and rounded, each
-    /// chroma product rounded half-up before adding `Y` — the fixed-point
-    /// kernel of `djpeg`'s default output.
+    /// The T.871 §7 equations in fixed point at `2^16`, each chroma
+    /// contribution rounded half-up before adding `Y` (the two G products
+    /// summed first) — the conversion of `djpeg`'s default output. The
+    /// G coefficients are the measured `0.344146` / `0.714142` (T.871's
+    /// values held to 15 bits), not the 16-bit-nearest ones.
     FixedPoint16,
 }
 
@@ -1041,6 +1043,24 @@ impl ConvertOptions {
             upsampling: ChromaUpsampling::Triangular,
             ycbcr: YcbcrKernel::FixedPoint16,
         }
+    }
+
+    /// Switch both conversion knobs to the reference-compatible pair
+    /// (`true`: [`ChromaUpsampling::Triangular`] +
+    /// [`YcbcrKernel::FixedPoint16`]) or back to the defaults (`false`).
+    pub fn with_reference_compat(self, on: bool) -> Self {
+        if on {
+            self.with_upsampling(ChromaUpsampling::Triangular)
+                .with_ycbcr(YcbcrKernel::FixedPoint16)
+        } else {
+            self.with_upsampling(ChromaUpsampling::Replicate)
+                .with_ycbcr(YcbcrKernel::Exact)
+        }
+    }
+
+    /// Both knobs are the reference-compatible pair.
+    pub fn is_reference_compat(&self) -> bool {
+        self.upsampling == ChromaUpsampling::Triangular && self.ycbcr == YcbcrKernel::FixedPoint16
     }
 
     /// Select the chroma upsampling.
@@ -1163,10 +1183,32 @@ impl DecodeOptions {
     /// black-box): [`IdctMethod::AccurateInteger`],
     /// [`ChromaUpsampling::Triangular`], [`YcbcrKernel::FixedPoint16`].
     pub fn libjpeg_compatible() -> Self {
-        Self::default()
-            .with_idct(IdctMethod::AccurateInteger)
-            .with_upsampling(ChromaUpsampling::Triangular)
-            .with_ycbcr(YcbcrKernel::FixedPoint16)
+        Self::default().with_reference_compat(true)
+    }
+
+    /// The opt-in reference-compatible decode as one switch: `true` sets
+    /// the three reconstruction knobs to [`IdctMethod::AccurateInteger`],
+    /// [`ChromaUpsampling::Triangular`] and [`YcbcrKernel::FixedPoint16`]
+    /// (bit-exact against `djpeg`'s default output, the same set as
+    /// [`Self::libjpeg_compatible`]); `false` restores the three
+    /// defaults. Limits, strictness and tables are kept either way.
+    pub fn with_reference_compat(self, on: bool) -> Self {
+        if on {
+            self.with_idct(IdctMethod::AccurateInteger)
+                .with_upsampling(ChromaUpsampling::Triangular)
+                .with_ycbcr(YcbcrKernel::FixedPoint16)
+        } else {
+            self.with_idct(IdctMethod::Float)
+                .with_upsampling(ChromaUpsampling::Replicate)
+                .with_ycbcr(YcbcrKernel::Exact)
+        }
+    }
+
+    /// All three reconstruction knobs are the reference-compatible set.
+    pub fn is_reference_compat(&self) -> bool {
+        self.idct == IdctMethod::AccurateInteger
+            && self.upsampling == ChromaUpsampling::Triangular
+            && self.ycbcr == YcbcrKernel::FixedPoint16
     }
 
     /// Select the inverse-DCT kernel.

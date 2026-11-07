@@ -439,8 +439,41 @@ mod registry_benches {
         group.finish();
     }
 
+    /// Standalone RGB decode, default reconstruction vs the opt-in
+    /// reference-compatible one (integer IDCT, triangular chroma,
+    /// fixed-point YCbCr; #19) on the same 4:2:0 stream.
+    fn bench_reference_compat_decode(c: &mut Criterion) {
+        let mut group = c.benchmark_group("rgb_decode");
+        let (w, h) = (256u32, 256u32);
+        let frame = make_natural_frame(w, h, PixelFormat::Yuv420P);
+        let jpeg = encode_jpeg(&frame, w, h, PixelFormat::Yuv420P, 75)
+            .expect("baseline 4:2:0 encode for the RGB decode bench");
+        group.throughput(Throughput::Elements((w as u64) * (h as u64)));
+        for (label, opts) in [
+            (
+                "yuv420_256x256_q75_default",
+                oxideav_mjpeg::DecodeOptions::new(),
+            ),
+            (
+                "yuv420_256x256_q75_reference_compat",
+                oxideav_mjpeg::DecodeOptions::new().with_reference_compat(true),
+            ),
+        ] {
+            group.bench_function(label, |b| {
+                b.iter(|| {
+                    black_box(
+                        oxideav_mjpeg::decode_rgb8_with(black_box(&jpeg), black_box(&opts))
+                            .expect("decode"),
+                    );
+                })
+            });
+        }
+        group.finish();
+    }
+
     criterion_group!(
         benches,
+        bench_reference_compat_decode,
         bench_baseline_encode,
         bench_baseline_decode,
         bench_progressive_decode,

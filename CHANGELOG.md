@@ -9,10 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reference-compatible decode as one switch (#19): `DecodeOptions::with_reference_compat(bool)` / `is_reference_compat()` and the `ConvertOptions` twins set (or reset) the integer IDCT, triangular chroma upsampling and fixed-point YCbCr knobs together; the existing `libjpeg_compatible()` presets are now defined through it. Defaults unchanged.
+- Registry decoder option bag `MjpegDecoderOptions` (#19), declared with `CodecInfo::decoder_options`: `reference_compat` (bool), `idct` (`float` / `integer`) and `upsampling` (`replicate` / `triangular`) from `CodecParameters::options`. Keys of other schemas, such as the encoder bag an encoder's output parameters carry, are ignored. Bad values are refused.
+- `notes/reference-compat.md` (#19): every fitted parameter of the compatible mode, with the black-box experiment and mismatch table that pinned it. The IDCT `(13, 2)` choice is unique over 3 456 crafted blocks. The YCbCr constants were checked over all 65 536 `(Cb, Cr)` pairs. The upsampling biases and edge rule were fitted on noise at 2 to 64 px. The notes also measure the residual on incomplete progressive streams.
+- `tests/fixtures/libjpeg/` grows from 25 to 87 `djpeg`-hashed streams (#19). New are crafted coefficient-level IDCT impulse / random / DC-sweep streams, this crate's own encodes (odd sizes; 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 / grey; sequential / progressive / restart) and 2–7 px chroma-edge streams. There is also a test against `djpeg`'s RGB for every `(Cb, Cr)` pair, and the live shared-library comparison (`tests/libjpeg_compat.rs`) now covers every RGB-input layout of the own encoder; it used to cover only 4:2:0, because the other sampling requests were silently rejected. Black-box total: 2 621 streams, 0 differing bytes.
+- `rgb_decode` bench group: default vs reference-compatible RGB decode.
 - `Default` on `MjpegFrame`, `JpegComponent`, `EncodedJpeg` and `InspectedComponent`; full-field `JpegFrame::new`, `QuantTableInfo::new` and `JpegInfo::new`; `with_<field>` setters on every newly `#[non_exhaustive]` record.
 
 ### Changed
 
+- Triangular upsampling indexes a materialised component row by row instead of calling a per-sample closure. On 1080p 4:2:0 the compatible RGB decode drops from 30.3 ms to 22.8 ms (default: 22.1 ms). Output is unchanged.
+- Corrected the documentation of the fixed-point YCbCr G constants (`22 554`, `46 802`): they are the measured `0.344146` / `0.714142` (T.871's coefficients held to 15 bits), not the 16-bit-nearest full-precision values, which miss 59 `(Cb, Cr)` pairs.
 - API hygiene: enums `MjpegPixelFormat`, `JpegProcess`, `HuffmanTables`, `ColorSignalling`, `SofKind`, `ChromaSubsampling` and `ColorHint`, and records `MjpegFrame`, `JpegComponent`, `JpegFrame`, `EncodedJpeg`, `PacketizeOpts`, `InspectedComponent`, `QuantTableInfo` and `JpegInfo` are now `#[non_exhaustive]`. Spec-fixed enums (`JfifUnits`, `JfxxThumbnail`, `AdobeColorTransform`, RTP `QMode` / `Progress`) and the RFC 2435 header records stay exhaustive. Internal `jpeg::*` modules were already `#[doc(hidden)]`.
 
 ## [0.1.15](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.14...v0.1.15) - 2026-11-06

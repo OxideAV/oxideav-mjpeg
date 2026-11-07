@@ -333,11 +333,17 @@ fn fill_ycbcr_with(
 
 /// `round(1.402 · 2^16)` — the T.871 §7 Cr → R coefficient.
 const CR_TO_R: i64 = 91_881;
-/// `round(0.114 · 1.772 / 0.587 · 2^16)` (`0.344136…`) — the full-precision
-/// T.871 §7 Cb → G coefficient (magnitude; it is subtracted).
+/// Cb → G (magnitude; it is subtracted): `2 · 11 277`, the T.871 §7
+/// coefficient `0.114 · 1.772 / 0.587 = 0.344136…` held to 15-bit
+/// resolution (`11 277 / 2^15 = 0.344146`). Measured, not derived: over
+/// every `(Cb, Cr)` pair, `djpeg`'s G offset is reproduced by exactly one
+/// constant pair within ±4 of the nominal values at each scale 2^15 …
+/// 2^18 (this one, scaled) and by none at 2^12 … 2^14 or 2^19 … 2^20;
+/// the 16-bit-nearest full-precision pair `(22 553, 46 802)` misses 59
+/// pairs (`notes/reference-compat.md`).
 const CB_TO_G: i64 = 22_554;
-/// `round(0.299 · 1.402 / 0.587 · 2^16)` (`0.714136…`) — Cr → G
-/// (magnitude; subtracted).
+/// Cr → G (magnitude; subtracted): `2 · 23 401`, `0.714136…` at the
+/// same 15-bit resolution (`0.714142`); measured with [`CB_TO_G`].
 const CR_TO_G: i64 = 46_802;
 /// `round(1.772 · 2^16)` — the T.871 §7 Cb → B coefficient.
 const CB_TO_B: i64 = 116_130;
@@ -347,9 +353,10 @@ const HALF_16: i64 = 1 << 15;
 /// T.871 §7 inverse relationship in 16-bit fixed point for 8-bit samples:
 /// each chroma contribution `(k · (C − 128) + 2^15) >> 16` (the two G
 /// products summed before the shift) is added to `Y`, then clamped to
-/// `0..=255`. Bit-exact with `djpeg`'s default colour conversion (observed
-/// black-box on every `(Y, Cb, Cr)` combination of the flat-block grids
-/// in the comparison corpus).
+/// `0..=255`. Bit-exact with `djpeg`'s default colour conversion,
+/// measured black-box over every `(Cb, Cr)` pair at `Y = 0` and
+/// `Y = 255` (the chroma offsets do not depend on `Y`) and on a 4:4:4
+/// noise image under `djpeg -nosmooth`.
 pub(crate) fn ycbcr_to_rgb8_fixed16(y: u32, cb: u32, cr: u32) -> (u8, u8, u8) {
     let y = y as i64;
     let cb = cb as i64 - 128;

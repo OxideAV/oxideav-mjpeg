@@ -242,7 +242,7 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `max_bytes` | `None` | Input length cap; `None` = unlimited. |
 | `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
 | `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
-| `idct` | `IdctMethod::Float` | Inverse DCT of 8- and 12-bit DCT frames: `Float` (f32 cosine matrix) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
+| `idct` | `IdctMethod::Float` | Inverse DCT of 8- and 12-bit DCT frames: `Float` (factorised separable f32 transform, the most accurate and the fastest: 13 samples of 2 073 600 off the rounded f64 definition on a 1080p q85 frame) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
 | `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 | `deblock` | `false` | Opt-in block-edge smoothing of 8-bit DCT frames (see *Deblocking*). |
@@ -314,8 +314,8 @@ default chroma reconstruction):
 
 On the synthetic set the effect is within ±0.08 dB. On a noisy 1080p
 photograph it changes PSNR by under 0.07 dB, while SSIM drops by up to
-0.005. That is why it stays opt-in. Thresholds 0.5 × and 2 × the step
-measured within 0.04 dB of 1 ×.
+0.005. That is why it stays opt-in. Thresholds of 0.5 × and 2 × the
+step measured up to 0.06 dB below 1 ×.
 
 ### Encoder quality
 
@@ -1972,6 +1972,25 @@ round-410 hot-path tuning): baseline 4:2:0 encode 256×256 q75 runs
 ~236 µs; lossless grayscale decode ~480-495 µs and encode ~360 µs
 largely independent of predictor choice (magnitude / Huffman emission
 dominates the per-sample cost).
+
+Full-size pictures (`decode` = planar output, `decode_rgb8` = with
+the default conversion; Apple Silicon, release, best of 7, quality 85
+photograph with ≈ 2 bpp of detail, encoded by `cjpeg`), before → after
+this round's decoder work:
+
+| stream | `decode` | `decode_rgb8` |
+|---|---|---|
+| 1080p baseline 4:2:0 | 11.0 → 5.1–5.9 ms | 17.0 (replicated chroma) → 12.3–13.2 ms (luma-guided) |
+| 1080p progressive 4:2:0 | 18.1 → 14.2 ms | 23.9 → 21.4 ms |
+| 1080p Motion-JPEG-style 4:2:2, restart per MCU row | 14.2 → 7.4 ms; 2.5 ms with `threads = 8` | 20.1 → 17.2 ms |
+| 4K baseline 4:2:0 | 42.7 → 20.0–22.9 ms | 66.0 → 48.7–51.6 ms |
+| 4K progressive 4:2:0 | 67.8 → 54.1 ms | 91.0 → 82.7 ms |
+| 4K, restart every 5 MCUs | 42.3 → 23.3 ms; 6.0 ms with `threads = 8` | |
+
+The gains come from a factorised, vectorised float IDCT, a 64-bit
+bit reader with bulk refills, a 10-bit symbol + magnitude lookahead,
+and the fused row-wise chroma reconstruction. Encode times are in
+*Encoder quality*.
 
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the

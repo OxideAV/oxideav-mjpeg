@@ -1002,8 +1002,10 @@ pub struct ImageInfo {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IdctMethod {
-    /// Separable cosine-matrix transform in `f32` with one rounding at the
-    /// end (the historical kernel; default).
+    /// Separable transform in `f32` (even / odd factorisation of the
+    /// cosine basis, eight lanes at a time) with one rounding at the end;
+    /// default. The most accurate kernel against the §A.3.3 definition
+    /// and the fastest.
     #[default]
     Float,
     /// Fixed-point transform with 13-bit constants, two passes keeping two

@@ -1052,7 +1052,7 @@ impl CodecOptionsStruct for MjpegDecoderOptions {
             name: "idct",
             kind: OptionKind::Enum(&["float", "integer"]),
             default: OptionValue::String(String::new()),
-            help: "inverse DCT of 8/12-bit DCT frames: float (f32 cosine matrix) or integer (13-bit fixed point); unset = from reference_compat",
+            help: "inverse DCT of 8/12-bit DCT frames: float (factorised f32 transform) or integer (13-bit fixed point); unset = from reference_compat",
         },
         OptionField {
             name: "upsampling",

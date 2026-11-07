@@ -56,6 +56,7 @@ use super::zigzag::ZIGZAG;
 /// not for the inspector's other fields, which describe the first
 /// (lowest-resolution) hierarchical frame only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SofKind {
     /// SOF0 (0xFFC0) — baseline DCT, sequential, 8-bit Huffman.
     Baseline,
@@ -165,6 +166,7 @@ impl SofKind {
 /// components have unequal sampling — falls into `Custom` because
 /// the conventional name doesn't apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ChromaSubsampling {
     /// Single-component frame; no chroma to subsample.
     GrayscaleOnly,
@@ -191,6 +193,7 @@ pub enum ChromaSubsampling {
 /// we report `Unspecified` and the caller must infer from component
 /// IDs / Nf.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ColorHint {
     /// No APP0 JFIF magic and no APP14 Adobe tag — colour space
     /// unknown.
@@ -211,7 +214,8 @@ pub enum ColorHint {
 
 /// Per-component sampling + table-selector descriptor copied verbatim
 /// from the SOF segment (T.81 Table B.2).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[non_exhaustive]
 pub struct InspectedComponent {
     /// Component identifier `Ci`. JFIF convention is 1/2/3 for
     /// Y/Cb/Cr; Adobe RGB JPEGs from photoshop use 'R'/'G'/'B' (0x52
@@ -225,6 +229,36 @@ pub struct InspectedComponent {
     /// SOF3 lossless, T.81 says this is always 0; the inspector
     /// reports the literal byte regardless.)
     pub quant_table: u8,
+}
+
+impl InspectedComponent {
+    /// Set `id`.
+    #[must_use]
+    pub fn with_id(mut self, v: u8) -> Self {
+        self.id = v;
+        self
+    }
+
+    /// Set `h_sampling`.
+    #[must_use]
+    pub fn with_h_sampling(mut self, v: u8) -> Self {
+        self.h_sampling = v;
+        self
+    }
+
+    /// Set `v_sampling`.
+    #[must_use]
+    pub fn with_v_sampling(mut self, v: u8) -> Self {
+        self.v_sampling = v;
+        self
+    }
+
+    /// Set `quant_table`.
+    #[must_use]
+    pub fn with_quant_table(mut self, v: u8) -> Self {
+        self.quant_table = v;
+        self
+    }
 }
 
 /// Units field of the JFIF APP0 segment (T.871 §10.1).
@@ -769,6 +803,7 @@ impl JpegComment {
 /// corpus dedup / table-fingerprinting, and quality estimation against
 /// the Annex K base tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct QuantTableInfo {
     /// Destination identifier `Tq` (low nibble of the `Pq | Tq` byte),
     /// in `0..=3`. Components in the SOF reference a table by this id
@@ -785,6 +820,38 @@ pub struct QuantTableInfo {
     /// `(row, col)` DCT coefficient. Already un-zigzagged from the wire
     /// order.
     pub values: [u16; 64],
+}
+
+impl QuantTableInfo {
+    /// Build a `QuantTableInfo` from every field.
+    pub fn new(id: u8, sixteen_bit: bool, values: [u16; 64]) -> Self {
+        Self {
+            id,
+            sixteen_bit,
+            values,
+        }
+    }
+
+    /// Set `id`.
+    #[must_use]
+    pub fn with_id(mut self, v: u8) -> Self {
+        self.id = v;
+        self
+    }
+
+    /// Set `sixteen_bit`.
+    #[must_use]
+    pub fn with_sixteen_bit(mut self, v: bool) -> Self {
+        self.sixteen_bit = v;
+        self
+    }
+
+    /// Set `values`.
+    #[must_use]
+    pub fn with_values(mut self, v: [u16; 64]) -> Self {
+        self.values = v;
+        self
+    }
 }
 
 impl QuantTableInfo {
@@ -860,6 +927,7 @@ pub fn parse_dqt_segment(payload: &[u8], out: &mut Vec<QuantTableInfo>) -> Resul
 
 /// Result of a successful `inspect_jpeg` call.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct JpegInfo {
     /// Which SOFn marker opened the frame.
     pub sof_kind: SofKind,
@@ -956,6 +1024,142 @@ pub struct JpegInfo {
     /// the exact segment sequence. Read `quant_table_for(id)` for the
     /// last-wins lookup that mirrors decode-time resolution.
     pub quant_tables: Vec<QuantTableInfo>,
+}
+
+impl JpegInfo {
+    /// Build a `JpegInfo` from every field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        sof_kind: SofKind,
+        precision: u8,
+        width: u16,
+        height: u16,
+        components: Vec<InspectedComponent>,
+        subsampling: ChromaSubsampling,
+        color_hint: ColorHint,
+        restart_interval: u16,
+        jfif: Option<JfifApp0>,
+        jfxx: Option<JfxxApp0>,
+        adobe: Option<AdobeApp14>,
+        icc_profile: Option<IccProfileChunks>,
+        comments: Vec<JpegComment>,
+        quant_tables: Vec<QuantTableInfo>,
+    ) -> Self {
+        Self {
+            sof_kind,
+            precision,
+            width,
+            height,
+            components,
+            subsampling,
+            color_hint,
+            restart_interval,
+            jfif,
+            jfxx,
+            adobe,
+            icc_profile,
+            comments,
+            quant_tables,
+        }
+    }
+
+    /// Set `sof_kind`.
+    #[must_use]
+    pub fn with_sof_kind(mut self, v: SofKind) -> Self {
+        self.sof_kind = v;
+        self
+    }
+
+    /// Set `precision`.
+    #[must_use]
+    pub fn with_precision(mut self, v: u8) -> Self {
+        self.precision = v;
+        self
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u16) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u16) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `components`.
+    #[must_use]
+    pub fn with_components(mut self, v: Vec<InspectedComponent>) -> Self {
+        self.components = v;
+        self
+    }
+
+    /// Set `subsampling`.
+    #[must_use]
+    pub fn with_subsampling(mut self, v: ChromaSubsampling) -> Self {
+        self.subsampling = v;
+        self
+    }
+
+    /// Set `color_hint`.
+    #[must_use]
+    pub fn with_color_hint(mut self, v: ColorHint) -> Self {
+        self.color_hint = v;
+        self
+    }
+
+    /// Set `restart_interval`.
+    #[must_use]
+    pub fn with_restart_interval(mut self, v: u16) -> Self {
+        self.restart_interval = v;
+        self
+    }
+
+    /// Set `jfif`.
+    #[must_use]
+    pub fn with_jfif(mut self, v: Option<JfifApp0>) -> Self {
+        self.jfif = v;
+        self
+    }
+
+    /// Set `jfxx`.
+    #[must_use]
+    pub fn with_jfxx(mut self, v: Option<JfxxApp0>) -> Self {
+        self.jfxx = v;
+        self
+    }
+
+    /// Set `adobe`.
+    #[must_use]
+    pub fn with_adobe(mut self, v: Option<AdobeApp14>) -> Self {
+        self.adobe = v;
+        self
+    }
+
+    /// Set `icc_profile`.
+    #[must_use]
+    pub fn with_icc_profile(mut self, v: Option<IccProfileChunks>) -> Self {
+        self.icc_profile = v;
+        self
+    }
+
+    /// Set `comments`.
+    #[must_use]
+    pub fn with_comments(mut self, v: Vec<JpegComment>) -> Self {
+        self.comments = v;
+        self
+    }
+
+    /// Set `quant_tables`.
+    #[must_use]
+    pub fn with_quant_tables(mut self, v: Vec<QuantTableInfo>) -> Self {
+        self.quant_tables = v;
+        self
+    }
 }
 
 impl JpegInfo {

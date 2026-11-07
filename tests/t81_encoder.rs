@@ -598,24 +598,17 @@ fn frame_api_shares_one_table_set_across_frames() {
     use oxideav_mjpeg::t81::{HuffStats, JpegComponent, JpegFrame, encode_frame, gather_stats};
     let a = planes(1, 12, &[]);
     let b: Vec<u16> = a[0].iter().map(|&v| 4095 - v).collect();
-    let frame = JpegFrame {
-        width: W as u16,
-        height: H as u16,
-        precision: 12,
-        process: JpegProcess::Sequential,
-        restart_interval: 4,
-    };
+    let frame = JpegFrame::new(W as u16, H as u16, 12, JpegProcess::Sequential, 4);
     fn comp(s: &[u16]) -> JpegComponent<'_> {
-        JpegComponent {
-            id: 1,
-            samples: s,
-            width: W as usize,
-            height: H as usize,
-            h: 1,
-            v: 1,
-            quant_id: 0,
-            huff_id: 0,
-        }
+        JpegComponent::default()
+            .with_id(1)
+            .with_samples(s)
+            .with_width(W as usize)
+            .with_height(H as usize)
+            .with_h(1)
+            .with_v(1)
+            .with_quant_id(0)
+            .with_huff_id(0)
     }
     let mut tables = JpegTableSet::typical(92, 12, false, 1);
     let mut dc: [HuffStats; 4] = Default::default();

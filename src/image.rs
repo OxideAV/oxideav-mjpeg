@@ -70,7 +70,8 @@ pub type MjpegPlane = Plane;
 /// are carried by the stream's codec parameters, not the frame). For
 /// still images use [`JpegImage`], which carries its own geometry —
 /// `MjpegFrame::from(image)` converts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct MjpegFrame {
     /// Optional presentation timestamp, in the surrounding container's
     /// time base when known.
@@ -79,6 +80,22 @@ pub struct MjpegFrame {
     /// pixel format the frame was decoded into (or is being encoded
     /// from).
     pub planes: Vec<MjpegPlane>,
+}
+
+impl MjpegFrame {
+    /// Set `pts`.
+    #[must_use]
+    pub fn with_pts(mut self, v: Option<i64>) -> Self {
+        self.pts = v;
+        self
+    }
+
+    /// Set `planes`.
+    #[must_use]
+    pub fn with_planes(mut self, v: Vec<MjpegPlane>) -> Self {
+        self.planes = v;
+        self
+    }
 }
 
 impl From<JpegImage> for MjpegFrame {
@@ -100,6 +117,7 @@ impl From<JpegImage> for MjpegFrame {
 /// (the `registry` feature maps them 1:1 by name). Defined here so the
 /// standalone build does not need to pull in `oxideav-core`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MjpegPixelFormat {
     /// 8-bit single-channel grayscale.
     Gray8,

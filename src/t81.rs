@@ -596,7 +596,8 @@ impl JpegTableSet {
 /// (A.1.1: `xi = ceil(X × Hi / Hmax)`, `yi = ceil(Y × Vi / Vmax)`), its
 /// identifier, the sampling factors, and the table destinations it
 /// selects.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct JpegComponent<'a> {
     /// Component identifier `Ci` (B.2.2) — distinct per component.
     pub id: u8,
@@ -615,8 +616,67 @@ pub struct JpegComponent<'a> {
     pub huff_id: u8,
 }
 
+impl<'a> JpegComponent<'a> {
+    /// Set `id`.
+    #[must_use]
+    pub fn with_id(mut self, v: u8) -> Self {
+        self.id = v;
+        self
+    }
+
+    /// Set `samples`.
+    #[must_use]
+    pub fn with_samples(mut self, v: &'a [u16]) -> Self {
+        self.samples = v;
+        self
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: usize) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: usize) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `h`.
+    #[must_use]
+    pub fn with_h(mut self, v: u8) -> Self {
+        self.h = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: u8) -> Self {
+        self.v = v;
+        self
+    }
+
+    /// Set `quant_id`.
+    #[must_use]
+    pub fn with_quant_id(mut self, v: u8) -> Self {
+        self.quant_id = v;
+        self
+    }
+
+    /// Set `huff_id`.
+    #[must_use]
+    pub fn with_huff_id(mut self, v: u8) -> Self {
+        self.huff_id = v;
+        self
+    }
+}
+
 /// The coding process of a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JpegProcess {
     /// Sequential DCT, Huffman: `SOF0` (baseline) when `P = 8`, every
     /// table destination is 0 or 1 and every quantiser fits 8 bits;
@@ -641,6 +701,7 @@ impl JpegProcess {
 
 /// Frame-level parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JpegFrame {
     /// Frame width `X` (samples per line of the highest-resolution
     /// component).
@@ -660,6 +721,60 @@ pub struct JpegFrame {
     /// the lossless process Table B.7 requires `Ri` to be an integer
     /// multiple of the number of MCUs in an MCU-row.
     pub restart_interval: u16,
+}
+
+impl JpegFrame {
+    /// Build a `JpegFrame` from every field.
+    pub fn new(
+        width: u16,
+        height: u16,
+        precision: u8,
+        process: JpegProcess,
+        restart_interval: u16,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            precision,
+            process,
+            restart_interval,
+        }
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u16) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u16) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `precision`.
+    #[must_use]
+    pub fn with_precision(mut self, v: u8) -> Self {
+        self.precision = v;
+        self
+    }
+
+    /// Set `process`.
+    #[must_use]
+    pub fn with_process(mut self, v: JpegProcess) -> Self {
+        self.process = v;
+        self
+    }
+
+    /// Set `restart_interval`.
+    #[must_use]
+    pub fn with_restart_interval(mut self, v: u16) -> Self {
+        self.restart_interval = v;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,6 +1688,7 @@ pub fn encode_frame_with_meta(
 
 /// Which Huffman tables the frame is coded with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum HuffmanTables {
     /// Annex K.3 "typical" tables (K.3–K.6; the lossless DC table for
     /// `SOF3`). At `P = 12` the DC / AC categories exceed the alphabet
@@ -1588,6 +1704,7 @@ pub enum HuffmanTables {
 /// How the colour space is signalled in the stream (marker segments +
 /// component identifiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ColorSignalling {
     /// One component → JFIF grayscale; three → JFIF YCbCr (ids 1/2/3);
     /// four → plain ("regular", no APP14) CMYK.
@@ -1805,7 +1922,8 @@ impl EncodeOptions {
 }
 
 /// The output of [`EncodeOptions::encode`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct EncodedJpeg {
     /// The frame stream (`SOI … EOI`). Complete interchange format
     /// unless `abbreviated` was set, in which case it carries no table
@@ -1814,6 +1932,22 @@ pub struct EncodedJpeg {
     /// The §B.5 tables-only stream (`SOI`, DQT / DHT, `EOI`) when
     /// `abbreviated` was set, `None` otherwise.
     pub tables: Option<Vec<u8>>,
+}
+
+impl EncodedJpeg {
+    /// Set `data`.
+    #[must_use]
+    pub fn with_data(mut self, v: Vec<u8>) -> Self {
+        self.data = v;
+        self
+    }
+
+    /// Set `tables`.
+    #[must_use]
+    pub fn with_tables(mut self, v: Option<Vec<u8>>) -> Self {
+        self.tables = v;
+        self
+    }
 }
 
 /// JFIF APP0 (T.871 §10.1): version 1.01, no density, no thumbnail.

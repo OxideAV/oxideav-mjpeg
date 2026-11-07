@@ -649,6 +649,15 @@ pub struct PacketizeOpts {
 }
 
 impl PacketizeOpts {
+    /// Set `qmode`.
+    #[must_use]
+    pub fn with_qmode(mut self, v: QMode) -> Self {
+        self.qmode = v;
+        self
+    }
+}
+
+impl PacketizeOpts {
     /// Build options with the given `qmode` and every other knob defaulted
     /// (no restart-aligned splitting; matches [`packetize`]).
     pub fn new(qmode: QMode) -> Self {

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on `MjpegFrame`, `JpegComponent`, `EncodedJpeg` and `InspectedComponent`; full-field `JpegFrame::new`, `QuantTableInfo::new` and `JpegInfo::new`; `with_<field>` setters on every newly `#[non_exhaustive]` record.
+
+### Changed
+
+- API hygiene: enums `MjpegPixelFormat`, `JpegProcess`, `HuffmanTables`, `ColorSignalling`, `SofKind`, `ChromaSubsampling` and `ColorHint`, and records `MjpegFrame`, `JpegComponent`, `JpegFrame`, `EncodedJpeg`, `PacketizeOpts`, `InspectedComponent`, `QuantTableInfo` and `JpegInfo` are now `#[non_exhaustive]`. Spec-fixed enums (`JfifUnits`, `JfxxThumbnail`, `AdobeColorTransform`, RTP `QMode` / `Progress`) and the RFC 2435 header records stay exhaustive. Internal `jpeg::*` modules were already `#[doc(hidden)]`.
+
 ## [0.1.15](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.14...v0.1.15) - 2026-11-06
 
 ### Other

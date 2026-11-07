@@ -28,6 +28,28 @@ pub struct HuffCode {
 /// ≤ 9 bits) while keeping the table at 512 entries (1 KiB).
 pub const FAST_BITS: u32 = 9;
 
+/// Width of the combined symbol + magnitude lookahead ([`HuffTable::lut`]).
+pub const LUT_BITS: u32 = 10;
+
+/// [`HuffTable::lut`] entry layout: bits 0..8 symbol, 8..12 code length,
+/// 12..17 code length + magnitude bits, bit 17 "magnitude resolved",
+/// bits 18..32 the extended (§F.2.2.1) magnitude as a signed 14-bit value.
+pub const LUT_RESOLVED: u32 = 1 << 17;
+
+/// T.81 §F.2.2.1 `EXTEND`: the `size`-bit magnitude category value `v`
+/// to its signed coefficient value.
+#[inline]
+pub fn extend(v: i32, size: u32) -> i32 {
+    if size == 0 {
+        return 0;
+    }
+    if v < (1 << (size - 1)) {
+        v - ((1 << size) - 1)
+    } else {
+        v
+    }
+}
+
 /// Decode table for a Huffman segment.
 #[derive(Clone, Debug)]
 pub struct HuffTable {
@@ -50,6 +72,13 @@ pub struct HuffTable {
     /// that routes the decoder to the canonical slow path). Built so that
     /// decoded symbols are bit-identical to the length-walk path.
     pub fast: Vec<u16>,
+    /// Combined lookahead indexed by the next [`LUT_BITS`] bits: the
+    /// symbol of a code no longer than `LUT_BITS` and, when the symbol's
+    /// low nibble `s` (the magnitude category of a DC difference or an
+    /// AC coefficient) still fits in the window (`len + s ≤ LUT_BITS`),
+    /// the `EXTEND`ed magnitude too, so a short code and its value cost
+    /// one load. Layout at [`LUT_RESOLVED`]; `0` = no code that short.
+    pub lut: Vec<u32>,
 }
 
 impl HuffTable {
@@ -142,6 +171,33 @@ impl HuffTable {
             c <<= 1;
         }
 
+        let mut lut = vec![0u32; 1usize << LUT_BITS];
+        let mut sidx = 0usize;
+        let mut c: u32 = 0;
+        for l in 0..16 {
+            let len = (l as u32) + 1;
+            for _ in 0..bits[l] as usize {
+                let sym = values[sidx] as u32;
+                sidx += 1;
+                if len <= LUT_BITS {
+                    let shift = LUT_BITS - len;
+                    let base = (c << shift) as usize;
+                    let size = sym & 0x0F;
+                    for (j, slot) in lut[base..base + (1usize << shift)].iter_mut().enumerate() {
+                        let mut e = sym | (len << 8);
+                        if size > 0 && len + size <= LUT_BITS {
+                            let v = (j as u32 >> (shift - size)) & ((1 << size) - 1);
+                            let val = extend(v as i32, size);
+                            e |= ((len + size) << 12) | LUT_RESOLVED | ((val as u32) << 18);
+                        }
+                        *slot = e;
+                    }
+                }
+                c += 1;
+            }
+            c <<= 1;
+        }
+
         Ok(Self {
             min_code,
             val_offset,
@@ -149,6 +205,7 @@ impl HuffTable {
             max_code,
             encode,
             fast,
+            lut,
         })
     }
 }

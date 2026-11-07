@@ -356,14 +356,33 @@ fn fill_ycbcr_interp(
     let bps = img.format.bytes_per_sample();
     let (dh, dv) = img.format.chroma_divisors();
     let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
+    let read_row = |p: &crate::image::Plane, y: usize, row: &mut [f32]| {
+        let start = y * p.stride;
+        match (bps, p.data.get(start..start + row.len() * bps)) {
+            (1, Some(src)) => {
+                for (d, &s) in row.iter_mut().zip(src) {
+                    *d = s as f32;
+                }
+            }
+            (_, Some(src)) => {
+                for (d, s) in row.iter_mut().zip(src.as_chunks::<2>().0) {
+                    *d = u16::from_le_bytes([s[0], s[1]]) as f32;
+                }
+            }
+            _ => {
+                for (x, d) in row.iter_mut().enumerate() {
+                    *d = sample(p, bps, x, y) as f32;
+                }
+            }
+        }
+    };
     let plane = |p: &crate::image::Plane, pw: usize, ph: usize| -> Vec<f32> {
-        let mut v = Vec::with_capacity(pw * ph);
-        for y in 0..ph {
-            v.extend((0..pw).map(|x| sample(p, bps, x, y) as f32));
+        let mut v = vec![0f32; pw * ph];
+        for (y, row) in v.chunks_exact_mut(pw).enumerate() {
+            read_row(p, y, row);
         }
         v
     };
-    let luma = plane(&img.planes[0], w, h);
     enum Recon {
         Lin(Linear),
         Guide(Guided),
@@ -372,38 +391,109 @@ fn fill_ycbcr_interp(
     let make = |p: &crate::image::Plane| {
         let c = plane(p, cw, ch);
         if guided {
-            Recon::Guide(Guided::new(&luma, c, cw, ch, dh, dv, w, h, maxval))
+            let mut luma = |y: usize, row: &mut [f32]| read_row(&img.planes[0], y, row);
+            Recon::Guide(Guided::new(&mut luma, c, cw, ch, dh, dv, w, h, maxval))
         } else {
             Recon::Lin(Linear::new(c, cw, ch, (1, dh), (1, dv), w, h))
         }
     };
     let mut recon = [make(&img.planes[1]), make(&img.planes[2])];
     let mut rows = [vec![0f32; w], vec![0f32; w]];
+    let mut lrow = vec![0f32; w];
     let fixed = opts.ycbcr == YcbcrKernel::FixedPoint16 && maxval == 255;
-    for y in 0..h {
-        let lrow = &luma[y * w..][..w];
+    for (y, dst) in out.chunks_exact_mut(w * bpp).take(h).enumerate() {
+        read_row(&img.planes[0], y, &mut lrow);
         for (r, row) in recon.iter_mut().zip(rows.iter_mut()) {
             match r {
                 Recon::Lin(l) => l.row(y, row),
-                Recon::Guide(g) => g.row(y, lrow, row),
+                Recon::Guide(g) => g.row(y, &lrow, row),
             }
         }
-        let dst = &mut out[y * w * bpp..][..w * bpp];
-        for (x, px) in dst.chunks_exact_mut(bpp).enumerate() {
-            let yy = lrow[x] as u32;
-            let (cb, cr) = (rows[0][x], rows[1][x]);
-            let (r, g, b) = if fixed {
+        let (l, cb, cr) = (&lrow[..], &rows[0][..], &rows[1][..]);
+        if fixed {
+            let k = |yy: f32, cb: f32, cr: f32| {
                 let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
-                ycbcr_to_rgb8_fixed16(yy, q(cb), q(cr))
-            } else {
-                let q = |v: f32| (v * 256.0).round() as i64;
-                ycbcr_frac_to_rgb8(yy, q(cb), q(cr), maxval)
+                let (r, g, b) = ycbcr_to_rgb8_fixed16(yy as u32, q(cb), q(cr));
+                [r, g, b]
             };
-            px[0] = r;
-            px[1] = g;
-            px[2] = b;
+            store_row_any(bpp, dst, l, cb, cr, k);
+        } else if maxval == 255 {
+            let k = |yy: f32, cb: f32, cr: f32| {
+                let q = |v: f32| (v * 256.0).round() as i32;
+                ycbcr_frac_to_rgb8_8bit(yy as i32, q(cb), q(cr))
+            };
+            store_row_any(bpp, dst, l, cb, cr, k);
+        } else {
+            let k = |yy: f32, cb: f32, cr: f32| {
+                let q = |v: f32| (v * 256.0).round() as i64;
+                let (r, g, b) = ycbcr_frac_to_rgb8(yy as u32, q(cb), q(cr), maxval);
+                [r, g, b]
+            };
+            store_row_any(bpp, dst, l, cb, cr, k);
         }
     }
+}
+
+/// [`store_row`] for a runtime pixel size (`3` or `4`).
+#[inline]
+fn store_row_any(
+    bpp: usize,
+    dst: &mut [u8],
+    y: &[f32],
+    cb: &[f32],
+    cr: &[f32],
+    kernel: impl Fn(f32, f32, f32) -> [u8; 3],
+) {
+    if bpp == 3 {
+        store_row::<3>(dst, y, cb, cr, kernel)
+    } else {
+        store_row::<4>(dst, y, cb, cr, kernel)
+    }
+}
+
+/// Convert one row of `Y`, `Cb`, `Cr` into `N`-byte pixels (`N = 3` RGB,
+/// `N = 4` RGBA, whose alpha is left as it is).
+#[inline]
+fn store_row<const N: usize>(
+    dst: &mut [u8],
+    y: &[f32],
+    cb: &[f32],
+    cr: &[f32],
+    kernel: impl Fn(f32, f32, f32) -> [u8; 3],
+) {
+    let (px, _) = dst.as_chunks_mut::<N>();
+    for (((p, &yy), &b), &r) in px.iter_mut().zip(y).zip(cb).zip(cr) {
+        let [r, g, b] = kernel(yy, b, r);
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+    }
+}
+
+/// [`ycbcr_frac_to_rgb8`] at `D = 255`: `Y` is an integer, so
+/// `Round(Y + t) = Y + Round(t)` and only the chroma offsets are divided
+/// (R and B as unsigned divisions by a constant after a bias that makes
+/// the numerator non-negative, G in exact `f64`). Bit-identical to the
+/// general form.
+#[inline]
+pub(crate) fn ycbcr_frac_to_rgb8_8bit(y: i32, cb256: i32, cr256: i32) -> [u8; 3] {
+    // cb'' / cr'' are within ±2^15 (chroma clamped by the reconstruction
+    // to the sample range, then scaled by 256).
+    let cb = (cb256 - 128 * 256).clamp(-(1 << 15), 1 << 15);
+    let cr = (cr256 - 128 * 256).clamp(-(1 << 15), 1 << 15);
+    // Round(n / d) = ⌊(n + d/2 + K·d) / d⌋ − K with K·d > |n|; the R and
+    // B numerators stay below 2^31, G needs 64 bits.
+    const K: i32 = 256;
+    let rr = ((1402 * cr + 128_000 + K * 256_000) as u32 / 256_000) as i32 - K;
+    let bb = ((1772 * cb + 128_000 + K * 256_000) as u32 / 256_000) as i32 - K;
+    // G in f64: the numerator (|n| < 2^35) and the denominator are exact,
+    // the quotient is correctly rounded, and a quotient that is not a
+    // half-integer lies at least 1 / (2 · 150 272 000) from one — far
+    // beyond f64's resolution at |q| < 2^8 — so ⌊q + ½⌋ is exact.
+    let n = -202_008.0 * cb as f64 - 419_198.0 * cr as f64;
+    let gg = (n / 150_272_000.0 + 0.5).floor() as i32;
+    let c = |v: i32| v.clamp(0, 255) as u8;
+    [c(y + rr), c(y + gg), c(y + bb)]
 }
 
 /// [`ycbcr_to_rgb8`] with the chroma given in `1/256` sample units
@@ -420,14 +510,6 @@ fn fill_ycbcr_interp(
 #[inline]
 pub(crate) fn ycbcr_frac_to_rgb8(y: u32, cb256: i64, cr256: i64, maxval: u32) -> (u8, u8, u8) {
     let y = y as i64;
-    if maxval == 255 {
-        let cb = cb256 - 128 * 256;
-        let cr = cr256 - 128 * 256;
-        let r = round_div(256_000 * y + 1402 * cr, 256_000);
-        let g = round_div(150_272_000 * y - 202_008 * cb - 419_198 * cr, 150_272_000);
-        let b = round_div(256_000 * y + 1772 * cb, 256_000);
-        return (clamp8(r), clamp8(g), clamp8(b));
-    }
     let d = maxval as i64;
     let half = (d + 1) / 2;
     let cb = cb256 - half * 256;
@@ -710,6 +792,15 @@ mod tests {
                         ycbcr_frac_to_rgb8(y, f(cb), f(cr), 255),
                         ycbcr_to_rgb8(y, cb, cr, 255)
                     );
+                    // The 8-bit fast form, at every fraction step.
+                    for frac in [0i64, 1, 77, 128, 255] {
+                        let (a, b) = (f(cb) + frac, f(cr) + 255 - frac);
+                        let (r, g, bb) = ycbcr_frac_to_rgb8(y, a, b, 255);
+                        assert_eq!(
+                            ycbcr_frac_to_rgb8_8bit(y as i32, a as i32, b as i32),
+                            [r, g, bb]
+                        );
+                    }
                     let g = |v: u32| v as i64 * 16 * 256;
                     assert_eq!(
                         ycbcr_frac_to_rgb8(y * 16, g(cb), g(cr), 4095),

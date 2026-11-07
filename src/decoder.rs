@@ -1069,12 +1069,21 @@ fn init_coef_buffers(sof: &SofInfo) -> Result<Vec<Vec<[i32; 64]>>> {
 struct BitReader<'a> {
     buf: &'a [u8],
     pos: usize,
-    /// 32-bit bit-buffer (MSB-aligned).
-    bits: u32,
+    /// 64-bit bit-buffer (MSB-aligned).
+    bits: u64,
     /// Number of valid bits currently in `bits`.
     nbits: u32,
     /// Set when we hit a restart marker while refilling.
     pub saw_rst: Option<u8>,
+}
+
+/// Mask of the high bit of every byte of `w` that equals `0xFF`, exact
+/// per byte (no borrow crosses a byte boundary).
+#[inline(always)]
+fn ff_bytes(w: u64) -> u64 {
+    const LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    let x = !w; // 0xFF → 0x00
+    !(((x & LO7) + LO7) | x | LO7)
 }
 
 impl<'a> BitReader<'a> {
@@ -1085,6 +1094,26 @@ impl<'a> BitReader<'a> {
             bits: 0,
             nbits: 0,
             saw_rst: None,
+        }
+    }
+
+    /// Bulk refill: append the run of plain entropy bytes (none `0xFF`, so
+    /// no stuffing / marker / fill-run logic applies) that starts at `pos`,
+    /// as many whole bytes as the buffer has room for, from one 8-byte
+    /// load. Byte-for-byte what the single-byte paths would append.
+    #[inline(always)]
+    fn refill_plain(&mut self) {
+        if let Some(chunk) = self.buf.get(self.pos..self.pos + 8) {
+            let w = u64::from_be_bytes(chunk.try_into().unwrap());
+            let ff = ff_bytes(w);
+            let plain = if ff == 0 { 8 } else { ff.leading_zeros() / 8 };
+            let k = plain.min((64 - self.nbits) / 8);
+            if k > 0 {
+                let take = w >> (64 - 8 * k);
+                self.bits |= take << (64 - self.nbits - 8 * k);
+                self.nbits += 8 * k;
+                self.pos += k as usize;
+            }
         }
     }
 
@@ -1121,41 +1150,27 @@ impl<'a> BitReader<'a> {
     }
 
     fn fill(&mut self, needed: u32) -> Result<()> {
-        // The shift `24 - self.nbits` in the refill below underflows
-        // for `self.nbits > 24`. JPEG entropy tokens never need more
-        // than 16 bits at a time (`extend` symbols cap at 16, and the
-        // Annex F lossless residual is the only 16-bit slot — handled
-        // out-of-band), so requesting more than 24 here is always a
-        // caller bug. Refuse rather than panic.
+        // JPEG entropy tokens never need more than 16 bits at a time
+        // (`extend` symbols cap at 16, and the Annex F lossless residual
+        // is the only 16-bit slot — handled out-of-band), so requesting
+        // more than 24 here is always a caller bug. Refuse rather than
+        // misbehave.
         if needed > 24 {
             return Err(Error::invalid("BitReader: requested > 24 bits"));
         }
+        if self.nbits < needed {
+            self.refill_plain();
+        }
         while self.nbits < needed {
-            // Bulk fast path: when the next two bytes are both plain entropy
-            // bytes (neither is 0xFF, so no stuffing / marker / fill-run
-            // logic can apply), committing them together is byte-for-byte
-            // identical to two iterations of the single-byte path below.
-            if self.nbits <= 16 && self.pos + 2 <= self.buf.len() {
-                let b0 = self.buf[self.pos];
-                let b1 = self.buf[self.pos + 1];
-                if b0 != 0xFF && b1 != 0xFF {
-                    let w = ((b0 as u32) << 8) | b1 as u32;
-                    self.bits |= w << (16 - self.nbits);
-                    self.nbits += 16;
-                    self.pos += 2;
-                    continue;
-                }
-            }
             match self.next_byte_with_stuff()? {
                 Some(b) => {
-                    self.bits |= (b as u32) << (24 - self.nbits);
+                    self.bits |= (b as u64) << (56 - self.nbits);
                     self.nbits += 8;
                 }
                 None => {
                     // If we ran out of bits mid-decode, pad with zeros —
                     // a conventional tolerance at scan end. The caller is
                     // responsible for noticing `saw_rst` / EOI and stopping.
-                    self.bits |= 0;
                     self.nbits = needed;
                     break;
                 }
@@ -1164,9 +1179,9 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 
+    #[inline]
     fn get_bits(&mut self, n: u32) -> Result<u32> {
-        // `n == 0` would compute `self.bits >> 32` which is UB on u32
-        // (debug-panic, release-wraparound). Both fuzz and real-world
+        // `n == 0` would shift by the full width. Both fuzz and real-world
         // Huffman tables can decode a SSSS of 0 ("magnitude zero" → no
         // extra bits to read), so short-circuit cleanly here rather
         // than push the guard onto every caller.
@@ -1176,8 +1191,10 @@ impl<'a> BitReader<'a> {
         if n > 24 {
             return Err(Error::invalid("BitReader: get_bits(n > 24)"));
         }
-        self.fill(n)?;
-        let v = self.bits >> (32 - n);
+        if self.nbits < n {
+            self.fill(n)?;
+        }
+        let v = (self.bits >> (64 - n)) as u32;
         self.bits <<= n;
         self.nbits -= n;
         Ok(v)
@@ -1199,14 +1216,14 @@ impl<'a> BitReader<'a> {
     /// last symbol before a restart marker: the bit-by-bit `get_bits(1)`
     /// walk only ever consumes the marker once it genuinely runs out of
     /// real bits *for the current symbol*, never speculatively. An eager
-    /// `FAST_BITS`-wide peek must mirror that — it must not consume the
+    /// lookahead peek must mirror that — it must not consume the
     /// `RSTn` (and reset DC prediction / desync the AC run that follows)
     /// just because it looked one byte too far ahead. The peeked high bits
     /// that correspond to real buffered data are still exact, so the fast
     /// table resolves the same symbol; the slow path then re-reads the same
     /// bytes destructively when (and only when) a code actually needs them.
     /// `n` must be ≤ 24 (same window cap as `get_bits`).
-    #[inline]
+    #[inline(always)]
     fn peek_bits(&mut self, n: u32) -> Result<u32> {
         if n == 0 {
             return Ok(0);
@@ -1214,21 +1231,20 @@ impl<'a> BitReader<'a> {
         if n > 24 {
             return Err(Error::invalid("BitReader: peek_bits(n > 24)"));
         }
-        while self.nbits < n {
-            // Bulk fast path: two plain entropy bytes (neither 0xFF) commit
-            // together — byte-for-byte identical to two iterations of the
-            // single-byte path below, and the dominant case between markers.
-            if self.nbits <= 16 && self.pos + 2 <= self.buf.len() {
-                let b0 = self.buf[self.pos];
-                let b1 = self.buf[self.pos + 1];
-                if b0 != 0xFF && b1 != 0xFF {
-                    let w = ((b0 as u32) << 8) | b1 as u32;
-                    self.bits |= w << (16 - self.nbits);
-                    self.nbits += 16;
-                    self.pos += 2;
-                    continue;
-                }
+        if self.nbits < n {
+            self.refill_plain();
+            if self.nbits < n {
+                self.peek_refill_slow(n);
             }
+        }
+        Ok((self.bits >> (64 - n)) as u32)
+    }
+
+    /// The byte-at-a-time tail of [`Self::peek_bits`]: stuffed bytes and
+    /// the stop at a marker.
+    #[inline(never)]
+    fn peek_refill_slow(&mut self, n: u32) {
+        while self.nbits < n {
             // Only consume a *plain* byte (or a stuffed 0xFF00 → 0xFF). A
             // run-collapsed marker leaves `pos` untouched and pads.
             if self.pos >= self.buf.len() {
@@ -1247,7 +1263,7 @@ impl<'a> BitReader<'a> {
                 }
                 if self.buf[p] == 0x00 {
                     // Stuffed zero → literal 0xFF byte. Safe to commit.
-                    self.bits |= 0xFFu32 << (24 - self.nbits);
+                    self.bits |= 0xFFu64 << (56 - self.nbits);
                     self.nbits += 8;
                     self.pos = p + 1;
                     continue;
@@ -1255,11 +1271,10 @@ impl<'a> BitReader<'a> {
                 // Real marker (RSTn or otherwise): do not consume it here.
                 break;
             }
-            self.bits |= (b as u32) << (24 - self.nbits);
+            self.bits |= (b as u64) << (56 - self.nbits);
             self.nbits += 8;
             self.pos += 1;
         }
-        Ok(self.bits >> (32 - n))
     }
 
     /// Drop the next `n` bits that a prior `peek_bits` already validated as
@@ -1376,15 +1391,10 @@ fn render_block_8bit(
     for j in 0..8 {
         let dst = &mut buf[(dst_y0 + j) * stride + dst_x0..][..8];
         let src = &fblock[j * 8..j * 8 + 8];
+        // `v ≤ 0 → 0`, `v ≥ 255 → 255`, else `round(v)`, branch-free
+        // (`v` is never NaN).
         for (out, &f) in dst.iter_mut().zip(src) {
-            let v = f + 128.0;
-            *out = if v <= 0.0 {
-                0
-            } else if v >= 255.0 {
-                255
-            } else {
-                v.round() as u8
-            };
+            *out = (f + 128.0).clamp(0.0, 255.0).round() as u8;
         }
     }
 }
@@ -1892,20 +1902,46 @@ fn decode_block(
     prev_dc: &mut i32,
     out_natural: &mut [i32; 64],
 ) -> Result<()> {
+    use crate::jpeg::huffman::{LUT_BITS, LUT_RESOLVED};
+    // One combined-lookahead step: `Some((symbol, value))` when the next
+    // code (and, if resolved, its magnitude bits) are real buffered bits;
+    // the bits are consumed. `value` is `None` when the magnitude still
+    // has to be read. Codes the lookahead cannot settle take the
+    // canonical path, exactly as `decode_huff` would.
+    #[inline(always)]
+    fn step(br: &mut BitReader<'_>, t: &HuffTable) -> Result<(u8, Option<i32>)> {
+        let e = t.lut[br.peek_bits(LUT_BITS)? as usize];
+        let code_len = (e >> 8) & 0x0F;
+        if e & LUT_RESOLVED != 0 {
+            let total = (e >> 12) & 0x1F;
+            if total <= br.nbits {
+                br.consume(total);
+                return Ok((e as u8, Some((e as i32) >> 18)));
+            }
+        }
+        if code_len != 0 && code_len <= br.nbits {
+            br.consume(code_len);
+            return Ok((e as u8, None));
+        }
+        Ok((decode_huff(br, t)?, None))
+    }
     // DC.
-    let t = decode_huff(br, dc)? as u32;
-    let dc_diff = if t == 0 {
-        0
-    } else {
-        let bits = br.get_bits(t)? as i32;
-        extend(bits, t)
+    let (t, v) = step(br, dc)?;
+    let dc_diff = match v {
+        Some(v) => v,
+        None if t == 0 => 0,
+        None => {
+            let t = t as u32;
+            let bits = br.get_bits(t)? as i32;
+            extend(bits, t)
+        }
     };
     *prev_dc = prev_dc.wrapping_add(dc_diff);
     out_natural[0] = *prev_dc;
     // AC: zigzag run-length decode into natural order.
     let mut k: usize = 1;
     while k < 64 {
-        let rs = decode_huff(br, ac)?;
+        let (rs, v) = step(br, ac)?;
         let run = (rs >> 4) as usize;
         let size = (rs & 0x0F) as u32;
         if size == 0 {
@@ -1921,8 +1957,13 @@ fn decode_block(
         if k >= 64 {
             return Err(Error::invalid("JPEG AC: run out of block"));
         }
-        let bits = br.get_bits(size)? as i32;
-        let val = extend(bits, size);
+        let val = match v {
+            Some(v) => v,
+            None => {
+                let bits = br.get_bits(size)? as i32;
+                extend(bits, size)
+            }
+        };
         out_natural[ZIGZAG[k]] = val;
         k += 1;
     }

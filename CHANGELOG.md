@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.15...v0.1.16) - 2026-11-07
+
+### Other
+
+- before/after decode table, factorised IDCT wording, deblock threshold note
+- opt-in deblocking (DecodeOptions::deblock, registry key deblock)
+- optimal tables + rate-distortion levels by default, exact chroma average, one DCT pass
+- restart-interval-parallel sequential scans (DecodeOptions::threads, set_execution_context)
+- factorised float IDCT, 64-bit bit reader, combined Huffman lookahead, fused guided conversion
+- luma-guided reconstruction by default, centred linear for every ratio
+- read / render / write quantised DCT coefficients and tables ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- Adobe APP14 transform 0 by default, YCCK per T.872 §7, triangular 4-component upsampling ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- COM (comment) segments read, counted, written, replaced, stripped ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- DQT ahead of the frame header, DHT after it, only referenced tables ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- sequential arithmetic (SOF9) at P = 12 and with four components ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- reference-compatible decode as one switch + registry option bag, fitted-parameter notes, 87-stream djpeg oracle ([#19](https://github.com/OxideAV/oxideav-mjpeg/pull/19))
+- API hygiene: non_exhaustive option/kind enums + records, builders
+
 ### Added
 
 - `DecodeOptions::deblock` / `with_deblock` (default `false`) and registry decoder key `deblock`: opt-in smoothing of 8 × 8 block edges whose step is below the first-AC quantiser step along that axis and whose sides are flat (8-bit sequential and progressive frames, each component with its own table). On photographs it gains +0.54 dB at quality 10, +0.62 dB at 30, +0.56 dB at 50 and +0.32 dB at 75 (SSIM +0.026 to +0.002). Measurements are in the README *Deblocking* section.

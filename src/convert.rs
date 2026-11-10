@@ -284,15 +284,134 @@ fn clamp8(v: i64) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+/// Pixels per step of the row kernels: the per-channel loops of
+/// [`rgb_chunk`] run over fixed arrays of this many values.
+const CHUNK: usize = 16;
+
+/// `⌊(k · c + 128 000) / 256 000⌋` for a chroma offset `|c| ≤ 2^15` in
+/// `1/256` sample units and `k ≤ 1772` — the R and B offsets of
+/// [`ycbcr_frac_to_rgb8_8bit`] — in 32-bit arithmetic. `bias` makes the
+/// numerator `x` non-negative (`bias · 256 000 ≥ k · 2^15`); then
+/// `⌊x / 256 000⌋ = ⌊⌊x / 2^11⌋ / 125⌋`, and `⌊v / 125⌋` is
+/// `(v · 33 555) >> 22` for `v < 59 074` (`33 555 · 125 = 2^22 + 71`,
+/// so the product overshoots `v / 125` by `71 v / (125 · 2^22)`, less
+/// than `1 / 125`), which
+/// `v ≤ (1772 · 2^15 + 128 000 + 227 · 256 000) / 2^11 < 56 788` meets.
+#[inline(always)]
+fn chroma_offset<const K: i32, const BIAS: i32>(c: i32) -> i32 {
+    let x = (K * c + 128_000 + BIAS * 256_000) as u32;
+    (((x >> 11) * 33_555) >> 22) as i32 - BIAS
+}
+
+/// The G offset of [`ycbcr_frac_to_rgb8_8bit`],
+/// `Round(−(202 008 cb + 419 198 cr) / 150 272 000)` for chroma offsets
+/// `|cb|, |cr| ≤ 2^15` in `1/256` sample units, in 32-bit arithmetic.
+///
+/// Halving numerator and denominator, the value is `⌊m / 75 136 000⌋`
+/// with `m = −101 004 cb − 209 599 cr + 37 568 000`, and
+/// `75 136 000 = 2^10 · 73 375`, so it is `⌊u / 73 375⌋` with
+/// `u = ⌊m / 2^10⌋`. Writing each coefficient as a multiple of `2^10`
+/// plus a remainder (`−101 004 = −99 · 2^10 + 372`, `−209 599 = −205 ·
+/// 2^10 + 321`, `37 568 000 = 36 687 · 2^10 + 512`) gives `u` without a
+/// 64-bit product: `−99 cb − 205 cr + 36 687 + ⌊(372 cb + 321 cr + 512)
+/// / 2^10⌋`. `|u| < 10^7`; adding `137 · 73 375` makes it positive
+/// (`u' < 2.01 · 10^7`). The quotient estimate
+/// `e = (⌊u' / 2^9⌋ · 29 267) >> 22` (`29 267 = ⌊2^31 / 73 375⌋`) never
+/// exceeds `⌊u' / 73 375⌋` and falls short of it by less than one
+/// (`< 1/143` from the shift, `< 273 / 29 267` from the multiplier), so
+/// one comparison of the remainder completes it.
+#[inline(always)]
+fn green_offset(cb: i32, cr: i32) -> i32 {
+    const BIAS: i32 = 137;
+    let low = (372 * cb + 321 * cr + 512) >> 10;
+    let u = (low - 99 * cb - 205 * cr + (36_687 + BIAS * 73_375)) as u32;
+    let e = ((u >> 9) * 29_267) >> 22;
+    let r = u - e * 73_375;
+    (e + u32::from(r >= 73_375)) as i32 - BIAS
+}
+
+/// [`ycbcr_frac_to_rgb8_8bit`] for [`CHUNK`] pixels: `y` is the luma,
+/// `cb` / `cr` the chroma offsets `cb'' = cb256 − 128 · 256`, already
+/// limited to `±2^15`. Bit-identical to the scalar kernel, one channel
+/// per loop, in 32-bit integers with no division.
+#[inline(always)]
+fn rgb_chunk(y: &[i32; CHUNK], cb: &[i32; CHUNK], cr: &[i32; CHUNK]) -> [[u8; CHUNK]; 3] {
+    let c = |v: i32| v.clamp(0, 255) as u8;
+    let mut out = [[0u8; CHUNK]; 3];
+    for i in 0..CHUNK {
+        out[0][i] = c(y[i] + chroma_offset::<1402, 180>(cr[i]));
+    }
+    for i in 0..CHUNK {
+        out[1][i] = c(y[i] + green_offset(cb[i], cr[i]));
+    }
+    for i in 0..CHUNK {
+        out[2][i] = c(y[i] + chroma_offset::<1772, 227>(cb[i]));
+    }
+    out
+}
+
+/// Interleave the three channels of [`rgb_chunk`] into `N`-byte pixels.
+#[inline(always)]
+fn put_chunk<const N: usize>(px: &mut [[u8; N]; CHUNK], rgb: &[[u8; CHUNK]; 3]) {
+    for (i, p) in px.iter_mut().enumerate() {
+        p[0] = rgb[0][i];
+        p[1] = rgb[1][i];
+        p[2] = rgb[2][i];
+    }
+}
+
 /// One row of 8-bit `Y`, `Cb`, `Cr` (equal lengths) into `N`-byte
 /// pixels with the exact kernel (`N = 4` leaves alpha as it is).
-#[inline]
+#[inline(never)]
 fn row_ycbcr_8bit<const N: usize>(dst: &mut [u8], y: &[u8], cb: &[u8], cr: &[u8]) {
     let (px, _) = dst.as_chunks_mut::<N>();
-    for (((p, &yy), &b), &r) in px.iter_mut().zip(y).zip(cb).zip(cr) {
+    let n = px.len().min(y.len()).min(cb.len()).min(cr.len());
+    let (px, y, cb, cr) = (&mut px[..n], &y[..n], &cb[..n], &cr[..n]);
+    let (yc, yt) = y.as_chunks::<CHUNK>();
+    let (bc, bt) = cb.as_chunks::<CHUNK>();
+    let (rc, rt) = cr.as_chunks::<CHUNK>();
+    let (groups, tail) = px.as_chunks_mut::<CHUNK>();
+    for (((p, y), b), r) in groups.iter_mut().zip(yc).zip(bc).zip(rc) {
         // The fractional kernel at a whole chroma sample: the exact
         // rounding of the same T.871 §7 value as `ycbcr_to_rgb8`.
+        let yy: [i32; CHUNK] = std::array::from_fn(|i| y[i] as i32);
+        let bb: [i32; CHUNK] = std::array::from_fn(|i| (b[i] as i32 - 128) << 8);
+        let rr: [i32; CHUNK] = std::array::from_fn(|i| (r[i] as i32 - 128) << 8);
+        put_chunk(p, &rgb_chunk(&yy, &bb, &rr));
+    }
+    for (((p, &yy), &b), &r) in tail.iter_mut().zip(yt).zip(bt).zip(rt) {
         let rgb = ycbcr_frac_to_rgb8_8bit(yy as i32, (b as i32) << 8, (r as i32) << 8);
+        p[..3].copy_from_slice(&rgb);
+    }
+}
+
+/// One row of 8-bit-range `Y` with fractional `Cb`, `Cr` (`f32`, equal
+/// lengths) into `N`-byte pixels: the chroma rounded to `1/256` of a
+/// sample and handed to the exact kernel, as
+/// `ycbcr_frac_to_rgb8_8bit(y as i32, round(cb · 256), round(cr · 256))`.
+#[inline(never)]
+fn row_ycbcr_frac_8bit<const N: usize>(dst: &mut [u8], y: &[f32], cb: &[f32], cr: &[f32]) {
+    let (px, _) = dst.as_chunks_mut::<N>();
+    let n = px.len().min(y.len()).min(cb.len()).min(cr.len());
+    let (px, y, cb, cr) = (&mut px[..n], &y[..n], &cb[..n], &cr[..n]);
+    let (yc, yt) = y.as_chunks::<CHUNK>();
+    let (bc, bt) = cb.as_chunks::<CHUNK>();
+    let (rc, rt) = cr.as_chunks::<CHUNK>();
+    use crate::jpeg::fround::round_clamped;
+    // `(round(v · 256) − 128 · 256).clamp(−2^15, 2^15)`: limiting the
+    // scaled value to `0..=2^16` before rounding limits the offset the
+    // same way. The luma is a whole sample value (`0..=65 535`).
+    let offset = |v: f32| round_clamped(v * 256.0, 65_536.0) - 128 * 256;
+    let (groups, tail) = px.as_chunks_mut::<CHUNK>();
+    for (((p, y), b), r) in groups.iter_mut().zip(yc).zip(bc).zip(rc) {
+        let yy: [i32; CHUNK] = std::array::from_fn(|i| round_clamped(y[i], 65_535.0));
+        let bb: [i32; CHUNK] = std::array::from_fn(|i| offset(b[i]));
+        let rr: [i32; CHUNK] = std::array::from_fn(|i| offset(r[i]));
+        put_chunk(p, &rgb_chunk(&yy, &bb, &rr));
+    }
+    for (((p, &yy), &b), &r) in tail.iter_mut().zip(yt).zip(bt).zip(rt) {
+        let q = |v: f32| (v * 256.0).round() as i32;
+        let rgb = ycbcr_frac_to_rgb8_8bit(yy as i32, q(b), q(r));
         p[..3].copy_from_slice(&rgb);
     }
 }
@@ -327,8 +446,24 @@ fn fill_ycbcr_replicate_8bit(img: &JpegImage, out: &mut [u8], bpp: usize, thread
                 (cb_row, cr_row)
             } else {
                 for (src, buf) in [cb_row, cr_row].into_iter().zip(wide.iter_mut()) {
-                    for (cell, &v) in buf.chunks_exact_mut(dh).zip(src) {
-                        cell.fill(v);
+                    // Fixed-size cells for the common ratios, so the
+                    // widening is a plain loop.
+                    match dh {
+                        2 => {
+                            for (cell, &v) in buf.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                                *cell = [v; 2];
+                            }
+                        }
+                        4 => {
+                            for (cell, &v) in buf.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                                *cell = [v; 4];
+                            }
+                        }
+                        _ => {
+                            for (cell, &v) in buf.chunks_exact_mut(dh).zip(src) {
+                                cell.fill(v);
+                            }
+                        }
                     }
                 }
                 (&wide[0][..w], &wide[1][..w])
@@ -425,7 +560,7 @@ fn fill_ycbcr_interp(
     opts: &ConvertOptions,
     maxval: u32,
 ) {
-    use crate::jpeg::resample::{Guided, Linear};
+    use crate::jpeg::resample::{GuideLuma, Guided, Linear};
     let w = img.width as usize;
     let h = img.height as usize;
     let bps = img.format.bytes_per_sample();
@@ -462,14 +597,23 @@ fn fill_ycbcr_interp(
         Lin(Linear),
         Guide(Guided),
     }
-    let guided = opts.upsampling == ChromaUpsampling::LumaGuided;
+    // The luma statistics of the guided reconstruction serve both chroma
+    // components.
+    let guide = (opts.upsampling == ChromaUpsampling::LumaGuided).then(|| {
+        let py = &img.planes[0];
+        let whole = py.stride >= w && py.data.len() >= (h - 1) * py.stride + w;
+        if bps == 1 && maxval == 255 && whole {
+            GuideLuma::from_u8(&py.data, py.stride, cw, ch, dh, dv, w, h)
+        } else {
+            let mut luma = |y: usize, row: &mut [f32]| read_row(py, y, row);
+            GuideLuma::new(&mut luma, cw, ch, dh, dv, w, h, maxval)
+        }
+    });
     let make = |p: &crate::image::Plane| {
         let c = plane(p, cw, ch);
-        if guided {
-            let mut luma = |y: usize, row: &mut [f32]| read_row(&img.planes[0], y, row);
-            Recon::Guide(Guided::new(&mut luma, c, cw, ch, dh, dv, w, h, maxval))
-        } else {
-            Recon::Lin(Linear::new(c, cw, ch, (1, dh), (1, dv), w, h))
+        match &guide {
+            Some(g) => Recon::Guide(Guided::new(g, c)),
+            None => Recon::Lin(Linear::new(c, cw, ch, (1, dh), (1, dv), w, h)),
         }
     };
     let workers = opts.threads.clamp(1, h);
@@ -491,20 +635,27 @@ fn fill_ycbcr_interp(
         let mut rows = [vec![0f32; w], vec![0f32; w]];
         let mut lrow = vec![0f32; w];
         let mut lin = [Vec::new(), Vec::new()];
-        let mut gui: [[Vec<f32>; 3]; 2] = Default::default();
+        let mut gui: [[Vec<f32>; 2]; 2] = Default::default();
         for (i, r) in recon.iter().enumerate() {
-            match r {
-                Recon::Lin(l) => lin[i] = l.scratch(),
-                Recon::Guide(g) => gui[i] = g.scratch(),
+            match (r, &guide) {
+                (Recon::Guide(g), Some(gl)) => gui[i] = g.scratch(gl),
+                (Recon::Lin(l), _) => lin[i] = l.scratch(),
+                _ => {}
             }
         }
+        let mut ycol = guide.as_ref().map(GuideLuma::scratch).unwrap_or_default();
+        let mut detail = vec![0f32; if guide.is_some() { w } else { 0 }];
         for (i, dst) in band.chunks_exact_mut(w * bpp).enumerate() {
             let y = y0 + i;
             read_row(&img.planes[0], y, &mut lrow);
+            if let Some(gl) = &guide {
+                gl.detail_row(&mut ycol, y, &lrow, &mut detail);
+            }
             for (i, (r, row)) in recon.iter().zip(rows.iter_mut()).enumerate() {
-                match r {
-                    Recon::Lin(l) => l.row_with(&mut lin[i], y, row),
-                    Recon::Guide(g) => g.row_with(&mut gui[i], y, &lrow, row),
+                match (r, &guide) {
+                    (Recon::Guide(g), Some(gl)) => g.row_with(gl, &mut gui[i], y, &detail, row),
+                    (Recon::Lin(l), _) => l.row_with(&mut lin[i], y, row),
+                    _ => {}
                 }
             }
             let (l, cb, cr) = (&lrow[..], &rows[0][..], &rows[1][..]);
@@ -516,11 +667,11 @@ fn fill_ycbcr_interp(
                 };
                 store_row_any(bpp, dst, l, cb, cr, k);
             } else if maxval == 255 {
-                let k = |yy: f32, cb: f32, cr: f32| {
-                    let q = |v: f32| (v * 256.0).round() as i32;
-                    ycbcr_frac_to_rgb8_8bit(yy as i32, q(cb), q(cr))
-                };
-                store_row_any(bpp, dst, l, cb, cr, k);
+                if bpp == 3 {
+                    row_ycbcr_frac_8bit::<3>(dst, l, cb, cr);
+                } else {
+                    row_ycbcr_frac_8bit::<4>(dst, l, cb, cr);
+                }
             } else {
                 let k = |yy: f32, cb: f32, cr: f32| {
                     let q = |v: f32| (v * 256.0).round() as i64;
@@ -909,6 +1060,149 @@ mod tests {
                         "y {y} cb {cb} cr {cr}"
                     );
                 }
+            }
+        }
+    }
+
+    /// `rgb_chunk` against the scalar kernel for one `(cb'', cr'')`
+    /// pair at a spread of luma values.
+    fn assert_chunk(cb: i32, cr: i32) {
+        let y: [i32; CHUNK] = std::array::from_fn(|i| [0, 1, 127, 128, 254, 255, 90, 200][i % 8]);
+        let got = rgb_chunk(&y, &[cb; CHUNK], &[cr; CHUNK]);
+        for i in 0..8 {
+            let want = ycbcr_frac_to_rgb8_8bit(y[i], cb + 128 * 256, cr + 128 * 256);
+            assert_eq!([got[0][i], got[1][i], got[2][i]], want, "cb {cb} cr {cr}");
+        }
+    }
+
+    #[test]
+    fn chunk_kernel_is_the_scalar_kernel() {
+        const LIM: i32 = 1 << 15;
+        // A coprime-stride lattice over the whole ±2^15 square, the
+        // square's border, and every whole-sample pair.
+        let (mut cb, mut cr) = (-LIM, -LIM);
+        for _ in 0..600_000 {
+            assert_chunk(cb, cr);
+            cb += 7919;
+            if cb > LIM {
+                cb -= 2 * LIM + 1;
+            }
+            cr += 104_729 % (2 * LIM + 1);
+            if cr > LIM {
+                cr -= 2 * LIM + 1;
+            }
+        }
+        for v in (-LIM..=LIM).step_by(3) {
+            for edge in [-LIM, LIM] {
+                assert_chunk(v, edge);
+                assert_chunk(edge, v);
+            }
+        }
+        for cb in -128..128 {
+            for cr in -128..128 {
+                assert_chunk(cb << 8, cr << 8);
+            }
+        }
+        // The G quotients that are exact half-integers:
+        // 101004 cb'' + 209599 cr'' = 37568000 (2k + 1).
+        let mut ties = 0;
+        for k in -136i64..136 {
+            let target = 37_568_000 * (2 * k + 1);
+            for cb in -LIM as i64..=LIM as i64 {
+                let rest = target - 101_004 * cb;
+                if rest % 209_599 == 0 && (rest / 209_599).abs() <= LIM as i64 {
+                    let cr = rest / 209_599;
+                    assert_chunk(cb as i32, cr as i32);
+                    assert_chunk(-cb as i32, -cr as i32);
+                    ties += 1;
+                }
+            }
+        }
+        assert!(ties > 0, "no exact tie exercised");
+    }
+
+    #[test]
+    fn green_offset_is_the_rounded_quotient() {
+        const LIM: i64 = 1 << 15;
+        let exact = |cb: i64, cr: i64| {
+            let n = -202_008 * cb - 419_198 * cr;
+            (2 * n + 150_272_000).div_euclid(2 * 150_272_000) as i32
+        };
+        // Every pair on a lattice of coprime strides (the full square is
+        // 2^34 pairs), the borders, and the quotients next to a step.
+        for cb in (-LIM..=LIM).step_by(61) {
+            for cr in (-LIM..=LIM).step_by(67) {
+                assert_eq!(
+                    green_offset(cb as i32, cr as i32),
+                    exact(cb, cr),
+                    "{cb} {cr}"
+                );
+            }
+        }
+        for v in -LIM..=LIM {
+            for e in [-LIM, 0, LIM] {
+                assert_eq!(green_offset(v as i32, e as i32), exact(v, e));
+                assert_eq!(green_offset(e as i32, v as i32), exact(e, v));
+            }
+        }
+        // For each cb, the cr values around every step of the quotient.
+        for cb in (-LIM..=LIM).step_by(257) {
+            for k in -136i64..=136 {
+                // 419198 cr ≈ −202008 cb − (2k + 1) · 75136000
+                let cr = (-202_008 * cb - (2 * k + 1) * 75_136_000) / 419_198;
+                for cr in cr - 2..=cr + 2 {
+                    if cr.abs() <= LIM {
+                        assert_eq!(green_offset(cb as i32, cr as i32), exact(cb, cr));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_offsets_are_the_rounded_quotients() {
+        for c in -(1 << 15)..=(1 << 15) {
+            let exact = |k: i64| (k * c as i64 + 128_000).div_euclid(256_000) as i32;
+            assert_eq!(chroma_offset::<1402, 180>(c), exact(1402), "R at {c}");
+            assert_eq!(chroma_offset::<1772, 227>(c), exact(1772), "B at {c}");
+        }
+        for v in 0..59_074u32 {
+            assert_eq!((v * 33_555) >> 22, v / 125);
+        }
+    }
+
+    #[test]
+    fn row_kernels_match_the_scalar_kernel() {
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for n in [1usize, 15, 16, 17, 40, 257] {
+            let y: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let cb: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let cr: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut got = vec![7u8; n * 4];
+            row_ycbcr_8bit::<4>(&mut got, &y, &cb, &cr);
+            for i in 0..n {
+                let (r, g, b) = ycbcr_to_rgb8(y[i] as u32, cb[i] as u32, cr[i] as u32, 255);
+                assert_eq!(got[i * 4..i * 4 + 4], [r, g, b, 7]);
+            }
+            let yf: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+            let frac = |v: &[u8], next: &mut dyn FnMut() -> u32| -> Vec<f32> {
+                v.iter()
+                    .map(|&v| (v as f32 + (next() % 4096) as f32 / 4096.0).min(255.0))
+                    .collect()
+            };
+            let (bf, rf) = (frac(&cb, &mut next), frac(&cr, &mut next));
+            let mut got = vec![0u8; n * 3];
+            row_ycbcr_frac_8bit::<3>(&mut got, &yf, &bf, &rf);
+            for i in 0..n {
+                let q = |v: f32| (v * 256.0).round() as i32;
+                let want = ycbcr_frac_to_rgb8_8bit(y[i] as i32, q(bf[i]), q(rf[i]));
+                assert_eq!(got[i * 3..i * 3 + 3], want);
             }
         }
     }

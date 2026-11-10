@@ -7,6 +7,7 @@ pub mod color;
 #[doc(hidden)]
 pub mod dct;
 pub(crate) mod deblock;
+pub(crate) mod fround;
 #[doc(hidden)]
 pub mod huffman;
 pub(crate) mod idct_int;

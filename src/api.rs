@@ -782,6 +782,14 @@ fn gather(
     h: usize,
 ) -> Result<Vec<u16>> {
     let mut out = Vec::with_capacity(w * h);
+    if bps == 1 && channels == 1 && w > 0 && p.stride >= w && p.data.len() >= (h - 1) * p.stride + w
+    {
+        // One byte per sample, one channel: widen row by row.
+        for row in p.data.chunks(p.stride).take(h) {
+            out.extend(row[..w].iter().map(|&v| v as u16));
+        }
+        return Ok(out);
+    }
     for y in 0..h {
         let row = y * p.stride;
         for x in 0..w {
@@ -930,41 +938,50 @@ pub(crate) fn rgb8_to_native(
     //   CR = Round((0.701 R − 0.587 G − 0.114 B) / 1.402 + 128)
     // with CB / CR evaluated on the mean over each chroma cell (T.871 §9
     // NOTE 1's two-tap filter per subsampled axis) before the rounding.
-    let mut yp = vec![0u8; w * h];
+    let gray = format == PixelFormat::Gray8;
     let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
-    // Chroma numerators `−299 R − 587 G + 886 B` (CB, over 1772) and
-    // `701 R − 587 G − 114 B` (CR, over 1402) summed exactly over each
-    // chroma cell's samples, so the two-tap box average is rounded once.
-    let mut cb_sum = vec![0i64; cw * ch];
-    let mut cr_sum = vec![0i64; cw * ch];
-    let mut cnt = vec![0i64; cw * ch];
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) * 3;
-            let (r, g, b) = (rgb[i] as i64, rgb[i + 1] as i64, rgb[i + 2] as i64);
-            let yy = round_div(299 * r + 587 * g + 114 * b, 1000);
-            yp[y * w + x] = yy.clamp(0, 255) as u8;
-            if format != PixelFormat::Gray8 {
-                let ci = (y / dv) * cw + x / dh;
-                cb_sum[ci] += -299 * r - 587 * g + 886 * b;
-                cr_sum[ci] += 701 * r - 587 * g - 114 * b;
-                cnt[ci] += 1;
+    let mut yp = vec![0u8; w * h];
+    let (mut cbp, mut crp) = if gray {
+        (Vec::new(), Vec::new())
+    } else {
+        (vec![0u8; cw * ch], vec![0u8; cw * ch])
+    };
+    // Bands of whole chroma rows are independent of each other, so they
+    // can be converted by separate workers with the same result.
+    let band = |y0: usize, yrows: &mut [u8], cb: &mut [u8], cr: &mut [u8]| {
+        convert_band(
+            &rgb[y0 * w * 3..],
+            w,
+            yrows.len() / w.max(1),
+            (dh, dv),
+            gray,
+            yrows,
+            cb,
+            cr,
+        )
+    };
+    let workers = opts.threads.clamp(1, ch.max(1));
+    if workers <= 1 || w == 0 {
+        band(0, &mut yp, &mut cbp, &mut crp);
+    } else {
+        let crows = ch.div_ceil(workers);
+        std::thread::scope(|sc| {
+            let mut ys = yp.chunks_mut(crows * dv * w);
+            let mut cbs = cbp.chunks_mut((crows * cw).max(1));
+            let mut crs = crp.chunks_mut((crows * cw).max(1));
+            let band = &band;
+            for i in 0.. {
+                let Some(yrows) = ys.next() else { break };
+                let cb = cbs.next().unwrap_or_default();
+                let cr = crs.next().unwrap_or_default();
+                sc.spawn(move || band(i * crows * dv, yrows, cb, cr));
             }
-        }
+        });
     }
     let mut planes = vec![Plane::new(w, yp)];
-    if format != PixelFormat::Gray8 {
-        let avg = |sum: &[i64], den: i64| -> Vec<u8> {
-            sum.iter()
-                .zip(&cnt)
-                .map(|(&s, &n)| {
-                    let n = n.max(1);
-                    round_div(s + 128 * den * n, den * n).clamp(0, 255) as u8
-                })
-                .collect()
-        };
-        planes.push(Plane::new(cw, avg(&cb_sum, 1772)));
-        planes.push(Plane::new(cw, avg(&cr_sum, 1402)));
+    if !gray {
+        planes.push(Plane::new(cw, cbp));
+        planes.push(Plane::new(cw, crp));
     }
     let color = if format == PixelFormat::Gray8 {
         ColorInfo::gray()
@@ -974,10 +991,126 @@ pub(crate) fn rgb8_to_native(
     Ok(JpegImage::new(width, height, format, planes)?.with_color(color))
 }
 
-/// `⌊num / den + 0.5⌋`, exact.
-#[inline]
-fn round_div(num: i64, den: i64) -> i64 {
-    (2 * num + den).div_euclid(2 * den)
+/// Luma numerator weights × 1000 and the chroma numerators of T.871 §7:
+/// `CB · 1772 = −299 R − 587 G + 886 B`, `CR · 1402 = 701 R − 587 G −
+/// 114 B` (both before the `+ 128` offset).
+const CB_DEN: u32 = 1772;
+const CR_DEN: u32 = 1402;
+
+/// `Round(sum / (den · n) + 128)` for every chroma cell of a row, where
+/// `sum` is the cell's numerator total over `n` pixels: `⌊(2 · sum + 257
+/// · den · n) / (2 · den · n)⌋`. The numerator is positive (`|sum| ≤
+/// 886 · 255 · n < 128 · den · n`) and the quotient is at most 255, so
+/// the division is unsigned and needs no clamp; with `DN = den · n` a
+/// compile-time constant it is a multiplication.
+#[inline(always)]
+fn chroma_cells<const DN: u32>(sum: &[i32], out: &mut [u8]) {
+    for (o, &s) in out.iter_mut().zip(sum) {
+        *o = ((2 * s + 257 * DN as i32) as u32 / (2 * DN)) as u8;
+    }
+}
+
+/// [`chroma_cells`] for a run of cells of `n` pixels each (the common
+/// counts get a constant divisor).
+fn chroma_run(sum: &[i32], out: &mut [u8], den: u32, n: u32) {
+    match (den, n) {
+        (CB_DEN, 1) => chroma_cells::<{ CB_DEN }>(sum, out),
+        (CB_DEN, 2) => chroma_cells::<{ CB_DEN * 2 }>(sum, out),
+        (CB_DEN, 4) => chroma_cells::<{ CB_DEN * 4 }>(sum, out),
+        (CR_DEN, 1) => chroma_cells::<{ CR_DEN }>(sum, out),
+        (CR_DEN, 2) => chroma_cells::<{ CR_DEN * 2 }>(sum, out),
+        (CR_DEN, 4) => chroma_cells::<{ CR_DEN * 4 }>(sum, out),
+        _ => {
+            let dn = den * n;
+            for (o, &s) in out.iter_mut().zip(sum) {
+                *o = ((2 * s + 257 * dn as i32) as u32 / (2 * dn)) as u8;
+            }
+        }
+    }
+}
+
+/// Convert `rows` RGB rows (`w` pixels each) to luma rows and, unless
+/// `gray`, to the chroma rows of their `dh × dv` cells. `rows` starts on
+/// a chroma-row boundary; a last cell row or column may be partial.
+#[allow(clippy::too_many_arguments)]
+fn convert_band(
+    rgb: &[u8],
+    w: usize,
+    rows: usize,
+    (dh, dv): (usize, usize),
+    gray: bool,
+    yp: &mut [u8],
+    cb: &mut [u8],
+    cr: &mut [u8],
+) {
+    let cw = w.div_ceil(dh);
+    // Per-pixel chroma numerators of one row, then per-cell totals.
+    let mut cb_px = vec![0i32; w];
+    let mut cr_px = vec![0i32; w];
+    let mut cb_sum = vec![0i32; cw];
+    let mut cr_sum = vec![0i32; cw];
+    let full = w / dh;
+    for (cy, band) in (0..rows).step_by(dv).enumerate() {
+        let lines = dv.min(rows - band);
+        cb_sum.fill(0);
+        cr_sum.fill(0);
+        for y in band..band + lines {
+            let src = &rgb[y * w * 3..(y + 1) * w * 3];
+            let dst = &mut yp[y * w..(y + 1) * w];
+            for ((px, o), (b_num, r_num)) in src
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(dst.iter_mut())
+                .zip(cb_px.iter_mut().zip(cr_px.iter_mut()))
+            {
+                let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                // ⌊(299 R + 587 G + 114 B) / 1000 + ½⌋.
+                *o = ((299 * r + 587 * g + 114 * b + 500) as u32 / 1000) as u8;
+                *b_num = -299 * r - 587 * g + 886 * b;
+                *r_num = 701 * r - 587 * g - 114 * b;
+            }
+            if gray {
+                continue;
+            }
+            for (px, sum) in [(&cb_px, &mut cb_sum), (&cr_px, &mut cr_sum)] {
+                match dh {
+                    1 => {
+                        for (s, &v) in sum.iter_mut().zip(px.iter()) {
+                            *s += v;
+                        }
+                    }
+                    2 => {
+                        for (s, v) in sum.iter_mut().zip(px.as_chunks::<2>().0) {
+                            *s += v[0] + v[1];
+                        }
+                    }
+                    _ => {
+                        for (s, v) in sum.iter_mut().zip(px.chunks_exact(dh)) {
+                            *s += v.iter().sum::<i32>();
+                        }
+                    }
+                }
+                if full < cw {
+                    sum[full] += px[full * dh..].iter().sum::<i32>();
+                }
+            }
+        }
+        if gray {
+            continue;
+        }
+        let n = (dh * lines) as u32;
+        for (sum, out, den) in [
+            (&cb_sum, &mut cb[cy * cw..(cy + 1) * cw], CB_DEN),
+            (&cr_sum, &mut cr[cy * cw..(cy + 1) * cw], CR_DEN),
+        ] {
+            chroma_run(&sum[..full], &mut out[..full], den, n);
+            if full < cw {
+                let last = ((w - full * dh) * lines) as u32;
+                chroma_run(&sum[full..], &mut out[full..], den, last);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

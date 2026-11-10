@@ -21,8 +21,6 @@
 //! the component's table. The DC level keeps its §A.3.4 rounding (its
 //! difference coding links neighbouring blocks).
 
-use crate::jpeg::zigzag::ZIGZAG;
-
 /// `λ / mean(Q_ac)²`, chosen by sweeping the rate-PSNR curve (README,
 /// *Encoder quality*).
 pub(crate) const LAMBDA_SCALE: f32 = 0.0085;
@@ -59,11 +57,30 @@ impl AcRate {
         Self { bits, min_len }
     }
 
-    /// Bits of symbol `rs` and its magnitude bits.
-    #[inline(always)]
-    fn bits(&self, rs: usize) -> f32 {
-        self.bits[rs]
+    /// The model with every rate multiplied by `lambda` once, for the
+    /// per-block search.
+    pub(crate) fn scaled(&self, lambda: f32) -> ScaledRate {
+        ScaledRate {
+            cost: std::array::from_fn(|rs| lambda * self.bits[rs]),
+            zrl: lambda * self.bits[0xF0],
+            eob: lambda * self.bits[0x00],
+            min: lambda * (self.min_len + 1.0),
+        }
     }
+}
+
+/// `λ ·` rate terms of one component's AC table.
+#[derive(Clone, Debug)]
+pub(crate) struct ScaledRate {
+    /// `λ ·` bits of symbol `RRRRSSSS` including its magnitude bits.
+    cost: [f32; 256],
+    /// `λ ·` bits of one `ZRL`.
+    zrl: f32,
+    /// `λ ·` bits of `EOB`.
+    eob: f32,
+    /// `λ ·` (shortest code + one magnitude bit): what any non-zero
+    /// level costs at least.
+    min: f32,
 }
 
 /// Magnitude category `SSSS` of a non-zero level.
@@ -72,43 +89,41 @@ fn category(v: i32) -> u32 {
     32 - v.unsigned_abs().leading_zeros()
 }
 
-/// Choose the AC levels of `out` (natural order; `out[0]` is left as
-/// is) from the unquantised `ratio[k] = S_k / Q_k` (natural order), the
-/// steps `q` and the rate model, minimising `D + λ · R`.
+/// Choose the AC levels of `out` (zig-zag order; `out[0]` is left as
+/// is) from the unquantised `ratio[k] = S_k / Q_k`, the steps `step[k]
+/// = Q_k` and the §A.3.4 levels `nearest[k] = round(ratio[k])` (all in
+/// zig-zag order), minimising `D + λ · R` under the rate model.
 pub(crate) fn quantise_ac(
     ratio: &[f32; 64],
-    q: &[u16; 64],
-    rate: &AcRate,
-    lambda: f32,
+    step: &[f32; 64],
+    nearest: &[i32; 64],
+    rate: &ScaledRate,
     out: &mut [i32; 64],
 ) {
-    // Zigzag positions 1..=63: error of coding zero, and the candidate
-    // non-zero levels with their errors.
+    // Per position, independent of its neighbours (so the loop
+    // vectorises): the error of coding zero, the candidate one step
+    // nearer zero and the errors of both candidates.
     let mut zero = [0f32; 64];
-    let mut cand = [[(0i32, 0f32); 2]; 64];
-    let mut ncand = [0u8; 64];
+    let mut d_near = [0f32; 64];
+    let mut d_low = [0f32; 64];
+    let mut lower = [0i32; 64];
+    for k in 0..64 {
+        let (r, s, l) = (ratio[k], step[k], nearest[k]);
+        zero[k] = (r * s) * (r * s);
+        let e = (r - l as f32) * s;
+        d_near[k] = e * e;
+        let l2 = l - l.signum();
+        lower[k] = l2;
+        let e2 = (r - l2 as f32) * s;
+        d_low[k] = e2 * e2;
+    }
+    // Positions that can carry a non-zero level, in zig-zag order.
     let mut live = [0u8; 64];
     let mut nlive = 0usize;
     for k in 1..64 {
-        let n = ZIGZAG[k];
-        let r = ratio[n];
-        let step = q[n] as f32;
-        zero[k] = (r * step) * (r * step);
-        let l = r.round() as i32;
-        if l != 0 {
-            let e = (r - l as f32) * step;
-            cand[k][0] = (l, e * e);
-            ncand[k] = 1;
-            if l.abs() >= 2 {
-                let l2 = l - l.signum();
-                let e2 = (r - l2 as f32) * step;
-                cand[k][1] = (l2, e2 * e2);
-                ncand[k] = 2;
-            }
-            live[nlive] = k as u8;
-            nlive += 1;
-        }
-        out[n] = 0;
+        live[nlive] = k as u8;
+        nlive += usize::from(nearest[k] != 0);
+        out[k] = 0;
     }
     if nlive == 0 {
         return;
@@ -118,11 +133,12 @@ pub(crate) fn quantise_ac(
     for k in 1..64 {
         zsum[k + 1] = zsum[k] + zero[k];
     }
-    let zrange = |a: usize, b: usize| if b > a { zsum[b] - zsum[a] } else { 0.0 };
-    let zrl = rate.bits(0xF0);
+    // Zero-coding error of positions `a..b` (`a ≤ b`; an empty range is
+    // `x − x = 0`).
+    let zrange = |a: usize, b: usize| zsum[b] - zsum[a];
     // Every non-zero level costs at least the shortest code plus one
     // magnitude bit: a lower bound for pruning predecessors.
-    let min_rate = lambda * (rate.min_len + 1.0);
+    let min_rate = rate.min;
     // best[i]: least cost of positions 1..=live[i] with live[i] the last
     // non-zero; from[i]: predecessor (usize::MAX = none), pick[i]: level.
     // With `a[j] = best[j] − zsum[live[j] + 1]` (and `0` for "no
@@ -137,13 +153,18 @@ pub(crate) fn quantise_ac(
         let k = live[i] as usize;
         let mut b = f32::INFINITY;
         let (mut bf, mut bl) = (usize::MAX, 0i32);
-        let cands = &cand[k][..ncand[k] as usize];
+        // The rounded level, and the one below it when that is not zero.
+        let cands = [
+            (nearest[k], d_near[k], category(nearest[k]) as usize),
+            (lower[k], d_low[k], category(lower[k]) as usize),
+        ];
+        let cands = &cands[..if lower[k] != 0 { 2 } else { 1 }];
         let mut consider = |p: usize, base: f32, j: usize, b: &mut f32| {
             let run = k - p - 1;
-            let pre = base + zrange(p + 1, k) + lambda * zrl * (run / 16) as f32;
-            for &(l, d) in cands {
-                let rs = ((run % 16) << 4) | category(l) as usize;
-                let c = pre + d + lambda * rate.bits(rs);
+            let pre = base + zrange(p + 1, k) + rate.zrl * (run / 16) as f32;
+            for &(l, d, cat) in cands {
+                let rs = ((run % 16) << 4) | cat;
+                let c = pre + d + rate.cost[rs];
                 if c < *b {
                     *b = c;
                     bf = j;
@@ -169,7 +190,7 @@ pub(crate) fn quantise_ac(
     }
     // End: all zero, or last non-zero at some live position, then EOB
     // unless that position is 63.
-    let eob = lambda * rate.bits(0x00);
+    let eob = rate.eob;
     let mut end_cost = zrange(1, 64) + eob;
     let mut end = usize::MAX;
     for i in 0..nlive {
@@ -182,7 +203,7 @@ pub(crate) fn quantise_ac(
     }
     let mut i = end;
     while i != usize::MAX {
-        out[ZIGZAG[live[i] as usize]] = pick[i];
+        out[live[i] as usize] = pick[i];
         i = from[i];
     }
 }
@@ -191,6 +212,10 @@ pub(crate) fn quantise_ac(
 mod tests {
     use super::*;
     use crate::jpeg::huffman::{STD_AC_LUMA_BITS, STD_AC_LUMA_VALS};
+
+    fn nearest(ratio: &[f32; 64]) -> [i32; 64] {
+        std::array::from_fn(|k| ratio[k].round() as i32)
+    }
 
     fn rate() -> AcRate {
         AcRate::new(&STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS)
@@ -202,9 +227,9 @@ mod tests {
         for (k, r) in ratio.iter_mut().enumerate() {
             *r = ((k as f32 * 1.37).sin() * 6.0) + 0.1;
         }
-        let q = [10u16; 64];
+        let q = [10f32; 64];
         let mut out = [0i32; 64];
-        quantise_ac(&ratio, &q, &rate(), 0.0, &mut out);
+        quantise_ac(&ratio, &q, &nearest(&ratio), &rate().scaled(0.0), &mut out);
         for k in 1..64 {
             assert_eq!(out[k], ratio[k].round() as i32, "{k}");
         }
@@ -215,13 +240,19 @@ mod tests {
         // One ±1 level at the end of the block costs a long run code; a
         // moderate λ drops it, a large level stays.
         let mut ratio = [0f32; 64];
-        ratio[ZIGZAG[1]] = 7.2;
-        ratio[ZIGZAG[60]] = 0.6;
-        let q = [16u16; 64];
+        ratio[1] = 7.2;
+        ratio[60] = 0.6;
+        let q = [16f32; 64];
         let mut out = [0i32; 64];
-        quantise_ac(&ratio, &q, &rate(), 0.06 * 256.0, &mut out);
-        assert_eq!(out[ZIGZAG[1]], 7);
-        assert_eq!(out[ZIGZAG[60]], 0);
+        quantise_ac(
+            &ratio,
+            &q,
+            &nearest(&ratio),
+            &rate().scaled(0.06 * 256.0),
+            &mut out,
+        );
+        assert_eq!(out[1], 7);
+        assert_eq!(out[60], 0);
     }
 
     #[test]
@@ -235,9 +266,9 @@ mod tests {
                 seed ^= seed << 5;
                 *r = (seed % 4001) as f32 / 200.0 - 10.0;
             }
-            let q = [8u16; 64];
+            let q = [8f32; 64];
             let mut out = [0i32; 64];
-            quantise_ac(&ratio, &q, &rate(), 20.0, &mut out);
+            quantise_ac(&ratio, &q, &nearest(&ratio), &rate().scaled(20.0), &mut out);
             for k in 1..64 {
                 let l = ratio[k].round() as i32;
                 assert!(out[k] == 0 || out[k].signum() == l.signum());

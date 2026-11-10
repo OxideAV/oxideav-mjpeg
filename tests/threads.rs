@@ -133,3 +133,88 @@ fn registry_decoder_takes_the_execution_context_budget() {
     };
     assert_eq!(frame(Some(4)), frame(None));
 }
+
+/// `EncodeOptions::threads` splits the colour conversion and the
+/// transform + quantisation of a picture between workers; every block
+/// is computed on its own, so the stream is the serial one byte for
+/// byte — every layout, process, quantiser, odd sizes (partial chroma
+/// cells, partial MCUs) and more workers than block rows.
+#[test]
+fn threaded_encode_equals_serial() {
+    use oxideav_mjpeg::{JpegProcess, Quantisation, encode};
+    for (w, h) in [(1u32, 1u32), (7, 3), (64, 48), (97, 61), (333, 219)] {
+        let rgb = picture(w, h);
+        for chroma in [
+            ChromaSubsampling::Yuv444,
+            ChromaSubsampling::Yuv422,
+            ChromaSubsampling::Yuv420,
+            ChromaSubsampling::Yuv411,
+            ChromaSubsampling::GrayscaleOnly,
+        ] {
+            for (process, quantisation, arithmetic) in [
+                (JpegProcess::Sequential, Quantisation::RateDistortion, false),
+                (JpegProcess::Sequential, Quantisation::Nearest, false),
+                (
+                    JpegProcess::Progressive,
+                    Quantisation::RateDistortion,
+                    false,
+                ),
+                (JpegProcess::Sequential, Quantisation::Nearest, true),
+            ] {
+                let opts = EncodeOptions::new()
+                    .with_quality(85)
+                    .with_chroma(chroma)
+                    .with_process(process)
+                    .with_quantisation(quantisation)
+                    .with_arithmetic(arithmetic);
+                assert_eq!(opts.threads, 1, "serial by default");
+                let serial = encode_rgb8(w, h, &rgb, &opts).unwrap();
+                for t in [0usize, 2, 3, 8, 64] {
+                    let out = encode_rgb8(w, h, &rgb, &opts.clone().with_threads(t)).unwrap();
+                    assert!(
+                        out == serial,
+                        "{w}x{h} {chroma:?} {process:?} {quantisation:?} threads {t}"
+                    );
+                }
+                // The planar entry point too.
+                let img = decode_with(&serial, &DecodeOptions::new()).unwrap();
+                let a = encode(&img, &opts).unwrap();
+                let b = encode(&img, &opts.clone().with_threads(5)).unwrap();
+                assert!(a == b, "{w}x{h} {chroma:?} planar");
+            }
+        }
+    }
+}
+
+/// The registry encoder takes its budget from
+/// `Encoder::set_execution_context` and writes the same packet.
+#[cfg(feature = "registry")]
+#[test]
+fn registry_encoder_thread_budget_keeps_the_bytes() {
+    use oxideav_core::frame::VideoPlane;
+    use oxideav_core::{CodecId, CodecParameters, ExecutionContext, Frame, VideoFrame};
+
+    let (w, h) = (160u32, 96u32);
+    let rgb = picture(w, h);
+    let mut p = CodecParameters::video(CodecId::new("mjpeg"));
+    p.width = Some(w);
+    p.height = Some(h);
+    p.pixel_format = Some(oxideav_core::PixelFormat::Rgb24);
+    let frame = Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride: w as usize * 3,
+            data: rgb,
+        }],
+    });
+    let mut packets = Vec::new();
+    for threads in [1usize, 4] {
+        let mut enc = oxideav_mjpeg::registry::make_encoder(&p).unwrap();
+        let mut ctx = ExecutionContext::serial();
+        ctx.threads = threads;
+        enc.set_execution_context(&ctx);
+        enc.send_frame(&frame).unwrap();
+        packets.push(enc.receive_packet().unwrap().data);
+    }
+    assert!(packets[0] == packets[1]);
+}

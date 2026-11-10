@@ -1525,6 +1525,9 @@ pub struct MjpegEncoder {
     /// When set, every frame goes through the general T.81 writer with
     /// these options (see [`MjpegEncoder::set_encode_options`]).
     general: Option<EncodeOptions>,
+    /// Thread budget from `Encoder::set_execution_context` (1 = serial),
+    /// handed to the general writer as [`EncodeOptions::threads`].
+    threads: usize,
     /// `general` was derived from the knobs (`set_progressive`, …) for a
     /// layout without a historical path, not set by the caller: it is
     /// re-derived on every frame so the knobs keep working.
@@ -1597,6 +1600,7 @@ impl MjpegEncoder {
             lossless_predictor: 1,
             cmyk_adobe_transform: Some(0),
             general: None,
+            threads: 1,
             general_implied: false,
             general_from_bag: false,
             shared_tables: None,
@@ -2460,6 +2464,7 @@ impl Encoder for MjpegEncoder {
                     (Some(mut opts), _) => {
                         opts.metadata = meta;
                         opts.jfif = self.jfif;
+                        opts.threads = self.threads;
                         self.encode_general(&opts, v)?
                     }
                     (None, Some(pix)) => {
@@ -2473,6 +2478,7 @@ impl Encoder for MjpegEncoder {
                     (None, None) => {
                         let mut o = self.implied_options();
                         o.metadata = meta;
+                        o.threads = self.threads;
                         self.encode_general_stateless(&o, v)?
                     }
                 };
@@ -2492,6 +2498,14 @@ impl Encoder for MjpegEncoder {
 
     fn receive_packet(&mut self) -> Result<Packet> {
         self.pending.pop_front().ok_or(Error::NeedMore)
+    }
+
+    /// The thread budget becomes [`EncodeOptions::threads`] of the
+    /// general writer: transform + quantisation of a DCT frame are split
+    /// between the workers (byte-identical to serial). The historical
+    /// per-layout encoders stay serial.
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.threads = ctx.threads.max(1);
     }
 
     fn flush(&mut self) -> Result<()> {

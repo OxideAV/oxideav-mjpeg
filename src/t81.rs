@@ -234,6 +234,9 @@ impl HuffSpec {
 struct HuffCodes {
     code: [u16; 256],
     size: [u8; 256],
+    /// `code << 8 | size` per symbol (0 = no code), one load in the
+    /// DCT emission loop.
+    packed: [u32; 256],
 }
 
 impl HuffCodes {
@@ -264,6 +267,7 @@ impl HuffCodes {
         let mut out = HuffCodes {
             code: [0; 256],
             size: [0; 256],
+            packed: [0; 256],
         };
         for (k, &v) in spec.vals.iter().enumerate() {
             if out.size[v as usize] != 0 {
@@ -273,6 +277,7 @@ impl HuffCodes {
             }
             out.code[v as usize] = huffcode[k];
             out.size[v as usize] = huffsize[k];
+            out.packed[v as usize] = (huffcode[k] as u32) << 8 | huffsize[k] as u32;
         }
         Ok(out)
     }
@@ -1003,12 +1008,10 @@ impl BitWriter {
     }
 
     /// Append the low `size` bits of `code` (`size ≤ 32`), MSB first.
-    #[inline]
+    #[inline(always)]
     fn put(&mut self, code: u32, size: u32) {
-        if size == 0 {
-            return;
-        }
         debug_assert!(size <= 32);
+        // `nbits < 32` on entry, so the accumulator never overflows.
         self.acc = (self.acc << size) | (code as u64 & ((1u64 << size) - 1));
         self.nbits += size;
         if self.nbits >= 32 {
@@ -1017,16 +1020,32 @@ impl BitWriter {
             self.nbits -= 32;
             let w = (self.acc >> self.nbits) as u32;
             self.acc &= (1u64 << self.nbits) - 1;
-            let bytes = w.to_be_bytes();
-            if bytes.contains(&0xFF) {
-                for b in bytes {
-                    self.out.push(b);
-                    if b == 0xFF {
-                        self.out.push(0x00);
-                    }
-                }
-            } else {
-                self.out.extend_from_slice(&bytes);
+            self.word(w);
+        }
+    }
+
+    /// Append four whole bytes, stuffing a zero after each `X'FF'`.
+    #[inline(always)]
+    fn word(&mut self, w: u32) {
+        // A byte of `w` is X'FF' exactly when the same byte of `!w` is
+        // zero: the classic "has a zero byte" test, which has no false
+        // positives.
+        let inv = !w;
+        if inv.wrapping_sub(0x0101_0101) & !inv & 0x8080_8080 != 0 {
+            self.stuffed(w);
+        } else {
+            self.out.extend_from_slice(&w.to_be_bytes());
+        }
+    }
+
+    /// Four bytes of which at least one is `X'FF'`: each gets its
+    /// stuffed zero.
+    #[cold]
+    fn stuffed(&mut self, w: u32) {
+        for b in w.to_be_bytes() {
+            self.out.push(b);
+            if b == 0xFF {
+                self.out.push(0x00);
             }
         }
     }
@@ -1108,32 +1127,6 @@ impl Sink<'_> {
         Ok(())
     }
 
-    /// Code one AC-class composite symbol (`RRRRSSSS`) plus additional
-    /// bits.
-    fn ac_symbol(&mut self, table: u8, symbol: u8, extra: u32, extra_bits: u32) -> Result<()> {
-        match self {
-            Sink::Emit { writer, tables } => {
-                let codes = tables.ac[table as usize].as_ref().ok_or_else(|| {
-                    Error::invalid(format!("JPEG encode: AC table {table} not defined"))
-                })?;
-                let size = codes.size[symbol as usize];
-                if size == 0 {
-                    return Err(Error::invalid(format!(
-                        "JPEG encode: AC table {table} has no code for run/size {symbol:#04x}"
-                    )));
-                }
-                // Code and additional bits in one append (≤ 16 + 15 bits).
-                let mask = (1u32 << extra_bits) - 1;
-                writer.put(
-                    ((codes.code[symbol as usize] as u32) << extra_bits) | (extra & mask),
-                    size as u32 + extra_bits,
-                );
-            }
-            Sink::Count { ac, .. } => ac[table as usize].count(symbol),
-        }
-        Ok(())
-    }
-
     /// E.1.3: end the current restart interval with `RSTm` (the
     /// statistics sink has nothing to emit).
     fn restart(&mut self, m: u8) {
@@ -1143,12 +1136,152 @@ impl Sink<'_> {
     }
 }
 
+/// Destination of the symbol stream of a DCT scan. The two
+/// implementations are the two arms of [`Sink`], so the block coders
+/// are compiled once per arm with nothing to dispatch (or to fail) per
+/// symbol.
+trait SymbolSink {
+    /// A DC-class symbol with `nbits` additional bits `extra`.
+    fn dc(&mut self, table: u8, symbol: u8, extra: u32, nbits: u32);
+    /// An AC-class symbol with `nbits` additional bits `extra`.
+    fn ac(&mut self, table: u8, symbol: u8, extra: u32, nbits: u32);
+    /// End the restart interval with `RSTm`.
+    fn restart(&mut self, m: u8);
+}
+
+/// K.2 statistics gathering.
+struct CountSink<'a> {
+    dc: &'a mut [HuffStats; 4],
+    ac: &'a mut [HuffStats; 4],
+}
+
+impl SymbolSink for CountSink<'_> {
+    #[inline(always)]
+    fn dc(&mut self, table: u8, symbol: u8, _extra: u32, _nbits: u32) {
+        self.dc[table as usize & 3].count(symbol);
+    }
+
+    #[inline(always)]
+    fn ac(&mut self, table: u8, symbol: u8, _extra: u32, _nbits: u32) {
+        self.ac[table as usize & 3].count(symbol);
+    }
+
+    fn restart(&mut self, _m: u8) {}
+}
+
+/// A table without any code: what an undefined destination looks like
+/// to [`EmitSink`].
+static NO_CODES: [u32; 256] = [0; 256];
+
+/// Bit emission. A symbol without a code is remembered (`missing` =
+/// class, destination, symbol) instead of failing in the loop;
+/// [`EmitSink::check`] reports the first one. The pending bits live in
+/// the sink itself while a scan is coded (so the compiler can keep them
+/// in registers across the inlined block coders) and go back to the
+/// writer in [`EmitSink::sync`].
+struct EmitSink<'a> {
+    writer: &'a mut BitWriter,
+    acc: u64,
+    nbits: u32,
+    dc: [&'a [u32; 256]; 4],
+    ac: [&'a [u32; 256]; 4],
+    defined: [[bool; 4]; 2],
+    missing: Option<(u8, u8, u8)>,
+}
+
+impl<'a> EmitSink<'a> {
+    fn new(writer: &'a mut BitWriter, tables: &'a ScanTables) -> Self {
+        let pick = |t: &'a Option<HuffCodes>| t.as_ref().map_or(&NO_CODES, |c| &c.packed);
+        EmitSink {
+            acc: writer.acc,
+            nbits: writer.nbits,
+            writer,
+            dc: std::array::from_fn(|i| pick(&tables.dc[i])),
+            ac: std::array::from_fn(|i| pick(&tables.ac[i])),
+            defined: [
+                std::array::from_fn(|i| tables.dc[i].is_some()),
+                std::array::from_fn(|i| tables.ac[i].is_some()),
+            ],
+            missing: None,
+        }
+    }
+
+    /// Hand the pending bits back to the writer.
+    fn sync(&mut self) {
+        self.writer.acc = self.acc;
+        self.writer.nbits = self.nbits;
+    }
+
+    #[inline(always)]
+    fn put(&mut self, packed: u32, class: u8, table: u8, symbol: u8, extra: u32, nbits: u32) {
+        let size = packed & 0xFF;
+        if size == 0 {
+            self.missing.get_or_insert((class, table, symbol));
+            return;
+        }
+        // Code and additional bits in one append (≤ 16 + 16 bits; the
+        // additional bits are already masked to `nbits`): the same
+        // steps as `BitWriter::put`.
+        let size = size + nbits;
+        self.acc = (self.acc << size) | (((packed >> 8) as u64) << nbits) | extra as u64;
+        self.nbits += size;
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            let w = (self.acc >> self.nbits) as u32;
+            self.acc &= (1u64 << self.nbits) - 1;
+            self.writer.word(w);
+        }
+    }
+
+    /// The first symbol that had no code, as the error the loop would
+    /// have raised.
+    fn check(&self) -> Result<()> {
+        let Some((class, table, symbol)) = self.missing else {
+            return Ok(());
+        };
+        let name = if class == 0 { "DC" } else { "AC" };
+        Err(if !self.defined[class as usize][table as usize & 3] {
+            Error::invalid(format!("JPEG encode: {name} table {table} not defined"))
+        } else if class == 0 {
+            Error::invalid(format!(
+                "JPEG encode: DC table {table} has no code for category {symbol}"
+            ))
+        } else {
+            Error::invalid(format!(
+                "JPEG encode: AC table {table} has no code for run/size {symbol:#04x}"
+            ))
+        })
+    }
+}
+
+impl SymbolSink for EmitSink<'_> {
+    #[inline(always)]
+    fn dc(&mut self, table: u8, symbol: u8, extra: u32, nbits: u32) {
+        let packed = self.dc[table as usize & 3][symbol as usize];
+        self.put(packed, 0, table, symbol, extra, nbits);
+    }
+
+    #[inline(always)]
+    fn ac(&mut self, table: u8, symbol: u8, extra: u32, nbits: u32) {
+        let packed = self.ac[table as usize & 3][symbol as usize];
+        self.put(packed, 1, table, symbol, extra, nbits);
+    }
+
+    fn restart(&mut self, m: u8) {
+        self.sync();
+        self.writer.restart(m);
+        self.acc = self.writer.acc;
+        self.nbits = self.writer.nbits;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Magnitude categories and additional bits (F.1.2.1.1 / F.1.2.2.1).
 // ---------------------------------------------------------------------------
 
 /// `SSSS` for a two's-complement value: the number of bits needed for
 /// its magnitude (Tables F.1 / F.2 / F.6 / F.7 / H.2).
+#[inline(always)]
 fn category(v: i32) -> u32 {
     let m = v.unsigned_abs();
     32 - m.leading_zeros()
@@ -1157,11 +1290,12 @@ fn category(v: i32) -> u32 {
 /// The additional bits: "When DIFF is positive, the SSSS low order bits
 /// of DIFF are appended. When DIFF is negative, the SSSS low order bits
 /// of (DIFF – 1) are appended."
+#[inline(always)]
 fn extra_bits(v: i32, ssss: u32) -> u32 {
-    if ssss == 0 {
-        return 0;
-    }
-    let raw = if v < 0 { v - 1 } else { v };
+    // `v − 1` for a negative value, `v` otherwise, without a branch on
+    // the (unpredictable) sign; `ssss ≤ 16`, and a zero category masks
+    // everything away.
+    let raw = v.wrapping_add(v >> 31);
     (raw as u32) & ((1u32 << ssss) - 1)
 }
 
@@ -1280,7 +1414,9 @@ fn validate_geometry(
             )));
         }
         let limit = 1u32 << frame.precision;
-        if check_samples && c.samples.iter().any(|&s| (s as u32) >= limit) {
+        // (A maximum over the whole plane vectorises; an early-exit
+        // search does not.)
+        if check_samples && c.samples.iter().fold(0u16, |m, &s| m.max(s)) as u32 >= limit {
             return Err(Error::invalid(format!(
                 "JPEG encode: component {i} has a sample outside 0..2^{}",
                 frame.precision
@@ -1395,22 +1531,104 @@ fn write_dri(out: &mut Vec<u8>, ri: u16) {
 /// grid (`bx_pad × by_pad`); `bx_true × by_true` is the A.2.2
 /// non-interleaved extent `ceil(xi / 8) × ceil(yi / 8)`.
 struct DctComponent {
-    blocks: Vec<[i32; 64]>,
+    /// Levels in zig-zag order within a block (index `k` of Figure A.6),
+    /// the order every entropy coder walks. A level fits 16 bits: the
+    /// orthonormal transform bounds `|S| ≤ 8 · 2^(P−1)` and `Q ≥ 1`.
+    blocks: Vec<[i16; 64]>,
+    /// Per block: bit `k` set when level `k` is non-zero.
+    nz: Vec<u64>,
     bx_pad: usize,
     bx_true: usize,
     by_true: usize,
 }
 
+/// Bit `k` set for every non-zero level `k`.
+#[inline]
+fn nonzero_mask(q: &[i16; 64]) -> u64 {
+    let mut m = 0u64;
+    for (k, &v) in q.iter().enumerate() {
+        m |= u64::from(v != 0) << k;
+    }
+    m
+}
+
+/// What the block loop of one component needs besides its samples.
+struct BlockQuantiser<'a> {
+    c: &'a JpegComponent<'a>,
+    level: i32,
+    /// `1 / Q` in zig-zag order.
+    inv_q: [f32; 64],
+    /// `Q` in zig-zag order.
+    step: [f32; 64],
+    rdo: Option<crate::jpeg::rdq::ScaledRate>,
+    bx_pad: usize,
+}
+
+impl BlockQuantiser<'_> {
+    /// A.2.4 + A.3.1 + A.3.3 + A.3.4 for the block rows `by0..` that
+    /// `blocks` / `nz` hold (whole rows of `bx_pad` blocks).
+    fn rows(&self, by0: usize, blocks: &mut [[i16; 64]], nz: &mut [u64]) {
+        let c = self.c;
+        let mut block = [0f32; 64];
+        for (i, (dst, mask)) in blocks.iter_mut().zip(nz.iter_mut()).enumerate() {
+            let (by, bx) = (by0 + i / self.bx_pad, i % self.bx_pad);
+            if bx * 8 + 8 <= c.width && by * 8 + 8 <= c.height {
+                for y in 0..8 {
+                    let o = (by * 8 + y) * c.width + bx * 8;
+                    let row = &c.samples[o..o + 8];
+                    for x in 0..8 {
+                        block[y * 8 + x] = (row[x] as i32 - self.level) as f32;
+                    }
+                }
+            } else {
+                // A.2.4: complete partial blocks / MCUs by replicating the
+                // right-most column and the bottom line.
+                for y in 0..8 {
+                    let sy = (by * 8 + y).min(c.height - 1);
+                    let row = &c.samples[sy * c.width..(sy + 1) * c.width];
+                    for x in 0..8 {
+                        let sx = (bx * 8 + x).min(c.width - 1);
+                        block[y * 8 + x] = (row[sx] as i32 - self.level) as f32;
+                    }
+                }
+            }
+            fdct8x8(&mut block);
+            // Zig-zag order from here on; `S / Q` as `S · (1 / Q)`.
+            let mut ratio = [0f32; 64];
+            for k in 0..64 {
+                ratio[k] = block[ZIGZAG[k]];
+            }
+            let mut q = [0i32; 64];
+            for k in 0..64 {
+                ratio[k] *= self.inv_q[k];
+                // A.3.4: Sq = round(S / Q), half away from zero.
+                q[k] = ratio[k].round() as i32;
+            }
+            if let Some(rate) = &self.rdo {
+                let nearest = q;
+                crate::jpeg::rdq::quantise_ac(&ratio, &self.step, &nearest, rate, &mut q);
+            }
+            for k in 0..64 {
+                dst[k] = q[k] as i16;
+            }
+            *mask = nonzero_mask(dst);
+        }
+    }
+}
+
 /// A.2.4 + A.3.1 + A.3.3 + A.3.4: level-shift, transform and quantise
 /// every block of every component once; the scan coders then only walk
 /// the block grid (statistics pass and emission pass see identical
-/// coefficients).
+/// coefficients). With `threads > 1` the block rows of a component are
+/// split between that many workers; every block is computed on its own,
+/// so the result does not depend on the split.
 fn prepare_dct(
     frame: &JpegFrame,
     comps: &[JpegComponent<'_>],
     geo: &Geometry,
     tables: &JpegTableSet,
     quantisation: Quantisation,
+    threads: usize,
 ) -> Result<Vec<DctComponent>> {
     let level = 1i32 << (frame.precision - 1);
     let mcus_x = (frame.width as usize).div_ceil(8 * geo.h_max);
@@ -1423,7 +1641,8 @@ fn prepare_dct(
                 c.quant_id
             ))
         })?;
-        let inv_q: Vec<f32> = quant.iter().map(|&q| 1.0 / q.max(1) as f32).collect();
+        let inv_q: [f32; 64] = std::array::from_fn(|k| 1.0 / quant[ZIGZAG[k]].max(1) as f32);
+        let step: [f32; 64] = std::array::from_fn(|k| quant[ZIGZAG[k]] as f32);
         // Rate model of the rate-distortion quantiser: the Annex K typical
         // AC table of the component's class (destination 0 luminance, the
         // others chrominance), whatever table the frame ends up coded
@@ -1439,10 +1658,8 @@ fn prepare_dct(
                     HuffSpec::k6_ac_chrominance()
                 };
                 let mean = quant[1..].iter().map(|&q| q as f32).sum::<f32>() / 63.0;
-                (
-                    crate::jpeg::rdq::AcRate::new(&spec.bits, &spec.vals),
-                    crate::jpeg::rdq::LAMBDA_SCALE * mean * mean,
-                )
+                crate::jpeg::rdq::AcRate::new(&spec.bits, &spec.vals)
+                    .scaled(crate::jpeg::rdq::LAMBDA_SCALE * mean * mean)
             });
         let (bx_pad, by_pad) = if geo.interleaved {
             (mcus_x * c.h as usize, mcus_y * c.v as usize)
@@ -1450,36 +1667,36 @@ fn prepare_dct(
             (c.width.div_ceil(8), c.height.div_ceil(8))
         };
         let (bx_true, by_true) = (c.width.div_ceil(8), c.height.div_ceil(8));
-        let mut blocks = Vec::with_capacity(bx_pad * by_pad);
-        let mut block = [0f32; 64];
-        for by in 0..by_pad {
-            for bx in 0..bx_pad {
-                // A.2.4: complete partial blocks / MCUs by replicating the
-                // right-most column and the bottom line.
-                for y in 0..8 {
-                    let sy = (by * 8 + y).min(c.height - 1);
-                    let row = &c.samples[sy * c.width..(sy + 1) * c.width];
-                    for x in 0..8 {
-                        let sx = (bx * 8 + x).min(c.width - 1);
-                        block[y * 8 + x] = (row[sx] as i32 - level) as f32;
-                    }
+        let mut blocks = vec![[0i16; 64]; bx_pad * by_pad];
+        let mut nz = vec![0u64; bx_pad * by_pad];
+        let bq = BlockQuantiser {
+            c,
+            level,
+            inv_q,
+            step,
+            rdo,
+            bx_pad,
+        };
+        let workers = threads.clamp(1, by_pad.max(1));
+        if workers <= 1 {
+            bq.rows(0, &mut blocks, &mut nz);
+        } else {
+            let rows_per = by_pad.div_ceil(workers);
+            let chunk = rows_per * bx_pad;
+            std::thread::scope(|sc| {
+                for (i, (b, m)) in blocks
+                    .chunks_mut(chunk)
+                    .zip(nz.chunks_mut(chunk))
+                    .enumerate()
+                {
+                    let bq = &bq;
+                    sc.spawn(move || bq.rows(i * rows_per, b, m));
                 }
-                fdct8x8(&mut block);
-                let mut q = [0i32; 64];
-                for k in 0..64 {
-                    // A.3.4: Sq = round(S / Q), half away from zero.
-                    q[k] = (block[k] * inv_q[k]).round() as i32;
-                }
-                if let Some((rate, lambda)) = &rdo {
-                    let ratio: [f32; 64] = std::array::from_fn(|k| block[k] * inv_q[k]);
-                    crate::jpeg::rdq::quantise_ac(&ratio, &quant, rate, *lambda, &mut q);
-                }
-                blocks.push(q);
-            }
+            });
         }
-        debug_assert_eq!(blocks.len(), bx_pad * by_pad);
         out.push(DctComponent {
             blocks,
+            nz,
             bx_pad,
             bx_true,
             by_true,
@@ -1530,40 +1747,51 @@ fn prepare_lossless(
 // ---------------------------------------------------------------------------
 
 /// F.1.2.1.3: code the DC difference of one block.
-fn code_dc(q: &[i32; 64], pred: &mut i32, table: u8, sink: &mut Sink<'_>) -> Result<()> {
-    let dc = q[0];
+#[inline(always)]
+fn code_dc<S: SymbolSink>(q: &[i16; 64], pred: &mut i32, table: u8, sink: &mut S) {
+    let dc = q[0] as i32;
     let diff = dc - *pred;
     *pred = dc;
     let ssss = category(diff);
-    sink.dc_symbol(table, ssss as u8, extra_bits(diff, ssss), ssss)
+    sink.dc(table, ssss as u8, extra_bits(diff, ssss), ssss);
 }
 
 /// F.1.2.2.3 (Figures F.2 / F.3) restricted to the zig-zag band
 /// `ss..=se` (G.1.2.2 AC first scans with `Al = 0`; the full `1..=63`
 /// band is the sequential case): run/size composites in zig-zag order,
 /// `ZRL = X'F0'` for 16 zeros, `EOB = X'00'` when the band ends in
-/// zeros.
-fn code_ac_band(q: &[i32; 64], ss: usize, se: usize, table: u8, sink: &mut Sink<'_>) -> Result<()> {
-    let mut run: u32 = 0;
-    for k in ss..=se {
-        let coef = q[ZIGZAG[k]];
-        if coef == 0 {
-            run += 1;
-            continue;
-        }
+/// zeros. `nz` is the block's non-zero mask, so only the non-zero
+/// levels are visited and each run is the gap between two set bits.
+#[inline(always)]
+fn code_ac_band<S: SymbolSink>(
+    q: &[i16; 64],
+    nz: u64,
+    ss: usize,
+    se: usize,
+    table: u8,
+    sink: &mut S,
+) {
+    // Bits ss..=se.
+    let band = (u64::MAX >> (63 - se)) & (u64::MAX << ss);
+    let mut m = nz & band;
+    let mut next = ss;
+    while m != 0 {
+        let k = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let mut run = (k - next) as u32;
         while run > 15 {
-            sink.ac_symbol(table, 0xF0, 0, 0)?;
+            sink.ac(table, 0xF0, 0, 0);
             run -= 16;
         }
+        let coef = q[k] as i32;
         let ssss = category(coef);
         let rs = ((run << 4) | ssss) as u8;
-        sink.ac_symbol(table, rs, extra_bits(coef, ssss), ssss)?;
-        run = 0;
+        sink.ac(table, rs, extra_bits(coef, ssss), ssss);
+        next = k + 1;
     }
-    if run > 0 {
-        sink.ac_symbol(table, 0x00, 0, 0)?;
+    if next <= se {
+        sink.ac(table, 0x00, 0, 0);
     }
-    Ok(())
 }
 
 /// Restart-interval bookkeeping shared by every scan coder (E.1.3):
@@ -1584,82 +1812,123 @@ impl Restarts {
         }
     }
 
-    /// Call before coding the next unit; returns true when an `RSTm`
-    /// was emitted (the caller resets its predictions).
-    fn before_unit(&mut self, sink: &mut Sink<'_>) -> bool {
-        let boundary = self.ri > 0 && self.done > 0 && self.done.is_multiple_of(self.ri);
-        if boundary {
-            sink.restart(self.m);
-            self.m = (self.m + 1) & 7;
-        }
+    /// Call before coding the next unit; returns the `m` of the `RSTm`
+    /// that closes the previous interval when this unit opens a new one
+    /// (the caller emits it and resets its predictions).
+    #[inline]
+    fn boundary(&mut self) -> Option<u8> {
+        let hit = self.ri > 0 && self.done > 0 && self.done.is_multiple_of(self.ri);
         self.done += 1;
-        boundary
+        if !hit {
+            return None;
+        }
+        let m = self.m;
+        self.m = (self.m + 1) & 7;
+        Some(m)
     }
 }
 
 /// A.2.3 interleaved MCU walk over the padded block grids: sequential
 /// scans code DC + AC of every block, progressive DC scans (`dc_only`)
 /// code DC only.
-fn code_dct_interleaved(
+#[inline(always)]
+fn code_dct_interleaved<S: SymbolSink>(
     comps: &[JpegComponent<'_>],
     dct: &[DctComponent],
     mcus_x: usize,
     mcus_y: usize,
     ri: u16,
     dc_only: bool,
-    sink: &mut Sink<'_>,
-) -> Result<()> {
-    let mut pred: Vec<i32> = vec![0; comps.len()];
+    sink: &mut S,
+) {
+    let mut pred = [0i32; 4];
     let mut restarts = Restarts::new(ri);
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
-            if restarts.before_unit(sink) {
-                pred.fill(0);
+            if let Some(m) = restarts.boundary() {
+                sink.restart(m);
+                pred = [0; 4];
             }
             for (ci, c) in comps.iter().enumerate() {
                 let d = &dct[ci];
                 for v in 0..c.v as usize {
-                    for h in 0..c.h as usize {
-                        let q =
-                            &d.blocks[(my * c.v as usize + v) * d.bx_pad + mx * c.h as usize + h];
-                        code_dc(q, &mut pred[ci], c.huff_id, sink)?;
+                    let row = (my * c.v as usize + v) * d.bx_pad + mx * c.h as usize;
+                    for bi in row..row + c.h as usize {
+                        let q = &d.blocks[bi];
+                        code_dc(q, &mut pred[ci], c.huff_id, sink);
                         if !dc_only {
-                            code_ac_band(q, 1, 63, c.huff_id, sink)?;
+                            code_ac_band(q, d.nz[bi], 1, 63, c.huff_id, sink);
                         }
                     }
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// A.2.2 non-interleaved walk over one component's true block extent.
-fn code_dct_single(
+#[inline(always)]
+fn code_dct_single<S: SymbolSink>(
     c: &JpegComponent<'_>,
     d: &DctComponent,
     ri: u16,
     ss: usize,
     se: usize,
-    sink: &mut Sink<'_>,
-) -> Result<()> {
+    sink: &mut S,
+) {
     let mut pred = 0i32;
     let mut restarts = Restarts::new(ri);
     for by in 0..d.by_true {
         for bx in 0..d.bx_true {
-            if restarts.before_unit(sink) {
+            if let Some(m) = restarts.boundary() {
+                sink.restart(m);
                 pred = 0;
             }
-            let q = &d.blocks[by * d.bx_pad + bx];
+            let bi = by * d.bx_pad + bx;
+            let q = &d.blocks[bi];
             if ss == 0 {
-                code_dc(q, &mut pred, c.huff_id, sink)?;
+                code_dc(q, &mut pred, c.huff_id, sink);
             }
             if se >= 1 {
-                code_ac_band(q, ss.max(1), se, c.huff_id, sink)?;
+                code_ac_band(q, d.nz[bi], ss.max(1), se, c.huff_id, sink);
             }
         }
     }
-    Ok(())
+}
+
+/// One DCT scan into a concrete sink.
+#[inline(always)]
+fn code_dct_scan<S: SymbolSink>(
+    frame: &JpegFrame,
+    comps: &[JpegComponent<'_>],
+    geo: &Geometry,
+    dct: &[DctComponent],
+    plan: &ScanPlan,
+    sink: &mut S,
+) {
+    if plan.comps.len() > 1 {
+        let mcus_x = (frame.width as usize).div_ceil(8 * geo.h_max);
+        let mcus_y = (frame.height as usize).div_ceil(8 * geo.v_max);
+        code_dct_interleaved(
+            comps,
+            dct,
+            mcus_x,
+            mcus_y,
+            frame.restart_interval,
+            plan.se == 0,
+            sink,
+        );
+    } else {
+        let ci = plan.comps[0];
+        code_dct_single(
+            &comps[ci],
+            &dct[ci],
+            frame.restart_interval,
+            plan.ss as usize,
+            plan.se as usize,
+            sink,
+        );
+    }
 }
 
 /// Annex H lossless scan (interleaved when `Nf > 1`), with the
@@ -1697,7 +1966,11 @@ fn code_lossless(
     let mut first_row: Vec<usize> = vec![0; comps.len()];
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
-            if restarts.before_unit(sink) {
+            let boundary = restarts.boundary();
+            if let Some(m) = boundary {
+                sink.restart(m);
+            }
+            if boundary.is_some() {
                 for (ci, c) in comps.iter().enumerate() {
                     first_row[ci] = if geo.interleaved {
                         my * c.v as usize
@@ -1826,11 +2099,11 @@ impl ArithScan {
     /// One block of component `ci` (table destination `dest`): the DC
     /// difference when `ss == 0`, then the zig-zag band `max(ss, 1)..=se`
     /// when `se ≥ 1`.
-    fn block(&mut self, q: &[i32; 64], ci: usize, dest: usize, ss: usize, se: usize) -> Result<()> {
+    fn block(&mut self, q: &[i16; 64], ci: usize, dest: usize, ss: usize, se: usize) -> Result<()> {
         use crate::jpeg::arith::{encode_ac, encode_dc_diff};
         if ss == 0 {
             let pr = &mut self.pred[ci];
-            let diff = q[0] - pr.pred;
+            let diff = q[0] as i32 - pr.pred;
             // Figure F.8 ends its magnitude categories at X15: `Sz =
             // |diff| − 1` must stay below 2^15.
             if diff.unsigned_abs() > 1 << 15 {
@@ -1839,19 +2112,11 @@ impl ArithScan {
                 )));
             }
             encode_dc_diff(&mut self.enc, &mut self.dc[dest], pr, diff);
-            pr.pred = q[0];
+            pr.pred = q[0] as i32;
         }
         if se >= 1 {
-            let zz: [i32; 64] = std::array::from_fn(|k| q[ZIGZAG[k]]);
-            // Same bound for an AC magnitude (Figure F.8, X2..X15).
-            if zz[ss.max(1)..=se]
-                .iter()
-                .any(|v| v.unsigned_abs() > 1 << 15)
-            {
-                return Err(Error::invalid(
-                    "JPEG encode: AC coefficient outside the ±32768 the arithmetic AC model codes",
-                ));
-            }
+            // (An AC level is 16 bits wide: its `Sz` is within X15.)
+            let zz: [i32; 64] = std::array::from_fn(|k| q[k] as i32);
             encode_ac(&mut self.enc, &mut self.ac[dest], &zz, ss.max(1), se);
         }
         Ok(())
@@ -1979,29 +2244,18 @@ fn code_scan(
         } => code_lossless(frame, comps, geo, predictor, point_transform, sink),
         JpegProcess::Sequential | JpegProcess::Progressive => {
             let dct = dct.expect("DCT blocks prepared");
-            let dc_only = plan.se == 0;
-            if plan.comps.len() > 1 {
-                let mcus_x = (frame.width as usize).div_ceil(8 * geo.h_max);
-                let mcus_y = (frame.height as usize).div_ceil(8 * geo.v_max);
-                code_dct_interleaved(
-                    comps,
-                    dct,
-                    mcus_x,
-                    mcus_y,
-                    frame.restart_interval,
-                    dc_only,
-                    sink,
-                )
-            } else {
-                let ci = plan.comps[0];
-                code_dct_single(
-                    &comps[ci],
-                    &dct[ci],
-                    frame.restart_interval,
-                    plan.ss as usize,
-                    plan.se as usize,
-                    sink,
-                )
+            match sink {
+                Sink::Count { dc, ac } => {
+                    let mut s = CountSink { dc, ac };
+                    code_dct_scan(frame, comps, geo, dct, plan, &mut s);
+                    Ok(())
+                }
+                Sink::Emit { writer, tables } => {
+                    let mut s = EmitSink::new(writer, tables);
+                    code_dct_scan(frame, comps, geo, dct, plan, &mut s);
+                    s.sync();
+                    s.check()
+                }
             }
         }
     }
@@ -2030,6 +2284,7 @@ pub fn gather_stats(
             &geo,
             tables,
             Quantisation::Nearest,
+            1,
         )?)
     } else {
         None
@@ -2080,6 +2335,7 @@ pub fn encode_frame_with_meta(
             &geo,
             tables,
             Quantisation::Nearest,
+            1,
         )?)
     } else {
         None
@@ -2110,11 +2366,19 @@ fn encode_frame_opts(
     emit_tables: bool,
     meta: &[u8],
     quantisation: Quantisation,
+    threads: usize,
 ) -> Result<(Vec<u8>, JpegTableSet)> {
     let geo = validate(frame, comps)?;
     let dct = frame.process.is_dct();
     let blocks = if dct {
-        Some(prepare_dct(frame, comps, &geo, tables, quantisation)?)
+        Some(prepare_dct(
+            frame,
+            comps,
+            &geo,
+            tables,
+            quantisation,
+            threads,
+        )?)
     } else {
         None
     };
@@ -2241,8 +2505,17 @@ pub(crate) fn encode_coefficient_frame(
         .map(|(i, c)| {
             let (bx_pad, _) = coefs.block_grid(i);
             let (bx_true, by_true) = coefs.block_extent(i);
+            // Natural order → zig-zag (`validate` bounds every level
+            // within 16 bits).
+            let blocks: Vec<[i16; 64]> = c
+                .blocks
+                .iter()
+                .map(|b| std::array::from_fn(|k| b[ZIGZAG[k]] as i16))
+                .collect();
+            let nz = blocks.iter().map(nonzero_mask).collect();
             DctComponent {
-                blocks: c.blocks.clone(),
+                blocks,
+                nz,
                 bx_pad,
                 bx_true,
                 by_true,
@@ -2587,6 +2860,13 @@ pub struct EncodeOptions {
     /// `Kx = 5`; anything else is written as a `DAC` segment). Ignored
     /// under Huffman coding.
     pub conditioning: ArithConditioning,
+    /// Workers for one picture (default 1 = serial). With more, the
+    /// colour conversion of the RGB entry points and the transform +
+    /// quantisation of the DCT processes are split between that many
+    /// scoped threads; the entropy coding stays serial. The stream is
+    /// byte-identical for every value. The registry encoder takes it
+    /// from `Encoder::set_execution_context`.
+    pub threads: usize,
 }
 
 /// Historical name of [`EncodeOptions`].
@@ -2612,6 +2892,7 @@ impl Default for EncodeOptions {
             marker_order: MarkerOrder::QuantFrameHuffman,
             entropy: EntropyCoding::Huffman,
             conditioning: ArithConditioning::default(),
+            threads: 1,
         }
     }
 }
@@ -2740,6 +3021,13 @@ impl EncodeOptions {
     #[must_use]
     pub fn with_entropy(mut self, entropy: EntropyCoding) -> Self {
         self.entropy = entropy;
+        self
+    }
+
+    /// Set the worker count for one picture (0 is read as 1).
+    #[must_use]
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 
@@ -2917,8 +3205,17 @@ impl EncodeOptions {
         if !optimise {
             return Ok(t);
         }
-        let (_, t) =
-            encode_frame_opts(frame, comps, &t, true, false, false, &[], self.quantisation)?;
+        let (_, t) = encode_frame_opts(
+            frame,
+            comps,
+            &t,
+            true,
+            false,
+            false,
+            &[],
+            self.quantisation,
+            self.threads,
+        )?;
         Ok(t)
     }
 
@@ -3074,6 +3371,7 @@ impl EncodeOptions {
             !self.abbreviated,
             &prep.meta,
             self.quantisation,
+            self.threads,
         )?;
         self.wrap(&prep, data, &tables)
     }
@@ -3105,6 +3403,7 @@ impl EncodeOptions {
             !self.abbreviated,
             &prep.meta,
             self.quantisation,
+            self.threads,
         )?;
         self.wrap(prep, data, tables)
     }

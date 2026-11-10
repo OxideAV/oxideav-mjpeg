@@ -471,8 +471,120 @@ mod registry_benches {
         group.finish();
     }
 
+    /// A 1600 × 1200 picture with smooth areas, texture and noise
+    /// (multi-octave value noise per channel), as packed RGB.
+    fn make_full_size_rgb(w: usize, h: usize) -> Vec<u8> {
+        fn lattice(seed: u32, x: i32, y: i32) -> f32 {
+            let mut v =
+                seed ^ (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
+            v ^= v >> 15;
+            v = v.wrapping_mul(0x2C1B_3C6D);
+            v ^= v >> 12;
+            (v & 0xFFFF) as f32 / 65535.0
+        }
+        fn smooth(seed: u32, x: f32, y: f32) -> f32 {
+            let (xi, yi) = (x.floor(), y.floor());
+            let (fx, fy) = (x - xi, y - yi);
+            let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+            let (xi, yi) = (xi as i32, yi as i32);
+            let (a, b) = (lattice(seed, xi, yi), lattice(seed, xi + 1, yi));
+            let (c, d) = (lattice(seed, xi, yi + 1), lattice(seed, xi + 1, yi + 1));
+            a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
+        }
+        fn octaves(seed: u32, x: f32, y: f32, n: u32) -> f32 {
+            let (mut sum, mut amp, mut freq, mut norm) = (0.0, 1.0, 1.0, 0.0);
+            for o in 0..n {
+                sum += amp * smooth(seed + o, x * freq, y * freq);
+                norm += amp;
+                amp *= 0.66;
+                freq *= 2.0;
+            }
+            sum / norm
+        }
+        let mut out = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32 / 300.0, y as f32 / 300.0);
+                let base = (octaves(1, fx, fy, 9) - 0.5) * 1.6 + 0.5;
+                let r = base + (octaves(100, fx * 0.5, fy * 0.5, 6) - 0.5) * 0.6;
+                let b = base + (octaves(200, fx * 0.5, fy * 0.5, 6) - 0.5) * 0.6;
+                for (c, v) in [r, base, b].into_iter().enumerate() {
+                    out[(y * w + x) * 3 + c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    /// Full-size pictures through the standalone API: `encode_rgb8` at
+    /// quality 85 (defaults, and typical tables + nearest levels) and
+    /// `decode` / `decode_rgb8` of the default stream, serial and on
+    /// four workers.
+    fn bench_full_size(c: &mut Criterion) {
+        use oxideav_mjpeg::{ChromaSubsampling, DecodeOptions, EncodeOptions, Quantisation};
+        let mut group = c.benchmark_group("full_size");
+        group.sample_size(20);
+        let (w, h) = (1600u32, 1200u32);
+        let rgb = make_full_size_rgb(w as usize, h as usize);
+        group.throughput(Throughput::Elements((w as u64) * (h as u64)));
+        for (name, chroma) in [
+            ("420", ChromaSubsampling::Yuv420),
+            ("422", ChromaSubsampling::Yuv422),
+            ("444", ChromaSubsampling::Yuv444),
+        ] {
+            let base = EncodeOptions::new().with_quality(85).with_chroma(chroma);
+            let fast = base
+                .clone()
+                .with_optimal_tables(false)
+                .with_quantisation(Quantisation::Nearest);
+            for (label, opts) in [
+                ("default", base.clone()),
+                ("default_threads4", base.clone().with_threads(4)),
+                ("typical_nearest", fast),
+                ("progressive", base.clone().with_progressive(true)),
+            ] {
+                group.bench_function(format!("encode_rgb8_1600x1200_q85_{name}_{label}"), |b| {
+                    b.iter(|| {
+                        black_box(
+                            oxideav_mjpeg::encode_rgb8(w, h, black_box(&rgb), &opts)
+                                .expect("encode"),
+                        );
+                    })
+                });
+            }
+            for (pname, progressive) in [("baseline", false), ("progressive", true)] {
+                let jpeg = oxideav_mjpeg::encode_rgb8(
+                    w,
+                    h,
+                    &rgb,
+                    &base.clone().with_progressive(progressive),
+                )
+                .expect("encode for the decode bench");
+                group.bench_function(format!("decode_1600x1200_{name}_{pname}"), |b| {
+                    b.iter(|| black_box(oxideav_mjpeg::decode(black_box(&jpeg)).expect("decode")))
+                });
+                for (tname, threads) in [("", 1usize), ("_threads4", 4)] {
+                    let opts = DecodeOptions::new().with_threads(threads);
+                    group.bench_function(
+                        format!("decode_rgb8_1600x1200_{name}_{pname}{tname}"),
+                        |b| {
+                            b.iter(|| {
+                                black_box(
+                                    oxideav_mjpeg::decode_rgb8_with(black_box(&jpeg), &opts)
+                                        .expect("decode"),
+                                )
+                            })
+                        },
+                    );
+                }
+            }
+        }
+        group.finish();
+    }
+
     criterion_group!(
         benches,
+        bench_full_size,
         bench_reference_compat_decode,
         bench_baseline_encode,
         bench_baseline_decode,

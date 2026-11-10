@@ -181,6 +181,9 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) 
                 fill_ycbcr_with(img, out, bpp, opts, maxval);
                 return;
             }
+            if bps == 1 && maxval == 255 && fill_ycbcr_replicate_8bit(img, out, bpp, opts.threads) {
+                return;
+            }
             for y in 0..h {
                 let cy = y / dv;
                 for x in 0..w {
@@ -279,6 +282,78 @@ fn round_div(num: i64, den: i64) -> i64 {
 #[inline]
 fn clamp8(v: i64) -> u8 {
     v.clamp(0, 255) as u8
+}
+
+/// One row of 8-bit `Y`, `Cb`, `Cr` (equal lengths) into `N`-byte
+/// pixels with the exact kernel (`N = 4` leaves alpha as it is).
+#[inline]
+fn row_ycbcr_8bit<const N: usize>(dst: &mut [u8], y: &[u8], cb: &[u8], cr: &[u8]) {
+    let (px, _) = dst.as_chunks_mut::<N>();
+    for (((p, &yy), &b), &r) in px.iter_mut().zip(y).zip(cb).zip(cr) {
+        // The fractional kernel at a whole chroma sample: the exact
+        // rounding of the same T.871 §7 value as `ycbcr_to_rgb8`.
+        let rgb = ycbcr_frac_to_rgb8_8bit(yy as i32, (b as i32) << 8, (r as i32) << 8);
+        p[..3].copy_from_slice(&rgb);
+    }
+}
+
+/// The 8-bit planar YCbCr layouts with replicated chroma and the exact
+/// kernel, row by row on slices (and in `threads` bands of rows).
+/// Returns `false`, leaving `out` alone, when a plane is shorter than
+/// its geometry (the per-sample path then reads what is there).
+fn fill_ycbcr_replicate_8bit(img: &JpegImage, out: &mut [u8], bpp: usize, threads: usize) -> bool {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let (dh, dv) = img.format.chroma_divisors();
+    let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
+    let (py, pcb, pcr) = (&img.planes[0], &img.planes[1], &img.planes[2]);
+    let fits = |p: &crate::image::Plane, pw: usize, ph: usize| {
+        p.stride >= pw && p.data.len() >= (ph - 1) * p.stride + pw
+    };
+    if !(fits(py, w, h) && fits(pcb, cw, ch) && fits(pcr, cw, ch)) || out.len() < w * h * bpp {
+        return false;
+    }
+    let convert = |y0: usize, band: &mut [u8]| {
+        // Chroma rows widened to the luma grid (replication).
+        let mut wide = [vec![0u8; cw * dh], vec![0u8; cw * dh]];
+        for (i, dst) in band.chunks_exact_mut(w * bpp).enumerate() {
+            let y = y0 + i;
+            let lrow = &py.data[y * py.stride..][..w];
+            let cy = y / dv;
+            let (cb_row, cr_row) = (
+                &pcb.data[cy * pcb.stride..][..cw],
+                &pcr.data[cy * pcr.stride..][..cw],
+            );
+            let (cb, cr): (&[u8], &[u8]) = if dh == 1 {
+                (cb_row, cr_row)
+            } else {
+                for (src, buf) in [cb_row, cr_row].into_iter().zip(wide.iter_mut()) {
+                    for (cell, &v) in buf.chunks_exact_mut(dh).zip(src) {
+                        cell.fill(v);
+                    }
+                }
+                (&wide[0][..w], &wide[1][..w])
+            };
+            if bpp == 3 {
+                row_ycbcr_8bit::<3>(dst, lrow, cb, cr);
+            } else {
+                row_ycbcr_8bit::<4>(dst, lrow, cb, cr);
+            }
+        }
+    };
+    let out = &mut out[..w * h * bpp];
+    let workers = threads.clamp(1, h);
+    if workers <= 1 {
+        convert(0, out);
+    } else {
+        let rows_per = h.div_ceil(workers);
+        std::thread::scope(|sc| {
+            let convert = &convert;
+            for (i, band) in out.chunks_mut(rows_per * w * bpp).enumerate() {
+                sc.spawn(move || convert(i * rows_per, band));
+            }
+        });
+    }
+    true
 }
 
 /// [`fill_rgb`] for the planar YCbCr layouts under non-default
@@ -397,40 +472,77 @@ fn fill_ycbcr_interp(
             Recon::Lin(Linear::new(c, cw, ch, (1, dh), (1, dv), w, h))
         }
     };
-    let mut recon = [make(&img.planes[1]), make(&img.planes[2])];
-    let mut rows = [vec![0f32; w], vec![0f32; w]];
-    let mut lrow = vec![0f32; w];
+    let workers = opts.threads.clamp(1, h);
+    // The two chroma planes are prepared independently.
+    let recon = if workers > 1 {
+        std::thread::scope(|sc| {
+            let cr = sc.spawn(|| make(&img.planes[2]));
+            let cb = make(&img.planes[1]);
+            [cb, cr.join().expect("chroma worker")]
+        })
+    } else {
+        [make(&img.planes[1]), make(&img.planes[2])]
+    };
     let fixed = opts.ycbcr == YcbcrKernel::FixedPoint16 && maxval == 255;
-    for (y, dst) in out.chunks_exact_mut(w * bpp).take(h).enumerate() {
-        read_row(&img.planes[0], y, &mut lrow);
-        for (r, row) in recon.iter_mut().zip(rows.iter_mut()) {
+    // Rows `y0..` of the picture into `band`: every row is a function of
+    // the shared reconstruction state and its own luma row, so bands can
+    // be converted by separate workers.
+    let convert = |y0: usize, band: &mut [u8]| {
+        let mut rows = [vec![0f32; w], vec![0f32; w]];
+        let mut lrow = vec![0f32; w];
+        let mut lin = [Vec::new(), Vec::new()];
+        let mut gui: [[Vec<f32>; 3]; 2] = Default::default();
+        for (i, r) in recon.iter().enumerate() {
             match r {
-                Recon::Lin(l) => l.row(y, row),
-                Recon::Guide(g) => g.row(y, &lrow, row),
+                Recon::Lin(l) => lin[i] = l.scratch(),
+                Recon::Guide(g) => gui[i] = g.scratch(),
             }
         }
-        let (l, cb, cr) = (&lrow[..], &rows[0][..], &rows[1][..]);
-        if fixed {
-            let k = |yy: f32, cb: f32, cr: f32| {
-                let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
-                let (r, g, b) = ycbcr_to_rgb8_fixed16(yy as u32, q(cb), q(cr));
-                [r, g, b]
-            };
-            store_row_any(bpp, dst, l, cb, cr, k);
-        } else if maxval == 255 {
-            let k = |yy: f32, cb: f32, cr: f32| {
-                let q = |v: f32| (v * 256.0).round() as i32;
-                ycbcr_frac_to_rgb8_8bit(yy as i32, q(cb), q(cr))
-            };
-            store_row_any(bpp, dst, l, cb, cr, k);
-        } else {
-            let k = |yy: f32, cb: f32, cr: f32| {
-                let q = |v: f32| (v * 256.0).round() as i64;
-                let (r, g, b) = ycbcr_frac_to_rgb8(yy as u32, q(cb), q(cr), maxval);
-                [r, g, b]
-            };
-            store_row_any(bpp, dst, l, cb, cr, k);
+        for (i, dst) in band.chunks_exact_mut(w * bpp).enumerate() {
+            let y = y0 + i;
+            read_row(&img.planes[0], y, &mut lrow);
+            for (i, (r, row)) in recon.iter().zip(rows.iter_mut()).enumerate() {
+                match r {
+                    Recon::Lin(l) => l.row_with(&mut lin[i], y, row),
+                    Recon::Guide(g) => g.row_with(&mut gui[i], y, &lrow, row),
+                }
+            }
+            let (l, cb, cr) = (&lrow[..], &rows[0][..], &rows[1][..]);
+            if fixed {
+                let k = |yy: f32, cb: f32, cr: f32| {
+                    let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
+                    let (r, g, b) = ycbcr_to_rgb8_fixed16(yy as u32, q(cb), q(cr));
+                    [r, g, b]
+                };
+                store_row_any(bpp, dst, l, cb, cr, k);
+            } else if maxval == 255 {
+                let k = |yy: f32, cb: f32, cr: f32| {
+                    let q = |v: f32| (v * 256.0).round() as i32;
+                    ycbcr_frac_to_rgb8_8bit(yy as i32, q(cb), q(cr))
+                };
+                store_row_any(bpp, dst, l, cb, cr, k);
+            } else {
+                let k = |yy: f32, cb: f32, cr: f32| {
+                    let q = |v: f32| (v * 256.0).round() as i64;
+                    let (r, g, b) = ycbcr_frac_to_rgb8(yy as u32, q(cb), q(cr), maxval);
+                    [r, g, b]
+                };
+                store_row_any(bpp, dst, l, cb, cr, k);
+            }
         }
+    };
+    let n = (w * bpp * h).min(out.len());
+    let out = &mut out[..n];
+    if workers <= 1 {
+        convert(0, out);
+    } else {
+        let rows_per = h.div_ceil(workers);
+        std::thread::scope(|sc| {
+            let convert = &convert;
+            for (i, band) in out.chunks_mut(rows_per * w * bpp).enumerate() {
+                sc.spawn(move || convert(i * rows_per, band));
+            }
+        });
     }
 }
 
@@ -780,6 +892,25 @@ mod tests {
         assert_eq!(to_rgb8(&img), want);
         let lin = ConvertOptions::new().with_upsampling(ChromaUpsampling::Linear);
         assert_eq!(to_rgb8_with(&img, &lin), want);
+    }
+
+    /// The row converter of the replicating path uses the fractional
+    /// 8-bit kernel at whole chroma samples; it must be the integer
+    /// kernel for every `(Cb, Cr)` pair (each over a spread of `Y`).
+    #[test]
+    fn whole_sample_fast_kernel_is_the_integer_kernel() {
+        for cb in 0..=255u32 {
+            for cr in 0..=255u32 {
+                for y in [0u32, 1, 2, 17, 63, 64, 127, 128, 129, 200, 253, 254, 255] {
+                    let (r, g, b) = ycbcr_to_rgb8(y, cb, cr, 255);
+                    assert_eq!(
+                        ycbcr_frac_to_rgb8_8bit(y as i32, (cb as i32) << 8, (cr as i32) << 8),
+                        [r, g, b],
+                        "y {y} cb {cb} cr {cr}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

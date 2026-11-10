@@ -1073,13 +1073,29 @@ pub enum YcbcrKernel {
 }
 
 /// Options for [`JpegImage::to_rgb8_with`] / [`JpegImage::to_rgba8_with`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct ConvertOptions {
     /// Chroma upsampling for the planar subsampled layouts.
     pub upsampling: ChromaUpsampling,
     /// YCbCr → RGB kernel.
     pub ycbcr: YcbcrKernel,
+    /// Workers for one picture (`1` = serial, the default): the
+    /// interpolating reconstructions ([`ChromaUpsampling::LumaGuided`],
+    /// [`ChromaUpsampling::Linear`]) build the two chroma planes on two
+    /// workers and convert the rows in that many bands. The pixels are
+    /// the same for every value.
+    pub threads: usize,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            upsampling: ChromaUpsampling::default(),
+            ycbcr: YcbcrKernel::default(),
+            threads: 1,
+        }
+    }
 }
 
 impl ConvertOptions {
@@ -1097,6 +1113,7 @@ impl ConvertOptions {
         Self {
             upsampling: ChromaUpsampling::Triangular,
             ycbcr: YcbcrKernel::FixedPoint16,
+            threads: 1,
         }
     }
 
@@ -1127,6 +1144,12 @@ impl ConvertOptions {
     /// Select the YCbCr → RGB kernel.
     pub fn with_ycbcr(mut self, ycbcr: YcbcrKernel) -> Self {
         self.ycbcr = ycbcr;
+        self
+    }
+
+    /// Allow up to `threads` workers per picture (`0` is taken as `1`).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 }
@@ -1316,6 +1339,7 @@ impl DecodeOptions {
         ConvertOptions::new()
             .with_upsampling(self.upsampling)
             .with_ycbcr(self.ycbcr)
+            .with_threads(self.threads)
     }
 }
 

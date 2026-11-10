@@ -127,15 +127,28 @@ impl Linear {
 
     /// Output row `y` into `out` (`w` samples).
     pub(crate) fn row(&mut self, y: usize, out: &mut [f32]) {
+        let mut col = std::mem::take(&mut self.col);
+        self.row_with(&mut col, y, out);
+        self.col = col;
+    }
+
+    /// Scratch for [`Linear::row_with`].
+    pub(crate) fn scratch(&self) -> Vec<f32> {
+        vec![0.0; self.cw]
+    }
+
+    /// [`Linear::row`] on shared state: `col` is a caller-owned
+    /// [`Linear::scratch`], so several workers can produce rows at once.
+    pub(crate) fn row_with(&self, col: &mut [f32], y: usize, out: &mut [f32]) {
         let t = self.ty[y];
         let cw = self.cw;
         let r0 = &self.c[t.i0 as usize * cw..][..cw];
         let r1 = &self.c[t.i1 as usize * cw..][..cw];
-        for ((d, &a), &b) in self.col.iter_mut().zip(r0).zip(r1) {
+        for ((d, &a), &b) in col.iter_mut().zip(r0).zip(r1) {
             *d = lerp(a, b, t.f);
         }
         for (o, tx) in out.iter_mut().zip(&self.tx) {
-            *o = lerp(self.col[tx.i0 as usize], self.col[tx.i1 as usize], tx.f);
+            *o = lerp(col[tx.i0 as usize], col[tx.i1 as usize], tx.f);
         }
     }
 }
@@ -276,11 +289,18 @@ fn regression(yd: &[f32], c: &[f32], w: usize, h: usize, eps: f32) -> Vec<f32> {
 impl Guided {
     /// The outputs of chroma cell `i` of the current row (general path).
     #[inline]
-    fn cell(&self, i: usize, out: &mut [f32], luma: &[f32], lo: f32, hi: f32) {
+    fn cell(
+        &self,
+        [cc, cy, ca]: [&[f32]; 3],
+        i: usize,
+        out: &mut [f32],
+        luma: &[f32],
+        lo: f32,
+        hi: f32,
+    ) {
         let rh = self.px.len();
         let last = self.cw - 1;
         let (l, r) = (i.saturating_sub(1), (i + 1).min(last));
-        let (cc, cy, ca) = (&self.col_c, &self.col_y, &self.col_a);
         let end = (i * rh + rh).min(out.len());
         for (x, p) in (i * rh..end).zip(&self.px) {
             let (i0, i1) = if p.left { (l, i) } else { (i, r) };
@@ -363,20 +383,47 @@ impl Guided {
 
     /// Output row `y` into `out`, guided by the matching luma row.
     pub(crate) fn row(&mut self, y: usize, luma: &[f32], out: &mut [f32]) {
+        let mut cols = [
+            std::mem::take(&mut self.col_c),
+            std::mem::take(&mut self.col_y),
+            std::mem::take(&mut self.col_a),
+        ];
+        self.row_with(&mut cols, y, luma, out);
+        let [c, yy, a] = cols;
+        (self.col_c, self.col_y, self.col_a) = (c, yy, a);
+    }
+
+    /// Scratch for [`Guided::row_with`].
+    pub(crate) fn scratch(&self) -> [Vec<f32>; 3] {
+        std::array::from_fn(|_| vec![0.0; self.cw])
+    }
+
+    /// [`Guided::row`] on shared state: `cols` is a caller-owned
+    /// [`Guided::scratch`], so several workers can produce rows at once.
+    pub(crate) fn row_with(
+        &self,
+        cols: &mut [Vec<f32>; 3],
+        y: usize,
+        luma: &[f32],
+        out: &mut [f32],
+    ) {
         let t = self.ty[y];
         let cw = self.cw;
         let (o0, o1) = (t.i0 as usize * cw, t.i1 as usize * cw);
         let (c0, c1) = (&self.c[o0..][..cw], &self.c[o1..][..cw]);
         let (y0, y1) = (&self.yd[o0..][..cw], &self.yd[o1..][..cw]);
         let (a0, a1) = (&self.a[o0..][..cw], &self.a[o1..][..cw]);
-        for i in 0..cw {
-            self.col_c[i] = lerp(c0[i], c1[i], t.f);
-            self.col_y[i] = lerp(y0[i], y1[i], t.f);
-            self.col_a[i] = lerp(a0[i], a1[i], t.f);
+        {
+            let [col_c, col_y, col_a] = &mut *cols;
+            for i in 0..cw {
+                col_c[i] = lerp(c0[i], c1[i], t.f);
+                col_y[i] = lerp(y0[i], y1[i], t.f);
+                col_a[i] = lerp(a0[i], a1[i], t.f);
+            }
         }
         let cy = (y / self.rv).min(self.ch - 1) * cw;
         let (lo, hi) = (&self.lo[cy..][..cw], &self.hi[cy..][..cw]);
-        let (cc, cy_, ca) = (&self.col_c, &self.col_y, &self.col_a);
+        let (cc, cy_, ca) = (&cols[0][..cw], &cols[1][..cw], &cols[2][..cw]);
         let rh = self.px.len();
         let last = cw - 1;
         let out = &mut out[..self.w];
@@ -404,7 +451,7 @@ impl Guided {
                     .min(hi);
             }
             for i in [0, last] {
-                self.cell(i, out, luma, lo[i], hi[i]);
+                self.cell([cc, cy_, ca], i, out, luma, lo[i], hi[i]);
             }
             return;
         }

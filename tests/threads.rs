@@ -218,3 +218,47 @@ fn registry_encoder_thread_budget_keeps_the_bytes() {
     }
     assert!(packets[0] == packets[1]);
 }
+
+/// `ConvertOptions::threads` / `DecodeOptions::threads` split the RGB
+/// conversion into row bands (and build the two chroma planes on two
+/// workers): the pixels do not depend on the worker count, for every
+/// reconstruction, layout and odd size.
+#[test]
+fn threaded_rgb_conversion_equals_serial() {
+    use oxideav_mjpeg::{ChromaUpsampling, ConvertOptions, decode, decode_rgb8_with};
+    assert_eq!(ConvertOptions::new().threads, 1);
+    for (w, h) in [(1u32, 1u32), (5, 3), (97, 61), (333, 219)] {
+        let rgb = picture(w, h);
+        for chroma in [
+            ChromaSubsampling::Yuv444,
+            ChromaSubsampling::Yuv422,
+            ChromaSubsampling::Yuv420,
+            ChromaSubsampling::Yuv411,
+        ] {
+            let opts = EncodeOptions::new().with_quality(80).with_chroma(chroma);
+            let jpeg = encode_rgb8(w, h, &rgb, &opts).unwrap();
+            let img = decode(&jpeg).unwrap();
+            for up in [
+                ChromaUpsampling::LumaGuided,
+                ChromaUpsampling::Linear,
+                ChromaUpsampling::Replicate,
+                ChromaUpsampling::Triangular,
+            ] {
+                let serial = ConvertOptions::new().with_upsampling(up);
+                let want = img.to_rgb8_with(&serial);
+                let want_a = img.to_rgba8_with(&serial);
+                for t in [0usize, 2, 3, 8, 500] {
+                    let tag = format!("{w}x{h} {chroma:?} {up:?} threads {t}");
+                    let o = serial.with_threads(t);
+                    assert!(img.to_rgb8_with(&o) == want, "{tag}");
+                    assert!(img.to_rgba8_with(&o) == want_a, "{tag} rgba");
+                    let d = DecodeOptions::new().with_upsampling(up).with_threads(t);
+                    assert!(
+                        decode_rgb8_with(&jpeg, &d).unwrap().data == want,
+                        "{tag} decode"
+                    );
+                }
+            }
+        }
+    }
+}

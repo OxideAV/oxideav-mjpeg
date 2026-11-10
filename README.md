@@ -221,6 +221,7 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 | `entropy` | `Huffman` | `EntropyCoding::Arithmetic` (`with_arithmetic(true)`) codes the DCT processes with the Annex D arithmetic coder: `SOF9` sequential, `SOF10` progressive, no `DHT`. |
 | `conditioning` | `L = 0`, `U = 1`, `Kx = 5` | `ArithConditioning` of the arithmetic models (§F.1.4.4.1.4 / §F.1.4.4.2.1); a non-default value is written as a `DAC` segment. |
 | `marker_order` | `QuantFrameHuffman` | Where the tables sit relative to the frame header (§B.2.1 allows all three): `QuantFrameHuffman` = `DQT SOFn DHT`, `TablesBeforeFrame` = `DQT DHT SOFn`, `FrameBeforeTables` = `SOFn DQT DHT`. Scan data is identical. |
+| `threads` | 1 | Workers for one picture: the RGB → YCbCr conversion and the transform + quantisation run in that many row bands (entropy coding stays serial). Byte-identical output for every value. The registry encoder takes it from `Encoder::set_execution_context`. |
 | `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
 
 The registry encoder's `MjpegEncoderOptions` (`CodecOptions` keys
@@ -250,7 +251,7 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 | `deblock` | `false` | Opt-in block-edge smoothing of 8-bit DCT frames (see *Deblocking*). |
-| `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly. The registry decoder takes it from `Decoder::set_execution_context`. |
+| `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly; `decode_rgb8_with` / `decode_rgba8_with` also convert to RGB in that many row bands (`ConvertOptions::threads`), with the same pixels. The registry decoder takes it from `Decoder::set_execution_context`. |
 
 Breaches are `Error::LimitExceeded`.
 
@@ -1949,7 +1950,9 @@ paths. Run with:
 cargo bench -p oxideav-mjpeg --bench codec
 ```
 
-Fourteen scenarios, each fed by a deterministically-built in-bench
+Fourteen small scenarios plus a `full_size` group (1600 × 1200
+`encode_rgb8` / `decode` / `decode_rgb8` per chroma layout, serial and
+on four workers), each fed by a deterministically-built in-bench
 fixture (xorshift32 + low-amplitude triangle-wave gradient — no
 committed payload files, no `docs/` reads, no third-party library
 calls):
@@ -2000,6 +2003,42 @@ The gains come from a factorised, vectorised float IDCT, a 64-bit
 bit reader with bulk refills, a 10-bit symbol + magnitude lookahead,
 and the fused row-wise chroma reconstruction. Encode times are in
 *Encoder quality*.
+
+1600 × 1200 and 4000 × 3000 (12 MP) pictures through the standalone
+API, before → after the encoder and conversion work that followed
+(same machine class; medians of 9 runs taken while other builds were
+running, so read them to about ±10 %; multi-octave noise picture, 1.6 /
+1.4 bpp at quality 85, decode streams from a black-box encoder;
+`full_size` bench group). Output is byte-identical before and after and
+for every worker count.
+
+| case | 1600 × 1200 | 12 MP |
+|---|---|---|
+| `encode_rgb8` q85 4:2:0, defaults (optimal tables, RD levels) | 33.7 → 19.6 ms; 7.7 ms with `threads = 4` | 203 → 107 ms; 41 ms (4), 29 ms (8) |
+| `encode_rgb8` q85 4:2:2, defaults | 39.1 → 20.6 ms; 8.1 ms (4) | 249 → 120 ms; 47 ms (4) |
+| `encode_rgb8` q85 4:4:4, defaults | 49.1 → 25.3 ms; 9.7 ms (4) | 291 → 153 ms; 59 ms (4) |
+| `encode_rgb8` q85 4:2:0, typical tables + nearest levels | 16.1 → 7.7 ms; 4.2 ms (4) | 109 → 42 ms; 23 ms (4) |
+| `encode_rgb8` q85 4:2:0 progressive, defaults | 33.1 → 18.8 ms | 216 → 110 ms |
+| `decode` baseline 4:2:0 (planar) | 4.7 → 4.7 ms | 25 → 25 ms |
+| `decode_rgb8` baseline 4:2:0 (luma-guided) | 12.5 → 12.5 ms; 7.8 ms (4) | 73 → 73 ms; 43 ms (4) |
+| `decode_rgb8` baseline 4:2:2 | 16.2 → 16.2 ms; 10.1 ms (4) | 96 → 96 ms; 58 ms (4) |
+| `decode_rgb8` baseline 4:4:4 | 12.5 → 8.1 ms | 73 → 50 ms |
+| `decode_rgb8` baseline 4:2:0, restart per MCU row | 11.6 → 11.6 ms; 5.1 ms (4), 4.1 ms (8) | 73 → 73 ms; 33 ms (4), 25 ms (8) |
+| `decode` progressive 4:2:0 (planar) | 11.5 → 10.7 ms | 65 → 62 ms |
+
+Where the time went: the RGB → YCbCr conversion now runs in 32-bit
+integers with constant divisors (exact, same rounding); quantised
+blocks are stored in zig-zag order as 16-bit levels with a non-zero
+mask, so the entropy coders touch only the non-zero levels; the Huffman
+block coders are compiled once per sink with the pending bits in
+registers; the rate-distortion search works on zig-zag inputs with a
+pre-scaled rate table. On the decode side the 4:4:4 / replicated
+conversion works on row slices, progressive refinement scans visit
+non-zero coefficients through a bit mask, and the interpolating
+conversions split into row bands under `threads`. What a serial decode
+of a subsampled stream spends beyond the planar decode is the
+luma-guided reconstruction (see *Chroma reconstruction*);
+`ChromaUpsampling::Replicate` is the cheapest conversion.
 
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the

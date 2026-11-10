@@ -3254,10 +3254,180 @@ fn prog_decode_ac_first(
     Ok(())
 }
 
-/// Successive-approximation AC refinement scan. Each already-nonzero AC in
-/// `[ss..=se]` gains one correction bit; new coefficients appear at positions
-/// where the first pass coded a zero but this pass decodes a fresh sign.
+/// For each byte position `i` and byte value `v` of a natural-order
+/// non-zero mask: the zig-zag-order bits of the positions `8 i + b`
+/// with bit `b` of `v` set (the Figure A.6 permutation, bytewise).
+const NATURAL_TO_ZIGZAG_BITS: [[u64; 256]; 8] = {
+    let mut t = [[0u64; 256]; 8];
+    let mut i = 0;
+    while i < 8 {
+        let mut v = 0;
+        while v < 256 {
+            let mut b = 0;
+            while b < 8 {
+                if v >> b & 1 != 0 {
+                    t[i][v] |= 1u64 << crate::jpeg::zigzag::INV_ZIGZAG[8 * i + b];
+                }
+                b += 1;
+            }
+            v += 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Bit `k` set when the coefficient at zig-zag position `k` of `block`
+/// (natural order) is non-zero.
+#[inline]
+fn zigzag_nonzero_mask(block: &[i32; 64]) -> u64 {
+    // Eight 0 / 1 bytes `b0..b7` read as a little-endian word `x = Σ bi ·
+    // 2^(8i)`, times `Σ 2^(56 − 7i)`, leave `bi` at bit `56 + i`: the
+    // other partial products land on distinct bits below 56 or beyond
+    // 63, so nothing carries into the top byte.
+    const GATHER: u64 = (1 << 56)
+        | (1 << 49)
+        | (1 << 42)
+        | (1 << 35)
+        | (1 << 28)
+        | (1 << 21)
+        | (1 << 14)
+        | (1 << 7);
+    let mut zz = 0u64;
+    for (r, row) in block.as_chunks::<8>().0.iter().enumerate() {
+        let flags: [u8; 8] = std::array::from_fn(|i| u8::from(row[i] != 0));
+        let byte = (u64::from_le_bytes(flags).wrapping_mul(GATHER) >> 56) as usize;
+        zz |= NATURAL_TO_ZIGZAG_BITS[r][byte];
+    }
+    zz
+}
+
+/// Successive-approximation AC refinement scan (T.81 §G.1.2.3). Each
+/// already-nonzero AC in `[ss..=se]` gains one correction bit; new
+/// coefficients appear at positions where the earlier passes coded a
+/// zero and this pass decodes a fresh sign.
+///
+/// The block's non-zero positions are taken once as a zig-zag bit mask,
+/// so a run of `r` zeros is "the `(r + 1)`-th clear bit from here" and
+/// only the non-zero coefficients in between are visited (each reads
+/// its correction bit, in position order as Figure G.7 requires). A
+/// coefficient placed by this call sits behind the position the walk
+/// has reached, so the mask stays valid for the rest of the call.
 fn prog_decode_ac_refine(
+    br: &mut BitReader<'_>,
+    ac: &HuffTable,
+    block: &mut [i32; 64],
+    ss: usize,
+    se: usize,
+    al: u8,
+    eob_run: &mut u32,
+) -> Result<()> {
+    let p1: i32 = 1 << al;
+    let m1: i32 = -1 << al;
+    debug_assert!(se < 64);
+    // Zig-zag positions ss..=se.
+    let band = if ss <= se {
+        (u64::MAX >> (63 - se.min(63))) & (u64::MAX << ss)
+    } else {
+        0
+    };
+    let nz = zigzag_nonzero_mask(block) & band;
+    // One correction bit for each non-zero coefficient of `positions`,
+    // in ascending zig-zag order.
+    #[inline(always)]
+    fn correct(
+        br: &mut BitReader<'_>,
+        block: &mut [i32; 64],
+        mut positions: u64,
+        p1: i32,
+        m1: i32,
+    ) -> Result<()> {
+        while positions != 0 {
+            let pos = ZIGZAG[positions.trailing_zeros() as usize];
+            positions &= positions - 1;
+            let bit = br.get_bit()?;
+            // Figure G.7: a set correction bit moves the coefficient one
+            // step away from zero unless that bit is already set. The
+            // bit is as good as random, so the update is selected, not
+            // branched on.
+            let c = block[pos];
+            let step = if c >= 0 { p1 } else { m1 };
+            let apply = (bit != 0) & (c & p1 == 0);
+            block[pos] = c + (step & -(apply as i32));
+        }
+        Ok(())
+    }
+
+    let mut k = ss;
+    if *eob_run == 0 {
+        while k <= se {
+            let (rs, v) = huff_step(br, ac)?;
+            let r = (rs >> 4) as usize;
+            let s = (rs & 0x0F) as u32;
+            let new_val: i32 = if s == 0 {
+                if r != 15 {
+                    // EOBn: refine remaining non-zeros then schedule n-1 EOB blocks.
+                    let extra = if r == 0 { 0 } else { br.get_bits(r as u32)? };
+                    *eob_run = (1u32 << r) + extra;
+                    break;
+                }
+                // ZRL: skip 16 zero-history positions (refining any current nonzeros).
+                0
+            } else if s == 1 {
+                // A new nonzero: its sign bit follows the code. The
+                // lookahead's `EXTEND` of one bit is `−1` / `+1` — the
+                // same `m1` / `p1` once shifted by `Al`.
+                match v {
+                    Some(v) => v << al,
+                    None => {
+                        if br.get_bit()? == 0 {
+                            m1
+                        } else {
+                            p1
+                        }
+                    }
+                }
+            } else {
+                return Err(Error::invalid("progressive AC refine: bad s"));
+            };
+
+            // The position this symbol ends on: the `(r + 1)`-th zero at
+            // or after `k`. Every non-zero before it is corrected.
+            let ahead = u64::MAX << k;
+            let mut zeros = !nz & band & ahead;
+            for _ in 0..r {
+                zeros &= zeros.wrapping_sub(1);
+            }
+            if zeros == 0 {
+                correct(br, block, nz & ahead, p1, m1)?;
+                return Err(Error::invalid("progressive AC refine: k past se"));
+            }
+            let target = zeros.trailing_zeros() as usize;
+            correct(br, block, nz & ahead & ((1u64 << target) - 1), p1, m1)?;
+            k = target;
+            if new_val != 0 {
+                block[ZIGZAG[k]] = new_val;
+            }
+            k += 1;
+        }
+    }
+
+    // Handle EOB-run tail: continue refining nonzero history for the rest of
+    // the band (no new coefficients allowed).
+    if *eob_run > 0 {
+        if k <= se {
+            correct(br, block, nz & (u64::MAX << k), p1, m1)?;
+        }
+        *eob_run -= 1;
+    }
+
+    Ok(())
+}
+
+/// The position-by-position form of [`prog_decode_ac_refine`], kept as
+/// the oracle of its differential test.
+#[cfg(test)]
+fn prog_decode_ac_refine_reference(
     br: &mut BitReader<'_>,
     ac: &HuffTable,
     block: &mut [i32; 64],
@@ -6382,6 +6552,85 @@ mod prog_tests {
 
     /// Refinement of an already-nonzero coefficient must add one correction
     /// bit at position `Al`.
+    /// The mask-driven refinement against the position-by-position
+    /// oracle on random blocks and random bit streams (valid or not):
+    /// same result, same block, same EOB run, same reader state.
+    #[test]
+    fn ac_refine_matches_the_positionwise_oracle() {
+        use crate::jpeg::huffman::{STD_AC_LUMA_BITS, STD_AC_LUMA_VALS};
+        let ac = HuffTable::build(&STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS).unwrap();
+        let mut seed = 0x2545_F491u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let (mut oks, mut errs) = (0, 0);
+        for trial in 0..60_000 {
+            let al = (rnd() % 4) as u8;
+            let ss = 1 + (rnd() % 63) as usize;
+            let se = if rnd() % 3 == 0 {
+                63
+            } else {
+                ss + (rnd() as usize % (64 - ss))
+            };
+            let density = rnd() % 5;
+            let mut block = [0i32; 64];
+            for c in block.iter_mut() {
+                if rnd() % 5 < density {
+                    *c = ((rnd() % 31) as i32 - 15) << (al + (rnd() % 2) as u8);
+                }
+            }
+            // Mostly short codes (EOB / small runs) so many trials decode
+            // cleanly; some all-random streams for the error paths.
+            let len = 1 + (rnd() % 24) as usize;
+            let mut buf: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+            if trial % 4 != 0 {
+                for b in buf.iter_mut() {
+                    *b &= 0x7F;
+                }
+            }
+            let eob0 = [0u32, 0, 0, 1, 5][(rnd() % 5) as usize];
+            let (mut a, mut b) = (block, block);
+            let (mut ea, mut eb) = (eob0, eob0);
+            let mut ra = BitReader::new(&buf);
+            let mut rb = BitReader::new(&buf);
+            let x = prog_decode_ac_refine(&mut ra, &ac, &mut a, ss, se, al, &mut ea);
+            let y = prog_decode_ac_refine_reference(&mut rb, &ac, &mut b, ss, se, al, &mut eb);
+            let tag = format!("trial {trial}: ss {ss} se {se} al {al} eob {eob0}");
+            assert_eq!(x.is_ok(), y.is_ok(), "{tag}");
+            assert_eq!(a, b, "{tag}");
+            assert_eq!(ea, eb, "{tag}");
+            assert_eq!(
+                (ra.pos, ra.bits, ra.nbits, ra.saw_rst, ra.padded),
+                (rb.pos, rb.bits, rb.nbits, rb.saw_rst, rb.padded),
+                "{tag}"
+            );
+            if x.is_ok() {
+                oks += 1;
+            } else {
+                errs += 1;
+            }
+        }
+        assert!(oks > 5_000 && errs > 500, "{oks} ok / {errs} err");
+    }
+
+    #[test]
+    fn zigzag_mask_marks_exactly_the_nonzero_positions() {
+        let mut block = [0i32; 64];
+        assert_eq!(zigzag_nonzero_mask(&block), 0);
+        for k in 0..64 {
+            block[ZIGZAG[k]] = if k % 2 == 0 { -3 } else { 1 << 20 };
+            assert_eq!(zigzag_nonzero_mask(&block), u64::MAX >> (63 - k), "{k}");
+        }
+        for k in 0..64 {
+            let mut one = [0i32; 64];
+            one[ZIGZAG[k]] = i32::MIN;
+            assert_eq!(zigzag_nonzero_mask(&one), 1 << k);
+        }
+    }
+
     #[test]
     fn ac_refine_extends_existing_coef() {
         use crate::jpeg::huffman::{STD_AC_LUMA_BITS, STD_AC_LUMA_VALS};

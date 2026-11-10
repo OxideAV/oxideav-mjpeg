@@ -598,7 +598,7 @@ fn library_transforms_match_the_black_box_transcoder() {
     ];
     for (args, ours) in cases {
         let Some(want) = run(args) else {
-            eprintln!("jpegtran not available — skipping the black-box transform check");
+            eprintln!("black-box transcoder not available — skipping the transform check");
             break;
         };
         assert_eq!(

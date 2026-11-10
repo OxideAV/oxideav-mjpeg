@@ -173,7 +173,9 @@ fn black_box_arithmetic_streams_decode_to_the_validator_output() {
 fn our_arithmetic_streams_decode_in_the_black_box_decoder() {
     let tools = have("djpeg");
     if !tools {
-        eprintln!("djpeg not available — checking the arithmetic writer against our decoder only");
+        eprintln!(
+            "black-box decoder not available — checking the arithmetic writer against our decoder only"
+        );
     }
     let dir = scratch("encode");
     let jpg = dir.join("e.jpg");

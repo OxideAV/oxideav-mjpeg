@@ -465,9 +465,13 @@ table and run any inverse DCT to get samples, or call
 record back (`EncodeOptions::process` sequential or progressive,
 `tables` typical or optimal, `restart_interval`, `metadata`, `jfif`),
 keeping ids, sampling, tables and the Adobe flag, so coefficient-domain
-transforms work: a horizontal mirror (reverse the block columns, negate
-the odd `u`) or a transpose (swap block rows / columns, `u` / `v` and
-the tables) reproduces `jpegtran -flip horizontal` / `-transpose`
+transforms work. The exact ones are built in: `transposed()`,
+`flipped_horizontal()` / `flipped_vertical()`, `rotated(quarter_turns)`
+(clockwise) and `cropped(left, top, width, height)`. A mirror needs the
+mirrored dimension to be a multiple of the MCU size (`mcu_size()`), a
+crop an MCU-aligned origin; anything else is `Error::Unsupported`
+rather than an approximation. Each reproduces the black-box lossless
+transcoder (`-flip`, `-transpose`, `-rotate 90 / 180 / 270`, `-crop`)
 coefficient for coefficient (`tests/coefficients.rs`). Over the 115
 fixture streams, rendering equals `decode` and every re-code reads back
 to the same coefficients; `djpeg` decodes the re-codes of the 92 8-bit ones

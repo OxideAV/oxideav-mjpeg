@@ -437,3 +437,177 @@ fn arithmetic_recode_reproduces_the_validator_scan_bytes() {
     }
     assert!(exact >= 5, "{exact} byte-exact streams");
 }
+
+/// The library transforms (#21) reproduce the helpers above — which
+/// match the black-box lossless transcoder — and obey the group laws on
+/// the coefficients themselves.
+#[test]
+fn library_transforms_are_exact() {
+    let src = read_coefficients(&std::fs::read(format!("{COEF}/flip_src.jpg")).unwrap()).unwrap();
+    assert_eq!(src.mcu_size(), (16, 16));
+    assert_eq!(src.flipped_horizontal().unwrap(), flip_horizontal(&src));
+    let t = src.transposed();
+    let want = transpose(&src);
+    assert_eq!(t.components, want.components);
+    assert_eq!(t.quant_tables, want.quant_tables);
+    assert_eq!((t.width, t.height), (src.height, src.width));
+    assert_eq!(t.metadata, src.metadata);
+    // Involutions and the rotation group.
+    assert_eq!(t.transposed(), src);
+    assert_eq!(
+        src.flipped_horizontal()
+            .unwrap()
+            .flipped_horizontal()
+            .unwrap(),
+        src
+    );
+    assert_eq!(
+        src.flipped_vertical().unwrap().flipped_vertical().unwrap(),
+        src
+    );
+    assert_eq!(src.rotated(0).unwrap(), src);
+    assert_eq!(src.rotated(4).unwrap(), src);
+    let r1 = src.rotated(1).unwrap();
+    assert_eq!((r1.width, r1.height), (src.height, src.width));
+    assert_eq!(r1.rotated(3).unwrap(), src);
+    assert_eq!(r1.rotated(1).unwrap(), src.rotated(2).unwrap());
+    assert_eq!(src.rotated(2).unwrap().rotated(2).unwrap(), src);
+    assert_eq!(
+        src.rotated(2).unwrap(),
+        src.flipped_vertical()
+            .unwrap()
+            .flipped_horizontal()
+            .unwrap()
+    );
+    // A vertical mirror is the transpose of a horizontal one.
+    assert_eq!(
+        src.flipped_vertical().unwrap(),
+        src.transposed().flipped_horizontal().unwrap().transposed()
+    );
+    // Every result codes and reads back.
+    for c in [
+        src.rotated(1).unwrap(),
+        src.rotated(2).unwrap(),
+        src.rotated(3).unwrap(),
+        src.flipped_vertical().unwrap(),
+    ] {
+        let out = encode_coefficients(&c, &EncodeOptions::default()).unwrap();
+        assert_eq!(read_coefficients(&out).unwrap().components, c.components);
+    }
+    // The pixels follow (4:2:0 planar output: luma is plane 0). The
+    // inverse DCT is evaluated in another order on the mirrored block,
+    // so a sample may round the other way.
+    let base = decode_coefficients(&src, &DecodeOptions::default()).unwrap();
+    let flip = decode_coefficients(
+        &src.flipped_horizontal().unwrap(),
+        &DecodeOptions::default(),
+    )
+    .unwrap();
+    let (w, h) = (src.width as usize, src.height as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let a = base.planes[0].data[y * base.planes[0].stride + x] as i32;
+            let b = flip.planes[0].data[y * flip.planes[0].stride + (w - 1 - x)] as i32;
+            assert!((a - b).abs() <= 1, "({x}, {y}): {a} vs {b}");
+        }
+    }
+}
+
+/// Crops copy whole blocks: an MCU-aligned origin, any size inside the
+/// frame; mirrors refuse a frame with a partial MCU on that axis until
+/// it is trimmed.
+#[test]
+fn crops_are_exact_and_mirrors_refuse_partial_mcus() {
+    let src = read_coefficients(&std::fs::read(format!("{COEF}/flip_src.jpg")).unwrap()).unwrap();
+    // 48 × 32 at 4:2:0: three by two MCUs.
+    let c = src.cropped(16, 16, 32, 16).unwrap();
+    assert_eq!((c.width, c.height), (32, 16));
+    assert_eq!(c.block_grid(0), (4, 2));
+    assert_eq!(c.block_grid(1), (2, 1));
+    let (bw, _) = src.block_grid(0);
+    assert_eq!(
+        c.components[0].blocks[0],
+        src.components[0].blocks[2 * bw + 2]
+    );
+    assert_eq!(c.components[1].blocks[1], src.components[1].blocks[3 + 2]);
+    assert_eq!(c.quant_tables, src.quant_tables);
+    assert_eq!(src.cropped(0, 0, 48, 32).unwrap(), src);
+    // The crop decodes to the same samples as that region of the source.
+    let whole = decode_coefficients(&src, &DecodeOptions::default()).unwrap();
+    let part = decode_coefficients(&c, &DecodeOptions::default()).unwrap();
+    for y in 0..16 {
+        assert_eq!(
+            part.planes[0].data[y * part.planes[0].stride..][..32],
+            whole.planes[0].data[(16 + y) * whole.planes[0].stride + 16..][..32]
+        );
+    }
+    // A ragged size keeps the blocks of its last MCU as padding.
+    let ragged = src.cropped(16, 0, 21, 19).unwrap();
+    assert_eq!(ragged.block_grid(0), (4, 4));
+    ragged.validate().unwrap();
+    let out = encode_coefficients(&ragged, &EncodeOptions::default()).unwrap();
+    let img = decode(&out).unwrap();
+    assert_eq!((img.width, img.height), (21, 19));
+    for y in 0..19 {
+        assert_eq!(
+            img.planes[0].data[y * img.planes[0].stride..][..21],
+            whole.planes[0].data[y * whole.planes[0].stride + 16..][..21]
+        );
+    }
+    // Mirrors on the ragged axis are refused, the transpose is not.
+    assert!(ragged.flipped_horizontal().is_err());
+    assert!(ragged.flipped_vertical().is_err());
+    assert!(ragged.rotated(1).is_err());
+    ragged.transposed().validate().unwrap();
+    let trimmed = ragged.cropped(0, 0, 16, 16).unwrap();
+    trimmed.rotated(1).unwrap().validate().unwrap();
+    // Bad regions.
+    assert!(src.cropped(8, 0, 16, 16).is_err());
+    assert!(src.cropped(0, 16, 48, 17).is_err());
+    assert!(src.cropped(0, 0, 0, 16).is_err());
+}
+
+/// The same transforms against the black-box lossless transcoder, when
+/// it is installed: vertical mirror, the three rotations and a crop.
+#[test]
+fn library_transforms_match_the_black_box_transcoder() {
+    let dir = std::env::temp_dir().join(format!("oxideav-mjpeg-xform-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = format!("{COEF}/flip_src.jpg");
+    let src = read_coefficients(&std::fs::read(&path).unwrap()).unwrap();
+    let run = |args: &[&str]| -> Option<JpegCoefficients> {
+        let o = std::process::Command::new("jpegtran")
+            .args(["-copy", "none"])
+            .args(args)
+            .arg(&path)
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| read_coefficients(&o.stdout).unwrap())
+    };
+    let cases: [(&[&str], JpegCoefficients); 5] = [
+        (&["-flip", "vertical"], src.flipped_vertical().unwrap()),
+        (&["-rotate", "90"], src.rotated(1).unwrap()),
+        (&["-rotate", "180"], src.rotated(2).unwrap()),
+        (&["-rotate", "270"], src.rotated(3).unwrap()),
+        (
+            &["-crop", "32x16+16+16"],
+            src.cropped(16, 16, 32, 16).unwrap(),
+        ),
+    ];
+    for (args, ours) in cases {
+        let Some(want) = run(args) else {
+            eprintln!("jpegtran not available — skipping the black-box transform check");
+            break;
+        };
+        assert_eq!(
+            (ours.width, ours.height),
+            (want.width, want.height),
+            "{args:?}"
+        );
+        assert!(ours.components == want.components, "{args:?}: coefficients");
+        assert_eq!(ours.quant_tables, want.quant_tables, "{args:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

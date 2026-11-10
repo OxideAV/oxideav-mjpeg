@@ -192,6 +192,167 @@ impl JpegCoefficients {
         (xi.div_ceil(8), yi.div_ceil(8))
     }
 
+    /// The MCU size in samples, `(8 · Hmax, 8 · Vmax)`.
+    pub fn mcu_size(&self) -> (usize, usize) {
+        let (hm, vm) = self.max_factors();
+        (8 * hm, 8 * vm)
+    }
+
+    /// A record with the same frame-level fields (precision, process,
+    /// Adobe flag, JFIF presence, metadata) for a `width × height`
+    /// frame, without tables or components.
+    fn like(&self, width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            precision: self.precision,
+            kind: self.kind,
+            quant_tables: [None; 4],
+            components: Vec::new(),
+            adobe_transform: self.adobe_transform,
+            jfif: self.jfif,
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    /// The picture transposed (mirrored about its main diagonal),
+    /// exactly: block rows and columns swap, each block's `u` and `v`
+    /// swap, the sampling factors `H` and `V` swap and the quantisation
+    /// tables are transposed. The §A.3.3 transform is separable and
+    /// symmetric in its two axes, so the decoded samples are the
+    /// transposed samples. Valid for every frame size: the padding
+    /// stays on the right and bottom edges.
+    pub fn transposed(&self) -> Self {
+        let mut out = self.like(self.height, self.width);
+        for (tq, t) in self.quant_tables.iter().enumerate() {
+            out.quant_tables[tq] = t.map(|t| std::array::from_fn(|i| t[(i % 8) * 8 + i / 8]));
+        }
+        for (ci, comp) in self.components.iter().enumerate() {
+            let (bw, bh) = self.block_grid(ci);
+            let mut blocks = vec![[0i32; 64]; bw * bh];
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let b = &comp.blocks[by * bw + bx];
+                    blocks[bx * bh + by] = std::array::from_fn(|i| b[(i % 8) * 8 + i / 8]);
+                }
+            }
+            out.components.push(
+                CoefficientComponent::new(comp.id, comp.v, comp.h, comp.quant_id)
+                    .with_blocks(blocks),
+            );
+        }
+        out
+    }
+
+    /// Mirror the block grid along one axis, negating the odd
+    /// frequencies of that axis (a basis function of odd index is
+    /// antisymmetric about the block centre, §A.3.3).
+    fn mirrored(&self, horizontal: bool) -> Result<Self> {
+        let (mw, mh) = self.mcu_size();
+        let (extent, mcu, axis) = if horizontal {
+            (self.width as usize, mw, "width")
+        } else {
+            (self.height as usize, mh, "height")
+        };
+        if !extent.is_multiple_of(mcu) {
+            return Err(Error::unsupported(format!(
+                "JPEG coefficients: a mirror needs the frame {axis} ({extent}) to be a multiple of the MCU size ({mcu}); the partial MCU would move to the leading edge (crop to whole MCUs first)"
+            )));
+        }
+        let mut out = self.clone();
+        for (ci, comp) in out.components.iter_mut().enumerate() {
+            let (bw, bh) = self.block_grid(ci);
+            let src = &self.components[ci].blocks;
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let (sx, sy) = if horizontal {
+                        (bw - 1 - bx, by)
+                    } else {
+                        (bx, bh - 1 - by)
+                    };
+                    let b = &src[sy * bw + sx];
+                    comp.blocks[by * bw + bx] = std::array::from_fn(|i| {
+                        let odd = if horizontal { i % 8 } else { i / 8 } & 1 != 0;
+                        if odd { -b[i] } else { b[i] }
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The picture mirrored left ↔ right, exactly. The frame width must
+    /// be a multiple of the MCU width ([`Self::mcu_size`]);
+    /// `Error::Unsupported` otherwise (see [`Self::cropped`]).
+    pub fn flipped_horizontal(&self) -> Result<Self> {
+        self.mirrored(true)
+    }
+
+    /// The picture mirrored top ↔ bottom, exactly. The frame height
+    /// must be a multiple of the MCU height.
+    pub fn flipped_vertical(&self) -> Result<Self> {
+        self.mirrored(false)
+    }
+
+    /// The picture rotated clockwise by `quarter_turns × 90°` (taken
+    /// modulo 4), exactly: a transpose and / or mirrors. The dimension
+    /// that ends up mirrored must be a multiple of the MCU size: the
+    /// height for one quarter turn, both for two, the width for three.
+    pub fn rotated(&self, quarter_turns: u8) -> Result<Self> {
+        match quarter_turns % 4 {
+            0 => Ok(self.clone()),
+            1 => self.transposed().flipped_horizontal(),
+            2 => self.flipped_horizontal()?.flipped_vertical(),
+            _ => self.transposed().flipped_vertical(),
+        }
+    }
+
+    /// The `width × height` region whose top-left sample is `(left,
+    /// top)`, exactly: whole blocks are copied, so `left` and `top`
+    /// must be multiples of the MCU size ([`Self::mcu_size`]) and the
+    /// region must lie inside the frame. The size is free; a region
+    /// that ends inside an MCU keeps that MCU's blocks as its padding.
+    /// `cropped(0, 0, w − w % mcu_w, h − h % mcu_h)` trims a frame to
+    /// whole MCUs.
+    pub fn cropped(&self, left: u32, top: u32, width: u32, height: u32) -> Result<Self> {
+        let (mw, mh) = self.mcu_size();
+        let (l, t, w, h) = (left as usize, top as usize, width as usize, height as usize);
+        if w == 0 || h == 0 || l + w > self.width as usize || t + h > self.height as usize {
+            return Err(Error::invalid(format!(
+                "JPEG coefficients: crop {w}x{h}+{l}+{t} outside the {}x{} frame",
+                self.width, self.height
+            )));
+        }
+        if !l.is_multiple_of(mw) || !t.is_multiple_of(mh) {
+            return Err(Error::unsupported(format!(
+                "JPEG coefficients: crop origin ({l}, {t}) must be a multiple of the MCU size {mw}x{mh}"
+            )));
+        }
+        let mut out = self.like(width as u16, height as u16);
+        out.quant_tables = self.quant_tables;
+        // The component list first: the new grid depends on its factors.
+        for comp in &self.components {
+            out.components.push(CoefficientComponent::new(
+                comp.id,
+                comp.h,
+                comp.v,
+                comp.quant_id,
+            ));
+        }
+        for (ci, comp) in self.components.iter().enumerate() {
+            let (bw, _) = self.block_grid(ci);
+            let (nw, nh) = out.block_grid(ci);
+            let (x0, y0) = (l / mw * comp.h as usize, t / mh * comp.v as usize);
+            let mut blocks = Vec::with_capacity(nw * nh);
+            for by in 0..nh {
+                let row = (y0 + by) * bw + x0;
+                blocks.extend_from_slice(&comp.blocks[row..row + nw]);
+            }
+            out.components[ci].blocks = blocks;
+        }
+        Ok(out)
+    }
+
     /// Check the record: geometry, sampling factors, table references
     /// (every entry `Qk ≥ 1`; 16-bit entries are kept even at `P = 8`,
     /// where Table B.4 asks for 8-bit ones, so such streams transcode

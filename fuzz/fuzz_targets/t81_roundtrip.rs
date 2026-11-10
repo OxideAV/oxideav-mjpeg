@@ -164,7 +164,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let quality = 50 + data[5] % 51;
     let width = 1 + (data[6] % 16) as usize;
-    let sig_sel = data[7] % 3;
+    let sig_sel = data[7] % 4;
 
     let h_max = layout.iter().map(|s| s.0).max().unwrap() as usize;
     let v_max = layout.iter().map(|s| s.1).max().unwrap() as usize;
@@ -207,8 +207,14 @@ fuzz_target!(|data: &[u8]| {
     } else {
         (data[3] >> 2 & 3) as u16
     };
+    // Four components: `Auto` resolves to Adobe `transform = 0` (the
+    // complemented wire form); selector 3 asks for the marker-less
+    // layout explicitly.
     let signalling = match (nf, sig_sel) {
         (3, 0) => ColorSignalling::Rgb,
+        (4, 3) => ColorSignalling::Cmyk {
+            adobe_transform: None,
+        },
         (4, 1) => ColorSignalling::Cmyk {
             adobe_transform: Some(0),
         },
@@ -267,10 +273,15 @@ fuzz_target!(|data: &[u8]| {
         // Adobe-inverted CMYK codes `max − v`; the point transform acts on
         // that coded value, so reconstruction is `max − (((max − v) >> Pt)
         // << Pt)` — the inversion and the shift do not commute.
-        let inverted = signalling
-            == (ColorSignalling::Cmyk {
-                adobe_transform: Some(0),
-            });
+        let inverted = matches!(
+            (nf, signalling),
+            (
+                _,
+                ColorSignalling::Cmyk {
+                    adobe_transform: Some(0)
+                }
+            ) | (4, ColorSignalling::Auto)
+        );
         for (c, &(h, v)) in layout.iter().enumerate() {
             let cw = (width * h as usize).div_ceil(h_max);
             for y in 0..height {

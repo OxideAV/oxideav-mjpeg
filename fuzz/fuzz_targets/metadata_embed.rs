@@ -133,10 +133,15 @@ fn arbitrary_stream(ctl: &[u8], jpeg: &[u8]) {
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), embedded.clone()))
             .expect("send");
         if let Ok(Frame::Video(vf)) = dec.receive_frame() {
+            // `COM` segments have no blob form: the frame record is the
+            // ICC / Exif / XMP part of the stream's metadata.
+            let mut carried = after.clone();
+            carried.comments.clear();
+            carried.gamma = None;
             assert_eq!(
                 Metadata::from_blobs(&vf.blobs()),
-                after,
-                "frame blobs == metadata"
+                carried,
+                "frame blobs == blob-carried metadata"
             );
         }
     }

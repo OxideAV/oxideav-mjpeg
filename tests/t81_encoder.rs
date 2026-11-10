@@ -458,6 +458,63 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
     }
 }
 
+/// Fuzz regression (`t81_roundtrip`, crash `ed3687d7`): four lossless
+/// components under [`ColorSignalling::Auto`] travel complemented
+/// (Adobe APP14 `transform = 0`), and the point transform acts on the
+/// wire value, so the decoder returns `max − (((max − v) >> Pt) << Pt)`
+/// and not `(v >> Pt) << Pt`. The marker-less layout keeps the plain
+/// shift.
+#[test]
+fn lossless_auto_cmyk_applies_the_point_transform_to_the_wire_value() {
+    let src = planes(4, 8, &[]);
+    let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
+    for predictor in [1u8, 4, 7] {
+        for pt in [0u8, 1, 3] {
+            for (signalling, complemented) in [
+                (ColorSignalling::Auto, true),
+                (
+                    ColorSignalling::Cmyk {
+                        adobe_transform: Some(0),
+                    },
+                    true,
+                ),
+                (
+                    ColorSignalling::Cmyk {
+                        adobe_transform: None,
+                    },
+                    false,
+                ),
+            ] {
+                let mut o = EncodeOptions::default();
+                o.process = JpegProcess::Lossless {
+                    predictor,
+                    point_transform: pt,
+                };
+                o.signalling = signalling;
+                let out = o.encode(W, H, &refs).expect("encode");
+                let got = decoded_components(&out.data, 4, 8, &[]);
+                for c in 0..4 {
+                    let want: Vec<u32> = src[c]
+                        .iter()
+                        .map(|&v| {
+                            let v = u32::from(v);
+                            if complemented {
+                                255 - (((255 - v) >> pt) << pt)
+                            } else {
+                                (v >> pt) << pt
+                            }
+                        })
+                        .collect();
+                    assert!(
+                        got[c] == want,
+                        "pred{predictor} pt{pt} {signalling:?}: component {c}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Split a stream into its marker segments (`FF xx` + payload; an `SOS`
 /// segment keeps its entropy-coded data, restart markers included).
 fn segments(jpeg: &[u8]) -> Vec<Vec<u8>> {

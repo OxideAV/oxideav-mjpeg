@@ -163,3 +163,34 @@ fn rdjpgcom_reads_our_comments() {
         "written by oxideav\nline two\n"
     );
 }
+
+/// Fuzz regression (`metadata_embed`, crash `cce9333d`): a `COM` segment
+/// has no framework blob form, so the registry decoder's frame record is
+/// the ICC / Exif / XMP part of [`read_metadata`] and nothing else. The
+/// harness used to expect the two records to be equal, comments included.
+#[cfg(feature = "registry")]
+#[test]
+fn registry_frame_blobs_leave_comments_out() {
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+
+    let meta = Metadata::new()
+        .with_exif(vec![0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8, 0, 0])
+        .with_comment(b"kept in the stream".to_vec());
+    let jpeg = embed_metadata(TWO_COM, &meta, JfifPolicy::Auto).expect("embed");
+    let read = read_metadata(&jpeg).expect("read");
+    assert_eq!(read.comments, vec![b"kept in the stream".to_vec()]);
+    assert!(read.exif.is_some());
+
+    let params = CodecParameters::video(CodecId::new(oxideav_mjpeg::CODEC_ID_STR));
+    let mut dec = oxideav_mjpeg::registry::make_decoder(&params).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), jpeg))
+        .expect("send");
+    let Ok(Frame::Video(vf)) = dec.receive_frame() else {
+        panic!("no frame");
+    };
+    let from_frame = Metadata::from_blobs(&vf.blobs());
+    assert!(from_frame.comments.is_empty());
+    let mut carried = read.clone();
+    carried.comments.clear();
+    assert_eq!(from_frame, carried);
+}

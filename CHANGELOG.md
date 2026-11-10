@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fuzz workflow red on two harness oracles that predate 0.1.16 behaviour (library unchanged). `metadata_embed` expected the registry frame's blob record to equal `read_metadata`, comments included; `COM` segments have no blob form, so the comparison is now against the ICC / Exif / XMP part. `t81_roundtrip` expected four lossless components under `ColorSignalling::Auto` to come back as `(v >> Pt) << Pt`; `Auto` is Adobe `transform = 0` since 0.1.16, so the point transform acts on the complemented wire value. The marker-less layout is now sampled explicitly. Both rules are pinned in `tests/comments.rs` and `tests/t81_encoder.rs`.
+
 ## [0.1.16](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.15...v0.1.16) - 2026-11-07
 
 ### Other

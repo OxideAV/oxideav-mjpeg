@@ -725,6 +725,151 @@ impl JpegProcess {
     }
 }
 
+/// Where the table segments sit relative to the frame header.
+///
+/// T.81 §B.2.1 places "tables / miscellaneous" segments both ahead of
+/// the frame header and ahead of every scan header, so a `DQT` or
+/// `DHT` is legal anywhere before the first scan that needs it. Readers
+/// that process a stream in one pass sometimes want a particular
+/// layout, e.g. the frame geometry before any Huffman table, or every
+/// table before the frame header. The entropy-coded data is the same
+/// for every order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum MarkerOrder {
+    /// `DQT… SOFn DHT… [DRI] SOS` (the default): quantisation tables
+    /// ahead of the frame header that names their destinations, each
+    /// Huffman table ahead of the first scan that uses it.
+    #[default]
+    QuantFrameHuffman,
+    /// `DQT… DHT… SOFn [DRI] SOS`: every table of the frame (all scans
+    /// of a progressive frame) ahead of the frame header.
+    TablesBeforeFrame,
+    /// `SOFn DQT… DHT… [DRI] SOS`: the frame header first, directly
+    /// after the `APPn` / `COM` segments; every quantisation table ahead
+    /// of the first scan, each Huffman table ahead of the first scan
+    /// that uses it.
+    FrameBeforeTables,
+}
+
+impl MarkerOrder {
+    /// Parse the registry option spelling: `quant_frame_huffman` (or
+    /// empty), `tables_first`, `frame_first`.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "" | "quant_frame_huffman" => Ok(MarkerOrder::QuantFrameHuffman),
+            "tables_first" => Ok(MarkerOrder::TablesBeforeFrame),
+            "frame_first" => Ok(MarkerOrder::FrameBeforeTables),
+            other => Err(Error::invalid(format!(
+                "JPEG encode: marker order '{other}' (quant_frame_huffman / tables_first / frame_first)"
+            ))),
+        }
+    }
+
+    /// The registry option spelling of this order.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarkerOrder::QuantFrameHuffman => "quant_frame_huffman",
+            MarkerOrder::TablesBeforeFrame => "tables_first",
+            MarkerOrder::FrameBeforeTables => "frame_first",
+        }
+    }
+}
+
+/// Entropy coding of the DCT processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum EntropyCoding {
+    /// Huffman coding (Annex F.1.2 / G.1.2): `SOF0` / `SOF1` / `SOF2`.
+    #[default]
+    Huffman,
+    /// Arithmetic coding (Annex D, F.1.4, G.1.3) with the default
+    /// conditioning (`L = 0`, `U = 1`, `Kx = 5`; no `DAC` segment):
+    /// `SOF9` for the sequential process, `SOF10` for the progressive
+    /// one. No `DHT` segment is written. DCT processes only.
+    Arithmetic,
+}
+
+impl EntropyCoding {
+    /// Parse the registry option spelling: `huffman` (or empty),
+    /// `arithmetic`.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "" | "huffman" => Ok(EntropyCoding::Huffman),
+            "arithmetic" => Ok(EntropyCoding::Arithmetic),
+            other => Err(Error::invalid(format!(
+                "JPEG encode: entropy coding '{other}' (huffman / arithmetic)"
+            ))),
+        }
+    }
+
+    /// The registry option spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntropyCoding::Huffman => "huffman",
+            EntropyCoding::Arithmetic => "arithmetic",
+        }
+    }
+}
+
+/// Conditioning of the arithmetic statistical models (T.81 §B.2.4.3,
+/// §F.1.4.4.1.4, §F.1.4.4.2.1), applied to every table destination the
+/// frame uses. The default (`L = 0`, `U = 1`, `Kx = 5`) is what `SOI`
+/// establishes and needs no segment; any other value is written as a
+/// `DAC` segment ahead of the first scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ArithConditioning {
+    /// Lower DC conditioning bound `L` (`0 ≤ L ≤ U`).
+    pub dc_lower: u8,
+    /// Upper DC conditioning bound `U` (`L ≤ U ≤ 15`).
+    pub dc_upper: u8,
+    /// AC magnitude-context threshold `Kx` (`1..=63`).
+    pub ac_kx: u8,
+}
+
+impl Default for ArithConditioning {
+    fn default() -> Self {
+        ArithConditioning {
+            dc_lower: 0,
+            dc_upper: 1,
+            ac_kx: 5,
+        }
+    }
+}
+
+impl ArithConditioning {
+    /// The default conditioning.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the DC bounds `L` and `U`.
+    #[must_use]
+    pub fn with_dc_bounds(mut self, lower: u8, upper: u8) -> Self {
+        self.dc_lower = lower;
+        self.dc_upper = upper;
+        self
+    }
+
+    /// Set the AC threshold `Kx`.
+    #[must_use]
+    pub fn with_ac_kx(mut self, kx: u8) -> Self {
+        self.ac_kx = kx;
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.dc_lower > self.dc_upper || self.dc_upper > 15 || !(1..=63).contains(&self.ac_kx) {
+            return Err(Error::invalid(format!(
+                "JPEG encode: arithmetic conditioning L={} U={} Kx={} (Table B.6: 0 ≤ L ≤ U ≤ 15, 1 ≤ Kx ≤ 63)",
+                self.dc_lower, self.dc_upper, self.ac_kx
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Frame-level parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -747,6 +892,14 @@ pub struct JpegFrame {
     /// the lossless process Table B.7 requires `Ri` to be an integer
     /// multiple of the number of MCUs in an MCU-row.
     pub restart_interval: u16,
+    /// Placement of `DQT` / `DHT` relative to `SOFn` (default
+    /// [`MarkerOrder::QuantFrameHuffman`]).
+    pub marker_order: MarkerOrder,
+    /// Huffman (default) or arithmetic entropy coding.
+    pub entropy: EntropyCoding,
+    /// Conditioning of the arithmetic models (ignored under Huffman
+    /// coding).
+    pub conditioning: ArithConditioning,
 }
 
 impl JpegFrame {
@@ -764,7 +917,31 @@ impl JpegFrame {
             precision,
             process,
             restart_interval,
+            marker_order: MarkerOrder::default(),
+            entropy: EntropyCoding::default(),
+            conditioning: ArithConditioning::default(),
         }
+    }
+
+    /// Set `conditioning`.
+    #[must_use]
+    pub fn with_conditioning(mut self, v: ArithConditioning) -> Self {
+        self.conditioning = v;
+        self
+    }
+
+    /// Set `entropy`.
+    #[must_use]
+    pub fn with_entropy(mut self, v: EntropyCoding) -> Self {
+        self.entropy = v;
+        self
+    }
+
+    /// Set `marker_order`.
+    #[must_use]
+    pub fn with_marker_order(mut self, v: MarkerOrder) -> Self {
+        self.marker_order = v;
+        self
     }
 
     /// Set `width`.
@@ -1025,6 +1202,14 @@ fn validate_geometry(
             "JPEG encode: frame dimensions must be non-zero (B.2.2: X ≥ 1)",
         ));
     }
+    if frame.entropy == EntropyCoding::Arithmetic {
+        frame.conditioning.validate()?;
+    }
+    if frame.entropy == EntropyCoding::Arithmetic && !frame.process.is_dct() {
+        return Err(Error::unsupported(
+            "JPEG encode: the general writer codes arithmetic entropy for the DCT processes only (SOF9 / SOF10)",
+        ));
+    }
     match frame.process {
         JpegProcess::Sequential | JpegProcess::Progressive => {
             if frame.precision != 8 && frame.precision != 12 {
@@ -1149,7 +1334,10 @@ fn write_sof(
     comps: &[JpegComponent<'_>],
     tables: &JpegTableSet,
 ) {
+    let arith = frame.entropy == EntropyCoding::Arithmetic;
     let marker = match frame.process {
+        JpegProcess::Sequential if arith => markers::SOF9,
+        JpegProcess::Progressive if arith => markers::SOF10,
         JpegProcess::Sequential if sequential_is_baseline(frame, comps, tables) => markers::SOF0,
         JpegProcess::Sequential => markers::SOF1,
         JpegProcess::Progressive => markers::SOF2,
@@ -1567,6 +1755,165 @@ fn code_lossless(
 }
 
 // ---------------------------------------------------------------------------
+// Arithmetic-coded scans (Annex D, F.1.4, G.1.3).
+// ---------------------------------------------------------------------------
+
+/// Statistics and prediction state of one arithmetic-coded scan: one DC
+/// and one AC statistics area per table destination (§B.2.3: the scan
+/// header's `Td` / `Ta` select the area), one DC prediction per
+/// component. Default conditioning (no `DAC`).
+struct ArithScan {
+    enc: crate::jpeg::arith::ArithEncoder,
+    dc: [crate::jpeg::arith::DcStats; 4],
+    ac: [crate::jpeg::arith::AcStats; 4],
+    pred: Vec<crate::jpeg::arith::DcPredictor>,
+    out: Vec<u8>,
+    restarts: Restarts,
+    cond: ArithConditioning,
+}
+
+impl ArithScan {
+    fn new(ncomp: usize, ri: u16, cond: ArithConditioning) -> Self {
+        use crate::jpeg::arith::{ArithEncoder, DcPredictor};
+        ArithScan {
+            enc: ArithEncoder::new(),
+            dc: std::array::from_fn(|_| Self::fresh_dc(cond)),
+            ac: std::array::from_fn(|_| Self::fresh_ac(cond)),
+            pred: vec![DcPredictor::new(); ncomp],
+            out: Vec::new(),
+            restarts: Restarts::new(ri),
+            cond,
+        }
+    }
+
+    /// A DC statistics area in its initial state under `cond`.
+    fn fresh_dc(cond: ArithConditioning) -> crate::jpeg::arith::DcStats {
+        let mut d = crate::jpeg::arith::DcStats::new();
+        d.l = cond.dc_lower;
+        d.u = cond.dc_upper;
+        d
+    }
+
+    /// An AC statistics area in its initial state under `cond`.
+    fn fresh_ac(cond: ArithConditioning) -> crate::jpeg::arith::AcStats {
+        let mut a = crate::jpeg::arith::AcStats::new();
+        a.kx = cond.ac_kx;
+        a
+    }
+
+    /// E.1.3 / F.1.4.3: at a restart boundary flush the coder, write
+    /// `RSTm` and re-initialise the statistics areas and predictions.
+    fn before_unit(&mut self) {
+        let r = &mut self.restarts;
+        if r.ri > 0 && r.done > 0 && r.done.is_multiple_of(r.ri) {
+            let done = std::mem::take(&mut self.enc).finish();
+            self.out.extend_from_slice(&done);
+            self.out.extend_from_slice(&[0xFF, markers::RST0 + r.m]);
+            r.m = (r.m + 1) & 7;
+            for d in &mut self.dc {
+                *d = Self::fresh_dc(self.cond);
+            }
+            for a in &mut self.ac {
+                *a = Self::fresh_ac(self.cond);
+            }
+            for p in &mut self.pred {
+                *p = crate::jpeg::arith::DcPredictor::new();
+            }
+        }
+        self.restarts.done += 1;
+    }
+
+    /// One block of component `ci` (table destination `dest`): the DC
+    /// difference when `ss == 0`, then the zig-zag band `max(ss, 1)..=se`
+    /// when `se ≥ 1`.
+    fn block(&mut self, q: &[i32; 64], ci: usize, dest: usize, ss: usize, se: usize) -> Result<()> {
+        use crate::jpeg::arith::{encode_ac, encode_dc_diff};
+        if ss == 0 {
+            let pr = &mut self.pred[ci];
+            let diff = q[0] - pr.pred;
+            // Figure F.8 ends its magnitude categories at X15: `Sz =
+            // |diff| − 1` must stay below 2^15.
+            if diff.unsigned_abs() > 1 << 15 {
+                return Err(Error::invalid(format!(
+                    "JPEG encode: DC difference {diff} outside the ±32768 the arithmetic DC model codes"
+                )));
+            }
+            encode_dc_diff(&mut self.enc, &mut self.dc[dest], pr, diff);
+            pr.pred = q[0];
+        }
+        if se >= 1 {
+            let zz: [i32; 64] = std::array::from_fn(|k| q[ZIGZAG[k]]);
+            // Same bound for an AC magnitude (Figure F.8, X2..X15).
+            if zz[ss.max(1)..=se]
+                .iter()
+                .any(|v| v.unsigned_abs() > 1 << 15)
+            {
+                return Err(Error::invalid(
+                    "JPEG encode: AC coefficient outside the ±32768 the arithmetic AC model codes",
+                ));
+            }
+            encode_ac(&mut self.enc, &mut self.ac[dest], &zz, ss.max(1), se);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        let tail = self.enc.finish();
+        self.out.extend_from_slice(&tail);
+        self.out
+    }
+}
+
+/// The entropy-coded segments (with their `RSTm` markers) of one
+/// arithmetic-coded DCT scan: the same block walks as the Huffman
+/// coders (A.2.3 interleaved MCUs, A.2.2 single-component extent).
+fn code_scan_arith(
+    frame: &JpegFrame,
+    comps: &[JpegComponent<'_>],
+    geo: &Geometry,
+    dct: &[DctComponent],
+    plan: &ScanPlan,
+) -> Result<Vec<u8>> {
+    let mut scan = ArithScan::new(comps.len(), frame.restart_interval, frame.conditioning);
+    let (ss, se) = (plan.ss as usize, plan.se as usize);
+    if plan.comps.len() > 1 {
+        let mcus_x = (frame.width as usize).div_ceil(8 * geo.h_max);
+        let mcus_y = (frame.height as usize).div_ceil(8 * geo.v_max);
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                scan.before_unit();
+                for &ci in &plan.comps {
+                    let (c, d) = (&comps[ci], &dct[ci]);
+                    for v in 0..c.v as usize {
+                        for h in 0..c.h as usize {
+                            let q = &d.blocks
+                                [(my * c.v as usize + v) * d.bx_pad + mx * c.h as usize + h];
+                            scan.block(q, ci, c.huff_id as usize, ss, se)?;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let ci = plan.comps[0];
+        let (c, d) = (&comps[ci], &dct[ci]);
+        for by in 0..d.by_true {
+            for bx in 0..d.bx_true {
+                scan.before_unit();
+                scan.block(
+                    &d.blocks[by * d.bx_pad + bx],
+                    ci,
+                    c.huff_id as usize,
+                    ss,
+                    se,
+                )?;
+            }
+        }
+    }
+    Ok(scan.finish())
+}
+
+// ---------------------------------------------------------------------------
 // Scan plans.
 // ---------------------------------------------------------------------------
 
@@ -1772,7 +2119,7 @@ fn encode_frame_opts(
         None
     };
     let mut t = tables.clone();
-    if optimise {
+    if optimise && frame.entropy == EntropyCoding::Huffman {
         let mut dc: [HuffStats; 4] = Default::default();
         let mut ac: [HuffStats; 4] = Default::default();
         let mut sink = Sink::Count {
@@ -1844,20 +2191,22 @@ fn build_scan_tables(
 /// then `meta` under `policy`.
 pub(crate) fn encode_coefficient_frame(
     coefs: &crate::coefficients::JpegCoefficients,
-    process: JpegProcess,
-    restart_interval: u16,
+    opts: &EncodeOptions,
     optimal: bool,
     jfif: bool,
     meta: &Metadata,
-    policy: JfifPolicy,
 ) -> Result<Vec<u8>> {
+    let (entropy, policy) = (opts.entropy, opts.jfif);
     let frame = JpegFrame::new(
         coefs.width,
         coefs.height,
         coefs.precision,
-        process,
-        restart_interval,
-    );
+        opts.process,
+        opts.restart_interval,
+    )
+    .with_marker_order(opts.marker_order)
+    .with_entropy(entropy)
+    .with_conditioning(opts.conditioning);
     let comps: Vec<JpegComponent<'static>> = coefs
         .components
         .iter()
@@ -1902,7 +2251,7 @@ pub(crate) fn encode_coefficient_frame(
         .collect();
     let mut tables = JpegTableSet::typical(50, coefs.precision, false, comps.len());
     tables.quant = coefs.quant_tables;
-    if optimal {
+    if optimal && entropy == EntropyCoding::Huffman {
         let mut dc: [HuffStats; 4] = Default::default();
         let mut ac: [HuffStats; 4] = Default::default();
         {
@@ -1985,55 +2334,110 @@ fn emit_frame(
 ) -> Result<Vec<u8>> {
     let dct = frame.process.is_dct();
     // Marker order (B.2.4 / B.2.1 allow tables anywhere before the scan
-    // that uses them): DQT ahead of the frame header, which references
-    // the quantisation destinations; then SOFn; then, ahead of each scan,
-    // the DHT segments of the destinations that scan is the first to
-    // use; DRI once, ahead of the first SOS. A sequential or lossless
-    // frame therefore reads `DQT… SOFn DHT… [DRI] SOS`, and a
-    // progressive one carries its AC tables in front of the first AC
-    // scan of each destination.
+    // that uses them). Default: DQT ahead of the frame header, which
+    // references the quantisation destinations; then SOFn; then, ahead
+    // of each scan, the DHT segments of the destinations that scan is
+    // the first to use; DRI once, ahead of the first SOS. A sequential
+    // or lossless frame therefore reads `DQT… SOFn DHT… [DRI] SOS`, and
+    // a progressive one carries its AC tables in front of the first AC
+    // scan of each destination. `MarkerOrder` moves the frame header to
+    // either end of the table segments.
+    let order = frame.marker_order;
     let mut out = vec![0xFF, markers::SOI];
     out.extend_from_slice(meta);
-    if emit_tables && dct {
-        for tq in 0..4u8 {
-            if comps.iter().any(|c| c.quant_id == tq) {
-                tables.write_quant_table(&mut out, tq as usize);
+    let write_dqt = |out: &mut Vec<u8>| {
+        if emit_tables && dct {
+            for tq in 0..4u8 {
+                if comps.iter().any(|c| c.quant_id == tq) {
+                    tables.write_quant_table(out, tq as usize);
+                }
             }
         }
+    };
+    let plans = scan_plans(frame, comps);
+    let mut emitted = [[false; 4]; 2];
+    // The DHT segments scan `plan` is the first to need.
+    let arith = frame.entropy == EntropyCoding::Arithmetic;
+    let mut write_dht = |out: &mut Vec<u8>, plan: &ScanPlan| {
+        if !emit_tables || arith {
+            return;
+        }
+        for class in [0u8, 1u8] {
+            let used = if class == 0 {
+                plan.ss == 0 || !dct
+            } else {
+                dct && plan.se > 0
+            };
+            if !used {
+                continue;
+            }
+            for &ci in &plan.comps {
+                let th = comps[ci].huff_id as usize;
+                if !emitted[class as usize][th] {
+                    emitted[class as usize][th] = true;
+                    tables.write_huffman_table(out, class, th);
+                }
+            }
+        }
+    };
+    // B.2.4.3: non-default arithmetic conditioning of every destination
+    // the frame names, DC entries (`Tc = 0`, `Cs = L + 16 U`) then AC
+    // ones (`Tc = 1`, `Cs = Kx`).
+    let write_dac = |out: &mut Vec<u8>| {
+        if !arith || frame.conditioning == ArithConditioning::default() {
+            return;
+        }
+        let mut dests: Vec<u8> = comps.iter().map(|c| c.huff_id).collect();
+        dests.sort_unstable();
+        dests.dedup();
+        let cond = frame.conditioning;
+        out.extend_from_slice(&[0xFF, markers::DAC]);
+        out.extend_from_slice(&((2 + 4 * dests.len()) as u16).to_be_bytes());
+        for &tb in &dests {
+            out.extend_from_slice(&[tb, cond.dc_lower | (cond.dc_upper << 4)]);
+        }
+        for &tb in &dests {
+            out.extend_from_slice(&[0x10 | tb, cond.ac_kx]);
+        }
+    };
+    match order {
+        MarkerOrder::QuantFrameHuffman => {
+            write_dqt(&mut out);
+            write_sof(&mut out, frame, comps, tables);
+            write_dac(&mut out);
+        }
+        MarkerOrder::TablesBeforeFrame => {
+            write_dqt(&mut out);
+            for plan in &plans {
+                write_dht(&mut out, plan);
+            }
+            write_dac(&mut out);
+            write_sof(&mut out, frame, comps, tables);
+        }
+        MarkerOrder::FrameBeforeTables => {
+            write_sof(&mut out, frame, comps, tables);
+            write_dqt(&mut out);
+            write_dac(&mut out);
+        }
     }
-    write_sof(&mut out, frame, comps, tables);
     let ah_al = match frame.process {
         JpegProcess::Lossless {
             point_transform, ..
         } => point_transform & 0x0F,
         _ => 0,
     };
-    let mut emitted = [[false; 4]; 2];
-    for (si, plan) in scan_plans(frame, comps).into_iter().enumerate() {
+    for (si, plan) in plans.into_iter().enumerate() {
         let scan_comps: Vec<&JpegComponent<'_>> = plan.comps.iter().map(|&i| &comps[i]).collect();
-        if emit_tables {
-            for class in [0u8, 1u8] {
-                let used = if class == 0 {
-                    plan.ss == 0 || !dct
-                } else {
-                    dct && plan.se > 0
-                };
-                if !used {
-                    continue;
-                }
-                for c in &scan_comps {
-                    let th = c.huff_id as usize;
-                    if !emitted[class as usize][th] {
-                        emitted[class as usize][th] = true;
-                        tables.write_huffman_table(&mut out, class, th);
-                    }
-                }
-            }
-        }
+        write_dht(&mut out, &plan);
         if si == 0 && frame.restart_interval > 0 {
             write_dri(&mut out, frame.restart_interval);
         }
         write_sos(&mut out, &scan_comps, dct, plan.ss, plan.se, ah_al);
+        if arith {
+            let dct_blocks = blocks.expect("DCT blocks prepared");
+            out.extend_from_slice(&code_scan_arith(frame, comps, geo, dct_blocks, &plan)?);
+            continue;
+        }
         let mut writer = BitWriter::new();
         {
             let mut sink = Sink::Emit {
@@ -2171,6 +2575,18 @@ pub struct EncodeOptions {
     /// How the DCT processes pick quantised levels (default
     /// [`Quantisation::RateDistortion`]).
     pub quantisation: Quantisation,
+    /// Placement of `DQT` / `DHT` relative to `SOFn` (default
+    /// [`MarkerOrder::QuantFrameHuffman`]).
+    pub marker_order: MarkerOrder,
+    /// Huffman (default) or arithmetic entropy coding of the DCT
+    /// processes ([`EntropyCoding::Arithmetic`]: `SOF9` / `SOF10`,
+    /// `tables` is then irrelevant). The lossless process refuses
+    /// arithmetic coding here.
+    pub entropy: EntropyCoding,
+    /// Conditioning of the arithmetic models (default `L = 0`, `U = 1`,
+    /// `Kx = 5`; anything else is written as a `DAC` segment). Ignored
+    /// under Huffman coding.
+    pub conditioning: ArithConditioning,
 }
 
 /// Historical name of [`EncodeOptions`].
@@ -2193,6 +2609,9 @@ impl Default for EncodeOptions {
             metadata: Metadata::new(),
             jfif: JfifPolicy::Auto,
             quantisation: Quantisation::RateDistortion,
+            marker_order: MarkerOrder::QuantFrameHuffman,
+            entropy: EntropyCoding::Huffman,
+            conditioning: ArithConditioning::default(),
         }
     }
 }
@@ -2314,6 +2733,38 @@ impl EncodeOptions {
     /// Select how quantised levels are chosen.
     pub fn with_quantisation(mut self, quantisation: Quantisation) -> Self {
         self.quantisation = quantisation;
+        self
+    }
+
+    /// Set the entropy coding of the DCT processes.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: EntropyCoding) -> Self {
+        self.entropy = entropy;
+        self
+    }
+
+    /// Set the conditioning of the arithmetic models.
+    #[must_use]
+    pub fn with_conditioning(mut self, conditioning: ArithConditioning) -> Self {
+        self.conditioning = conditioning;
+        self
+    }
+
+    /// Arithmetic (`true`) or Huffman (`false`) entropy coding.
+    #[must_use]
+    pub fn with_arithmetic(mut self, arithmetic: bool) -> Self {
+        self.entropy = if arithmetic {
+            EntropyCoding::Arithmetic
+        } else {
+            EntropyCoding::Huffman
+        };
+        self
+    }
+
+    /// Set the placement of `DQT` / `DHT` relative to `SOFn`.
+    #[must_use]
+    pub fn with_marker_order(mut self, order: MarkerOrder) -> Self {
+        self.marker_order = order;
         self
     }
 }
@@ -2516,6 +2967,9 @@ impl EncodeOptions {
             precision: self.precision,
             process: self.process,
             restart_interval: self.restart_interval,
+            marker_order: self.marker_order,
+            entropy: self.entropy,
+            conditioning: self.conditioning,
         };
         let sampling: Vec<(u8, u8)> = if self.sampling.is_empty() {
             vec![(1, 1); nf]
@@ -2859,6 +3313,9 @@ mod tests {
                 precision: 8,
                 process: JpegProcess::Sequential,
                 restart_interval: 0,
+                marker_order: MarkerOrder::default(),
+                entropy: EntropyCoding::default(),
+                conditioning: ArithConditioning::default(),
             },
         )
     }

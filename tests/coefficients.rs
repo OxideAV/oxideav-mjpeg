@@ -52,7 +52,20 @@ fn recode_options() -> Vec<(&'static str, EncodeOptions)> {
     prog.process = JpegProcess::Progressive;
     let mut rst = EncodeOptions::default();
     rst.restart_interval = 3;
-    vec![("seq", seq), ("optimal", opt), ("prog", prog), ("rst", rst)]
+    let arith = EncodeOptions::default().with_arithmetic(true);
+    let mut arith_prog = arith.clone();
+    arith_prog.process = JpegProcess::Progressive;
+    let mut arith_rst = arith.clone();
+    arith_rst.restart_interval = 3;
+    vec![
+        ("seq", seq),
+        ("optimal", opt),
+        ("prog", prog),
+        ("rst", rst),
+        ("arith", arith),
+        ("arith_prog", arith_prog),
+        ("arith_rst", arith_rst),
+    ]
 }
 
 #[test]
@@ -71,7 +84,7 @@ fn coefficients_render_and_recode_losslessly() {
                 let out = encode_coefficients(&coefs, &opts)
                     .unwrap_or_else(|e| panic!("{name} {tag}: {e}"));
                 let again = read_coefficients(&out).unwrap();
-                if tag == "prog" {
+                if tag.ends_with("prog") {
                     // Progressive AC scans are non-interleaved and cover
                     // only the blocks over real samples (§A.2.2); the
                     // §A.2.4 padding blocks keep their DC alone.
@@ -100,6 +113,18 @@ fn coefficients_render_and_recode_losslessly() {
                     "{name} {tag}: tables"
                 );
                 assert_eq!(again.adobe_transform, coefs.adobe_transform, "{name} {tag}");
+                if tag.starts_with("arith") {
+                    let kind = if tag.ends_with("prog") {
+                        SofKind::ProgressiveArith
+                    } else {
+                        SofKind::ExtendedSequentialArith
+                    };
+                    assert_eq!(again.kind, Some(kind), "{name} {tag}");
+                    assert!(
+                        !out.windows(2).any(|m| m == [0xFF, 0xC4]),
+                        "{name} {tag}: no DHT"
+                    );
+                }
                 let got = decode(&out).unwrap();
                 assert_eq!(got.format, want.format, "{name} {tag}");
                 assert_eq!(got.planes, want.planes, "{name} {tag}: samples");
@@ -354,4 +379,61 @@ fn single_component_with_sampling_factors_round_trips() {
         );
         assert_eq!(decode(&out).unwrap().planes, want.planes, "{tag}");
     }
+}
+
+/// The entropy-coded data behind the first `SOS` header, up to `EOI`,
+/// and the restart interval in force (0 without `DRI`).
+fn first_scan(jpeg: &[u8]) -> (Vec<u8>, u16, Vec<u8>) {
+    let (mut i, mut ri) = (2, 0u16);
+    loop {
+        let m = jpeg[i + 1];
+        let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        if m == 0xDD {
+            ri = u16::from_be_bytes([jpeg[i + 4], jpeg[i + 5]]);
+        }
+        if m == 0xDA {
+            let header = jpeg[i + 4..i + 2 + len].to_vec();
+            return (jpeg[i + 2 + len..jpeg.len() - 2].to_vec(), ri, header);
+        }
+        i += 2 + len;
+    }
+}
+
+/// Byte-level round trip of the arithmetic coder (#21): the sequential
+/// `fixtures/arith/arith_*.jpg` streams are a black-box lossless
+/// transcoder's arithmetic output. Reading their coefficients and
+/// writing them back with arithmetic coding and the same restart
+/// interval reproduces the entropy-coded segment byte for byte (when
+/// the scan header names the same table destinations), so the
+/// statistics model, the conditioning and the termination all agree
+/// with the validator.
+#[test]
+fn arithmetic_recode_reproduces_the_validator_scan_bytes() {
+    let mut exact = 0;
+    for (name, bytes) in jpegs(ARITH) {
+        let coefs = read_coefficients(&bytes).unwrap();
+        if coefs.kind != Some(SofKind::ExtendedSequentialArith) {
+            continue;
+        }
+        let (want, ri, header) = first_scan(&bytes);
+        let opts = EncodeOptions::default()
+            .with_arithmetic(true)
+            .with_restart_interval(ri);
+        let out = encode_coefficients(&coefs, &opts).unwrap();
+        let (got, _, our_header) = first_scan(&out);
+        assert_eq!(
+            read_coefficients(&out).unwrap().components,
+            coefs.components
+        );
+        if header != our_header {
+            // Other table destinations: other statistics areas shared.
+            continue;
+        }
+        assert!(
+            got == want,
+            "{name}: scan bytes differ from the validator's"
+        );
+        exact += 1;
+    }
+    assert!(exact >= 5, "{exact} byte-exact streams");
 }

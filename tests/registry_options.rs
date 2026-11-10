@@ -278,3 +278,44 @@ fn typed_options_on_the_concrete_encoder_match_the_string_bag() {
     assert_eq!(via_bag, via_typed);
     assert!(via_typed.windows(2).any(|m| m == [0xFF, 0xC2]));
 }
+
+/// `marker_order` in the option bag moves the frame header (#21): the
+/// default keeps `DQT SOFn DHT`, `tables_first` and `frame_first` put
+/// `SOFn` behind / ahead of every table, and the picture is the same.
+#[test]
+fn marker_order_key_reorders_the_header_segments() {
+    let first = |data: &[u8], m: u8| -> usize {
+        let mut i = 2;
+        while i + 4 <= data.len() {
+            if data[i + 1] == m {
+                return i;
+            }
+            i += 2 + u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        }
+        panic!("marker {m:02X} not found");
+    };
+    let frame = gray8();
+    let (base, _) = encode_one(&params(PixelFormat::Gray8, &[]), &frame);
+    let want = decode_with(&[], &base);
+    let (dqt, sof, dht) = (first(&base, 0xDB), first(&base, 0xC0), first(&base, 0xC4));
+    assert!(dqt < sof && sof < dht);
+    for (value, check) in [
+        ("quant_frame_huffman", 0),
+        ("tables_first", 1),
+        ("frame_first", 2),
+    ] {
+        let (data, _) = encode_one(
+            &params(PixelFormat::Gray8, &[("marker_order", value)]),
+            &frame,
+        );
+        let (dqt, sof, dht) = (first(&data, 0xDB), first(&data, 0xC0), first(&data, 0xC4));
+        match check {
+            0 => assert_eq!(data, base),
+            1 => assert!(dqt < dht && dht < sof, "{value}"),
+            _ => assert!(sof < dqt && dqt < dht, "{value}"),
+        }
+        assert_eq!(data.len(), base.len(), "{value}");
+        assert!(decode_with(&[], &data).planes[0].data == want.planes[0].data);
+    }
+    assert!(make_encoder(&params(PixelFormat::Gray8, &[("marker_order", "sof_last")])).is_err());
+}

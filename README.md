@@ -218,13 +218,17 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 | `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
 | `metadata` | empty | ICC / Exif / XMP blobs and `COM` comments to embed (merged with `JpegImage::metadata`, the option winning per blob — `Metadata::with_overrides`). |
 | `jfif` | `Auto` | JFIF `APP0` / Exif `APP1` slot rule (`JfifPolicy::Auto` / `Always` / `Never`, see *Metadata and colour*). |
+| `entropy` | `Huffman` | `EntropyCoding::Arithmetic` (`with_arithmetic(true)`) codes the DCT processes with the Annex D arithmetic coder: `SOF9` sequential, `SOF10` progressive, no `DHT`. |
+| `conditioning` | `L = 0`, `U = 1`, `Kx = 5` | `ArithConditioning` of the arithmetic models (§F.1.4.4.1.4 / §F.1.4.4.2.1); a non-default value is written as a `DAC` segment. |
+| `marker_order` | `QuantFrameHuffman` | Where the tables sit relative to the frame header (§B.2.1 allows all three): `QuantFrameHuffman` = `DQT SOFn DHT`, `TablesBeforeFrame` = `DQT DHT SOFn`, `FrameBeforeTables` = `SOFn DQT DHT`. Scan data is identical. |
 | `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
 
 The registry encoder's `MjpegEncoderOptions` (`CodecOptions` keys
 `quality`, `tables`, `process` (`auto` / `sequential` / `progressive` /
 `lossless`), `precision`, `restart`, `abbreviated`, `predictor`,
 `point_transform`, `sampling`, `chroma`, `adobe_transform`, `jfif`,
-`quantisation` (`nearest` / `rd`)) is the string-bag twin of this
+`quantisation` (`nearest` / `rd`), `entropy` (`huffman` / `arithmetic`),
+`marker_order` (`quant_frame_huffman` / `tables_first` / `frame_first`)) is the string-bag twin of this
 record (`#[non_exhaustive]`, `new()` / `with_*`). Its defaults stay
 `typical` tables and `nearest` levels, the streams RTP/JPEG and
 table-less Motion-JPEG consumers expect. `chroma` applies the `encode_rgb8` conversion to `Rgb24`
@@ -466,8 +470,13 @@ the tables) reproduces `jpegtran -flip horizontal` / `-transpose`
 coefficient for coefficient (`tests/coefficients.rs`). Over the 115
 fixture streams, rendering equals `decode` and every re-code reads back
 to the same coefficients; `djpeg` decodes the re-codes of the 92 8-bit ones
-byte-identically (four re-codes each). Lossless and hierarchical frames are
-`Error::Unsupported`; arithmetic coding is read but not written.
+byte-identically (seven re-codes each: Huffman sequential typical /
+optimal / restart, Huffman progressive, arithmetic sequential / restart /
+progressive). `EncodeOptions::entropy = Arithmetic` writes `SOF9` /
+`SOF10`; re-coding a black-box transcoder's sequential arithmetic stream
+reproduces its entropy-coded segment byte for byte. `marker_order` and
+`conditioning` apply as in `encode`. Lossless and hierarchical frames
+are `Error::Unsupported`.
 
 ## Metadata and colour
 

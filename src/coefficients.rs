@@ -339,13 +339,5 @@ pub fn encode_coefficients(coefs: &JpegCoefficients, opts: &EncodeOptions) -> Re
         && (coefs.jfif || coefs.kind.is_none());
     let optimal = opts.tables == HuffmanTables::Optimal || coefs.precision > 8;
     let meta = coefs.metadata.with_overrides(&opts.metadata);
-    crate::t81::encode_coefficient_frame(
-        coefs,
-        opts.process,
-        opts.restart_interval,
-        optimal,
-        jfif,
-        &meta,
-        opts.jfif,
-    )
+    crate::t81::encode_coefficient_frame(coefs, opts, optimal, jfif, &meta)
 }

@@ -697,6 +697,13 @@ pub struct MjpegEncoderOptions {
     /// ([`crate::Quantisation::RateDistortion`], the standalone
     /// default).
     pub quantisation: String,
+    /// Placement of `DQT` / `DHT` relative to `SOFn`:
+    /// `quant_frame_huffman` (empty, the default), `tables_first` or
+    /// `frame_first` ([`crate::MarkerOrder`]).
+    pub marker_order: String,
+    /// Entropy coding of the DCT processes: `huffman` (empty, the
+    /// default) or `arithmetic` (`SOF9` / `SOF10`).
+    pub entropy: String,
 }
 
 impl Default for MjpegEncoderOptions {
@@ -715,6 +722,8 @@ impl Default for MjpegEncoderOptions {
             adobe_transform: String::new(),
             jfif: String::new(),
             quantisation: String::new(),
+            marker_order: String::new(),
+            entropy: String::new(),
         }
     }
 }
@@ -806,6 +815,19 @@ impl MjpegEncoderOptions {
         self
     }
 
+    /// `"huffman"` or `"arithmetic"` (empty = Huffman).
+    pub fn with_entropy(mut self, entropy: impl Into<String>) -> Self {
+        self.entropy = entropy.into();
+        self
+    }
+
+    /// `"quant_frame_huffman"`, `"tables_first"` or `"frame_first"`
+    /// (empty = the first).
+    pub fn with_marker_order(mut self, marker_order: impl Into<String>) -> Self {
+        self.marker_order = marker_order.into();
+        self
+    }
+
     /// The [`JfifPolicy`] `jfif` denotes.
     pub fn jfif_policy(&self) -> Result<JfifPolicy> {
         Ok(JfifPolicy::parse(&self.jfif)?)
@@ -848,6 +870,18 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             kind: OptionKind::Enum(&["nearest", "rd"]),
             default: OptionValue::String(String::new()),
             help: "DCT level choice: nearest (T.81 A.3.4 rounding, default) or rd (rate-distortion optimised AC levels)",
+        },
+        OptionField {
+            name: "entropy",
+            kind: OptionKind::Enum(&["huffman", "arithmetic"]),
+            default: OptionValue::String(String::new()),
+            help: "entropy coding of the DCT processes: huffman (default) or arithmetic (SOF9 / SOF10, default conditioning)",
+        },
+        OptionField {
+            name: "marker_order",
+            kind: OptionKind::Enum(&["quant_frame_huffman", "tables_first", "frame_first"]),
+            default: OptionValue::String(String::new()),
+            help: "table segments relative to the frame header: quant_frame_huffman (DQT SOFn DHT, default), tables_first (DQT DHT SOFn) or frame_first (SOFn DQT DHT)",
         },
         OptionField {
             name: "process",
@@ -916,6 +950,8 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             "quality" => self.quality = v.as_u32()?,
             "tables" => self.tables = v.as_str()?.to_owned(),
             "quantisation" => self.quantisation = v.as_str()?.to_owned(),
+            "marker_order" => self.marker_order = v.as_str()?.to_owned(),
+            "entropy" => self.entropy = v.as_str()?.to_owned(),
             "process" => self.process = v.as_str()?.to_owned(),
             "precision" => self.precision = v.as_u32()?,
             "restart" => self.restart = v.as_u32()?,
@@ -1170,6 +1206,8 @@ impl MjpegEncoderOptions {
             sampling: parse_sampling(&self.sampling)?,
             jfif: self.jfif_policy()?,
             quantisation,
+            marker_order: crate::MarkerOrder::parse(&self.marker_order)?,
+            entropy: crate::EntropyCoding::parse(&self.entropy)?,
             ..EncodeOptions::default()
         })
     }

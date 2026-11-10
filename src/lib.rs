@@ -215,8 +215,9 @@ pub use image::{
 // General T.81 writer surface (the one JPEG encoder sibling crates
 // build on): typed options plus the frame / table-set primitives.
 pub use t81::{
-    ColorSignalling, EncodeOptions, EncodedJpeg, HuffSpec, HuffStats, HuffmanTables, JpegComponent,
-    JpegFrame, JpegProcess, JpegTableSet, Quantisation,
+    ArithConditioning, ColorSignalling, EncodeOptions, EncodedJpeg, EntropyCoding, HuffSpec,
+    HuffStats, HuffmanTables, JpegComponent, JpegFrame, JpegProcess, JpegTableSet, MarkerOrder,
+    Quantisation,
 };
 
 // Coefficient-level access (#21): read / render / write the quantised

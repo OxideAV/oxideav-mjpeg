@@ -811,3 +811,197 @@ fn interchange_marker_order_puts_the_frame_header_before_dht() {
         decode(s).unwrap();
     }
 }
+
+/// Marker names of the segments behind `SOI` (scans keep their data).
+fn marker_names(jpeg: &[u8]) -> Vec<String> {
+    segments(jpeg)
+        .iter()
+        .map(|s| match s[1] {
+            0xDB => "DQT".to_owned(),
+            0xC4 => "DHT".to_owned(),
+            0xC0..=0xC3 => "SOF".to_owned(),
+            0xDD => "DRI".to_owned(),
+            0xDA => "SOS".to_owned(),
+            0xFE => "COM".to_owned(),
+            m @ 0xE0..=0xEF => format!("APP{}", m - 0xE0),
+            m => format!("{m:02X}"),
+        })
+        .collect()
+}
+
+/// #21: `MarkerOrder` moves the frame header to either end of the table
+/// segments (T.81 §B.2.1 admits tables ahead of the frame header and
+/// ahead of each scan header). The entropy-coded segments are the same
+/// bytes in every order, the metadata segments stay in front, and every
+/// order decodes here and in the black-box decoder.
+#[test]
+fn marker_order_option_places_sof_around_the_tables() {
+    use oxideav_mjpeg::{MarkerOrder, encode_coefficients};
+    use oxideav_mjpeg::{Metadata, read_coefficients, read_metadata};
+
+    let src = planes(3, 8, &[(2, 2), (1, 1), (1, 1)]);
+    let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
+    let meta = Metadata::new()
+        .with_exif(vec![0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8, 0, 0])
+        .with_comment(b"order test".to_vec());
+    let scans = |jpeg: &[u8]| -> Vec<Vec<u8>> {
+        segments(jpeg)
+            .into_iter()
+            .filter(|s| s[1] == 0xDA)
+            .collect()
+    };
+    for (pname, process, ri) in [
+        ("seq", JpegProcess::Sequential, 0u16),
+        ("rst", JpegProcess::Sequential, 2),
+        ("prog", JpegProcess::Progressive, 0),
+    ] {
+        let mut o = EncodeOptions::default();
+        o.sampling = vec![(2, 2), (1, 1), (1, 1)];
+        o.process = process;
+        o.restart_interval = ri;
+        o.metadata = meta.clone();
+        assert_eq!(o.marker_order, MarkerOrder::QuantFrameHuffman);
+        let base = o.encode(W, H, &refs).unwrap().data;
+        let base_names = marker_names(&base);
+        let base_img = decode(&base).unwrap();
+        let n_dht = base_names.iter().filter(|n| *n == "DHT").count();
+        for order in [
+            MarkerOrder::QuantFrameHuffman,
+            MarkerOrder::TablesBeforeFrame,
+            MarkerOrder::FrameBeforeTables,
+        ] {
+            let tag = format!("{pname} {order:?}");
+            let out = o
+                .clone()
+                .with_marker_order(order)
+                .encode(W, H, &refs)
+                .unwrap()
+                .data;
+            let names = marker_names(&out);
+            let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+            let last = |n: &str| names.iter().rposition(|x| x == n).unwrap();
+            // Metadata first, whatever the order.
+            assert_eq!(&names[..2], ["APP1", "COM"], "{tag}");
+            match order {
+                MarkerOrder::QuantFrameHuffman => {
+                    assert_eq!(out, base, "{tag}: the default order");
+                    assert!(last("DQT") < pos("SOF") && pos("SOF") < pos("DHT"), "{tag}");
+                }
+                MarkerOrder::TablesBeforeFrame => {
+                    assert!(last("DQT") < pos("DHT"), "{tag}");
+                    assert!(last("DHT") < pos("SOF"), "{tag}: {names:?}");
+                    assert_eq!(
+                        pos("SOF") + 1,
+                        pos(if ri > 0 { "DRI" } else { "SOS" }),
+                        "{tag}"
+                    );
+                }
+                MarkerOrder::FrameBeforeTables => {
+                    assert_eq!(pos("SOF"), 2, "{tag}: {names:?}");
+                    assert!(pos("SOF") < pos("DQT") && last("DQT") < pos("DHT"), "{tag}");
+                    assert!(last("DQT") < pos("SOS"), "{tag}");
+                }
+                _ => unreachable!(),
+            }
+            // Same segments, permuted; same entropy-coded data.
+            let (mut a, mut b) = (names.clone(), base_names.clone());
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{tag}");
+            assert_eq!(names.iter().filter(|n| *n == "DHT").count(), n_dht);
+            assert_eq!(scans(&out), scans(&base), "{tag}: scan data");
+            assert_eq!(out.len(), base.len(), "{tag}");
+            // Reads back: picture, metadata, coefficients.
+            let img = decode(&out).unwrap();
+            assert!(img.planes == base_img.planes, "{tag}: planes");
+            let m = read_metadata(&out).unwrap();
+            assert_eq!(m.comments, meta.comments, "{tag}");
+            assert_eq!(m.exif, meta.exif, "{tag}");
+            let coefs = read_coefficients(&out).unwrap();
+            assert!(
+                coefs == read_coefficients(&base).unwrap(),
+                "{tag}: coefficients"
+            );
+            // The coefficient writer honours the option too.
+            let re = encode_coefficients(&coefs, &o.clone().with_marker_order(order)).unwrap();
+            let rn = marker_names(&re);
+            let rpos = |n: &str| rn.iter().position(|x| x == n).unwrap();
+            let rlast = |n: &str| rn.iter().rposition(|x| x == n).unwrap();
+            match order {
+                MarkerOrder::QuantFrameHuffman => {
+                    assert!(
+                        rlast("DQT") < rpos("SOF") && rpos("SOF") < rpos("DHT"),
+                        "{tag}"
+                    )
+                }
+                MarkerOrder::TablesBeforeFrame => assert!(rlast("DHT") < rpos("SOF"), "{tag}"),
+                MarkerOrder::FrameBeforeTables => assert!(rpos("SOF") < rpos("DQT"), "{tag}"),
+                _ => unreachable!(),
+            }
+            assert!(
+                read_coefficients(&re).unwrap().components == coefs.components,
+                "{tag}"
+            );
+            // Black-box decoder: same picture as the default order.
+            if let (Some(x), Some(y)) = (
+                djpeg(&out, &format!("order_{pname}_{}", order.as_str()), &[]),
+                djpeg(&base, &format!("order_{pname}_base"), &[]),
+            ) {
+                assert!(x == y, "{tag}: black-box decoder output differs");
+            }
+        }
+    }
+    // Lossless and 12-bit frames: no DQT / 16-bit DQT.
+    let gray = &refs[..1];
+    let mut g = EncodeOptions::default();
+    g.process = JpegProcess::Lossless {
+        predictor: 1,
+        point_transform: 0,
+    };
+    let want = decode(&g.encode(W, H, gray).unwrap().data).unwrap();
+    for (order, names) in [
+        (
+            MarkerOrder::TablesBeforeFrame,
+            ["APP0", "DHT", "SOF", "SOS"],
+        ),
+        (
+            MarkerOrder::FrameBeforeTables,
+            ["APP0", "SOF", "DHT", "SOS"],
+        ),
+    ] {
+        let ll = g
+            .clone()
+            .with_marker_order(order)
+            .encode(W, H, gray)
+            .unwrap()
+            .data;
+        assert_eq!(marker_names(&ll), names);
+        assert!(decode(&ll).unwrap().planes == want.planes);
+    }
+    let hi = planes(1, 12, &[]);
+    let hrefs: Vec<&[u16]> = hi.iter().map(|v| v.as_slice()).collect();
+    let mut t = EncodeOptions::default();
+    t.precision = 12;
+    let want = decode(&t.encode(W, H, &hrefs).unwrap().data).unwrap();
+    for order in [
+        MarkerOrder::TablesBeforeFrame,
+        MarkerOrder::FrameBeforeTables,
+    ] {
+        let out = t
+            .clone()
+            .with_marker_order(order)
+            .encode(W, H, &hrefs)
+            .unwrap()
+            .data;
+        assert!(decode(&out).unwrap().planes == want.planes, "{order:?}");
+    }
+    // Spellings round-trip.
+    for order in [
+        MarkerOrder::QuantFrameHuffman,
+        MarkerOrder::TablesBeforeFrame,
+        MarkerOrder::FrameBeforeTables,
+    ] {
+        assert_eq!(MarkerOrder::parse(order.as_str()).unwrap(), order);
+    }
+    assert!(MarkerOrder::parse("sof_last").is_err());
+}

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EntropyCoding` (`EncodeOptions::entropy` / `with_entropy` / `with_arithmetic`, `JpegFrame::entropy`, registry encoder key `entropy` = `huffman` / `arithmetic`): the general writer and `encode_coefficients` code the DCT processes with the Annex D arithmetic coder (#21): `SOF9` sequential, `SOF10` progressive, 8- and 12-bit, 1 to 4 components, restart intervals, no `DHT`. A coefficient record can now be written back arithmetically: re-coding a black-box transcoder's sequential arithmetic stream reproduces its entropy-coded segment byte for byte, and a black-box decoder reads every re-code of the fixture set identically. The lossless process is refused (`Error::Unsupported`); the dedicated lossless arithmetic encoders are unchanged.
+- `ArithConditioning` (`EncodeOptions::conditioning`, `JpegFrame::conditioning`): DC bounds `L` / `U` and AC threshold `Kx` of the arithmetic models. A non-default value is written as a `DAC` segment (T.81 §B.2.4.3). A black-box decoder returns the same pixels for the default and three non-default conditionings.
+- `MarkerOrder` (`EncodeOptions::marker_order` / `with_marker_order`, `JpegFrame::marker_order`, registry encoder key `marker_order` = `quant_frame_huffman` / `tables_first` / `frame_first`) (#21): where `DQT` / `DHT` sit relative to `SOFn`. `QuantFrameHuffman` (default, unchanged bytes) is `DQT SOFn DHT`; `TablesBeforeFrame` is `DQT DHT SOFn`; `FrameBeforeTables` is `SOFn DQT DHT`. T.81 §B.2.1 admits all three. The entropy-coded segments are the same bytes in every order; `encode_coefficients` honours it too.
+- `tests/arith_matrix.rs`: 540 sequential and progressive arithmetic streams from a black-box encoder (5 sizes × 6 sampling layouts × 3 restart settings × 3 qualities) read to the coefficients of their lossless Huffman transcode and decode to the black-box decoder's pixels byte for byte under `DecodeOptions::libjpeg_compatible()`; 360 streams of this crate's arithmetic writer decode identically here and in the black-box decoder.
+
 ### Fixed
 
 - Fuzz workflow red on two harness oracles that predate 0.1.16 behaviour (library unchanged). `metadata_embed` expected the registry frame's blob record to equal `read_metadata`, comments included; `COM` segments have no blob form, so the comparison is now against the ICC / Exif / XMP part. `t81_roundtrip` expected four lossless components under `ColorSignalling::Auto` to come back as `(v >> Pt) << Pt`; `Auto` is Adobe `transform = 0` since 0.1.16, so the point transform acts on the complemented wire value. The marker-less layout is now sampled explicitly. Both rules are pinned in `tests/comments.rs` and `tests/t81_encoder.rs`.

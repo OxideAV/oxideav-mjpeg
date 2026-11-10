@@ -20,6 +20,9 @@
 //!   decoded through `decode_jpeg_with_tables`)
 //! * colour signalling — JFIF / RGB (Adobe APP14 + 'R'/'G'/'B') / CMYK
 //!   (no APP14, Adobe inverted, YCCK)
+//! * entropy coding — Huffman or arithmetic (DCT processes), with
+//!   default or `DAC` conditioning; the three marker orders; 1..=4
+//!   workers
 //!
 //! Oracle: every accepted combination must decode, with the plane
 //! geometry the pixel format implies; the lossless process (outside the
@@ -28,7 +31,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_mjpeg::DecodeOptions;
-use oxideav_mjpeg::t81::{ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess};
+use oxideav_mjpeg::t81::{
+    ArithConditioning, ColorSignalling, EncodeOptions, EntropyCoding, HuffmanTables, JpegProcess,
+    MarkerOrder,
+};
 
 const MAX_PIXELS: usize = 512;
 
@@ -249,6 +255,23 @@ fuzz_target!(|data: &[u8]| {
         o.signalling = signalling;
         o.sampling = layout.clone();
         o.table_ids = Vec::new();
+        // Arithmetic coding (DCT processes), conditioning, the marker
+        // order and the worker count ride on the spare bits.
+        if !lossless && data[7] & 4 != 0 {
+            o.entropy = EntropyCoding::Arithmetic;
+            if data[7] & 8 != 0 {
+                let l = data[5] >> 6;
+                o.conditioning = ArithConditioning::new()
+                    .with_dc_bounds(l, l + (data[6] >> 5))
+                    .with_ac_kx(1 + data[4] % 63);
+            }
+        }
+        o.marker_order = match data[7] >> 4 & 3 {
+            1 => MarkerOrder::TablesBeforeFrame,
+            2 => MarkerOrder::FrameBeforeTables,
+            _ => MarkerOrder::QuantFrameHuffman,
+        };
+        o.threads = 1 + (data[7] >> 6) as usize;
         o
     };
     let refs: Vec<&[u16]> = planes.iter().map(|p| p.as_slice()).collect();

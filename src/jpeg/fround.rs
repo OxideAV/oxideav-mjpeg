@@ -43,6 +43,27 @@ pub(crate) fn round_clamped_by_grid(x: f32, max: f32) -> i32 {
     n + i32::from(c - (t - INT_GRID) == 0.5)
 }
 
+/// `x.round() as i32` (half away from zero) for `|x| ≤ 2^22`; a larger
+/// magnitude is taken as `2^22`. Used where the value is bounded by
+/// construction (a DCT coefficient over its quantiser step).
+#[inline(always)]
+pub(crate) fn round_half_away(x: f32) -> i32 {
+    if cfg!(target_arch = "aarch64") {
+        let m = 4_194_304.0;
+        x.max(-m).min(m).round() as i32
+    } else {
+        round_half_away_by_grid(x)
+    }
+}
+
+/// [`round_half_away`] in additions: [`round_clamped_by_grid`] of the
+/// magnitude, with the sign put back.
+#[inline(always)]
+pub(crate) fn round_half_away_by_grid(x: f32) -> i32 {
+    let n = round_clamped_by_grid(x.abs(), 4_194_304.0);
+    if x < 0.0 { -n } else { n }
+}
+
 /// The smaller of two numbers. `f32::min` also defines the result for
 /// a `NaN` operand, which on targets whose minimum instruction has a
 /// different `NaN` rule costs a comparison and a blend per call; the
@@ -124,6 +145,37 @@ mod tests {
                 check(x, max);
                 check(-x, max);
             }
+        }
+    }
+
+    #[test]
+    fn signed_grid_rounding_is_round() {
+        let check = |x: f32| {
+            let want = x.clamp(-4_194_304.0, 4_194_304.0).round() as i32;
+            assert_eq!(round_half_away_by_grid(x), want, "{x:e} (grid)");
+            assert_eq!(round_half_away(x), want, "{x:e}");
+        };
+        for k in 0..=70_000u32 {
+            let h = k as f32 + 0.5;
+            for x in [
+                h,
+                f32::from_bits(h.to_bits() - 1),
+                f32::from_bits(h.to_bits() + 1),
+                k as f32,
+            ] {
+                check(x);
+                check(-x);
+            }
+        }
+        for bits in (0..=u32::MAX).step_by(2731) {
+            let x = f32::from_bits(bits);
+            if !x.is_nan() {
+                check(x);
+            }
+        }
+        for x in [0.0, -0.0, 4_194_303.5, 4_194_304.0, 1.0e12, f32::INFINITY] {
+            check(x);
+            check(-x);
         }
     }
 

@@ -56,3 +56,27 @@ fn deblocking_is_off_by_default_and_helps_at_low_quality() {
         );
     }
 }
+
+/// A frame header declaring `X = 0` (no samples per line) decodes to an
+/// empty picture; asking for deblocking on it must not panic (it used to
+/// split a zero-width plane into rows).
+#[test]
+fn deblocking_an_empty_frame_does_not_panic() {
+    const STREAM: &str = "ffd8010000ffdb004300080606070605080707070909080a0c140d0c0b0b0c19\
+        12130f141d1a1f1e1d1a1c1c20242e2720222c231c1c2837292c30313434341f27393d38323c2e333432\
+        ffc9000b088100000001011100ffcc000600101005ffda000f010100003f00ff00cf8686d83efa58ee05\
+        675a3f5a1574348add04011c62a5371118b9130e00000000000000f45076369cb7119bffd9";
+    let hex: Vec<u8> = STREAM.bytes().filter(u8::is_ascii_hexdigit).collect();
+    let nibble = |c: u8| (c as char).to_digit(16).unwrap() as u8;
+    let bytes: Vec<u8> = hex
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| nibble(p[0]) << 4 | nibble(p[1]))
+        .collect();
+    assert_eq!(bytes.len(), 153);
+    let plain = oxideav_mjpeg::decode(&bytes).map(|i| (i.width, i.planes.len()));
+    let opts = DecodeOptions::new().with_deblock(true);
+    let smoothed = oxideav_mjpeg::decode_with(&bytes, &opts).map(|i| (i.width, i.planes.len()));
+    assert_eq!(plain.ok(), smoothed.ok());
+}

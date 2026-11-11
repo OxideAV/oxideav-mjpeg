@@ -3983,13 +3983,8 @@ fn render_from_coefs_12bit(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Resul
                 for j in 0..8 {
                     for i in 0..8 {
                         let v = fblock[j * 8 + i] + 2048.0;
-                        let px = if v <= 0.0 {
-                            0
-                        } else if v >= 4095.0 {
-                            4095
-                        } else {
-                            v.round() as u16
-                        };
+                        // `v ≤ 0 → 0`, `v ≥ 4095 → 4095`, else `round(v)`.
+                        let px = crate::jpeg::fround::round_clamped(v, 4095.0) as u16;
                         buf[(dst_y0 + j) * stride + dst_x0 + i] = px;
                     }
                 }
@@ -5691,13 +5686,7 @@ fn decode_hierarchical_dct_frame_inner(
                             (v.round() as i32 as u32) & 0xFFFF
                         } else {
                             // Clamp to the displayable range 0..2^P.
-                            if v <= 0.0 {
-                                0
-                            } else if v >= max_val {
-                                max_val as u32
-                            } else {
-                                v.round() as u32
-                            }
+                            crate::jpeg::fround::round_clamped(v, max_val) as u32
                         };
                         full[(dst_y0 + j) * comp_w + dst_x0 + i] = s;
                     }
@@ -6125,6 +6114,36 @@ fn decode_lossless_arith_scan_planes(
     scan: &[u8],
     differential: bool,
 ) -> Result<Vec<Vec<u32>>> {
+    #[cfg(test)]
+    let skip = !tail_skip_test::DISABLED.with(|d| d.get());
+    #[cfg(not(test))]
+    let skip = true;
+    lossless_arith_planes(state, sos, scan, differential, skip)
+}
+
+/// [`decode_lossless_arith_scan_planes`]. With `skip_settled_tail` a
+/// frame whose code string ends before its samples do stops decoding
+/// once every remaining difference is known to be zero, and writes the
+/// predictions directly (same samples; the flag exists for the
+/// differential test).
+///
+/// An encoder's flush discards trailing zero bytes (§D.1.8), so a
+/// frame's last lines may have no code bytes of their own — and a
+/// segment a few bytes long can stand for a frame of any size. When the
+/// code string is over ([`ArithDecoder::code_string_over`]) the
+/// decisions no longer depend on data. At the start of a line, if the
+/// line above coded only zero differences and the zero-difference
+/// decision of the `(Da, Db) = (0, 0)` context is settled on zero for
+/// every component, then the first sample decodes a zero difference,
+/// which leaves the next sample in the same context, and so on to the
+/// end of the frame: every remaining sample is its prediction.
+fn lossless_arith_planes(
+    state: &JpegState,
+    sos: &SosInfo,
+    scan: &[u8],
+    differential: bool,
+    skip_settled_tail: bool,
+) -> Result<Vec<Vec<u32>>> {
     let sof = state
         .sof
         .as_ref()
@@ -6190,8 +6209,54 @@ fn decode_lossless_arith_scan_planes(
     let mut samples_since_restart: u32 = 0;
     let mut reset_pred = true; // true at scan start and after each RSTn
     let mut first_line_y = 0usize; // first line of the current restart interval
+    // The line above coded no non-zero difference (true before the first
+    // line: the history starts at zero).
+    let mut above_all_zero = true;
+    let mut tail_zero = false;
 
     for y in 0..height {
+        if skip_settled_tail
+            && !tail_zero
+            && above_all_zero
+            && state.restart_interval == 0
+            && decoder.code_string_over()
+            && dest.iter().all(|&d| {
+                let st = &stats[d];
+                st.classify(0) == 0 && st.bins[0].settled_on_zero()
+            })
+        {
+            tail_zero = true;
+        } else if tail_zero {
+            // A whole line of predictions (the line the tail began on
+            // took the general loop below, which knows the first-line
+            // and first-sample rules).
+            for plane in samples.iter_mut() {
+                let (done, rest) = plane.split_at_mut(y * width);
+                let above = &done[(y - 1) * width..];
+                let line = &mut rest[..width];
+                if differential {
+                    // No prediction: the sample is the zero difference.
+                    line.fill(0);
+                    continue;
+                }
+                line[0] = above[0] & sample_mask;
+                for x in 1..width {
+                    let (ra, rb, rc) = (line[x - 1], above[x], above[x - 1]);
+                    let pred = match predictor {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                        _ => (ra.wrapping_add(rb)) >> 1,
+                    };
+                    line[x] = pred & sample_mask;
+                }
+            }
+            continue;
+        }
+        let mut line_nonzero = 0i32;
         for x in 0..width {
             if state.restart_interval != 0
                 && samples_since_restart != 0
@@ -6246,10 +6311,17 @@ fn decode_lossless_arith_scan_planes(
                     }
                 };
 
-                let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
-                let db = prev_diff[ci][x];
-                let diff = arith_decode_lossless_diff(&mut decoder, &mut stats[dest[ci]], da, db)?;
-                cur_diff[ci][x] = diff;
+                let diff = if tail_zero {
+                    0
+                } else {
+                    let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
+                    let db = prev_diff[ci][x];
+                    let diff =
+                        arith_decode_lossless_diff(&mut decoder, &mut stats[dest[ci]], da, db)?;
+                    cur_diff[ci][x] = diff;
+                    line_nonzero |= diff;
+                    diff
+                };
 
                 let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
                 samples[ci][y * width + x] = sv;
@@ -6257,6 +6329,7 @@ fn decode_lossless_arith_scan_planes(
             reset_pred = false;
             samples_since_restart += 1;
         }
+        above_all_zero = line_nonzero == 0;
         std::mem::swap(&mut prev_diff, &mut cur_diff);
     }
 
@@ -6749,6 +6822,130 @@ mod prog_tests {
         prog_decode_ac_refine(&mut br, &ac, &mut block, &mut nz, 1, 63, 1, &mut eob).unwrap();
         // 4 (binary 0b100) + 0b10 (1 << Al=1) = 0b110 = 6.
         assert_eq!(block[ZIGZAG[1]], 6);
+    }
+}
+
+#[cfg(test)]
+mod tail_skip_test {
+    use crate::encoder::{
+        encode_lossless_arith_jpeg_grayscale_with_opts, encode_lossless_arith_jpeg_rgb,
+    };
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Decode the tail of an ended code string decision by decision.
+        pub(super) static DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The decoded planes, or `None` for a refused stream.
+    type Planes = Option<Vec<Vec<u8>>>;
+
+    fn both(stream: &[u8]) -> (Planes, Planes) {
+        let run = |off: bool| {
+            DISABLED.with(|d| d.set(off));
+            let r = super::decode_planes(stream);
+            DISABLED.with(|d| d.set(false));
+            r.ok()
+                .map(|i| i.planes.into_iter().map(|p| p.data).collect())
+        };
+        (run(false), run(true))
+    }
+
+    /// Overwrite the frame header's `Y` and `X`.
+    fn resize(stream: &mut [u8], w: u16, h: u16) {
+        let i = stream.windows(2).position(|m| m == [0xFF, 0xCB]).unwrap();
+        stream[i + 5..i + 7].copy_from_slice(&h.to_be_bytes());
+        stream[i + 7..i + 9].copy_from_slice(&w.to_be_bytes());
+    }
+
+    #[test]
+    fn settled_tail_is_the_decision_by_decision_decode() {
+        let mut seed = 0x7F4A_7C15u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let (mut skipped_same, mut cases) = (0, 0);
+        for trial in 0..600 {
+            let (w, h) = (1 + rnd() % 24, 1 + rnd() % 24);
+            let predictor = 1 + (rnd() % 7) as u8;
+            let precision = [8u8, 8, 12, 16][(rnd() % 4) as usize];
+            // Flat, banded and noisy content (flat tails end the code
+            // string early; noise keeps it alive).
+            let style = rnd() % 4;
+            let n = (w * h) as usize;
+            let bytes = if precision > 8 { 2 } else { 1 };
+            let mut px = vec![0u8; n * bytes];
+            let base = rnd() as u8;
+            for (i, s) in px.chunks_exact_mut(bytes).enumerate() {
+                let row = i / w as usize;
+                let v = match style {
+                    0 => base,
+                    1 if row < h as usize / 2 => rnd() as u8,
+                    1 => base,
+                    2 => (i % w as usize) as u8,
+                    _ => rnd() as u8,
+                };
+                s[0] = v;
+            }
+            let mut stream = if trial % 3 == 0 && precision == 8 {
+                let planes = [&px[..], &px[..], &px[..]];
+                let strides = [w as usize; 3];
+                encode_lossless_arith_jpeg_rgb(w, h, planes, strides, 8, predictor).unwrap()
+            } else {
+                let pt = if trial % 5 == 0 { 1 } else { 0 };
+                encode_lossless_arith_jpeg_grayscale_with_opts(
+                    w,
+                    h,
+                    &px,
+                    w as usize * bytes,
+                    precision,
+                    predictor,
+                    0,
+                    pt,
+                )
+                .unwrap()
+            };
+            // As written; with a taller / wider frame declared over the
+            // same code string; cut short; with the entropy bytes
+            // replaced by noise or zeros.
+            let sos = stream.windows(2).rposition(|m| m == [0xFF, 0xDA]).unwrap();
+            let data = sos + 2 + u16::from_be_bytes([stream[sos + 2], stream[sos + 3]]) as usize;
+            match trial % 6 {
+                1 => resize(&mut stream, w as u16 + (rnd() % 40) as u16, h as u16 + 60),
+                2 => {
+                    let keep = data + rnd() as usize % (stream.len() - data).max(1);
+                    stream.truncate(keep);
+                    resize(&mut stream, w as u16, h as u16 + (rnd() % 90) as u16);
+                }
+                3 => {
+                    for b in stream[data..].iter_mut() {
+                        *b = (rnd() % 251) as u8;
+                    }
+                    resize(&mut stream, 40, 200);
+                }
+                4 => {
+                    for b in stream[data..].iter_mut() {
+                        *b = 0;
+                    }
+                    resize(&mut stream, 33, 77);
+                }
+                _ => {}
+            }
+            let (fast, plain) = both(&stream);
+            assert_eq!(
+                fast, plain,
+                "trial {trial}: {w}x{h} P{precision} Ss{predictor}"
+            );
+            cases += 1;
+            skipped_same += usize::from(fast.is_some());
+        }
+        assert!(
+            skipped_same > cases / 2,
+            "{skipped_same} of {cases} decoded"
+        );
     }
 }
 

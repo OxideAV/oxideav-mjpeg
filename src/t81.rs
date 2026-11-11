@@ -1602,7 +1602,8 @@ impl BlockQuantiser<'_> {
             for k in 0..64 {
                 ratio[k] *= self.inv_q[k];
                 // A.3.4: Sq = round(S / Q), half away from zero.
-                q[k] = ratio[k].round() as i32;
+                // (|S / Q| ≤ 8 · 2^12 here, far inside the helper's range.)
+                q[k] = crate::jpeg::fround::round_half_away(ratio[k]);
             }
             if let Some(rate) = &self.rdo {
                 let nearest = q;

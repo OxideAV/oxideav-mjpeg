@@ -410,8 +410,11 @@ fn row_ycbcr_frac_8bit<const N: usize>(dst: &mut [u8], y: &[f32], cb: &[f32], cr
         put_chunk(p, &rgb_chunk(&yy, &bb, &rr));
     }
     for (((p, &yy), &b), &r) in tail.iter_mut().zip(yt).zip(bt).zip(rt) {
-        let q = |v: f32| (v * 256.0).round() as i32;
-        let rgb = ycbcr_frac_to_rgb8_8bit(yy as i32, q(b), q(r));
+        let rgb = ycbcr_frac_to_rgb8_8bit(
+            round_clamped(yy, 65_535.0),
+            offset(b) + 128 * 256,
+            offset(r) + 128 * 256,
+        );
         p[..3].copy_from_slice(&rgb);
     }
 }
@@ -661,7 +664,7 @@ fn fill_ycbcr_interp(
             let (l, cb, cr) = (&lrow[..], &rows[0][..], &rows[1][..]);
             if fixed {
                 let k = |yy: f32, cb: f32, cr: f32| {
-                    let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
+                    let q = |v: f32| crate::jpeg::fround::round_clamped(v, 255.0) as u32;
                     let (r, g, b) = ycbcr_to_rgb8_fixed16(yy as u32, q(cb), q(cr));
                     [r, g, b]
                 };

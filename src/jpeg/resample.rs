@@ -637,7 +637,7 @@ pub(crate) fn reconstruct(
     let mut row = vec![0f32; w];
     let store = |row: &[f32], dst: &mut [u32]| {
         for (d, &v) in dst.iter_mut().zip(row) {
-            *d = v.round().clamp(0.0, maxval as f32) as u32;
+            *d = crate::jpeg::fround::round_clamped(v, maxval as f32) as u32;
         }
     };
     match guide {

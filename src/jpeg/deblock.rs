@@ -16,7 +16,9 @@
 /// pitch `stride`, block grid at multiples of 8). `qh` / `qv`: the
 /// quantiser steps of the first horizontal / vertical AC coefficient.
 pub(crate) fn deblock_u8(buf: &mut [u8], stride: usize, w: usize, h: usize, qh: f32, qv: f32) {
-    if w < 10 && h < 10 {
+    // Nothing to smooth without a block edge inside the component (and
+    // a frame header can declare no samples per line at all).
+    if w == 0 || h == 0 || (w < 10 && h < 10) {
         return;
     }
     let mut f = vec![0f32; w * h];
@@ -60,7 +62,7 @@ pub(crate) fn deblock_u8(buf: &mut [u8], stride: usize, w: usize, h: usize, qh: 
     }
     for (y, row) in g.chunks_exact(w).enumerate() {
         for (d, &s) in buf[y * stride..y * stride + w].iter_mut().zip(row) {
-            *d = s.round().clamp(0.0, 255.0) as u8;
+            *d = crate::jpeg::fround::round_clamped(s, 255.0) as u8;
         }
     }
 }

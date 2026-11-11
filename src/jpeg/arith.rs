@@ -196,6 +196,26 @@ impl<'a> ByteSource<'a> {
         }
     }
 
+    /// Every byte this source will still deliver is zero: it has ended
+    /// (a marker or the end of the data), or only `0x00` bytes remain
+    /// before it does.
+    pub fn only_zeros_left(&self) -> bool {
+        if self.seen_marker.is_some() {
+            return true;
+        }
+        let rest = &self.buf[self.pos.min(self.buf.len())..];
+        match rest.iter().position(|&b| b != 0) {
+            None => true,
+            // A lone trailing `0xFF`, or one that opens a marker (after
+            // any fill bytes), ends the data; `0xFF 0x00` is a data byte.
+            Some(i) if rest[i] == 0xFF => {
+                let after = rest[i + 1..].iter().find(|&&b| b != 0xFF);
+                after != Some(&0x00)
+            }
+            Some(_) => false,
+        }
+    }
+
     /// Fetch one decoder byte, applying the `0xFF 0x00` stuff convention.
     /// Returns `Some(byte)` for normal data and `None` once a non-stuff
     /// marker has been seen (after which reads pad with zero).
@@ -230,6 +250,38 @@ impl<'a> ByteSource<'a> {
             return 0;
         }
         b
+    }
+}
+
+/// `SETTLED[i]`: from state `i` on, a run of more-probable-symbol
+/// decisions never meets a conditional exchange. Figure D.18 exchanges
+/// when `A − Qe < Qe` after `A − Qe` fell below `X'8000'`; with
+/// `A ≥ X'8000'` before the subtraction that needs `Qe > X'4000'`. A run
+/// of such decisions moves the state along its `NMPS` chain only, so the
+/// state is settled when no state on that chain has `Qe > X'4000'`.
+pub const SETTLED: [bool; 113] = {
+    let mut t = [false; 113];
+    let mut i = 0;
+    while i < 113 {
+        let (mut s, mut ok, mut steps) = (i, true, 0);
+        while steps < 113 {
+            if QE_TABLE[s].qe > 0x4000 {
+                ok = false;
+            }
+            s = QE_TABLE[s].nmps as usize;
+            steps += 1;
+        }
+        t[i] = ok;
+        i += 1;
+    }
+    t
+};
+
+impl Context {
+    /// Once the code string is over ([`ArithDecoder::code_string_over`])
+    /// every decision in this context is `0`.
+    pub fn settled_on_zero(&self) -> bool {
+        self.mps == 0 && SETTLED[self.idx as usize]
     }
 }
 
@@ -408,6 +460,16 @@ impl<'a> ArithDecoder<'a> {
             ctx.idx = entry.nmps;
         }
         d
+    }
+
+    /// The code string is over: the code register is zero and the source
+    /// has only zero bytes left (the trailing zeros an encoder's flush
+    /// discards, §D.1.8, or a truncated segment). From here on the
+    /// decisions do not depend on the data: `Cx = 0 < A` at every
+    /// [`Self::decode`], so each is the more probable symbol of its
+    /// context unless the interval forces a conditional exchange.
+    pub fn code_string_over(&self) -> bool {
+        self.c == 0 && self.src.only_zeros_left()
     }
 
     /// Has the source consumed any non-stuff marker yet? Returns the marker
@@ -1540,6 +1602,51 @@ mod tests {
         assert_eq!(st.classify(32), 1);
         assert_eq!(st.classify(33), 3);
         assert_eq!(st.classify(-33), 4);
+    }
+
+    #[test]
+    fn settled_contexts_decode_zeros_once_the_code_string_is_over() {
+        // Every settled state with MPS = 0, from every reachable interval
+        // register value: a long run of decisions on an ended code string
+        // is all zeros and leaves the code register at zero.
+        assert!(SETTLED.iter().any(|&s| s) && !SETTLED[0]);
+        for idx in 0..113u8 {
+            if !SETTLED[idx as usize] {
+                continue;
+            }
+            for a0 in [0u32, 0x8000, 0x8001, 0xA5E3, 0xFFFF] {
+                let mut d = ArithDecoder::new(&[]);
+                d.a = a0;
+                assert!(d.code_string_over());
+                let mut ctx = Context { idx, mps: 0 };
+                assert!(ctx.settled_on_zero());
+                for _ in 0..200_000 {
+                    assert_eq!(d.decode(&mut ctx), 0, "state {idx}, A {a0:#x}");
+                }
+                assert!(d.code_string_over() && ctx.settled_on_zero());
+            }
+        }
+        // An unsettled state does exchange: state 0 yields a 1 at once.
+        let mut d = ArithDecoder::new(&[]);
+        let mut ctx = Context { idx: 0, mps: 0 };
+        let first: Vec<u8> = (0..4).map(|_| d.decode(&mut ctx)).collect();
+        assert!(first.contains(&1), "{first:?}");
+    }
+
+    #[test]
+    fn only_zeros_left_reads_the_tail() {
+        let over = |b: &[u8]| ByteSource::new(b).only_zeros_left();
+        assert!(over(&[]) && over(&[0, 0, 0]));
+        assert!(over(&[0, 0xFF, 0xD9]) && over(&[0xFF]) && over(&[0, 0xFF, 0xFF, 0xD0, 7]));
+        assert!(!over(&[0, 1]) && !over(&[0xFF, 0x00]) && !over(&[0, 0xFF, 0xFF, 0x00]));
+        let mut s = ByteSource::new(&[5, 0, 0, 0xFF, 0xD9]);
+        assert!(!s.only_zeros_left());
+        assert_eq!(s.next_byte(), 5);
+        assert!(s.only_zeros_left());
+        for _ in 0..6 {
+            assert_eq!(s.next_byte(), 0);
+        }
+        assert!(s.only_zeros_left());
     }
 
     #[test]

@@ -2081,9 +2081,10 @@ Those are 64-bit Arm numbers. The same source built for baseline
 x86-64 — a target with no rounding instruction, where every
 `f32::round` was a library call per sample and the sample loops did
 not vectorise — and run under binary translation on that machine
-(ratios; the absolute times are the translator's): baseline 4:2:0
-`decode` 11.0 → 4.2 ms, progressive 18.1 → 11.0 ms, `decode_rgb8`
-4:2:0 about 3× (4:2:2 3.8×, 4:4:4 2.3×, grey 4.8×).
+(the absolute times are the translator's; two quiet runs): baseline
+4:2:0 `decode` 9.3 → 3.4 ms (2.7×), progressive 13.5 → 7.7 ms (1.7×),
+`decode_rgb8` 4:2:0 37 → 13 ms (2.9×), 4:2:2 48 → 14.5 ms (3.3×),
+4:4:4 23.5 → 10.5 ms (2.2×), grey 8.7 → 4.1 ms (2.1×).
 
 What changed: the luma-guided reconstruction is a stream of rows that
 forms each chroma row's statistics once for both components and keeps

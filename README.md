@@ -2108,9 +2108,13 @@ decode: refinement scans 46 % (49 %), dequantisation + IDCT + store
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the
 whole `docs/` fixture corpus and of the encoded bytes + decode-back
-planes for one call of every public encode family, so any change to
-rounding, accumulation order, or bitstream emission fails the suite
-instead of silently drifting.
+planes for one call of every public encode family, and
+`tests/golden_modes.rs` pins nine decode modes (float and integer IDCT,
+deblocking, every chroma reconstruction, both YCbCr kernels, RGBA) on
+seven sampling layouts, on streams built from synthetic coefficients so
+they do not move with the encoder. Any change to rounding, accumulation
+order, or bitstream emission fails the suite instead of silently
+drifting.
 
 ## License
 

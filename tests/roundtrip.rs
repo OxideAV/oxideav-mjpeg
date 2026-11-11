@@ -768,25 +768,38 @@ fn metadata_passthrough_progressive() {
     };
 }
 
-/// Debug: write SA and SS progressive JPEGs to /tmp for external analysis.
-/// Disabled normally; run with `-- --ignored` to enable.
+/// The successive-approximation and the spectral-selection progressive
+/// encoders arrange the same quantised coefficients differently (the
+/// first adds refinement scans, T.81 §G.1.2.3), so both streams read
+/// back to one coefficient set and decode to one picture.
 #[test]
-#[ignore = "manual debug: writes files to /tmp"]
-fn debug_write_sa_and_ss_to_tmp() {
+fn successive_approximation_and_spectral_selection_carry_the_same_picture() {
     use oxideav_mjpeg::encoder::{encode_jpeg_progressive, encode_jpeg_progressive_sa};
-    let w = 64u32;
-    let h = 64u32;
-    let pix = PixelFormat::Yuv420P;
-    let frame = make_gradient_frame(w, h, pix);
-    let sa = encode_jpeg_progressive_sa(&frame, w, h, pix, 75).unwrap();
-    let ss = encode_jpeg_progressive(&frame, w, h, pix, 75).unwrap();
-    std::fs::write("/tmp/test_sa.jpg", &sa).unwrap();
-    std::fs::write("/tmp/test_ss.jpg", &ss).unwrap();
-    eprintln!(
-        "Wrote /tmp/test_sa.jpg ({} bytes) and /tmp/test_ss.jpg ({} bytes)",
-        sa.len(),
-        ss.len()
-    );
+    for (w, h, pix) in [
+        (64u32, 64u32, PixelFormat::Yuv420P),
+        (96, 48, PixelFormat::Yuv422P),
+        (40, 56, PixelFormat::Yuv444P),
+    ] {
+        let frame = make_gradient_frame(w, h, pix);
+        for quality in [40u8, 75, 95] {
+            let sa = encode_jpeg_progressive_sa(&frame, w, h, pix, quality).unwrap();
+            let ss = encode_jpeg_progressive(&frame, w, h, pix, quality).unwrap();
+            let tag = format!("{w}x{h} {pix:?} q{quality}");
+            assert_ne!(sa, ss, "{tag}: the two scan scripts differ");
+            let (ca, cs) = (
+                oxideav_mjpeg::read_coefficients(&sa).unwrap(),
+                oxideav_mjpeg::read_coefficients(&ss).unwrap(),
+            );
+            for (a, b) in ca.components.iter().zip(&cs.components) {
+                assert!(a.blocks == b.blocks, "{tag}: coefficients");
+            }
+            let (pa, ps) = (
+                oxideav_mjpeg::decode(&sa).unwrap(),
+                oxideav_mjpeg::decode(&ss).unwrap(),
+            );
+            assert!(pa.planes == ps.planes, "{tag}: planes");
+        }
+    }
 }
 
 /// The decoder should treat an extended-sequential (SOF1) 8-bit JPEG the

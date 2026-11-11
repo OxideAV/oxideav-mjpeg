@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.16...v0.1.17) - 2026-11-11
+
+### Other
+
+- last coefficient read off the stop position; README / CHANGELOG re-measured on a quiet machine
+- x86-64 ratios re-measured on a quiet machine
+- lossless arithmetic tail as a settled class-pair table
+- decode-mode golden pins on coefficient-built streams; SA vs SS progressive equivalence replaces the ignored debug test
+- arithmetic coding of the lossless process (SOF11) in the general writer
+- empty columns left out; bench: replicated-chroma and grey decode; README: decode tables and stage shares
+- luma-guided reconstruction as a row stream, grey / packed RGB by rows
+- settled tail of an ended lossless arithmetic code string, call-free rounding on the remaining paths, deblock on an empty frame
+- extent-bounded IDCT, call-free sample store, running non-zero masks for refinement scans
+- shared luma statistics, integer 16-pixel YCbCr kernel, call-free rounding
+- skip notes name the validators generically
+- exact transpose / mirror / rotate / crop on a coefficient record ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- t81_roundtrip samples arithmetic coding, DAC conditioning, marker orders and worker counts
+- row-slice 4:4:4 / replicated RGB conversion, ConvertOptions::threads, mask-driven progressive refinement; full_size bench group
+- exact integer RGB conversion, zig-zag 16-bit blocks with non-zero masks, monomorphised Huffman sinks, EncodeOptions::threads
+- arithmetic entropy coding (SOF9/SOF10) + DAC conditioning + marker order option ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- metadata_embed + t81_roundtrip oracles follow COM carriage and Auto CMYK signalling
+
 ### Added
 
 - Arithmetic coding of the lossless process in the general writer: `JpegProcess::Lossless` with `EntropyCoding::Arithmetic` writes `SOF11` (T.81 §H.1.2.3) — `P ∈ 2..=16`, 1 to 4 components, interleaved sampling layouts, all predictors, point transform, restart intervals, one statistics area per table destination, `L` / `U` conditioning through `DAC` (`Tc = 0` entries only). It was refused before. 400+ streams over the Huffman lossless matrix decode bit-exact here under default and non-default conditioning, and a single-component frame carries the same entropy-coded segment, byte for byte, as `encode_lossless_arith_jpeg_grayscale_with_opts`. The `t81_roundtrip` fuzz target samples it.

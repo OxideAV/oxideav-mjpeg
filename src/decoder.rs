@@ -2213,9 +2213,6 @@ fn decode_block(
     };
     *prev_dc = prev_dc.wrapping_add(dc_diff);
     out_natural[0] = *prev_dc;
-    // Where the non-zero coefficients land (the DC position always
-    // counts: its bits are the ones a DC-only block is recognised by).
-    let mut last = 0;
     // AC: zigzag run-length decode into natural order.
     let mut k: usize = 1;
     while k < 64 {
@@ -2243,8 +2240,16 @@ fn decode_block(
             }
         };
         out_natural[ZIGZAG[k]] = val;
-        last = k;
         k += 1;
+    }
+    // The last coefficient placed is the one before `k` (a placed value
+    // is never zero: `EXTEND` of `size ≥ 1` bits is not) unless runs of
+    // 16 zeros came after it; step back over those. The DC position
+    // always counts: a block that ends up here with `last = 0` has no AC
+    // coefficient, which is what a DC-only block is recognised by.
+    let mut last = k.min(64) - 1;
+    while last > 0 && out_natural[ZIGZAG[last]] == 0 {
+        last -= 1;
     }
     Ok(ZIGZAG_EXTENT_UP_TO[last])
 }
@@ -6764,6 +6769,55 @@ mod prog_tests {
                 }
             }
             self.out
+        }
+    }
+
+    /// The extent a sequential block reports is that of its last non-zero
+    /// coefficient, whatever runs of zeros follow it.
+    #[test]
+    fn sequential_block_reports_its_last_coefficient() {
+        use crate::jpeg::huffman::{
+            STD_AC_LUMA_BITS, STD_AC_LUMA_VALS, STD_DC_LUMA_BITS, STD_DC_LUMA_VALS,
+        };
+        let dc = HuffTable::build(&STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS).unwrap();
+        let ac = HuffTable::build(&STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS).unwrap();
+        // (run, size) symbols after a zero DC difference; every placed
+        // coefficient is +1. `None`: the block fills up to position 63
+        // and takes no end-of-block.
+        let cases: &[(&[u8], bool, usize)] = &[
+            (&[], true, 0),
+            (&[0xF0], true, 0),
+            (&[0xF0, 0xF0, 0xF0], true, 0),
+            (&[0x01], true, 1),
+            (&[0x01, 0xF0, 0xF0], true, 1),
+            (&[0x31, 0x01, 0xF0], true, 5),
+            (&[0xF0, 0xF0, 0xF0, 0xE1], false, 63),
+            (&[0xF0, 0xF0, 0xF0, 0xD1], true, 62),
+            (&[0xF0, 0xF0, 0xF0, 0xD1, 0x01], false, 63),
+        ];
+        for &(symbols, eob, last) in cases {
+            let mut bw = ProgTestBitWriter::new();
+            let z = dc.encode[0x00];
+            bw.put(z.code as u32, z.len as u32);
+            for &sym in symbols {
+                let c = ac.encode[sym as usize];
+                bw.put(c.code as u32, c.len as u32);
+                if sym & 0x0F != 0 {
+                    bw.put(1, 1);
+                }
+            }
+            if eob {
+                let c = ac.encode[0x00];
+                bw.put(c.code as u32, c.len as u32);
+            }
+            let buf = bw.finish();
+            let mut br = BitReader::new(&buf);
+            let (mut block, mut pred) = ([0i32; 64], 0);
+            let extent = decode_block(&mut br, &dc, &ac, &mut pred, &mut block).unwrap();
+            let seen = (0..64).rev().find(|&k| block[ZIGZAG[k]] != 0).unwrap_or(0);
+            assert_eq!(seen, last, "{symbols:02X?}");
+            assert_eq!(extent, ZIGZAG_EXTENT_UP_TO[last], "{symbols:02X?}");
+            assert_eq!(extent_of(&block) & !extent, 0, "{symbols:02X?}");
         }
     }
 

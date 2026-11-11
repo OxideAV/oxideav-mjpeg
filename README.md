@@ -2051,31 +2051,32 @@ luma-guided reconstruction (see *Chroma reconstruction*);
 `ChromaUpsampling::Replicate` is the cheapest conversion.
 
 Decoder work that followed, same pictures and machine class, serial
-unless noted, before → after in ms (medians of 9 runs at 1600 × 1200
-and of 5 at 12 MP, taken while other builds were running: read them to
-about ±10 %). Every decode mode returns the same bytes as before
+unless noted, before → after in ms (median of 11 runs at 1600 × 1200
+and of 5 at 12 MP, the better of two rounds, on a quiet machine — the
+"before" column is therefore lower than the loaded-machine figures of
+the table above). Every decode mode returns the same bytes as before
 (hashes over the fixture corpus, 15 000 fuzz-corpus inputs and these
 pictures, for the default, replicated, linear, reference-compatible,
-deblocked and threaded paths).
+deblocked and threaded paths; `tests/golden_modes.rs`).
 
 | 1600 × 1200 stream | entropy only (`read_coefficients`) | `decode` (planar) | `decode_rgb8` (luma-guided) | `decode_rgb8`, `Replicate` | `decode_rgb8`, `threads = 4` |
 |---|---|---|---|---|---|
-| baseline 4:2:0 | 1.7 → 1.8 | 3.0 → 3.2 | 11.2 → 7.7 | 7.9 → 5.0 | 7.0 → 5.1 |
-| baseline 4:2:2 | 1.9 → 2.0 | 3.6 → 3.5 | 14.3 → 9.4 | 8.3 → 5.6 | 8.8 → 6.1 |
-| baseline 4:4:4 | 2.5 → 2.5 | 4.9 → 4.4 | 8.4 → 5.9 | | 6.4 → 5.8 |
-| baseline grey | 1.4 → 1.5 | 2.3 → 2.4 | 3.6 → 2.5 | | |
-| progressive 4:2:0 | 5.1 → 4.5 | 7.8 → 6.6 | 15.3 → 11.1 | 12.1 → 8.4 | 11.7 → 9.1 |
-| progressive 4:2:2 | 6.0 → 4.9 | 9.9 → 7.5 | 20.5 → 13.2 | 13.9 → 9.1 | 15.3 → 10.7 |
-| progressive 4:4:4 | 7.0 → 5.7 | 12.4 → 9.1 | 14.8 → 10.4 | | 13.3 → 9.9 |
-| progressive grey | 4.6 → 3.9 | 6.6 → 5.3 | 7.8 → 5.3 | | |
+| baseline 4:2:0 | 1.6 → 1.6 | 2.9 → 2.7 | 9.5 → 6.9 | 7.0 → 4.5 | 5.8 → 4.5 |
+| baseline 4:2:2 | 1.8 → 1.8 | 3.3 → 3.3 | 12.3 → 8.6 | 7.5 → 4.9 | 7.8 → 5.5 |
+| baseline 4:4:4 | 2.3 → 2.3 | 4.3 → 3.9 | 6.3 → 5.2 |  | 5.2 → 4.6 |
+| baseline grey | 1.3 → 1.3 | 2.2 → 2.2 | 3.3 → 2.2 |  |  |
+| progressive 4:2:0 | 4.8 → 4.0 | 7.3 → 5.8 | 13.7 → 10.1 | 11.5 → 7.7 | 10.3 → 7.6 |
+| progressive 4:2:2 | 5.3 → 4.5 | 8.7 → 6.7 | 17.5 → 12.1 | 12.8 → 8.5 | 12.9 → 8.9 |
+| progressive 4:4:4 | 6.5 → 5.2 | 11.2 → 8.2 | 13.2 → 9.5 |  | 12.2 → 8.9 |
+| progressive grey | 4.2 → 3.6 | 5.8 → 5.1 | 6.9 → 5.2 |  |  |
 
 | 12 MP stream | `decode` (planar) | `decode_rgb8` | `decode_rgb8`, `threads = 4` |
 |---|---|---|---|
-| baseline 4:2:0 | 21.9 → 21.5 | 73.7 → 53.0 | 44.9 → 30.2 |
-| baseline 4:2:2 | 24.6 → 23.6 | 92.7 → 63.4 | 56.1 → 35.1 |
-| baseline 4:4:4 | 32.9 → 31.3 | 47.7 → 38.8 | |
-| baseline grey | 18.3 → 17.1 | 27.8 → 18.1 | |
-| progressive 4:2:0 | 53.5 → 44.9 | 101.7 → 78.3 | 77.3 → 59.0 |
+| baseline 4:2:0 | 18.3 → 17.7 | 63.9 → 49.3 | 40.4 → 28.8 |
+| baseline 4:2:2 | 22.8 → 21.7 | 83.5 → 59.1 | 53.2 → 35.0 |
+| baseline 4:4:4 | 29.6 → 27.4 | 42.9 → 35.5 |  |
+| baseline grey | 14.6 → 14.6 | 22.3 → 16.2 |  |
+| progressive 4:2:0 | 48.2 → 39.4 | 93.8 → 68.2 | 70.6 → 50.8 |
 
 Those are 64-bit Arm numbers. The same source built for baseline
 x86-64 — a target with no rounding instruction, where every
@@ -2098,14 +2099,14 @@ convert by rows.
 
 Where a serial baseline 4:2:0 `decode_rgb8` spends its time now
 (sampling profile; before in brackets): chroma reconstruction 35 %
-(47 %), YCbCr kernel and pixel store 21 % (23 %), entropy decode 19 %
-(15 %), dequantisation + IDCT + sample store 19 % (12 %), the rest
-6 % (3 %). Entropy decode is one table load per symbol, about 2.4 ns:
+(43 %), YCbCr kernel and pixel store 24 % (24 %), entropy decode 24 %
+(15 %), dequantisation + IDCT + sample store 16 % (15 %), the rest
+1 % (4 %). Entropy decode is one table load per symbol, about 2.3 ns:
 the load and the shift it feeds are a dependency chain, so it does not
 get faster without resolving two symbols per step. Progressive planar
-decode: refinement scans 48 % (50 %), dequantisation + IDCT + store
-31 % (33 %), first-pass AC 7 %, block walk 6 %, DC 4 %. It is not
-memory-bound: 3.3, 3.4 and 3.7 ns per pixel at 0.12, 1.9 and 12 MP.
+decode: refinement scans 47 % (50 %), dequantisation + IDCT + store
+30 % (33 %), block walk 8 %, first-pass AC 7 %, DC 4 %. It is not
+memory-bound: 3.0 and 3.3 ns per pixel at 1.9 and 12 MP.
 
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the

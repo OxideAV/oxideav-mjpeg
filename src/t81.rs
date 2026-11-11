@@ -14,6 +14,10 @@
 //! * **Lossless** (`SOF3`, Table H.1 predictors 1..=7, point transform),
 //!   T.81 Annex H.1 — `P ∈ 2..=16`.
 //!
+//! each Huffman-coded or, with [`EntropyCoding::Arithmetic`], coded by
+//! the Annex D arithmetic coder (`SOF9` / `SOF10` / `SOF11`; F.1.4,
+//! G.1.3, H.1.2.3),
+//!
 //! with 1..=4 components, per-component sampling factors `Hi, Vi ∈
 //! 1..=4` (any §A.1.1 combination under the §B.2.3 `Σ Hi × Vi ≤ 10`
 //! interleave bound — 4×2 luma included), per-component quantisation /
@@ -788,10 +792,11 @@ pub enum EntropyCoding {
     /// Huffman coding (Annex F.1.2 / G.1.2): `SOF0` / `SOF1` / `SOF2`.
     #[default]
     Huffman,
-    /// Arithmetic coding (Annex D, F.1.4, G.1.3) with the default
-    /// conditioning (`L = 0`, `U = 1`, `Kx = 5`; no `DAC` segment):
-    /// `SOF9` for the sequential process, `SOF10` for the progressive
-    /// one. No `DHT` segment is written. DCT processes only.
+    /// Arithmetic coding (Annex D, F.1.4, G.1.3, H.1.2.3) with the
+    /// default conditioning (`L = 0`, `U = 1`, `Kx = 5`; no `DAC`
+    /// segment): `SOF9` for the sequential process, `SOF10` for the
+    /// progressive one, `SOF11` for the lossless one. No `DHT` segment
+    /// is written.
     Arithmetic,
 }
 
@@ -1339,11 +1344,6 @@ fn validate_geometry(
     if frame.entropy == EntropyCoding::Arithmetic {
         frame.conditioning.validate()?;
     }
-    if frame.entropy == EntropyCoding::Arithmetic && !frame.process.is_dct() {
-        return Err(Error::unsupported(
-            "JPEG encode: the general writer codes arithmetic entropy for the DCT processes only (SOF9 / SOF10)",
-        ));
-    }
     match frame.process {
         JpegProcess::Sequential | JpegProcess::Progressive => {
             if frame.precision != 8 && frame.precision != 12 {
@@ -1477,6 +1477,7 @@ fn write_sof(
         JpegProcess::Sequential if sequential_is_baseline(frame, comps, tables) => markers::SOF0,
         JpegProcess::Sequential => markers::SOF1,
         JpegProcess::Progressive => markers::SOF2,
+        JpegProcess::Lossless { .. } if arith => markers::SOF11,
         JpegProcess::Lossless { .. } => markers::SOF3,
     };
     out.extend_from_slice(&[0xFF, marker]);
@@ -2179,6 +2180,129 @@ fn code_scan_arith(
     Ok(scan.finish())
 }
 
+/// The entropy-coded segments (with their `RSTm` markers) of an Annex H
+/// lossless scan under arithmetic coding (§H.1.2.3): the sample walk
+/// and the §H.1.2.1 predictions of [`code_lossless`], each difference
+/// coded by the Table H.3 decision tree in the statistics area of the
+/// component's table destination, conditioned on the differences coded
+/// for the sample to its left (`Da`) and above it (`Db`) in the
+/// component — zero where there is none in the scan or restart interval
+/// (§H.1.2.3.1) — under the frame's `L` / `U` bounds.
+fn code_lossless_arith(
+    frame: &JpegFrame,
+    comps: &[JpegComponent<'_>],
+    geo: &Geometry,
+    predictor: u8,
+    pt: u8,
+) -> Result<Vec<u8>> {
+    use crate::jpeg::arith::{ArithEncoder, LosslessStats, encode_lossless_diff};
+    let (mcus_x, mcus_y) = if geo.interleaved {
+        (
+            (frame.width as usize).div_ceil(geo.h_max),
+            (frame.height as usize).div_ceil(geo.v_max),
+        )
+    } else {
+        (comps[0].width, comps[0].height)
+    };
+    let ri = frame.restart_interval as usize;
+    if ri > 0 && !ri.is_multiple_of(mcus_x) {
+        return Err(Error::invalid(format!(
+            "JPEG encode: lossless restart interval {ri} is not a multiple of the {mcus_x} MCUs per MCU-row (T.81 Table B.7)"
+        )));
+    }
+    let grids = prepare_lossless(comps, geo, mcus_x, mcus_y, pt);
+    let initial = 1i32 << (frame.precision - pt - 1);
+    let cond = frame.conditioning;
+    let mut stats: [LosslessStats; 4] = std::array::from_fn(|_| {
+        let mut s = LosslessStats::new();
+        (s.l, s.u) = (cond.dc_lower, cond.dc_upper);
+        s
+    });
+    // The differences coded so far, on each component's sample grid.
+    let mut coded: Vec<Vec<i32>> = grids.iter().map(|g| vec![0i32; g.grid.len()]).collect();
+    let mut enc = ArithEncoder::new();
+    let mut out = Vec::new();
+    let mut restarts = Restarts::new(frame.restart_interval);
+    // Grid row on which the current interval began, per component.
+    let mut first_row: Vec<usize> = vec![0; comps.len()];
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            if let Some(m) = restarts.boundary() {
+                // E.1.3 / H.1.2.3.4: flush the coder, write `RSTm`, and
+                // start over with fresh statistics and no history.
+                out.extend_from_slice(&std::mem::take(&mut enc).finish());
+                out.extend_from_slice(&[0xFF, markers::RST0 + m]);
+                for s in &mut stats {
+                    s.reset();
+                }
+                for d in &mut coded {
+                    d.fill(0);
+                }
+                for (ci, c) in comps.iter().enumerate() {
+                    first_row[ci] = if geo.interleaved {
+                        my * c.v as usize
+                    } else {
+                        my
+                    };
+                }
+            }
+            for (ci, c) in comps.iter().enumerate() {
+                let g = &grids[ci];
+                let (bh, bv) = if geo.interleaved {
+                    (c.h as usize, c.v as usize)
+                } else {
+                    (1, 1)
+                };
+                for v in 0..bv {
+                    for h in 0..bh {
+                        let x = mx * bh + h;
+                        let y = my * bv + v;
+                        let at = |xx: usize, yy: usize| g.grid[yy * g.w_pad + xx];
+                        let cur = at(x, y);
+                        let px = if y == first_row[ci] {
+                            if x == 0 { initial } else { at(x - 1, y) }
+                        } else if x == 0 {
+                            at(x, y - 1)
+                        } else {
+                            let ra = at(x - 1, y);
+                            let rb = at(x, y - 1);
+                            let rc = at(x - 1, y - 1);
+                            match predictor {
+                                1 => ra,
+                                2 => rb,
+                                3 => rc,
+                                4 => ra + rb - rc,
+                                5 => ra + ((rb - rc) >> 1),
+                                6 => rb + ((ra - rc) >> 1),
+                                _ => (ra + rb) >> 1,
+                            }
+                        };
+                        // Modulo 2^16, as the representative in
+                        // −32768..=32767 (`Sz = |diff| − 1 < 2^15`).
+                        let diff = ((cur - px) as i64).rem_euclid(65536) as i32;
+                        let diff = if diff >= 32768 { diff - 65536 } else { diff };
+                        let d = &mut coded[ci];
+                        let i = y * g.w_pad + x;
+                        let da = if x == 0 { 0 } else { d[i - 1] };
+                        // (Rows of an earlier interval were cleared.)
+                        let db = if y == 0 { 0 } else { d[i - g.w_pad] };
+                        encode_lossless_diff(
+                            &mut enc,
+                            &mut stats[c.huff_id as usize],
+                            da,
+                            db,
+                            diff,
+                        )?;
+                        d[i] = diff;
+                    }
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&enc.finish());
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Scan plans.
 // ---------------------------------------------------------------------------
@@ -2665,13 +2789,23 @@ fn emit_frame(
         dests.sort_unstable();
         dests.dedup();
         let cond = frame.conditioning;
+        // The lossless process has one statistics area per destination,
+        // conditioned by the `Tc = 0` bounds (H.1.2.3.3); `Kx` has no
+        // meaning there. Nothing to write when only `Kx` is non-default.
+        let dc_default = ArithConditioning::default();
+        if !dct && (cond.dc_lower, cond.dc_upper) == (dc_default.dc_lower, dc_default.dc_upper) {
+            return;
+        }
+        let entries = if dct { 2 } else { 1 };
         out.extend_from_slice(&[0xFF, markers::DAC]);
-        out.extend_from_slice(&((2 + 4 * dests.len()) as u16).to_be_bytes());
+        out.extend_from_slice(&((2 + 2 * entries * dests.len()) as u16).to_be_bytes());
         for &tb in &dests {
             out.extend_from_slice(&[tb, cond.dc_lower | (cond.dc_upper << 4)]);
         }
-        for &tb in &dests {
-            out.extend_from_slice(&[0x10 | tb, cond.ac_kx]);
+        if dct {
+            for &tb in &dests {
+                out.extend_from_slice(&[0x10 | tb, cond.ac_kx]);
+            }
         }
     };
     match order {
@@ -2708,8 +2842,17 @@ fn emit_frame(
         }
         write_sos(&mut out, &scan_comps, dct, plan.ss, plan.se, ah_al);
         if arith {
-            let dct_blocks = blocks.expect("DCT blocks prepared");
-            out.extend_from_slice(&code_scan_arith(frame, comps, geo, dct_blocks, &plan)?);
+            let segment = match frame.process {
+                JpegProcess::Lossless {
+                    predictor,
+                    point_transform,
+                } => code_lossless_arith(frame, comps, geo, predictor, point_transform)?,
+                _ => {
+                    let dct_blocks = blocks.expect("DCT blocks prepared");
+                    code_scan_arith(frame, comps, geo, dct_blocks, &plan)?
+                }
+            };
+            out.extend_from_slice(&segment);
             continue;
         }
         let mut writer = BitWriter::new();
@@ -2852,10 +2995,10 @@ pub struct EncodeOptions {
     /// Placement of `DQT` / `DHT` relative to `SOFn` (default
     /// [`MarkerOrder::QuantFrameHuffman`]).
     pub marker_order: MarkerOrder,
-    /// Huffman (default) or arithmetic entropy coding of the DCT
-    /// processes ([`EntropyCoding::Arithmetic`]: `SOF9` / `SOF10`,
-    /// `tables` is then irrelevant). The lossless process refuses
-    /// arithmetic coding here.
+    /// Huffman (default) or arithmetic entropy coding
+    /// ([`EntropyCoding::Arithmetic`]: `SOF9` / `SOF10` / `SOF11` for
+    /// the sequential / progressive / lossless process; `tables` is
+    /// then irrelevant).
     pub entropy: EntropyCoding,
     /// Conditioning of the arithmetic models (default `L = 0`, `U = 1`,
     /// `Kx = 5`; anything else is written as a `DAC` segment). Ignored

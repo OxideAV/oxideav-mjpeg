@@ -701,8 +701,8 @@ pub struct MjpegEncoderOptions {
     /// `quant_frame_huffman` (empty, the default), `tables_first` or
     /// `frame_first` ([`crate::MarkerOrder`]).
     pub marker_order: String,
-    /// Entropy coding of the DCT processes: `huffman` (empty, the
-    /// default) or `arithmetic` (`SOF9` / `SOF10`).
+    /// Entropy coding: `huffman` (empty, the default) or `arithmetic`
+    /// (`SOF9` / `SOF10` / `SOF11`).
     pub entropy: String,
 }
 
@@ -875,7 +875,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
             name: "entropy",
             kind: OptionKind::Enum(&["huffman", "arithmetic"]),
             default: OptionValue::String(String::new()),
-            help: "entropy coding of the DCT processes: huffman (default) or arithmetic (SOF9 / SOF10, default conditioning)",
+            help: "entropy coding: huffman (default) or arithmetic (SOF9 / SOF10 / SOF11, default conditioning)",
         },
         OptionField {
             name: "marker_order",

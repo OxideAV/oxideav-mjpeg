@@ -20,7 +20,7 @@
 //!   decoded through `decode_jpeg_with_tables`)
 //! * colour signalling — JFIF / RGB (Adobe APP14 + 'R'/'G'/'B') / CMYK
 //!   (no APP14, Adobe inverted, YCCK)
-//! * entropy coding — Huffman or arithmetic (DCT processes), with
+//! * entropy coding — Huffman or arithmetic (every process), with
 //!   default or `DAC` conditioning; the three marker orders; 1..=4
 //!   workers
 //!
@@ -255,9 +255,9 @@ fuzz_target!(|data: &[u8]| {
         o.signalling = signalling;
         o.sampling = layout.clone();
         o.table_ids = Vec::new();
-        // Arithmetic coding (DCT processes), conditioning, the marker
+        // Arithmetic coding (every process), conditioning, the marker
         // order and the worker count ride on the spare bits.
-        if !lossless && data[7] & 4 != 0 {
+        if data[7] & 4 != 0 {
             o.entropy = EntropyCoding::Arithmetic;
             if data[7] & 8 != 0 {
                 let l = data[5] >> 6;

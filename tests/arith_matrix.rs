@@ -249,7 +249,13 @@ fn our_arithmetic_streams_decode_in_the_black_box_decoder() {
             .with_conditioning(bad);
         assert!(encode_rgb8(8, 8, &picture(8, 8), &o).is_err(), "{bad:?}");
     }
-    // The lossless process has no arithmetic form in this writer.
-    let o = EncodeOptions::new().with_lossless(1).with_arithmetic(true);
-    assert!(encode_rgb8(8, 8, &picture(8, 8), &o).is_err());
+    // The lossless process codes arithmetically too (`SOF11`): the same
+    // samples as its Huffman form.
+    let rgb = picture(8, 8);
+    let o = EncodeOptions::new().with_lossless(1);
+    let huffman = encode_rgb8(8, 8, &rgb, &o).expect("lossless");
+    let arith = encode_rgb8(8, 8, &rgb, &o.with_arithmetic(true)).expect("lossless arithmetic");
+    assert!(arith.windows(2).any(|m| m == [0xFF, 0xCB]), "SOF11");
+    let planes = |j: &[u8]| oxideav_mjpeg::decode(j).expect("decode").planes;
+    assert_eq!(planes(&arith), planes(&huffman));
 }

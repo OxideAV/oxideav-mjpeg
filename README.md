@@ -218,8 +218,8 @@ metadata exactly for every layout above (`tests/standalone_api.rs`,
 | `signalling` | `Auto` | `Jfif`, `Rgb`, `Cmyk { adobe_transform }`, `None`. |
 | `metadata` | empty | ICC / Exif / XMP blobs and `COM` comments to embed (merged with `JpegImage::metadata`, the option winning per blob — `Metadata::with_overrides`). |
 | `jfif` | `Auto` | JFIF `APP0` / Exif `APP1` slot rule (`JfifPolicy::Auto` / `Always` / `Never`, see *Metadata and colour*). |
-| `entropy` | `Huffman` | `EntropyCoding::Arithmetic` (`with_arithmetic(true)`) codes the DCT processes with the Annex D arithmetic coder: `SOF9` sequential, `SOF10` progressive, no `DHT`. |
-| `conditioning` | `L = 0`, `U = 1`, `Kx = 5` | `ArithConditioning` of the arithmetic models (§F.1.4.4.1.4 / §F.1.4.4.2.1); a non-default value is written as a `DAC` segment. |
+| `entropy` | `Huffman` | `EntropyCoding::Arithmetic` (`with_arithmetic(true)`) codes with the Annex D arithmetic coder: `SOF9` sequential, `SOF10` progressive, `SOF11` lossless, no `DHT`. |
+| `conditioning` | `L = 0`, `U = 1`, `Kx = 5` | `ArithConditioning` of the arithmetic models (§F.1.4.4.1.4 / §F.1.4.4.2.1); a non-default value is written as a `DAC` segment (the lossless process uses `L` / `U` only). |
 | `marker_order` | `QuantFrameHuffman` | Where the tables sit relative to the frame header (§B.2.1 allows all three): `QuantFrameHuffman` = `DQT SOFn DHT`, `TablesBeforeFrame` = `DQT DHT SOFn`, `FrameBeforeTables` = `SOFn DQT DHT`. Scan data is identical. |
 | `threads` | 1 | Workers for one picture: the RGB → YCbCr conversion and the transform + quantisation run in that many row bands (entropy coding stays serial). Byte-identical output for every value. The registry encoder takes it from `Encoder::set_execution_context`. |
 | `precision`, `sampling`, `table_ids`, `abbreviated` | 8, `[]`, `[]`, `false` | Plane-level writer knobs (`EncodeOptions::encode(w, h, planes)`); `encode(&JpegImage)` derives precision and sampling from the image. |
@@ -629,6 +629,11 @@ abbreviated, signalling, sampling, table_ids, chroma, metadata }`
   (`SOF2`, one interleaved DC scan + per-component AC bands `1..=5` /
   `6..=63`, `P = 8` / `12`), `Lossless { predictor, point_transform }`
   (`SOF3`, `P ∈ 2..=16`, Table H.1 predictors 1..=7).
+- `entropy` — `Huffman`, or `Arithmetic` for any of the three
+  processes (`SOF9` / `SOF10` / `SOF11`; no `DHT`, a `DAC` segment for
+  non-default `conditioning`). The lossless arithmetic scan codes each
+  difference under the §H.1.2.3 model, conditioned on the differences
+  to the left and above, one statistics area per table destination.
 - `sampling` — per-component `(Hi, Vi)`; any T.81 §A.1.1 combination
   under the §B.2.3 `Σ Hi × Vi ≤ 10` bound (4×2 luma, mixed chroma,
   chroma oversampled relative to luma, …). Input planes are supplied

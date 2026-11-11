@@ -7,7 +7,8 @@ use std::io::Write;
 use std::process::Command;
 
 use oxideav_mjpeg::t81::{
-    ColorSignalling, EncodeOptions, HuffmanTables, JpegProcess, JpegTableSet,
+    ArithConditioning, ColorSignalling, EncodeOptions, EntropyCoding, HuffmanTables, JpegProcess,
+    JpegTableSet,
 };
 use oxideav_mjpeg::{ChromaUpsampling, DecodeOptions, decode, decode_with};
 use oxideav_mjpeg::{SofKind, inspect_jpeg};
@@ -453,6 +454,152 @@ fn lossless_process_is_bit_exact_in_our_decoder() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The lossless process under arithmetic coding (`SOF11`, T.81
+/// §H.1.2.3): every layout, precision, predictor, point transform and
+/// restart setting of the Huffman matrix comes back bit-exact, under
+/// the default conditioning and under `DAC`-signalled bounds.
+#[test]
+fn lossless_arithmetic_process_is_bit_exact_in_our_decoder() {
+    type Case = (usize, &'static [(u8, u8)], &'static [u8]);
+    let cases: &[Case] = &[
+        (1, &[], &[2, 4, 8, 12, 16]),
+        (3, &[], &[8, 12, 16]),
+        (3, &[(2, 2), (1, 1), (1, 1)], &[8]),
+        (3, &[(2, 1), (1, 1), (1, 1)], &[8]),
+        (4, &[], &[8]),
+    ];
+    let conditionings = [
+        ArithConditioning::default(),
+        ArithConditioning::new().with_dc_bounds(1, 3),
+        ArithConditioning::new().with_dc_bounds(0, 0).with_ac_kx(9),
+    ];
+    let mut streams = 0;
+    for &(nf, sampling, precisions) in cases {
+        for &precision in precisions {
+            for predictor in 1..=7u8 {
+                for pt in [0u8, 1] {
+                    if pt >= precision {
+                        continue;
+                    }
+                    let src = planes(nf, precision, sampling);
+                    let refs: Vec<&[u16]> = src.iter().map(|v| v.as_slice()).collect();
+                    let hm = sampling.iter().map(|x| x.0).max().unwrap_or(1) as usize;
+                    let mcur = if nf > 1 {
+                        (W as usize).div_ceil(hm)
+                    } else {
+                        W as usize
+                    };
+                    for (k, ri) in [0u16, mcur as u16, 3 * mcur as u16].into_iter().enumerate() {
+                        let cond = conditionings[(k + predictor as usize) % 3];
+                        let mut o = EncodeOptions::default();
+                        o.process = JpegProcess::Lossless {
+                            predictor,
+                            point_transform: pt,
+                        };
+                        o.entropy = EntropyCoding::Arithmetic;
+                        o.conditioning = cond;
+                        o.precision = precision;
+                        o.restart_interval = ri;
+                        o.sampling = sampling.to_vec();
+                        o.signalling = if nf == 3 && sampling.is_empty() {
+                            ColorSignalling::Rgb
+                        } else if nf == 4 && pt > 0 {
+                            ColorSignalling::Cmyk {
+                                adobe_transform: None,
+                            }
+                        } else {
+                            ColorSignalling::Auto
+                        };
+                        let tag = format!(
+                            "arith lossless P{precision} nf{nf} {sampling:?} pred{predictor} pt{pt} ri{ri} {cond:?}"
+                        );
+                        let out = o
+                            .encode(W, H, &refs)
+                            .unwrap_or_else(|e| panic!("{tag}: {e}"));
+                        assert!(
+                            matches!(sof_kind(&out.data), SofKind::LosslessArith),
+                            "{tag}"
+                        );
+                        // No Huffman tables; a DAC segment exactly when
+                        // the L / U bounds are not the defaults.
+                        let names = marker_names(&out.data);
+                        assert!(!names.iter().any(|n| n == "DHT"), "{tag}: {names:?}");
+                        // (`marker_names` spells DAC by its code.)
+                        let dac = names.iter().any(|n| n == "CC");
+                        assert_eq!(dac, k_bounds(cond) != (0, 1), "{tag}: {names:?}");
+                        let got = decoded_components(&out.data, nf, precision, sampling);
+                        let s: Vec<(u8, u8)> = if sampling.is_empty() {
+                            vec![(1, 1); nf]
+                        } else {
+                            sampling.to_vec()
+                        };
+                        let vm = s.iter().map(|x| x.1).max().unwrap() as usize;
+                        for c in 0..nf {
+                            let cw = (W as usize * s[c].0 as usize).div_ceil(hm);
+                            let want: Vec<u32> =
+                                upsample(&src[c], cw, s[c].0 as usize, s[c].1 as usize, hm, vm)
+                                    .iter()
+                                    .map(|&v| (v >> pt) << pt)
+                                    .collect();
+                            assert!(got[c] == want, "{tag}: component {c} not bit-exact");
+                        }
+                        streams += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(streams > 400, "{streams} streams");
+}
+
+/// `(L, U)` of a conditioning.
+fn k_bounds(c: ArithConditioning) -> (u8, u8) {
+    (c.dc_lower, c.dc_upper)
+}
+
+/// A single-component lossless arithmetic frame from the general writer
+/// carries the same entropy-coded segment as the dedicated grey encoder
+/// (same model, same walk), restart intervals included.
+#[test]
+fn lossless_arithmetic_matches_the_dedicated_grey_encoder() {
+    use oxideav_mjpeg::encoder::encode_lossless_arith_jpeg_grayscale_with_opts;
+    fn entropy(jpeg: &[u8]) -> &[u8] {
+        let sos = jpeg.windows(2).rposition(|m| m == [0xFF, 0xDA]).unwrap();
+        let len = u16::from_be_bytes([jpeg[sos + 2], jpeg[sos + 3]]) as usize;
+        &jpeg[sos + 2 + len..jpeg.len() - 2]
+    }
+    for precision in [8u8, 12, 16] {
+        for predictor in 1..=7u8 {
+            for (ri, pt) in [(0u16, 0u8), (W as u16, 0), (2 * W as u16, 1)] {
+                let src = planes(1, precision, &[]);
+                let bytes: Vec<u8> = if precision > 8 {
+                    src[0].iter().flat_map(|v| v.to_le_bytes()).collect()
+                } else {
+                    src[0].iter().map(|&v| v as u8).collect()
+                };
+                let stride = W as usize * if precision > 8 { 2 } else { 1 };
+                let dedicated = encode_lossless_arith_jpeg_grayscale_with_opts(
+                    W, H, &bytes, stride, precision, predictor, ri, pt,
+                )
+                .unwrap();
+                let mut o = EncodeOptions::default();
+                o.process = JpegProcess::Lossless {
+                    predictor,
+                    point_transform: pt,
+                };
+                o.entropy = EntropyCoding::Arithmetic;
+                o.precision = precision;
+                o.restart_interval = ri;
+                let general = o.encode(W, H, &[&src[0]]).unwrap();
+                assert!(
+                    entropy(&general.data) == entropy(&dedicated),
+                    "P{precision} pred{predictor} ri{ri} pt{pt}"
+                );
             }
         }
     }

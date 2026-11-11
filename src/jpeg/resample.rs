@@ -238,129 +238,25 @@ impl RowRing {
     }
 }
 
-/// The luma side of the luma-guided reconstruction (module docs),
-/// common to every component subsampled at the same integer ratio
-/// `rh × rv`: `Ŷ`, its 3 × 3 box mean and `var(Ŷ) + ε`.
+/// Geometry of a luma-guided reconstruction (module docs) at an integer
+/// ratio `rh × rv`: `cw × ch` chroma samples under `w × h` luma samples.
 #[derive(Debug)]
-pub(crate) struct GuideLuma {
+pub(crate) struct GuidedGeom {
     cw: usize,
     ch: usize,
+    rh: usize,
     rv: usize,
     w: usize,
-    /// `Ŷ`: luma averaged over each chroma cell's real samples.
-    yd: Vec<f32>,
-    /// Box mean of `Ŷ` over each 3 × 3 neighbourhood.
-    my: Vec<f32>,
-    /// `max(mean(Ŷ²) − mean(Ŷ)², 0) + ε`.
-    den: Vec<f32>,
+    h: usize,
+    eps: f32,
     px: Vec<Phase>,
     ty: Vec<Tap>,
 }
 
-impl GuideLuma {
-    /// `luma(y, row)` writes luma row `y` of the full-resolution guide
-    /// (`w` samples) into `row`; the components it guides are `cw × ch`
-    /// (`cw = ⌈w / rh⌉`, `ch = ⌈h / rv⌉`), `maxval` the sample range
+impl GuidedGeom {
+    /// `cw = ⌈w / rh⌉`, `ch = ⌈h / rv⌉`; `maxval` is the sample range
     /// `2^P − 1`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        luma: &mut dyn FnMut(usize, &mut [f32]),
-        cw: usize,
-        ch: usize,
-        rh: usize,
-        rv: usize,
-        w: usize,
-        h: usize,
-        maxval: u32,
-    ) -> Self {
-        let mut yd = vec![0f32; cw * ch];
-        let mut row = vec![0f32; w];
-        for y in 0..h {
-            luma(y, &mut row);
-            let dst = &mut yd[(y / rv).min(ch - 1) * cw..][..cw];
-            if rh == 2 {
-                let (pairs, tail) = row.as_chunks::<2>();
-                for (d, p) in dst.iter_mut().zip(pairs) {
-                    *d = (*d + p[0]) + p[1];
-                }
-                if let [t] = tail {
-                    dst[cw - 1] += t;
-                }
-            } else {
-                for (d, cell) in dst.iter_mut().zip(row.chunks(rh)) {
-                    for &v in cell {
-                        *d += v;
-                    }
-                }
-            }
-        }
-        for (j, r) in yd.chunks_exact_mut(cw).enumerate() {
-            let ny = rv.min(h - j * rv);
-            for (i, v) in r.iter_mut().enumerate() {
-                let nx = rh.min(w - i * rh);
-                *v /= (nx * ny) as f32;
-            }
-        }
-        Self::from_cell_means(yd, cw, ch, rh, rv, w, h, maxval)
-    }
-
-    /// [`GuideLuma::new`] over an 8-bit plane (`stride ≥ w`, at least
-    /// `h` rows; `cw = ⌈w / rh⌉`, `ch = ⌈h / rv⌉`, `rh · rv ≤ 257`): the
-    /// cell sums are accumulated as integers. A cell sum is below 2^24,
-    /// so the `f32` accumulation of [`GuideLuma::new`] is exact too and
-    /// both divide the same value.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_u8(
-        data: &[u8],
-        stride: usize,
-        cw: usize,
-        ch: usize,
-        rh: usize,
-        rv: usize,
-        w: usize,
-        h: usize,
-    ) -> Self {
-        debug_assert!(cw == w.div_ceil(rh) && ch == h.div_ceil(rv) && rh * rv <= 257);
-        let mut yd = vec![0f32; cw * ch];
-        let mut acc = vec![0u16; cw];
-        for (j, dst) in yd.chunks_exact_mut(cw).enumerate() {
-            acc.fill(0);
-            let (y0, y1) = (j * rv, (j * rv + rv).min(h));
-            for y in y0..y1 {
-                let row = &data[y * stride..][..w];
-                if rh == 2 {
-                    let (pairs, tail) = row.as_chunks::<2>();
-                    for (a, p) in acc.iter_mut().zip(pairs) {
-                        *a += p[0] as u16 + p[1] as u16;
-                    }
-                    if let [t] = tail {
-                        acc[cw - 1] += *t as u16;
-                    }
-                } else {
-                    for (a, cell) in acc.iter_mut().zip(row.chunks(rh)) {
-                        for &v in cell {
-                            *a += v as u16;
-                        }
-                    }
-                }
-            }
-            let ny = y1 - y0;
-            let full = (rh * ny) as f32;
-            for (v, &a) in dst[..cw - 1].iter_mut().zip(&acc) {
-                *v = a as f32 / full;
-            }
-            let nx = w - (cw - 1) * rh;
-            dst[cw - 1] = acc[cw - 1] as f32 / (nx * ny) as f32;
-        }
-        Self::from_cell_means(yd, cw, ch, rh, rv, w, h, 255)
-    }
-
-    /// The neighbourhood statistics of `Ŷ`: the box means of `Ŷ` and
-    /// `Ŷ²`, each `((u + m) + d) / 9` of the horizontal sums
-    /// `((l + m) + r)` (replicated edges).
-    #[allow(clippy::too_many_arguments)]
-    fn from_cell_means(
-        yd: Vec<f32>,
         cw: usize,
         ch: usize,
         rh: usize,
@@ -370,191 +266,296 @@ impl GuideLuma {
         maxval: u32,
     ) -> Self {
         let scale = maxval as f32 / 255.0;
-        let eps = GUIDED_EPS_8BIT * scale * scale;
-        let mut my = vec![0f32; cw * ch];
-        let mut den = vec![0f32; cw * ch];
-        let (mut sy, mut syy) = (RowRing::new(cw), RowRing::new(cw));
-        let mut sq = vec![0f32; cw];
-        let mut filled = 0;
-        let out = my.chunks_exact_mut(cw).zip(den.chunks_exact_mut(cw));
-        for (j, (my, den)) in out.enumerate() {
-            while filled <= (j + 1).min(ch - 1) {
-                let row = &yd[filled * cw..][..cw];
-                three_tap(row, sy.slot(filled), |a, b| a + b);
-                for (s, &v) in sq.iter_mut().zip(row) {
-                    *s = v * v;
-                }
-                three_tap(&sq, syy.slot(filled), |a, b| a + b);
-                filled += 1;
-            }
-            let [u, m, d] = sy.window(j, ch);
-            let [uu, mm, dd] = syy.window(j, ch);
-            let sums = u.iter().zip(m).zip(d).zip(uu.iter().zip(mm).zip(dd));
-            for ((my, den), (((&u, &m), &d), ((&uu, &mm), &dd))) in
-                my.iter_mut().zip(den.iter_mut()).zip(sums)
-            {
-                let y = ((u + m) + d) * (1.0 / 9.0);
-                let yy = ((uu + mm) + dd) * (1.0 / 9.0);
-                *my = y;
-                *den = fmax(yy - y * y, 0.0) + eps;
-            }
-        }
         Self {
             cw,
             ch,
+            rh,
             rv,
             w,
-            yd,
-            my,
-            den,
+            h,
+            eps: GUIDED_EPS_8BIT * scale * scale,
             px: phases(rh),
             ty: taps(h, ch, 1, rv),
         }
     }
+}
 
-    /// Scratch for [`GuideLuma::detail_row`].
-    pub(crate) fn scratch(&self) -> Vec<f32> {
-        vec![0.0; self.cw]
-    }
+/// The planes a [`GuidedRows`] reads, row by row.
+pub(crate) struct GuidedSource<'a> {
+    /// Writes luma row `y` (`w` samples).
+    pub(crate) luma: &'a (dyn Fn(usize, &mut [f32]) + Sync),
+    /// The luma plane itself when it is 8-bit (`data`, `stride ≥ w`, at
+    /// least `h` rows): cell sums are then accumulated as integers. A
+    /// cell sum is below 2^24, so the `f32` accumulation of the general
+    /// path is exact too and both divide the same value.
+    pub(crate) luma_u8: Option<(&'a [u8], usize)>,
+    /// Writes row `j` (`cw` samples) of component `k`.
+    pub(crate) chroma: &'a (dyn Fn(usize, usize, &mut [f32]) + Sync),
+}
 
-    /// The luma detail of output row `y`, `d[x] = Y(x, y) − lin(Ŷ)`,
-    /// from the matching luma row. `col` is a caller-owned
-    /// [`GuideLuma::scratch`].
-    pub(crate) fn detail_row(&self, col: &mut [f32], y: usize, luma: &[f32], d: &mut [f32]) {
-        let t = self.ty[y];
-        let cw = self.cw;
-        let (y0, y1) = (
-            &self.yd[t.i0 as usize * cw..][..cw],
-            &self.yd[t.i1 as usize * cw..][..cw],
-        );
-        let col = &mut col[..cw];
-        for ((c, &a), &b) in col.iter_mut().zip(y0).zip(y1) {
-            *c = lerp(a, b, t.f);
-        }
-        let cy = &*col;
-        let rh = self.px.len();
-        let last = cw - 1;
-        let d = &mut d[..self.w];
-        let luma = &luma[..self.w];
-        let cell = |i: usize, d: &mut [f32]| {
-            let (l, r) = (i.saturating_sub(1), (i + 1).min(last));
-            let end = (i * rh + rh).min(d.len());
-            for (x, p) in (i * rh..end).zip(&self.px) {
-                let (i0, i1) = if p.left { (l, i) } else { (i, r) };
-                d[x] = luma[x] - lerp(cy[i0], cy[i1], p.f);
-            }
+/// Three rows of a plane that is produced top to bottom, row `r` in
+/// slot `r mod 3`.
+type Rows3 = [Vec<f32>; 3];
+
+fn rows3(w: usize) -> Rows3 {
+    std::array::from_fn(|_| vec![0f32; w])
+}
+
+/// Per-component rows of a [`GuidedRows`].
+struct GuidedComp {
+    /// The component's samples.
+    c: Rows3,
+    /// Horizontal 3-tap sums of `C` and `Ŷ · C`, minima and maxima of `C`.
+    sc: RowRing,
+    syc: RowRing,
+    slo: RowRing,
+    shi: RowRing,
+    /// Regression slope and neighbourhood bounds of finished rows.
+    a: Rows3,
+    lo: Rows3,
+    hi: Rows3,
+}
+
+/// Luma-guided reconstruction (module docs) as a stream of rows: the
+/// statistics of chroma row `j` — `Ŷ`, the regression slope
+/// `a = cov(Ŷ, C) / (var(Ŷ) + ε)` over its 3 × 3 neighbourhood
+/// (replicated edges) and the neighbourhood bounds of `C` — are formed
+/// when an output row first needs them and kept for the three rows the
+/// interpolation can touch, so the reconstruction works on a few rows
+/// that stay in cache instead of whole planes. Output rows must be asked
+/// for in ascending order from the row given to [`GuidedRows::seek`].
+///
+/// Each box mean is `((u + m) + d) / 9` of the horizontal sums
+/// `((l + m) + r)`.
+pub(crate) struct GuidedRows {
+    /// `Ŷ`: luma averaged over each chroma cell's real samples.
+    yd: Rows3,
+    sy: RowRing,
+    syy: RowRing,
+    comps: Vec<GuidedComp>,
+    /// Next row whose horizontal sums are to be formed / next row to
+    /// finish.
+    h_next: usize,
+    f_next: usize,
+    lrow: Vec<f32>,
+    acc: Vec<u16>,
+    tmp: Vec<f32>,
+    my: Vec<f32>,
+    den: Vec<f32>,
+    col_y: Vec<f32>,
+    col_c: Vec<f32>,
+    col_a: Vec<f32>,
+    detail: Vec<f32>,
+}
+
+impl GuidedRows {
+    /// State for `ncomp` components sharing the geometry `g`.
+    pub(crate) fn new(g: &GuidedGeom, ncomp: usize) -> Self {
+        let cw = g.cw;
+        let comp = || GuidedComp {
+            c: rows3(cw),
+            sc: RowRing::new(cw),
+            syc: RowRing::new(cw),
+            slo: RowRing::new(cw),
+            shi: RowRing::new(cw),
+            a: rows3(cw),
+            lo: rows3(cw),
+            hi: rows3(cw),
         };
-        if rh == 2 && cw >= 2 {
-            // 2:1: the outputs `2b + 1` (¼ of the way from sample `b` to
-            // `b + 1`) and `2b + 2` (¾ of the way) on either side of
-            // each cell boundary interpolate the same pair, so the loop
-            // runs boundary by boundary over straight slices; the first
-            // and last output replicate an edge sample (general form).
-            let (fl, fr) = (self.px[0].f, self.px[1].f);
-            let body = d[1..2 * last + 1].as_chunks_mut::<2>().0.iter_mut();
-            let lbody = luma[1..2 * last + 1].as_chunks::<2>().0.iter();
-            for ((o, l), (&y0, &y1)) in body.zip(lbody).zip(cy[..last].iter().zip(&cy[1..])) {
-                o[0] = l[0] - lerp(y0, y1, fr);
-                o[1] = l[1] - lerp(y0, y1, fl);
-            }
-            d[0] = luma[0] - lerp(cy[0], cy[0], fl);
-            if let (Some(o), Some(&l)) = (d.get_mut(2 * last + 1), luma.get(2 * last + 1)) {
-                *o = l - lerp(cy[last], cy[last], fr);
-            }
-            return;
-        }
-        for i in 0..cw {
-            cell(i, d);
+        Self {
+            yd: rows3(cw),
+            sy: RowRing::new(cw),
+            syy: RowRing::new(cw),
+            comps: (0..ncomp).map(|_| comp()).collect(),
+            h_next: 0,
+            f_next: 0,
+            lrow: vec![0.0; g.w],
+            acc: vec![0; cw],
+            tmp: vec![0.0; cw],
+            my: vec![0.0; cw],
+            den: vec![0.0; cw],
+            col_y: vec![0.0; cw],
+            col_c: vec![0.0; cw],
+            col_a: vec![0.0; cw],
+            detail: vec![0.0; g.w],
         }
     }
-}
 
-/// Luma-guided reconstruction of one component (module docs) on a
-/// shared [`GuideLuma`].
-#[derive(Debug)]
-pub(crate) struct Guided {
-    c: Vec<f32>,
-    a: Vec<f32>,
-    lo: Vec<f32>,
-    hi: Vec<f32>,
-}
+    /// Start (or restart) at output row `y`.
+    pub(crate) fn seek(&mut self, g: &GuidedGeom, y: usize) {
+        let first = g.ty[y].i0 as usize;
+        self.h_next = first.saturating_sub(1);
+        self.f_next = first;
+    }
 
-impl Guided {
-    /// `c` is the `cw × ch` component `g` was built for. The regression
-    /// slope `a = cov(Ŷ, C) / (var(Ŷ) + ε)` over every 3 × 3
-    /// neighbourhood (replicated edges) comes from the box means of `C`
-    /// and `Ŷ · C`, formed like those of [`GuideLuma`]; `lo` / `hi` are
-    /// the neighbourhood bounds of `C`.
-    pub(crate) fn new(g: &GuideLuma, c: Vec<f32>) -> Self {
-        let (cw, ch) = (g.cw, g.ch);
-        debug_assert_eq!(c.len(), cw * ch);
-        let n = cw * ch;
-        let (mut a, mut lo, mut hi) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-        let mut rings: [RowRing; 4] = std::array::from_fn(|_| RowRing::new(cw));
-        let mut prod = vec![0f32; cw];
-        let mut filled = 0;
-        for j in 0..ch {
-            while filled <= (j + 1).min(ch - 1) {
-                let row = &c[filled * cw..][..cw];
-                let yrow = &g.yd[filled * cw..][..cw];
-                let [sc, syc, slo, shi] = &mut rings;
-                three_tap(row, sc.slot(filled), |a, b| a + b);
-                for ((p, &y), &c) in prod.iter_mut().zip(yrow).zip(row) {
-                    *p = y * c;
+    /// `Ŷ` and the horizontal sums of chroma row `j`.
+    fn horizontal(&mut self, g: &GuidedGeom, src: &GuidedSource<'_>, j: usize) {
+        let (cw, rh, rv, w, h) = (g.cw, g.rh, g.rv, g.w, g.h);
+        let (y0, y1) = (j * rv, (j * rv + rv).min(h));
+        let ny = y1 - y0;
+        let yd = &mut self.yd[j % 3][..cw];
+        match src.luma_u8 {
+            Some((data, stride)) if rh * rv <= 257 => {
+                let acc = &mut self.acc[..cw];
+                acc.fill(0);
+                for y in y0..y1 {
+                    let row = &data[y * stride..][..w];
+                    if rh == 2 {
+                        let (pairs, tail) = row.as_chunks::<2>();
+                        for (a, p) in acc.iter_mut().zip(pairs) {
+                            *a += p[0] as u16 + p[1] as u16;
+                        }
+                        if let [t] = tail {
+                            acc[cw - 1] += *t as u16;
+                        }
+                    } else {
+                        for (a, cell) in acc.iter_mut().zip(row.chunks(rh)) {
+                            for &v in cell {
+                                *a += v as u16;
+                            }
+                        }
+                    }
                 }
-                three_tap(&prod, syc.slot(filled), |a, b| a + b);
-                three_tap(row, slo.slot(filled), fmin);
-                three_tap(row, shi.slot(filled), fmax);
-                filled += 1;
+                let full = (rh * ny) as f32;
+                for (v, &a) in yd[..cw - 1].iter_mut().zip(&*acc) {
+                    *v = a as f32 / full;
+                }
+                let nx = w - (cw - 1) * rh;
+                yd[cw - 1] = acc[cw - 1] as f32 / (nx * ny) as f32;
             }
-            let o = j * cw;
-            let [u, m, d] = rings[0].window(j, ch);
-            let [uy, my_, dy] = rings[1].window(j, ch);
-            let (gm, gd) = (&g.my[o..][..cw], &g.den[o..][..cw]);
+            _ => {
+                yd.fill(0.0);
+                let row = &mut self.lrow[..w];
+                for y in y0..y1 {
+                    (src.luma)(y, row);
+                    if rh == 2 {
+                        let (pairs, tail) = row.as_chunks::<2>();
+                        for (d, p) in yd.iter_mut().zip(pairs) {
+                            *d = (*d + p[0]) + p[1];
+                        }
+                        if let [t] = tail {
+                            yd[cw - 1] += t;
+                        }
+                    } else {
+                        for (d, cell) in yd.iter_mut().zip(row.chunks(rh)) {
+                            for &v in cell {
+                                *d += v;
+                            }
+                        }
+                    }
+                }
+                for (i, v) in yd.iter_mut().enumerate() {
+                    let nx = rh.min(w - i * rh);
+                    *v /= (nx * ny) as f32;
+                }
+            }
+        }
+        let yd = &self.yd[j % 3][..cw];
+        let tmp = &mut self.tmp[..cw];
+        three_tap(yd, self.sy.slot(j), |a, b| a + b);
+        for (s, &v) in tmp.iter_mut().zip(yd) {
+            *s = v * v;
+        }
+        three_tap(tmp, self.syy.slot(j), |a, b| a + b);
+        for (k, comp) in self.comps.iter_mut().enumerate() {
+            let c = &mut comp.c[j % 3][..cw];
+            (src.chroma)(k, j, c);
+            let c = &*c;
+            three_tap(c, comp.sc.slot(j), |a, b| a + b);
+            for ((p, &y), &c) in tmp.iter_mut().zip(yd).zip(c) {
+                *p = y * c;
+            }
+            three_tap(tmp, comp.syc.slot(j), |a, b| a + b);
+            three_tap(c, comp.slo.slot(j), fmin);
+            three_tap(c, comp.shi.slot(j), fmax);
+        }
+    }
+
+    /// Slope and bounds of chroma row `j` from the horizontal sums of
+    /// rows `j − 1 ..= j + 1`.
+    fn finish(&mut self, g: &GuidedGeom, j: usize) {
+        let (cw, ch) = (g.cw, g.ch);
+        let (my, den) = (&mut self.my[..cw], &mut self.den[..cw]);
+        let [u, m, d] = self.sy.window(j, ch);
+        let [uu, mm, dd] = self.syy.window(j, ch);
+        let sums = u.iter().zip(m).zip(d).zip(uu.iter().zip(mm).zip(dd));
+        for ((my, den), (((&u, &m), &d), ((&uu, &mm), &dd))) in
+            my.iter_mut().zip(den.iter_mut()).zip(sums)
+        {
+            let y = ((u + m) + d) * (1.0 / 9.0);
+            let yy = ((uu + mm) + dd) * (1.0 / 9.0);
+            *my = y;
+            *den = fmax(yy - y * y, 0.0) + g.eps;
+        }
+        let (my, den) = (&*my, &*den);
+        for comp in self.comps.iter_mut() {
+            let [u, m, d] = comp.sc.window(j, ch);
+            let [uy, my_, dy] = comp.syc.window(j, ch);
             let sums = u.iter().zip(m).zip(d).zip(uy.iter().zip(my_).zip(dy));
-            for ((a, (&my, &den)), (((&u, &m), &d), ((&uy, &myc), &dy))) in
-                a[o..][..cw].iter_mut().zip(gm.iter().zip(gd)).zip(sums)
+            for ((a, (&my, &den)), (((&u, &m), &d), ((&uy, &myc), &dy))) in comp.a[j % 3][..cw]
+                .iter_mut()
+                .zip(my.iter().zip(den))
+                .zip(sums)
             {
                 let mc = ((u + m) + d) * (1.0 / 9.0);
                 let myc = ((uy + myc) + dy) * (1.0 / 9.0);
                 *a = (myc - my * mc) / den;
             }
-            let [u, m, d] = rings[2].window(j, ch);
-            for (((v, &u), &m), &d) in lo[o..][..cw].iter_mut().zip(u).zip(m).zip(d) {
+            let [u, m, d] = comp.slo.window(j, ch);
+            for (((v, &u), &m), &d) in comp.lo[j % 3][..cw].iter_mut().zip(u).zip(m).zip(d) {
                 *v = fmin(fmin(u, m), d);
             }
-            let [u, m, d] = rings[3].window(j, ch);
-            for (((v, &u), &m), &d) in hi[o..][..cw].iter_mut().zip(u).zip(m).zip(d) {
+            let [u, m, d] = comp.shi.window(j, ch);
+            for (((v, &u), &m), &d) in comp.hi[j % 3][..cw].iter_mut().zip(u).zip(m).zip(d) {
                 *v = fmax(fmax(u, m), d);
             }
         }
-        Self { c, a, lo, hi }
     }
 
-    /// Scratch for [`Guided::row_with`].
-    pub(crate) fn scratch(&self, g: &GuideLuma) -> [Vec<f32>; 2] {
-        std::array::from_fn(|_| vec![0.0; g.cw])
-    }
-
-    /// Output row `y` into `out`: `lin(C) + lin(a) · d`, clamped to the
-    /// neighbourhood bounds, with `d` the row's [`GuideLuma::detail_row`].
-    /// `cols` is a caller-owned [`Guided::scratch`], so several workers
-    /// can produce rows at once.
-    pub(crate) fn row_with(
-        &self,
-        g: &GuideLuma,
-        cols: &mut [Vec<f32>; 2],
+    /// Output row `y` of every component into `out` (one `w`-sample row
+    /// per component), guided by the matching luma row.
+    pub(crate) fn row(
+        &mut self,
+        g: &GuidedGeom,
+        src: &GuidedSource<'_>,
         y: usize,
-        d: &[f32],
-        out: &mut [f32],
+        luma: &[f32],
+        out: &mut [Vec<f32>],
     ) {
         let t = g.ty[y];
+        let (i0, i1) = (t.i0 as usize, t.i1 as usize);
+        // The row whose bounds clamp this output row: one of the two
+        // interpolated rows.
+        let cy = (y / g.rv).min(g.ch - 1);
+        let last = i1.max(cy);
+        while self.f_next <= last {
+            let need = (self.f_next + 1).min(g.ch - 1);
+            while self.h_next <= need {
+                self.horizontal(g, src, self.h_next);
+                self.h_next += 1;
+            }
+            self.finish(g, self.f_next);
+            self.f_next += 1;
+        }
+        debug_assert!(i0 + 3 > self.f_next.max(self.h_next) - 1 && cy >= i0);
         let cw = g.cw;
-        let (o0, o1) = (t.i0 as usize * cw, t.i1 as usize * cw);
-        let (c0, c1) = (&self.c[o0..][..cw], &self.c[o1..][..cw]);
-        let (a0, a1) = (&self.a[o0..][..cw], &self.a[o1..][..cw]);
-        {
-            let [col_c, col_a] = &mut *cols;
+        let Self {
+            yd,
+            comps,
+            col_y,
+            col_c,
+            col_a,
+            detail,
+            ..
+        } = self;
+        let (y0, y1) = (&yd[i0 % 3][..cw], &yd[i1 % 3][..cw]);
+        for ((c, &a), &b) in col_y[..cw].iter_mut().zip(y0).zip(y1) {
+            *c = lerp(a, b, t.f);
+        }
+        detail_row(g, &col_y[..cw], luma, detail);
+        for (comp, out) in comps.iter().zip(out.iter_mut()) {
+            let (c0, c1) = (&comp.c[i0 % 3][..cw], &comp.c[i1 % 3][..cw]);
+            let (a0, a1) = (&comp.a[i0 % 3][..cw], &comp.a[i1 % 3][..cw]);
             let rows = c0.iter().zip(c1).zip(a0.iter().zip(a1));
             for ((cc, ca), ((&c0, &c1), (&a0, &a1))) in
                 col_c[..cw].iter_mut().zip(col_a[..cw].iter_mut()).zip(rows)
@@ -562,49 +563,104 @@ impl Guided {
                 *cc = lerp(c0, c1, t.f);
                 *ca = lerp(a0, a1, t.f);
             }
+            let (lo, hi) = (&comp.lo[cy % 3][..cw], &comp.hi[cy % 3][..cw]);
+            guided_row(g, &col_c[..cw], &col_a[..cw], lo, hi, detail, out);
         }
-        let cy = (y / g.rv).min(g.ch - 1) * cw;
-        let (lo, hi) = (&self.lo[cy..][..cw], &self.hi[cy..][..cw]);
-        let (cc, ca) = (&cols[0][..cw], &cols[1][..cw]);
-        let rh = g.px.len();
-        let last = cw - 1;
-        let out = &mut out[..g.w];
-        let d = &d[..g.w];
-        let cell = |i: usize, out: &mut [f32]| {
-            let (l, r) = (i.saturating_sub(1), (i + 1).min(last));
-            let end = (i * rh + rh).min(out.len());
-            for (x, p) in (i * rh..end).zip(&g.px) {
-                let (i0, i1) = if p.left { (l, i) } else { (i, r) };
-                let cu = lerp(cc[i0], cc[i1], p.f);
-                let au = lerp(ca[i0], ca[i1], p.f);
-                out[x] = fmin(fmax(cu + au * d[x], lo[i]), hi[i]);
-            }
-        };
-        if rh == 2 && cw >= 2 {
-            // As in `GuideLuma::detail_row`: boundary by boundary, each
-            // output clamped to the bounds of the cell it lies in.
-            let (fl, fr) = (g.px[0].f, g.px[1].f);
-            let body = out[1..2 * last + 1].as_chunks_mut::<2>().0.iter_mut();
-            let dbody = d[1..2 * last + 1].as_chunks::<2>().0.iter();
-            let cs = cc[..last].iter().zip(&cc[1..]);
-            let as_ = ca[..last].iter().zip(&ca[1..]);
-            let los = lo[..last].iter().zip(&lo[1..]);
-            let his = hi[..last].iter().zip(&hi[1..]);
-            for (((((o, d), (&c0, &c1)), (&a0, &a1)), (&lo0, &lo1)), (&hi0, &hi1)) in
-                body.zip(dbody).zip(cs).zip(as_).zip(los).zip(his)
-            {
-                o[0] = fmin(fmax(lerp(c0, c1, fr) + lerp(a0, a1, fr) * d[0], lo0), hi0);
-                o[1] = fmin(fmax(lerp(c0, c1, fl) + lerp(a0, a1, fl) * d[1], lo1), hi1);
-            }
-            cell(0, &mut out[..1]);
-            if out.len() == 2 * last + 2 {
-                cell(last, out);
-            }
-            return;
+    }
+}
+
+/// The luma detail of one output row, `d[x] = Y(x, y) − lin(Ŷ)`: `cy` is
+/// the row's vertically interpolated `Ŷ`.
+fn detail_row(g: &GuidedGeom, cy: &[f32], luma: &[f32], d: &mut [f32]) {
+    let cw = g.cw;
+    let rh = g.px.len();
+    let last = cw - 1;
+    let d = &mut d[..g.w];
+    let luma = &luma[..g.w];
+    let cell = |i: usize, d: &mut [f32]| {
+        let (l, r) = (i.saturating_sub(1), (i + 1).min(last));
+        let end = (i * rh + rh).min(d.len());
+        for (x, p) in (i * rh..end).zip(&g.px) {
+            let (i0, i1) = if p.left { (l, i) } else { (i, r) };
+            d[x] = luma[x] - lerp(cy[i0], cy[i1], p.f);
         }
-        for i in 0..cw {
-            cell(i, out);
+    };
+    if rh == 2 && cw >= 2 {
+        // 2:1: the outputs `2b + 1` (¼ of the way from sample `b` to
+        // `b + 1`) and `2b + 2` (¾ of the way) on either side of each
+        // cell boundary interpolate the same pair, so the loop runs
+        // boundary by boundary over straight slices; the first and last
+        // output replicate an edge sample (general form).
+        let (fl, fr) = (g.px[0].f, g.px[1].f);
+        let body = d[1..2 * last + 1].as_chunks_mut::<2>().0.iter_mut();
+        let lbody = luma[1..2 * last + 1].as_chunks::<2>().0.iter();
+        for ((o, l), (&y0, &y1)) in body.zip(lbody).zip(cy[..last].iter().zip(&cy[1..])) {
+            o[0] = l[0] - lerp(y0, y1, fr);
+            o[1] = l[1] - lerp(y0, y1, fl);
         }
+        d[0] = luma[0] - lerp(cy[0], cy[0], fl);
+        if let (Some(o), Some(&l)) = (d.get_mut(2 * last + 1), luma.get(2 * last + 1)) {
+            *o = l - lerp(cy[last], cy[last], fr);
+        }
+        return;
+    }
+    for i in 0..cw {
+        cell(i, d);
+    }
+}
+
+/// One output row of a component: `lin(C) + lin(a) · d`, clamped to the
+/// neighbourhood bounds `lo` / `hi` of the chroma sample each output
+/// lies in. `cc` / `ca` are the row's vertically interpolated `C` and
+/// slope, `d` its [`detail_row`].
+fn guided_row(
+    g: &GuidedGeom,
+    cc: &[f32],
+    ca: &[f32],
+    lo: &[f32],
+    hi: &[f32],
+    d: &[f32],
+    out: &mut [f32],
+) {
+    let cw = g.cw;
+    let rh = g.px.len();
+    let last = cw - 1;
+    let out = &mut out[..g.w];
+    let d = &d[..g.w];
+    let cell = |i: usize, out: &mut [f32]| {
+        let (l, r) = (i.saturating_sub(1), (i + 1).min(last));
+        let end = (i * rh + rh).min(out.len());
+        for (x, p) in (i * rh..end).zip(&g.px) {
+            let (i0, i1) = if p.left { (l, i) } else { (i, r) };
+            let cu = lerp(cc[i0], cc[i1], p.f);
+            let au = lerp(ca[i0], ca[i1], p.f);
+            out[x] = fmin(fmax(cu + au * d[x], lo[i]), hi[i]);
+        }
+    };
+    if rh == 2 && cw >= 2 {
+        // As in `detail_row`: boundary by boundary, each output clamped
+        // to the bounds of the cell it lies in.
+        let (fl, fr) = (g.px[0].f, g.px[1].f);
+        let body = out[1..2 * last + 1].as_chunks_mut::<2>().0.iter_mut();
+        let dbody = d[1..2 * last + 1].as_chunks::<2>().0.iter();
+        let cs = cc[..last].iter().zip(&cc[1..]);
+        let as_ = ca[..last].iter().zip(&ca[1..]);
+        let los = lo[..last].iter().zip(&lo[1..]);
+        let his = hi[..last].iter().zip(&hi[1..]);
+        for (((((o, d), (&c0, &c1)), (&a0, &a1)), (&lo0, &lo1)), (&hi0, &hi1)) in
+            body.zip(dbody).zip(cs).zip(as_).zip(los).zip(his)
+        {
+            o[0] = fmin(fmax(lerp(c0, c1, fr) + lerp(a0, a1, fr) * d[0], lo0), hi0);
+            o[1] = fmin(fmax(lerp(c0, c1, fl) + lerp(a0, a1, fl) * d[1], lo1), hi1);
+        }
+        cell(0, &mut out[..1]);
+        if out.len() == 2 * last + 2 {
+            cell(last, out);
+        }
+        return;
+    }
+    for i in 0..cw {
+        cell(i, out);
     }
 }
 
@@ -643,15 +699,18 @@ pub(crate) fn reconstruct(
     match guide {
         Some((gy, (rh, rv))) => {
             let luma = grid(gy, w, h);
-            let mut fill = |y: usize, r: &mut [f32]| r.copy_from_slice(&luma[y * w..][..w]);
-            let gl = GuideLuma::new(&mut fill, cw, ch, rh, rv, w, h, maxval);
-            let g = Guided::new(&gl, c);
-            let (mut col, mut cols) = (gl.scratch(), g.scratch(&gl));
-            let mut detail = vec![0f32; w];
+            let g = GuidedGeom::new(cw, ch, rh, rv, w, h, maxval);
+            let src = GuidedSource {
+                luma: &|y, r| r.copy_from_slice(&luma[y * w..][..w]),
+                luma_u8: None,
+                chroma: &|_, j, r| r.copy_from_slice(&c[j * cw..][..cw]),
+            };
+            let mut rows = GuidedRows::new(&g, 1);
+            rows.seek(&g, 0);
+            let mut line = [row];
             for (y, dst) in out.chunks_exact_mut(w).enumerate() {
-                gl.detail_row(&mut col, y, &luma[y * w..][..w], &mut detail);
-                g.row_with(&gl, &mut cols, y, &detail, &mut row);
-                store(&row, dst);
+                rows.row(&g, &src, y, &luma[y * w..][..w], &mut line);
+                store(&line[0], dst);
             }
         }
         None => {
@@ -956,26 +1015,48 @@ mod tests {
     }
 
     /// Every output row of the guided reconstruction of `c` (`cw × ch`,
-    /// ratio `rh × rv`) under `luma` (`w × h`).
-    fn guided(
+    /// ratio `rh × rv`) under `luma` (`w × h`), produced from row
+    /// `start` on (rows before it stay zero); `bytes` hands the luma
+    /// over as an 8-bit plane too.
+    #[allow(clippy::too_many_arguments)]
+    fn guided_from(
         luma: &[f32],
-        c: Vec<f32>,
+        c: &[f32],
         (cw, ch): (usize, usize),
         (rh, rv): (usize, usize),
         (w, h): (usize, usize),
         maxval: u32,
+        start: usize,
+        bytes: Option<&[u8]>,
     ) -> Vec<f32> {
-        let mut fill = |y: usize, r: &mut [f32]| r.copy_from_slice(&luma[y * w..][..w]);
-        let gl = GuideLuma::new(&mut fill, cw, ch, rh, rv, w, h, maxval);
-        let g = Guided::new(&gl, c);
-        let (mut col, mut cols) = (gl.scratch(), g.scratch(&gl));
-        let mut detail = vec![0f32; w];
+        let g = GuidedGeom::new(cw, ch, rh, rv, w, h, maxval);
+        let src = GuidedSource {
+            luma: &|y, r| r.copy_from_slice(&luma[y * w..][..w]),
+            luma_u8: bytes.map(|b| (b, w)),
+            chroma: &|_, j, r| r.copy_from_slice(&c[j * cw..][..cw]),
+        };
+        // Two components fed the same plane must agree.
+        let mut rows = GuidedRows::new(&g, 2);
+        rows.seek(&g, start);
+        let mut line = vec![vec![0f32; w], vec![0f32; w]];
         let mut out = vec![0f32; w * h];
-        for (y, row) in out.chunks_exact_mut(w).enumerate() {
-            gl.detail_row(&mut col, y, &luma[y * w..][..w], &mut detail);
-            g.row_with(&gl, &mut cols, y, &detail, row);
+        for (y, row) in out.chunks_exact_mut(w).enumerate().skip(start) {
+            rows.row(&g, &src, y, &luma[y * w..][..w], &mut line);
+            assert_eq!(line[0], line[1]);
+            row.copy_from_slice(&line[0]);
         }
         out
+    }
+
+    fn guided(
+        luma: &[f32],
+        c: Vec<f32>,
+        chroma: (usize, usize),
+        ratio: (usize, usize),
+        size: (usize, usize),
+        maxval: u32,
+    ) -> Vec<f32> {
+        guided_from(luma, &c, chroma, ratio, size, maxval, 0, None)
     }
 
     #[test]
@@ -1027,13 +1108,20 @@ mod tests {
                     .all(|(a, b)| a.to_bits() == b.to_bits());
                 assert!(same, "case {case}: {w}x{h} at {rh}x{rv}, row {y}");
             }
-            // The 8-bit plane constructor sees the same cell means.
+            // A band that starts part-way down (a worker's band) gives
+            // the same rows, and so does the 8-bit luma plane.
+            let start = next() as usize % h;
+            let band = guided_from(&luma, &c, (cw, ch), (rh, rv), (w, h), maxval, start, None);
+            assert_eq!(
+                band[start * w..],
+                got[start * w..],
+                "case {case}: from row {start}"
+            );
             if maxval == 255 {
                 let bytes: Vec<u8> = luma.iter().map(|&v| v as u8).collect();
-                let a = GuideLuma::from_u8(&bytes, w, cw, ch, rh, rv, w, h);
-                let b = GuideLuma::new(&mut fill, cw, ch, rh, rv, w, h, 255);
-                assert_eq!(a.yd, b.yd, "case {case}");
-                assert_eq!(a.den, b.den, "case {case}");
+                let size = (w, h);
+                let b = guided_from(&luma, &c, (cw, ch), (rh, rv), size, 255, 0, Some(&bytes));
+                assert_eq!(b, got, "case {case}: 8-bit luma plane");
             }
         }
     }

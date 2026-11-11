@@ -91,6 +91,19 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) 
         F::Gray8 | F::Gray10Le | F::Gray12Le | F::Gray16Le => {
             let p = &img.planes[0];
             let bps = img.format.bytes_per_sample();
+            let whole = p.stride >= w && p.data.len() >= (h - 1) * p.stride + w;
+            if bps == 1 && maxval == 255 && whole && out.len() >= w * h * bpp {
+                // 8-bit samples go out as they are, row by row.
+                let rows = out[..w * h * bpp].chunks_exact_mut(w * bpp);
+                for (dst, src) in rows.zip(p.data.chunks(p.stride)) {
+                    if bpp == 3 {
+                        spread_gray::<3>(dst, &src[..w]);
+                    } else {
+                        spread_gray::<4>(dst, &src[..w]);
+                    }
+                }
+                return;
+            }
             for y in 0..h {
                 for x in 0..w {
                     let v = scale8(sample(p, bps, x, y), maxval);
@@ -103,6 +116,14 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) 
         }
         F::Rgb24 => {
             let p = &img.planes[0];
+            let whole = p.stride >= w * 3 && p.data.len() >= (h - 1) * p.stride + w * 3;
+            if bpp == 3 && whole && out.len() >= w * h * 3 {
+                let rows = out[..w * h * 3].chunks_exact_mut(w * 3);
+                for (dst, src) in rows.zip(p.data.chunks(p.stride)) {
+                    dst.copy_from_slice(&src[..w * 3]);
+                }
+                return;
+            }
             for y in 0..h {
                 for x in 0..w {
                     let i = y * p.stride + x * 3;
@@ -199,6 +220,16 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) 
                 }
             }
         }
+    }
+}
+
+/// One row of 8-bit grey into the R, G, B bytes of `N`-byte pixels.
+#[inline]
+fn spread_gray<const N: usize>(dst: &mut [u8], src: &[u8]) {
+    for (px, &v) in dst.as_chunks_mut::<N>().0.iter_mut().zip(src) {
+        px[0] = v;
+        px[1] = v;
+        px[2] = v;
     }
 }
 
@@ -563,7 +594,7 @@ fn fill_ycbcr_interp(
     opts: &ConvertOptions,
     maxval: u32,
 ) {
-    use crate::jpeg::resample::{GuideLuma, Guided, Linear};
+    use crate::jpeg::resample::{GuidedGeom, GuidedRows, GuidedSource, Linear};
     let w = img.width as usize;
     let h = img.height as usize;
     let bps = img.format.bytes_per_sample();
@@ -589,46 +620,36 @@ fn fill_ycbcr_interp(
             }
         }
     };
-    let plane = |p: &crate::image::Plane, pw: usize, ph: usize| -> Vec<f32> {
-        let mut v = vec![0f32; pw * ph];
-        for (y, row) in v.chunks_exact_mut(pw).enumerate() {
+    let workers = opts.threads.clamp(1, h);
+    // Luma-guided: every worker streams the rows of its band (the
+    // statistics of a chroma row are formed when a row first needs them).
+    let geom = (opts.upsampling == ChromaUpsampling::LumaGuided)
+        .then(|| GuidedGeom::new(cw, ch, dh, dv, w, h, maxval));
+    let py = &img.planes[0];
+    let whole_luma = py.stride >= w && py.data.len() >= (h - 1) * py.stride + w;
+    let luma_row = |y: usize, row: &mut [f32]| read_row(py, y, row);
+    let chroma_row = |k: usize, j: usize, row: &mut [f32]| read_row(&img.planes[1 + k], j, row);
+    let source = GuidedSource {
+        luma: &luma_row,
+        luma_u8: (bps == 1 && maxval == 255 && whole_luma).then(|| (&py.data[..], py.stride)),
+        chroma: &chroma_row,
+    };
+    // Linear: the two chroma planes in `f32`, prepared independently.
+    let plane = |p: &crate::image::Plane| -> Linear {
+        let mut v = vec![0f32; cw * ch];
+        for (y, row) in v.chunks_exact_mut(cw).enumerate() {
             read_row(p, y, row);
         }
-        v
+        Linear::new(v, cw, ch, (1, dh), (1, dv), w, h)
     };
-    enum Recon {
-        Lin(Linear),
-        Guide(Guided),
-    }
-    // The luma statistics of the guided reconstruction serve both chroma
-    // components.
-    let guide = (opts.upsampling == ChromaUpsampling::LumaGuided).then(|| {
-        let py = &img.planes[0];
-        let whole = py.stride >= w && py.data.len() >= (h - 1) * py.stride + w;
-        if bps == 1 && maxval == 255 && whole {
-            GuideLuma::from_u8(&py.data, py.stride, cw, ch, dh, dv, w, h)
-        } else {
-            let mut luma = |y: usize, row: &mut [f32]| read_row(py, y, row);
-            GuideLuma::new(&mut luma, cw, ch, dh, dv, w, h, maxval)
-        }
-    });
-    let make = |p: &crate::image::Plane| {
-        let c = plane(p, cw, ch);
-        match &guide {
-            Some(g) => Recon::Guide(Guided::new(g, c)),
-            None => Recon::Lin(Linear::new(c, cw, ch, (1, dh), (1, dv), w, h)),
-        }
-    };
-    let workers = opts.threads.clamp(1, h);
-    // The two chroma planes are prepared independently.
-    let recon = if workers > 1 {
-        std::thread::scope(|sc| {
-            let cr = sc.spawn(|| make(&img.planes[2]));
-            let cb = make(&img.planes[1]);
+    let linear: Option<[Linear; 2]> = match &geom {
+        Some(_) => None,
+        None if workers > 1 => Some(std::thread::scope(|sc| {
+            let cr = sc.spawn(|| plane(&img.planes[2]));
+            let cb = plane(&img.planes[1]);
             [cb, cr.join().expect("chroma worker")]
-        })
-    } else {
-        [make(&img.planes[1]), make(&img.planes[2])]
+        })),
+        None => Some([plane(&img.planes[1]), plane(&img.planes[2])]),
     };
     let fixed = opts.ycbcr == YcbcrKernel::FixedPoint16 && maxval == 255;
     // Rows `y0..` of the picture into `band`: every row is a function of
@@ -637,28 +658,20 @@ fn fill_ycbcr_interp(
     let convert = |y0: usize, band: &mut [u8]| {
         let mut rows = [vec![0f32; w], vec![0f32; w]];
         let mut lrow = vec![0f32; w];
-        let mut lin = [Vec::new(), Vec::new()];
-        let mut gui: [[Vec<f32>; 2]; 2] = Default::default();
-        for (i, r) in recon.iter().enumerate() {
-            match (r, &guide) {
-                (Recon::Guide(g), Some(gl)) => gui[i] = g.scratch(gl),
-                (Recon::Lin(l), _) => lin[i] = l.scratch(),
-                _ => {}
-            }
-        }
-        let mut ycol = guide.as_ref().map(GuideLuma::scratch).unwrap_or_default();
-        let mut detail = vec![0f32; if guide.is_some() { w } else { 0 }];
+        let mut lin = linear.as_ref().map(|l| [l[0].scratch(), l[1].scratch()]);
+        let mut guided = geom.as_ref().map(|g| {
+            let mut rows = GuidedRows::new(g, 2);
+            rows.seek(g, y0);
+            rows
+        });
         for (i, dst) in band.chunks_exact_mut(w * bpp).enumerate() {
             let y = y0 + i;
             read_row(&img.planes[0], y, &mut lrow);
-            if let Some(gl) = &guide {
-                gl.detail_row(&mut ycol, y, &lrow, &mut detail);
-            }
-            for (i, (r, row)) in recon.iter().zip(rows.iter_mut()).enumerate() {
-                match (r, &guide) {
-                    (Recon::Guide(g), Some(gl)) => g.row_with(gl, &mut gui[i], y, &detail, row),
-                    (Recon::Lin(l), _) => l.row_with(&mut lin[i], y, row),
-                    _ => {}
+            if let (Some(g), Some(stream)) = (&geom, &mut guided) {
+                stream.row(g, &source, y, &lrow, &mut rows);
+            } else if let (Some(l), Some(scratch)) = (&linear, &mut lin) {
+                for ((l, col), row) in l.iter().zip(scratch.iter_mut()).zip(rows.iter_mut()) {
+                    l.row_with(col, y, row);
                 }
             }
             let (l, cb, cr) = (&lrow[..], &rows[0][..], &rows[1][..]);

@@ -73,6 +73,8 @@
 //! frames use the same constants with one fraction bit between the
 //! passes, level shift 2048 and their own range limit.
 
+use crate::jpeg::dct::{Extent, FULL_EXTENT};
+
 /// `round(2^13 · √2 · cos(6π/16))`.
 const K6: i64 = 4433;
 /// `round(2^13 · √2 · (cos(2π/16) − cos(6π/16)))`.
@@ -189,12 +191,28 @@ fn limit_sample_12(v: i64) -> u16 {
 /// Dequantise `coef` (natural order) by `quant` and inverse-transform it
 /// with `mid_bits` fraction bits kept between the passes; returns the
 /// reconstructed samples before the level shift (row-major).
-fn transform_block(coef: &[i32; 64], quant: &[u16; 64], mid_bits: u32) -> [i64; 64] {
+///
+/// `extent` ([`crate::jpeg::dct::Extent`]) says which columns of `coef`
+/// can hold a non-zero coefficient. A column of zeros transforms to
+/// zeros (every term of [`transform_1d`] is a product with an input, and
+/// the rounding shift of zero is zero), so it is left out of the column
+/// pass. When only column 0 holds data every row of the intermediate
+/// block is `[m, 0, …, 0]`, whose transform is `m · 2^13` at every
+/// position: the row is one rounded value.
+fn transform_block(
+    coef: &[i32; 64],
+    quant: &[u16; 64],
+    mid_bits: u32,
+    extent: Extent,
+) -> [i64; 64] {
     let column_shift = CONST_FRACTION - mid_bits;
     let row_shift = CONST_FRACTION + mid_bits + 3;
     // Column pass: column u of the coefficient block → column u of `mid`.
     let mut mid = [0i64; 64];
     for u in 0..8 {
+        if extent & (1 << u) == 0 {
+            continue;
+        }
         let f: [i64; 8] = std::array::from_fn(|v| coef[v * 8 + u] as i64 * quant[v * 8 + u] as i64);
         let t = transform_1d(f);
         for y in 0..8 {
@@ -203,6 +221,17 @@ fn transform_block(coef: &[i32; 64], quant: &[u16; 64], mid_bits: u32) -> [i64; 
     }
     // Row pass.
     let mut out = [0i64; 64];
+    if extent & 0x00FE == 0 {
+        for (row, m) in out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(mid.as_chunks::<8>().0)
+        {
+            *row = [round_shift(m[0] << CONST_FRACTION, row_shift); 8];
+        }
+        return out;
+    }
     for y in 0..8 {
         let f: [i64; 8] = std::array::from_fn(|u| mid[y * 8 + u]);
         let t = transform_1d(f);
@@ -218,13 +247,14 @@ fn transform_block(coef: &[i32; 64], quant: &[u16; 64], mid_bits: u32) -> [i64; 
 /// `out` (row pitch `stride`).
 pub(crate) fn idct8x8_store_u8(
     coef: &[i32; 64],
+    extent: Extent,
     quant: &[u16; 64],
     out: &mut [u8],
     stride: usize,
     x0: usize,
     y0: usize,
 ) {
-    let t = transform_block(coef, quant, MID_FRACTION);
+    let t = transform_block(coef, quant, MID_FRACTION, extent);
     for y in 0..8 {
         let row = &mut out[(y0 + y) * stride + x0..][..8];
         for (o, &v) in row.iter_mut().zip(&t[y * 8..y * 8 + 8]) {
@@ -244,7 +274,7 @@ pub(crate) fn idct8x8_store_u16(
     x0: usize,
     y0: usize,
 ) {
-    let t = transform_block(coef, quant, MID_FRACTION_12);
+    let t = transform_block(coef, quant, MID_FRACTION_12, FULL_EXTENT);
     for y in 0..8 {
         let row = &mut out[(y0 + y) * stride + x0..][..8];
         for (o, &v) in row.iter_mut().zip(&t[y * 8..y * 8 + 8]) {
@@ -323,11 +353,56 @@ mod tests {
     }
 
     #[test]
+    fn column_extent_gives_the_full_transform() {
+        use crate::jpeg::dct::extent_of;
+        let mut seed = 0x3C6E_F372u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for trial in 0..20_000 {
+            // Coefficients confined to a random set of columns, from
+            // small levels to the extremes of the 16-bit ranges.
+            let cols = match trial % 4 {
+                0 => 1,
+                1 => 1 << (rnd() % 8),
+                _ => rnd() & 0xFF,
+            };
+            let amp = [8, 300, 32_767][(rnd() % 3) as usize];
+            let mut coef = [0i32; 64];
+            let mut quant = [1u16; 64];
+            for i in 0..64 {
+                if cols & (1 << (i % 8)) != 0 && rnd() % 3 != 0 {
+                    coef[i] = (rnd() % (2 * amp + 1)) as i32 - amp as i32;
+                }
+                quant[i] = if trial % 5 == 0 {
+                    rnd() as u16
+                } else {
+                    1 + (rnd() % 64) as u16
+                };
+            }
+            let full = transform_block(&coef, &quant, MID_FRACTION, FULL_EXTENT);
+            for ext in [extent_of(&coef), cols as Extent | 0xFF00] {
+                assert_eq!(
+                    transform_block(&coef, &quant, MID_FRACTION, ext),
+                    full,
+                    "{trial}"
+                );
+            }
+            let full = transform_block(&coef, &quant, MID_FRACTION_12, FULL_EXTENT);
+            let got = transform_block(&coef, &quant, MID_FRACTION_12, extent_of(&coef));
+            assert_eq!(got, full, "{trial} (12-bit)");
+        }
+    }
+
+    #[test]
     fn dc_only_block_is_flat() {
         let mut coef = [0i32; 64];
         coef[0] = 80; // DC 80 · q 1 → sample offset 80 / 8 = 10
         let mut out = [0u8; 64];
-        idct8x8_store_u8(&coef, &[1; 64], &mut out, 8, 0, 0);
+        idct8x8_store_u8(&coef, FULL_EXTENT, &[1; 64], &mut out, 8, 0, 0);
         assert!(out.iter().all(|&v| v == 138), "{out:?}");
     }
 
@@ -349,7 +424,7 @@ mod tests {
             }
             coef[0] = (next() % 801) as i32 - 400;
             let mut out = [0u8; 64];
-            idct8x8_store_u8(&coef, &[1; 64], &mut out, 8, 0, 0);
+            idct8x8_store_u8(&coef, FULL_EXTENT, &[1; 64], &mut out, 8, 0, 0);
             for y in 0..8 {
                 for x in 0..8 {
                     let mut s = 0.0;

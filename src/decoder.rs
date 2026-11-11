@@ -1429,7 +1429,11 @@ fn render_block_8bit(
 ) {
     use crate::jpeg::fround::round_clamped;
     if idct == IdctMethod::AccurateInteger {
-        crate::jpeg::idct_int::idct8x8_store_u8(block, &qt.values, buf, stride, dst_x0, dst_y0);
+        // A zero quantiser entry only turns coefficients into zeros, so
+        // the extent of the coded block still bounds the dequantised one.
+        crate::jpeg::idct_int::idct8x8_store_u8(
+            block, extent, &qt.values, buf, stride, dst_x0, dst_y0,
+        );
         return;
     }
     if extent & !extent_bit(0) == 0 && !qtf.has_zero {

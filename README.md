@@ -1956,7 +1956,8 @@ cargo bench -p oxideav-mjpeg --bench codec
 
 Fourteen small scenarios plus a `full_size` group (1600 × 1200
 `encode_rgb8` / `decode` / `decode_rgb8` per chroma layout, serial and
-on four workers), each fed by a deterministically-built in-bench
+on four workers, plus replicated-chroma and grey decodes), each fed by
+a deterministically-built in-bench
 fixture (xorshift32 + low-amplitude triangle-wave gradient — no
 committed payload files, no `docs/` reads, no third-party library
 calls):
@@ -2043,6 +2044,61 @@ conversions split into row bands under `threads`. What a serial decode
 of a subsampled stream spends beyond the planar decode is the
 luma-guided reconstruction (see *Chroma reconstruction*);
 `ChromaUpsampling::Replicate` is the cheapest conversion.
+
+Decoder work that followed, same pictures and machine class, serial
+unless noted, before → after in ms (medians of 9 runs at 1600 × 1200
+and of 5 at 12 MP, taken while other builds were running: read them to
+about ±10 %). Every decode mode returns the same bytes as before
+(hashes over the fixture corpus, 15 000 fuzz-corpus inputs and these
+pictures, for the default, replicated, linear, reference-compatible,
+deblocked and threaded paths).
+
+| 1600 × 1200 stream | entropy only (`read_coefficients`) | `decode` (planar) | `decode_rgb8` (luma-guided) | `decode_rgb8`, `Replicate` | `decode_rgb8`, `threads = 4` |
+|---|---|---|---|---|---|
+| baseline 4:2:0 | 1.7 → 1.8 | 3.0 → 3.2 | 11.2 → 7.7 | 7.9 → 5.0 | 7.0 → 5.1 |
+| baseline 4:2:2 | 1.9 → 2.0 | 3.6 → 3.5 | 14.3 → 9.4 | 8.3 → 5.6 | 8.8 → 6.1 |
+| baseline 4:4:4 | 2.5 → 2.5 | 4.9 → 4.4 | 8.4 → 5.9 | | 6.4 → 5.8 |
+| baseline grey | 1.4 → 1.5 | 2.3 → 2.4 | 3.6 → 2.5 | | |
+| progressive 4:2:0 | 5.1 → 4.5 | 7.8 → 6.6 | 15.3 → 11.1 | 12.1 → 8.4 | 11.7 → 9.1 |
+| progressive 4:2:2 | 6.0 → 4.9 | 9.9 → 7.5 | 20.5 → 13.2 | 13.9 → 9.1 | 15.3 → 10.7 |
+| progressive 4:4:4 | 7.0 → 5.7 | 12.4 → 9.1 | 14.8 → 10.4 | | 13.3 → 9.9 |
+| progressive grey | 4.6 → 3.9 | 6.6 → 5.3 | 7.8 → 5.3 | | |
+
+| 12 MP stream | `decode` (planar) | `decode_rgb8` | `decode_rgb8`, `threads = 4` |
+|---|---|---|---|
+| baseline 4:2:0 | 21.9 → 21.5 | 73.7 → 53.0 | 44.9 → 30.2 |
+| baseline 4:2:2 | 24.6 → 23.6 | 92.7 → 63.4 | 56.1 → 35.1 |
+| baseline 4:4:4 | 32.9 → 31.3 | 47.7 → 38.8 | |
+| baseline grey | 18.3 → 17.1 | 27.8 → 18.1 | |
+| progressive 4:2:0 | 53.5 → 44.9 | 101.7 → 78.3 | 77.3 → 59.0 |
+
+Those are 64-bit Arm numbers. The same source built for baseline
+x86-64 — a target with no rounding instruction, where every
+`f32::round` was a library call per sample and the sample loops did
+not vectorise — and run under binary translation on that machine
+(ratios; the absolute times are the translator's): baseline 4:2:0
+`decode` 11.0 → 4.2 ms, progressive 18.1 → 11.0 ms, `decode_rgb8`
+4:2:0 about 3× (4:2:2 3.8×, 4:4:4 2.3×, grey 4.8×).
+
+What changed: the luma-guided reconstruction is a stream of rows that
+forms each chroma row's statistics once for both components and keeps
+three rows of them instead of whole planes; the YCbCr kernel converts
+16 pixels at a time in 32-bit integers without a division; sample
+rounding, minima and maxima need no library call; the IDCT leaves out
+the rows / columns the entropy decoder reports empty (a DC-only block
+is one value); a progressive frame keeps each block's non-zero
+positions as a bit mask across scans; grey and packed-RGB pictures
+convert by rows.
+
+Where a serial baseline 4:2:0 `decode_rgb8` spends its time now
+(sampling profile; before in brackets): chroma reconstruction 34 %
+(48 %), YCbCr kernel and pixel store 21 % (24 %), entropy decode 19 %
+(13 %), dequantisation + IDCT + sample store 19 % (13 %), the rest
+7 % (2 %). Entropy decode is one table load per symbol, about 2.3 ns:
+the load and the shift it feeds are a dependency chain, so it does not
+get faster without decoding two symbols per step. Progressive planar
+decode: refinement scans 46 % (49 %), dequantisation + IDCT + store
+32 % (33 %), block walk 8 %, first-pass AC 6 %, DC 4 %.
 
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the

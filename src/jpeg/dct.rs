@@ -155,7 +155,6 @@ pub fn idct8x8(block: &mut [f32; 64]) {
 pub(crate) type Extent = u16;
 
 /// The [`Extent`] of a block about which nothing is known.
-#[cfg(test)]
 pub(crate) const FULL_EXTENT: Extent = 0xFFFF;
 
 /// The [`Extent`] bits of the coefficient at natural index `i`.

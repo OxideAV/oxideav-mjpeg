@@ -521,7 +521,11 @@ mod registry_benches {
     /// `decode` / `decode_rgb8` of the default stream, serial and on
     /// four workers.
     fn bench_full_size(c: &mut Criterion) {
-        use oxideav_mjpeg::{ChromaSubsampling, DecodeOptions, EncodeOptions, Quantisation};
+        use oxideav_mjpeg::image::Plane;
+        use oxideav_mjpeg::{
+            ChromaSubsampling, ChromaUpsampling, DecodeOptions, EncodeOptions, JpegImage,
+            MjpegPixelFormat, Quantisation,
+        };
         let mut group = c.benchmark_group("full_size");
         group.sample_size(20);
         let (w, h) = (1600u32, 1200u32);
@@ -578,6 +582,45 @@ mod registry_benches {
                     );
                 }
             }
+        }
+        // The cheapest conversion of a subsampled stream, and a grey
+        // picture (no colour conversion at all).
+        let jpeg = oxideav_mjpeg::encode_rgb8(
+            w,
+            h,
+            &rgb,
+            &EncodeOptions::new()
+                .with_quality(85)
+                .with_chroma(ChromaSubsampling::Yuv420),
+        )
+        .expect("encode for the decode bench");
+        let replicate = DecodeOptions::new().with_upsampling(ChromaUpsampling::Replicate);
+        group.bench_function("decode_rgb8_1600x1200_420_baseline_replicate", |b| {
+            b.iter(|| {
+                black_box(
+                    oxideav_mjpeg::decode_rgb8_with(black_box(&jpeg), &replicate).expect("decode"),
+                )
+            })
+        });
+        let luma: Vec<u8> = rgb.as_chunks::<3>().0.iter().map(|p| p[1]).collect();
+        let grey = JpegImage::new(
+            w,
+            h,
+            MjpegPixelFormat::Gray8,
+            vec![Plane::new(w as usize, luma)],
+        )
+        .expect("grey image");
+        for (pname, progressive) in [("baseline", false), ("progressive", true)] {
+            let opts = EncodeOptions::new()
+                .with_quality(85)
+                .with_progressive(progressive);
+            let jpeg = oxideav_mjpeg::encode(&grey, &opts).expect("encode grey");
+            group.bench_function(format!("decode_1600x1200_grey_{pname}"), |b| {
+                b.iter(|| black_box(oxideav_mjpeg::decode(black_box(&jpeg)).expect("decode")))
+            });
+            group.bench_function(format!("decode_rgb8_1600x1200_grey_{pname}"), |b| {
+                b.iter(|| black_box(oxideav_mjpeg::decode_rgb8(black_box(&jpeg)).expect("decode")))
+            });
         }
         group.finish();
     }

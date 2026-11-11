@@ -23,6 +23,7 @@ use crate::jpeg::arith::{
     decode_ac as arith_decode_ac, decode_ac_refine as arith_decode_ac_refine,
     decode_dc_diff as arith_decode_dc_diff, decode_fixed_bit as arith_decode_fixed_bit,
     decode_lossless_diff as arith_decode_lossless_diff,
+    settled_lossless_diff as arith_settled_lossless_diff,
 };
 use crate::jpeg::dct::{
     Extent, ZIGZAG_EXTENT_UP_TO, extent_bit, extent_of, idct8x8, idct8x8_within,
@@ -6125,22 +6126,104 @@ fn decode_lossless_arith_scan_planes(
     lossless_arith_planes(state, sos, scan, differential, skip)
 }
 
-/// [`decode_lossless_arith_scan_planes`]. With `skip_settled_tail` a
-/// frame whose code string ends before its samples do stops decoding
-/// once every remaining difference is known to be zero, and writes the
-/// predictions directly (same samples; the flag exists for the
-/// differential test).
+/// Per table destination: the difference a sample codes for each
+/// (class of `Da`, class of `Db`) pair once the code string is over
+/// ([`settled_tail`]).
+type SettledTail = [[[i32; 5]; 5]; 4];
+
+/// The class of each [`SettledTail`] difference.
+type TailClasses = [[[u8; 5]; 5]; 4];
+
+/// The class rows of a scan that reads its differences from a
+/// [`SettledTail`]: per component, the classes of the line above and
+/// of the line being written.
+struct TailRows {
+    class_of: TailClasses,
+    above: Vec<Vec<u8>>,
+    line: Vec<Vec<u8>>,
+}
+
+/// The differences every remaining sample of a lossless arithmetic scan
+/// will code, when they no longer depend on data.
 ///
-/// An encoder's flush discards trailing zero bytes (§D.1.8), so a
-/// frame's last lines may have no code bytes of their own — and a
-/// segment a few bytes long can stand for a frame of any size. When the
-/// code string is over ([`ArithDecoder::code_string_over`]) the
-/// decisions no longer depend on data. At the start of a line, if the
-/// line above coded only zero differences and the zero-difference
-/// decision of the `(Da, Db) = (0, 0)` context is settled on zero for
-/// every component, then the first sample decodes a zero difference,
-/// which leaves the next sample in the same context, and so on to the
-/// end of the frame: every remaining sample is its prediction.
+/// With the code string over ([`ArithDecoder::code_string_over`]) a
+/// decision in a settled context is that context's more probable symbol
+/// ([`crate::jpeg::arith::SETTLED`]), and taking it keeps the context
+/// settled with the same sense. A sample's decisions are selected by
+/// the classes of its two neighbouring differences (Figure H.2: five
+/// classes each), so if every decision on the way is settled, the pair
+/// of classes fixes the difference
+/// ([`crate::jpeg::arith::settled_lossless_diff`]).
+///
+/// Starting from the classes present in the line above (`above`, per
+/// component) and the zero class (the line start has no left
+/// neighbour), the reachable classes are closed under "the difference
+/// a reachable pair codes": if every reachable pair is settled, every
+/// sample still to come finds its difference in the table. `None` when
+/// a reachable pair meets an unsettled decision — the scan then goes on
+/// decision by decision and asks again at the next line.
+fn settled_tail(
+    stats: &[LosslessStats; 4],
+    dest: &[usize],
+    above: &[Vec<i32>],
+) -> Option<SettledTail> {
+    let mut table = [[[0i32; 5]; 5]; 4];
+    for d in 0..4 {
+        if !dest.contains(&d) {
+            continue;
+        }
+        let st = &stats[d];
+        // A difference of each class (`LosslessStats::classify`: zero up
+        // to the lower bound, small up to `2^U`, large beyond both). A
+        // class the bounds leave empty is never reached.
+        let lower = if st.l == 0 { 0 } else { 1i32 << (st.l - 1) };
+        let upper = 1i32 << st.u;
+        let large = lower.max(upper) + 1;
+        let reps = [0, upper, -upper, large, -large];
+        let mut reach = [false; 5];
+        reach[0] = true;
+        for (ci, row) in above.iter().enumerate() {
+            if dest[ci] == d {
+                for &v in row {
+                    reach[st.classify(v)] = true;
+                }
+            }
+        }
+        let mut done = [[false; 5]; 5];
+        loop {
+            let mut grew = false;
+            for ca in 0..5 {
+                for cb in 0..5 {
+                    if !(reach[ca] && reach[cb]) || done[ca][cb] {
+                        continue;
+                    }
+                    debug_assert!(st.classify(reps[ca]) == ca && st.classify(reps[cb]) == cb);
+                    let v = arith_settled_lossless_diff(st, reps[ca], reps[cb])?;
+                    table[d][ca][cb] = v;
+                    done[ca][cb] = true;
+                    let k = st.classify(v);
+                    grew |= !reach[k];
+                    reach[k] = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
+    Some(table)
+}
+
+/// [`decode_lossless_arith_scan_planes`]. With `skip_settled_tail` a
+/// frame whose code string ends before its samples do stops running the
+/// arithmetic decoder once every remaining difference is known
+/// ([`settled_tail`]) and reads the differences from a table (same
+/// samples; the flag exists for the differential test).
+///
+/// An encoder's flush discards trailing zero bytes (§D.1.8), so the
+/// last lines of a frame may have no code bytes of their own — and a
+/// segment a few bytes long can stand for a frame of any size (a flat
+/// picture codes zero differences throughout, a ramp a constant one).
 fn lossless_arith_planes(
     state: &JpegState,
     sos: &SosInfo,
@@ -6213,54 +6296,80 @@ fn lossless_arith_planes(
     let mut samples_since_restart: u32 = 0;
     let mut reset_pred = true; // true at scan start and after each RSTn
     let mut first_line_y = 0usize; // first line of the current restart interval
-    // The line above coded no non-zero difference (true before the first
-    // line: the history starts at zero).
-    let mut above_all_zero = true;
-    let mut tail_zero = false;
+    // Once the code string is over and every reachable decision is
+    // settled: per table destination, the difference each (Da class,
+    // Db class) pair codes.
+    let mut tail: Option<SettledTail> = None;
+    // The class rows, from the line after the one the table took over on.
+    let mut tail_rows: Option<TailRows> = None;
 
     for y in 0..height {
         if skip_settled_tail
-            && !tail_zero
-            && above_all_zero
+            && tail.is_none()
             && state.restart_interval == 0
             && decoder.code_string_over()
-            && dest.iter().all(|&d| {
-                let st = &stats[d];
-                st.classify(0) == 0 && st.bins[0].settled_on_zero()
-            })
         {
-            tail_zero = true;
-        } else if tail_zero {
-            // A whole line of predictions (the line the tail began on
-            // took the general loop below, which knows the first-line
-            // and first-sample rules).
-            for plane in samples.iter_mut() {
-                let (done, rest) = plane.split_at_mut(y * width);
+            // `prev_diff` holds the line above (zeros before the first).
+            tail = settled_tail(&stats, &dest, &prev_diff);
+            #[cfg(test)]
+            if tail.is_some() && y + 1 < height {
+                tail_skip_test::TAKEN.with(|n| n.set(n.get() + 1));
+            }
+        } else if let Some(table) = &tail {
+            // The line the table took over on went through the general
+            // loop below (it knows the first-line and first-sample
+            // rules); every later one is a walk over the class pairs.
+            let rows = tail_rows.get_or_insert_with(|| TailRows {
+                class_of: std::array::from_fn(|d| {
+                    table[d].map(|row| row.map(|v| stats[d].classify(v) as u8))
+                }),
+                above: (0..nc)
+                    .map(|ci| {
+                        let st = &stats[dest[ci]];
+                        prev_diff[ci]
+                            .iter()
+                            .map(|&v| st.classify(v) as u8)
+                            .collect()
+                    })
+                    .collect(),
+                line: vec![vec![0u8; width]; nc],
+            });
+            for ci in 0..nc {
+                let (t, k) = (&table[dest[ci]], &rows.class_of[dest[ci]]);
+                let (done, rest) = samples[ci].split_at_mut(y * width);
                 let above = &done[(y - 1) * width..];
                 let line = &mut rest[..width];
-                if differential {
-                    // No prediction: the sample is the zero difference.
-                    line.fill(0);
-                    continue;
-                }
-                line[0] = above[0] & sample_mask;
-                for x in 1..width {
-                    let (ra, rb, rc) = (line[x - 1], above[x], above[x - 1]);
-                    let pred = match predictor {
-                        1 => ra,
-                        2 => rb,
-                        3 => rc,
-                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
-                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
-                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
-                        _ => (ra.wrapping_add(rb)) >> 1,
+                let (cb_row, ca_row) = (&rows.above[ci][..width], &mut rows.line[ci][..width]);
+                // No left neighbour: Da = 0. Prediction from above (Rb),
+                // or none in a differential frame.
+                let mut ca = 0usize;
+                for x in 0..width {
+                    let cb = cb_row[x] as usize;
+                    let diff = t[ca][cb] as u32;
+                    ca = k[ca][cb] as usize;
+                    ca_row[x] = ca as u8;
+                    let pred = if differential {
+                        0
+                    } else if x == 0 {
+                        above[0]
+                    } else {
+                        let (ra, rb, rc) = (line[x - 1], above[x], above[x - 1]);
+                        match predictor {
+                            1 => ra,
+                            2 => rb,
+                            3 => rc,
+                            4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                            5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                            6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                            _ => (ra.wrapping_add(rb)) >> 1,
+                        }
                     };
-                    line[x] = pred & sample_mask;
+                    line[x] = pred.wrapping_add(diff) & sample_mask;
                 }
+                std::mem::swap(&mut rows.above[ci], &mut rows.line[ci]);
             }
             continue;
         }
-        let mut line_nonzero = 0i32;
         for x in 0..width {
             if state.restart_interval != 0
                 && samples_since_restart != 0
@@ -6315,17 +6424,14 @@ fn lossless_arith_planes(
                     }
                 };
 
-                let diff = if tail_zero {
-                    0
-                } else {
-                    let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
-                    let db = prev_diff[ci][x];
-                    let diff =
-                        arith_decode_lossless_diff(&mut decoder, &mut stats[dest[ci]], da, db)?;
-                    cur_diff[ci][x] = diff;
-                    line_nonzero |= diff;
-                    diff
+                let da = if x == 0 { 0 } else { cur_diff[ci][x - 1] };
+                let db = prev_diff[ci][x];
+                let st = &mut stats[dest[ci]];
+                let diff = match &tail {
+                    Some(t) => t[dest[ci]][st.classify(da)][st.classify(db)],
+                    None => arith_decode_lossless_diff(&mut decoder, st, da, db)?,
                 };
+                cur_diff[ci][x] = diff;
 
                 let sv = ((pred as i32).wrapping_add(diff) as u32) & sample_mask;
                 samples[ci][y * width + x] = sv;
@@ -6333,7 +6439,6 @@ fn lossless_arith_planes(
             reset_pred = false;
             samples_since_restart += 1;
         }
-        above_all_zero = line_nonzero == 0;
         std::mem::swap(&mut prev_diff, &mut cur_diff);
     }
 
@@ -6839,6 +6944,8 @@ mod tail_skip_test {
     thread_local! {
         /// Decode the tail of an ended code string decision by decision.
         pub(super) static DISABLED: Cell<bool> = const { Cell::new(false) };
+        /// Scans that switched to the table with lines still to come.
+        pub(super) static TAKEN: Cell<u32> = const { Cell::new(0) };
     }
 
     /// The decoded planes, or `None` for a refused stream.
@@ -6862,6 +6969,61 @@ mod tail_skip_test {
         stream[i + 7..i + 9].copy_from_slice(&w.to_be_bytes());
     }
 
+    /// Hierarchical arithmetic lossless sequences: the differential
+    /// frames (no prediction, §J.2.3.2) go through the same scan decoder.
+    /// Flat and ramp pictures leave every frame after the first with an
+    /// all-zero or constant tail.
+    #[test]
+    fn settled_tail_in_differential_frames() {
+        use crate::encoder::encode_hierarchical_lossless_arith_jpeg_grayscale;
+        let mut seed = 0x1B87_3593u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        TAKEN.with(|n| n.set(0));
+        let mut decoded = 0;
+        for trial in 0..300 {
+            let (w, h) = (8 * (1 + rnd() % 6), 8 * (1 + rnd() % 6));
+            let style = trial % 4;
+            let base = rnd() as u8;
+            let px: Vec<u8> = (0..w * h)
+                .map(|i| match style {
+                    0 => base,
+                    1 => (i % w) as u8,
+                    2 if i / w < h / 3 => rnd() as u8,
+                    2 => base,
+                    _ => rnd() as u8,
+                })
+                .collect();
+            let levels = 2 + (rnd() % 2) as u8;
+            let predictor = 1 + (rnd() % 7) as u8;
+            let Ok(mut stream) = encode_hierarchical_lossless_arith_jpeg_grayscale(
+                w, h, &px, w as usize, 8, predictor, levels,
+            ) else {
+                continue;
+            };
+            // As written, and with noise in the last bytes of the
+            // sequence (the final differential frame's code string).
+            if trial % 3 == 2 {
+                let n = stream.len();
+                for b in stream[n - 6..n - 2].iter_mut() {
+                    *b = (rnd() % 251) as u8;
+                }
+            }
+            let (fast, plain) = both(&stream);
+            assert_eq!(fast, plain, "trial {trial}: {w}x{h} levels {levels}");
+            decoded += usize::from(fast.is_some());
+        }
+        let taken = TAKEN.with(|n| n.get());
+        assert!(
+            decoded > 150 && taken > 100,
+            "{decoded} decoded, table used {taken} times"
+        );
+    }
+
     #[test]
     fn settled_tail_is_the_decision_by_decision_decode() {
         let mut seed = 0x7F4A_7C15u32;
@@ -6872,24 +7034,31 @@ mod tail_skip_test {
             seed
         };
         let (mut skipped_same, mut cases) = (0, 0);
-        for trial in 0..600 {
+        TAKEN.with(|n| n.set(0));
+        for trial in 0..3000 {
             let (w, h) = (1 + rnd() % 24, 1 + rnd() % 24);
+            let w = if trial % 17 == 0 { 1 + rnd() % 2 } else { w };
             let predictor = 1 + (rnd() % 7) as u8;
             let precision = [8u8, 8, 12, 16][(rnd() % 4) as usize];
             // Flat, banded and noisy content (flat tails end the code
             // string early; noise keeps it alive).
-            let style = rnd() % 4;
+            let style = rnd() % 6;
             let n = (w * h) as usize;
             let bytes = if precision > 8 { 2 } else { 1 };
             let mut px = vec![0u8; n * bytes];
             let base = rnd() as u8;
             for (i, s) in px.chunks_exact_mut(bytes).enumerate() {
                 let row = i / w as usize;
+                let col = i % w as usize;
                 let v = match style {
                     0 => base,
                     1 if row < h as usize / 2 => rnd() as u8,
                     1 => base,
-                    2 => (i % w as usize) as u8,
+                    // Ramps along either axis and both: constant
+                    // non-zero differences.
+                    2 => (col * 3) as u8,
+                    3 => (row * 5) as u8,
+                    4 => (col * 2 + row * 7) as u8,
                     _ => rnd() as u8,
                 };
                 s[0] = v;
@@ -6938,6 +7107,15 @@ mod tail_skip_test {
                 }
                 _ => {}
             }
+            // Any conditioning bounds (the decode is then of a different
+            // picture, by both routes).
+            if trial % 7 == 3 {
+                let u = (rnd() % 16) as u8;
+                let l = (rnd() % (u as u32 + 1)) as u8;
+                let sos = stream.windows(2).rposition(|m| m == [0xFF, 0xDA]).unwrap();
+                let dac = [0xFF, 0xCC, 0x00, 0x04, 0x00, l | (u << 4)];
+                stream.splice(sos..sos, dac);
+            }
             let (fast, plain) = both(&stream);
             assert_eq!(
                 fast, plain,
@@ -6949,6 +7127,13 @@ mod tail_skip_test {
         assert!(
             skipped_same > cases / 2,
             "{skipped_same} of {cases} decoded"
+        );
+        // (The fast route runs first in `both`, so each stream counts
+        // at most once per scan.)
+        let taken = TAKEN.with(|n| n.get());
+        assert!(
+            taken > cases as u32 / 8,
+            "table used in {taken} of {cases} streams"
         );
     }
 }

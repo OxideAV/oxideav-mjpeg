@@ -1217,6 +1217,62 @@ pub fn decode_lossless_diff(
     Ok(if sign != 0 { -v } else { v })
 }
 
+/// The difference [`decode_lossless_diff`] returns for `(da, db)` once
+/// the code string is over ([`ArithDecoder::code_string_over`]), when
+/// every decision on the way is taken in a settled context
+/// ([`SETTLED`]) and is therefore that context's more probable symbol;
+/// `None` when one is not (or the magnitude tree would overflow).
+///
+/// Such decisions change no context's sense and keep every visited
+/// context settled, so the answer holds for every later sample with the
+/// same `(da, db)` classes.
+pub fn settled_lossless_diff(st: &LosslessStats, da: i32, db: i32) -> Option<i32> {
+    let bit = |i: usize| -> Option<u8> {
+        let c = st.bins[i];
+        SETTLED[c.idx as usize].then_some(c.mps)
+    };
+    let s0 = st.s0(da, db);
+    if bit(s0)? == 0 {
+        return Some(0);
+    }
+    let sign = bit(s0 + 1)?;
+    // The magnitude tree of `decode_magnitude` in its DC layout.
+    let x1 = st.x1(db);
+    let mut s = s0 + 2 + sign as usize;
+    let (mut m, mut category) = (1i32, 0u32);
+    if bit(s)? != 0 {
+        (m, s, category) = (2, x1, 1);
+        if bit(s)? != 0 {
+            (m, s, category) = (4, x1 + 1, 2);
+            while bit(s)? != 0 {
+                m <<= 1;
+                s += 1;
+                category += 1;
+                if category > 15 {
+                    return None;
+                }
+            }
+        }
+    }
+    let sz = match category {
+        0 => 0,
+        1 => 1,
+        _ => {
+            // The leading one, then `category − 2` bits that are all the
+            // same decision of the `M` bin.
+            let lead = m >> 1;
+            let low = lead - 1;
+            if low != 0 && bit(s + 14)? != 0 {
+                lead | low
+            } else {
+                lead
+            }
+        }
+    };
+    let v = sz + 1;
+    Some(if sign != 0 { -v } else { v })
+}
+
 /// Encode one lossless prediction difference — the encoder-side mirror of
 /// [`decode_lossless_diff`] (T.81 §H.1.2.3, Table H.3). `v` must be the
 /// modulo-2^16 difference reduced to the representative range
@@ -1631,6 +1687,64 @@ mod tests {
         let mut ctx = Context { idx: 0, mps: 0 };
         let first: Vec<u8> = (0..4).map(|_| d.decode(&mut ctx)).collect();
         assert!(first.contains(&1), "{first:?}");
+    }
+
+    #[test]
+    fn settled_difference_is_what_the_decoder_returns() {
+        // Random statistics areas (states drawn mostly from the settled
+        // ones, any sense), random conditioning and neighbours: whenever
+        // the evaluation answers, the decoder on an ended code string
+        // returns that difference again and again and stays ended.
+        let settled: Vec<u8> = (0..113u8).filter(|&i| SETTLED[i as usize]).collect();
+        let mut seed = 0x51ED_270Bu32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let (mut answered, mut nonzero, mut large) = (0, 0, 0);
+        for trial in 0..40_000 {
+            let mut st = LosslessStats::new();
+            (st.l, st.u) = [(0, 1), (1, 3), (0, 0), (2, 9)][(rnd() % 4) as usize];
+            for b in st.bins.iter_mut() {
+                let idx = if rnd() % 16 == 0 {
+                    (rnd() % 113) as u8
+                } else {
+                    settled[(rnd() as usize) % settled.len()]
+                };
+                // Mostly "more decisions" so that long magnitude walks
+                // occur; a zero ends them.
+                let mps = u8::from(rnd() % 8 != 0);
+                *b = Context { idx, mps };
+            }
+            if trial % 3 == 0 {
+                st.bins[(rnd() % 100) as usize].mps = 0;
+            }
+            let pick = |r: u32| [0, 1, -1, 2, -3, 9, -700, 32_767, -32_768][(r % 9) as usize];
+            let (da, db) = (pick(rnd()), pick(rnd()));
+            let Some(want) = settled_lossless_diff(&st, da, db) else {
+                continue;
+            };
+            answered += 1;
+            nonzero += usize::from(want != 0);
+            large += usize::from(want.unsigned_abs() > 2);
+            let mut d = ArithDecoder::new(&[]);
+            d.a = [0u32, 0x8000, 0xC123, 0xFFFF][(rnd() % 4) as usize];
+            let mut live = st.clone();
+            for _ in 0..300 {
+                let got = decode_lossless_diff(&mut d, &mut live, da, db).unwrap();
+                assert_eq!(got, want, "trial {trial}: da {da} db {db}");
+                assert!(d.code_string_over());
+            }
+            // The contexts kept their senses and stay settled wherever
+            // they moved.
+            assert_eq!(settled_lossless_diff(&live, da, db), Some(want));
+        }
+        assert!(
+            answered > 5_000 && nonzero > 2_000 && large > 500,
+            "{answered} {nonzero} {large}"
+        );
     }
 
     #[test]

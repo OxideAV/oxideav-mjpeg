@@ -2096,14 +2096,15 @@ positions as a bit mask across scans; grey and packed-RGB pictures
 convert by rows.
 
 Where a serial baseline 4:2:0 `decode_rgb8` spends its time now
-(sampling profile; before in brackets): chroma reconstruction 34 %
-(48 %), YCbCr kernel and pixel store 21 % (24 %), entropy decode 19 %
-(13 %), dequantisation + IDCT + sample store 19 % (13 %), the rest
-7 % (2 %). Entropy decode is one table load per symbol, about 2.3 ns:
+(sampling profile; before in brackets): chroma reconstruction 35 %
+(47 %), YCbCr kernel and pixel store 21 % (23 %), entropy decode 19 %
+(15 %), dequantisation + IDCT + sample store 19 % (12 %), the rest
+6 % (3 %). Entropy decode is one table load per symbol, about 2.4 ns:
 the load and the shift it feeds are a dependency chain, so it does not
-get faster without decoding two symbols per step. Progressive planar
-decode: refinement scans 46 % (49 %), dequantisation + IDCT + store
-32 % (33 %), block walk 8 %, first-pass AC 6 %, DC 4 %.
+get faster without resolving two symbols per step. Progressive planar
+decode: refinement scans 48 % (50 %), dequantisation + IDCT + store
+31 % (33 %), first-pass AC 7 %, block walk 6 %, DC 4 %. It is not
+memory-bound: 3.3, 3.4 and 3.7 ns per pixel at 0.12, 1.9 and 12 MP.
 
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the

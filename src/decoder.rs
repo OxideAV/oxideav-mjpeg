@@ -24,7 +24,9 @@ use crate::jpeg::arith::{
     decode_dc_diff as arith_decode_dc_diff, decode_fixed_bit as arith_decode_fixed_bit,
     decode_lossless_diff as arith_decode_lossless_diff,
 };
-use crate::jpeg::dct::idct8x8;
+use crate::jpeg::dct::{
+    Extent, ZIGZAG_EXTENT_UP_TO, extent_bit, extent_of, idct8x8, idct8x8_within,
+};
 use crate::jpeg::huffman::{HuffTable, parse_dht};
 use crate::jpeg::markers::{self, *};
 use crate::jpeg::parser::{
@@ -732,6 +734,9 @@ fn walk_stream(mut state: JpegState, data: &[u8]) -> Result<Walked> {
     // baseline scan turns out to be non-interleaved. One [i32;64] per block
     // per component, in natural order.
     let mut coef_buf: Vec<Vec<[i32; 64]>> = Vec::new();
+    // Progressive Huffman frames: per block, the zig-zag positions of its
+    // non-zero AC coefficients (`NzMasks`), kept current scan after scan.
+    let mut nz_masks: NzMasks = Vec::new();
 
     loop {
         let Some(marker) = walker.next_marker()? else {
@@ -823,6 +828,7 @@ fn walk_stream(mut state: JpegState, data: &[u8]) -> Result<Walked> {
                     ));
                 }
                 coef_buf = init_coef_buffers(&sof)?;
+                nz_masks = coef_buf.iter().map(|c| vec![0u64; c.len()]).collect();
                 state.sof = Some(sof);
                 state.sof_marker = marker;
                 state.progressive = true;
@@ -959,7 +965,7 @@ fn walk_stream(mut state: JpegState, data: &[u8]) -> Result<Walked> {
                     decode_arith_scan(&state, &sos, scan, &mut coef_buf)?;
                     // Continue — more scans or EOI follow.
                 } else if state.progressive {
-                    decode_progressive_scan(&state, &sos, scan, &mut coef_buf)?;
+                    decode_progressive_scan(&state, &sos, scan, &mut coef_buf, &mut nz_masks)?;
                     // Continue — more scans or EOI follow.
                 } else {
                     let sof = state
@@ -1370,11 +1376,24 @@ fn extend(value: i32, size: u32) -> i32 {
     }
 }
 
+/// A quantisation table as the float IDCT path multiplies by it.
+struct QuantF32 {
+    /// The table in `f32` (exact: every `u16` is representable).
+    q: [f32; 64],
+    /// The table has a zero entry (outside T.81 §B.2.4.1's `1..`). A
+    /// coefficient under one dequantises to zero, so where the coded
+    /// coefficients lie no longer tells which dequantised ones are zero.
+    has_zero: bool,
+}
+
 /// Convert a quant table to f32 once per scan so the per-block dequantise
 /// loop skips the u16 → f32 conversion. The conversion is exact (every u16
 /// is representable in f32), so hoisting it cannot change any product.
-fn quant_to_f32(qt: &QuantTable) -> [f32; 64] {
-    std::array::from_fn(|k| qt.values[k] as f32)
+fn quant_to_f32(qt: &QuantTable) -> QuantF32 {
+    QuantF32 {
+        q: std::array::from_fn(|k| qt.values[k] as f32),
+        has_zero: qt.values.contains(&0),
+    }
 }
 
 /// Dequantise one natural-order coefficient block, inverse-DCT it, and
@@ -1383,12 +1402,14 @@ fn quant_to_f32(qt: &QuantTable) -> [f32; 64] {
 /// (`decode_scan`) and the coefficient-accumulator render
 /// (`render_from_coefs`).
 ///
-/// The arithmetic is exactly the historical inline sequence — dequantise
-/// in f32 (avoids i32 overflow when a Pq=1 16-bit quantiser meets a
-/// coefficient at the top of its range), `idct8x8`, `+ 128.0` level shift,
-/// `<= 0.0` / `>= 255.0` clamp, `round()` — so the output is bit-identical;
-/// the store loop walks 8-sample row slices so the bounds check runs once
-/// per row instead of once per sample.
+/// The arithmetic is the historical sequence — dequantise in f32 (avoids
+/// i32 overflow when a Pq=1 16-bit quantiser meets a coefficient at the
+/// top of its range), the §A.3.3 IDCT, `+ 128.0` level shift, limit to
+/// `0.0..=255.0`, round half away from zero — so the output is
+/// bit-identical. `extent` says where the block's non-zero coefficients
+/// are ([`crate::jpeg::dct::Extent`]): a block with only its DC
+/// coefficient is one sample value written 64 times, and the transform
+/// leaves out the passes' zero terms.
 ///
 /// With [`IdctMethod::AccurateInteger`] the block goes through the
 /// fixed-point transform of [`crate::jpeg::idct_int`] instead (dequantised
@@ -1397,7 +1418,8 @@ fn quant_to_f32(qt: &QuantTable) -> [f32; 64] {
 #[allow(clippy::too_many_arguments)]
 fn render_block_8bit(
     block: &[i32; 64],
-    qtf: &[f32; 64],
+    extent: Extent,
+    qtf: &QuantF32,
     qt: &QuantTable,
     idct: IdctMethod,
     buf: &mut [u8],
@@ -1405,22 +1427,35 @@ fn render_block_8bit(
     dst_x0: usize,
     dst_y0: usize,
 ) {
+    use crate::jpeg::fround::round_clamped;
     if idct == IdctMethod::AccurateInteger {
         crate::jpeg::idct_int::idct8x8_store_u8(block, &qt.values, buf, stride, dst_x0, dst_y0);
         return;
     }
+    if extent & !extent_bit(0) == 0 && !qtf.has_zero {
+        // Every sample is `S(0, 0) / 8`, as `idct8x8` makes it.
+        let v = (block[0] as f32 * qtf.q[0]) * 0.125;
+        let sample = round_clamped(v + 128.0, 255.0) as u8;
+        for j in 0..8 {
+            buf[(dst_y0 + j) * stride + dst_x0..][..8].fill(sample);
+        }
+        return;
+    }
     let mut fblock = [0.0f32; 64];
     for k in 0..64 {
-        fblock[k] = block[k] as f32 * qtf[k];
+        fblock[k] = block[k] as f32 * qtf.q[k];
     }
-    idct8x8(&mut fblock);
+    if qtf.has_zero {
+        idct8x8(&mut fblock);
+    } else {
+        idct8x8_within(&mut fblock, extent);
+    }
     for j in 0..8 {
         let dst = &mut buf[(dst_y0 + j) * stride + dst_x0..][..8];
         let src = &fblock[j * 8..j * 8 + 8];
-        // `v ≤ 0 → 0`, `v ≥ 255 → 255`, else `round(v)`, branch-free
-        // (`v` is never NaN).
+        // `(f + 128).clamp(0, 255).round()`, without a rounding call.
         for (out, &f) in dst.iter_mut().zip(src) {
-            *out = (f + 128.0).clamp(0.0, 255.0).round() as u8;
+            *out = round_clamped(f + 128.0, 255.0) as u8;
         }
     }
 }
@@ -1496,7 +1531,7 @@ fn decode_scan_parallel(
     sos_map: &[usize],
     dc_tables: &[&HuffTable],
     ac_tables: &[&HuffTable],
-    quant_f32: &[[f32; 64]],
+    quant_f32: &[QuantF32],
     quant_tables: &[&QuantTable],
     (mcus_x, mcus_y): (usize, usize),
     comp_buf: &mut [Vec<u8>],
@@ -1542,7 +1577,7 @@ fn decode_scan_parallel(
             for m in seg * ri..((seg + 1) * ri).min(total) {
                 for (bi, &(sidx, ci, _, _)) in layout.iter().enumerate() {
                     block.fill(0);
-                    decode_block(
+                    let extent = decode_block(
                         &mut br,
                         dc_tables[sidx],
                         ac_tables[sidx],
@@ -1553,6 +1588,7 @@ fn decode_scan_parallel(
                     let base = ((m - m0) * layout.len() + bi) * 64;
                     render_block_8bit(
                         &block,
+                        extent,
                         &quant_f32[ci],
                         quant_tables[ci],
                         state.idct,
@@ -1728,7 +1764,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
         })
         .collect::<Result<Vec<_>>>()?;
     // Per-component quantisers in f32, converted once for the whole scan.
-    let quant_f32: Vec<[f32; 64]> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
+    let quant_f32: Vec<QuantF32> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
 
     let parallel = state.threads > 1
         && state.restart_interval != 0
@@ -1805,7 +1841,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                 for by in 0..c.v_factor as usize {
                     for bx in 0..c.h_factor as usize {
                         let mut block = [0i32; 64];
-                        decode_block(
+                        let extent = decode_block(
                             &mut br,
                             dc_tables[sidx],
                             ac_tables[sidx],
@@ -1817,6 +1853,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                         let dst_y0 = my * 8 * c.v_factor as usize + by * 8;
                         render_block_8bit(
                             &block,
+                            extent,
                             &quant_f32[*sof_idx],
                             quant_tables[*sof_idx],
                             state.idct,
@@ -2149,13 +2186,15 @@ fn huff_step(br: &mut BitReader<'_>, t: &HuffTable) -> Result<(u8, Option<i32>)>
     Ok((decode_huff(br, t)?, None))
 }
 
+/// Decode one sequential block into `out_natural` (zeroed by the
+/// caller); returns the [`Extent`] of what was placed.
 fn decode_block(
     br: &mut BitReader<'_>,
     dc: &HuffTable,
     ac: &HuffTable,
     prev_dc: &mut i32,
     out_natural: &mut [i32; 64],
-) -> Result<()> {
+) -> Result<Extent> {
     // DC.
     let (t, v) = huff_step(br, dc)?;
     let dc_diff = match v {
@@ -2169,6 +2208,9 @@ fn decode_block(
     };
     *prev_dc = prev_dc.wrapping_add(dc_diff);
     out_natural[0] = *prev_dc;
+    // Where the non-zero coefficients land (the DC position always
+    // counts: its bits are the ones a DC-only block is recognised by).
+    let mut last = 0;
     // AC: zigzag run-length decode into natural order.
     let mut k: usize = 1;
     while k < 64 {
@@ -2196,9 +2238,10 @@ fn decode_block(
             }
         };
         out_natural[ZIGZAG[k]] = val;
+        last = k;
         k += 1;
     }
-    Ok(())
+    Ok(ZIGZAG_EXTENT_UP_TO[last])
 }
 
 // ---- Non-interleaved baseline / extended-sequential ---------------------
@@ -2943,13 +2986,23 @@ fn prog_arith_decode_dc(
 // The output of each scan is accumulated into the per-component coefficient
 // plane. Once EOI is reached, we dequantise + inverse-DCT each block.
 
+/// Per component, per block: bit `k` set when the AC coefficient at
+/// zig-zag position `k` is non-zero. A progressive frame's Huffman AC
+/// scans keep it current (a first pass and a refinement only ever turn
+/// zero coefficients into non-zero ones), so a refinement scan knows a
+/// block's history without reading its 64 coefficients back — most
+/// blocks of a late scan are inside an end-of-band run with little or
+/// nothing to correct.
+type NzMasks = Vec<Vec<u64>>;
+
 fn decode_progressive_scan(
     state: &JpegState,
     sos: &SosInfo,
     scan: &[u8],
     coefs: &mut [Vec<[i32; 64]>],
+    nz_masks: &mut NzMasks,
 ) -> Result<()> {
-    decode_progressive_scan_diff(state, sos, scan, coefs, false)
+    decode_progressive_scan_diff(state, sos, scan, coefs, Some(nz_masks), false)
 }
 
 /// Progressive-scan coefficient accumulator with an optional differential
@@ -2966,6 +3019,7 @@ fn decode_progressive_scan_diff(
     sos: &SosInfo,
     scan: &[u8],
     coefs: &mut [Vec<[i32; 64]>],
+    mut nz_masks: Option<&mut NzMasks>,
     differential: bool,
 ) -> Result<()> {
     let sof = state
@@ -3142,11 +3196,26 @@ fn decode_progressive_scan_diff(
                 let blocks_x = mcus_x * c.h_factor as usize;
                 let bi = my * blocks_x + mx;
                 let ac = ac_tables[0].unwrap();
+                let block = &mut coefs[sof_idx][bi];
+                // The block's non-zero mask: the frame's running one, or
+                // (a caller that keeps none) taken from the block for a
+                // refinement, which is the only pass that reads it.
+                let mut local = 0u64;
+                let nz = match nz_masks.as_deref_mut() {
+                    Some(m) => &mut m[sof_idx][bi],
+                    None => {
+                        if sos.ah != 0 {
+                            local = zigzag_nonzero_mask(block);
+                        }
+                        &mut local
+                    }
+                };
                 if sos.ah == 0 {
                     prog_decode_ac_first(
                         &mut br,
                         ac,
-                        &mut coefs[sof_idx][bi],
+                        block,
+                        nz,
                         sos.ss as usize,
                         sos.se as usize,
                         sos.al,
@@ -3156,7 +3225,8 @@ fn decode_progressive_scan_diff(
                     prog_decode_ac_refine(
                         &mut br,
                         ac,
-                        &mut coefs[sof_idx][bi],
+                        block,
+                        nz,
                         sos.ss as usize,
                         sos.se as usize,
                         sos.al,
@@ -3211,10 +3281,15 @@ fn prog_decode_dc(
 /// First-pass AC scan over `[ss..=se]`. Uses an EOBn symbol scheme where the
 /// low-nibble `s` with high-nibble `r` can also indicate the run-length of
 /// all-zero blocks (`r=15, s=0` → ZRL; `r<15, s=0` → EOBn where `n = r`).
+///
+/// `nz` gains the bit of every position that receives a coefficient
+/// (the value placed is never zero: `EXTEND` of `s ≥ 1` bits is not).
+#[allow(clippy::too_many_arguments)]
 fn prog_decode_ac_first(
     br: &mut BitReader<'_>,
     ac: &HuffTable,
     block: &mut [i32; 64],
+    nz: &mut u64,
     ss: usize,
     se: usize,
     al: u8,
@@ -3248,6 +3323,7 @@ fn prog_decode_ac_first(
                 None => extend(br.get_bits(s)? as i32, s),
             } << al;
             block[ZIGZAG[k]] = val;
+            *nz |= 1 << k;
             k += 1;
         }
     }
@@ -3307,16 +3383,21 @@ fn zigzag_nonzero_mask(block: &[i32; 64]) -> u64 {
 /// coefficients appear at positions where the earlier passes coded a
 /// zero and this pass decodes a fresh sign.
 ///
-/// The block's non-zero positions are taken once as a zig-zag bit mask,
-/// so a run of `r` zeros is "the `(r + 1)`-th clear bit from here" and
-/// only the non-zero coefficients in between are visited (each reads
-/// its correction bit, in position order as Figure G.7 requires). A
+/// The block's non-zero AC positions come in as the zig-zag bit mask
+/// `nz` (what [`zigzag_nonzero_mask`] reads off the block), so a run of
+/// `r` zeros is "the `(r + 1)`-th clear bit from here" and only the
+/// non-zero coefficients in between are visited (each reads its
+/// correction bit, in position order as Figure G.7 requires). A
 /// coefficient placed by this call sits behind the position the walk
-/// has reached, so the mask stays valid for the rest of the call.
+/// has reached, so the mask read at entry stays valid for the rest of
+/// the call; `nz` gains its bit for the scans that follow. A correction
+/// never makes a coefficient zero (it moves it away from zero).
+#[allow(clippy::too_many_arguments)]
 fn prog_decode_ac_refine(
     br: &mut BitReader<'_>,
     ac: &HuffTable,
     block: &mut [i32; 64],
+    nz_mask: &mut u64,
     ss: usize,
     se: usize,
     al: u8,
@@ -3331,7 +3412,7 @@ fn prog_decode_ac_refine(
     } else {
         0
     };
-    let nz = zigzag_nonzero_mask(block) & band;
+    let nz = *nz_mask & band;
     // One correction bit for each non-zero coefficient of `positions`,
     // in ascending zig-zag order.
     #[inline(always)]
@@ -3407,6 +3488,7 @@ fn prog_decode_ac_refine(
             k = target;
             if new_val != 0 {
                 block[ZIGZAG[k]] = new_val;
+                *nz_mask |= 1 << k;
             }
             k += 1;
         }
@@ -3612,6 +3694,7 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
                 let block = &coefs[ci][by * blocks_x + bx];
                 render_block_8bit(
                     block,
+                    extent_of(block),
                     &qtf,
                     quant_tables[ci],
                     state.idct,
@@ -5467,6 +5550,7 @@ fn decode_hierarchical_dct_frame_inner(
                             &sos,
                             scan,
                             &mut coefs,
+                            None,
                             differential,
                         )?;
                     }
@@ -6520,9 +6604,11 @@ mod prog_tests {
         let mut br = BitReader::new(&buf);
         let mut block = [0i32; 64];
         let mut eob = 0u32;
-        prog_decode_ac_first(&mut br, &ac, &mut block, 1, 63, 0, &mut eob).unwrap();
+        let mut nz = 0u64;
+        prog_decode_ac_first(&mut br, &ac, &mut block, &mut nz, 1, 63, 0, &mut eob).unwrap();
         // Coefficient at zigzag k=1 → natural position ZIGZAG[1] = 1.
         assert_eq!(block[ZIGZAG[1]], 1);
+        assert_eq!(nz, 1 << 1);
         for i in 0..64 {
             if i != ZIGZAG[1] {
                 assert_eq!(block[i], 0, "unexpected nonzero at {i}");
@@ -6546,7 +6632,7 @@ mod prog_tests {
         let mut br = BitReader::new(&buf);
         let mut block = [0i32; 64];
         let mut eob = 0u32;
-        prog_decode_ac_first(&mut br, &ac, &mut block, 1, 63, 2, &mut eob).unwrap();
+        prog_decode_ac_first(&mut br, &ac, &mut block, &mut 0, 1, 63, 2, &mut eob).unwrap();
         assert_eq!(block[ZIGZAG[1]], 4); // 1 << 2
     }
 
@@ -6596,11 +6682,18 @@ mod prog_tests {
             let (mut ea, mut eb) = (eob0, eob0);
             let mut ra = BitReader::new(&buf);
             let mut rb = BitReader::new(&buf);
-            let x = prog_decode_ac_refine(&mut ra, &ac, &mut a, ss, se, al, &mut ea);
+            // The running mask covers the AC positions (a DC scan does
+            // not maintain bit 0).
+            let ac_mask = |blk: &[i32; 64]| zigzag_nonzero_mask(blk) & !1;
+            let mut nz = ac_mask(&a);
+            let x = prog_decode_ac_refine(&mut ra, &ac, &mut a, &mut nz, ss, se, al, &mut ea);
             let y = prog_decode_ac_refine_reference(&mut rb, &ac, &mut b, ss, se, al, &mut eb);
             let tag = format!("trial {trial}: ss {ss} se {se} al {al} eob {eob0}");
             assert_eq!(x.is_ok(), y.is_ok(), "{tag}");
             assert_eq!(a, b, "{tag}");
+            if x.is_ok() {
+                assert_eq!(nz, ac_mask(&a), "{tag}: running mask");
+            }
             assert_eq!(ea, eb, "{tag}");
             assert_eq!(
                 (ra.pos, ra.bits, ra.nbits, ra.saw_rst, ra.padded),
@@ -6652,9 +6745,79 @@ mod prog_tests {
         let mut block = [0i32; 64];
         block[ZIGZAG[1]] = 4; // existing coef = +4 (from Al=2 first pass)
         let mut eob = 0u32;
-        prog_decode_ac_refine(&mut br, &ac, &mut block, 1, 63, 1, &mut eob).unwrap();
+        let mut nz = zigzag_nonzero_mask(&block);
+        prog_decode_ac_refine(&mut br, &ac, &mut block, &mut nz, 1, 63, 1, &mut eob).unwrap();
         // 4 (binary 0b100) + 0b10 (1 << Al=1) = 0b110 = 6.
         assert_eq!(block[ZIGZAG[1]], 6);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// The block render as one unconditional sequence: dequantise, full
+    /// IDCT, level shift, clamp, round.
+    fn plain(block: &[i32; 64], q: &[u16; 64]) -> [u8; 64] {
+        let mut f: [f32; 64] = std::array::from_fn(|k| block[k] as f32 * q[k] as f32);
+        idct8x8(&mut f);
+        std::array::from_fn(|k| (f[k] + 128.0).clamp(0.0, 255.0).round() as u8)
+    }
+
+    #[test]
+    fn extent_driven_render_is_the_plain_render() {
+        let mut seed = 0x6C8E_9CF5u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for trial in 0..30_000 {
+            let mut q = [0u16; 64];
+            for v in q.iter_mut() {
+                *v = 1 + (rnd() % if trial % 7 == 0 { 255 } else { 24 }) as u16;
+            }
+            // A table with zero entries (outside §B.2.4.1) must take the
+            // unconditional path.
+            if trial % 11 == 0 {
+                q[(rnd() % 64) as usize] = 0;
+                q[0] = if trial % 22 == 0 { 0 } else { q[0] };
+            }
+            let qt = QuantTable { values: q };
+            let qtf = quant_to_f32(&qt);
+            // Blocks ending at a random zig-zag position, DC-only ones
+            // (with levels that land on rounding ties) included.
+            let last = match trial % 5 {
+                0 => 0,
+                1 => (rnd() % 6) as usize,
+                _ => (rnd() % 64) as usize,
+            };
+            let mut block = [0i32; 64];
+            block[0] = (rnd() % 2049) as i32 - 1024;
+            for k in 1..=last {
+                if rnd() % 3 != 0 || k == last {
+                    let amp = if trial % 13 == 0 { 2047 } else { 40 };
+                    block[ZIGZAG[k]] = (rnd() % (2 * amp + 1)) as i32 - amp as i32;
+                }
+            }
+            let want = plain(&block, &q);
+            for extent in [ZIGZAG_EXTENT_UP_TO[last], extent_of(&block)] {
+                let mut got = [0u8; 64];
+                render_block_8bit(
+                    &block,
+                    extent,
+                    &qtf,
+                    &qt,
+                    IdctMethod::Float,
+                    &mut got,
+                    8,
+                    0,
+                    0,
+                );
+                assert_eq!(got, want, "trial {trial}, last {last}");
+            }
+        }
     }
 }
 

@@ -83,6 +83,43 @@ fn idct_lanes(v: &Lanes) -> Lanes {
     x
 }
 
+/// [`idct_lanes`] when rows 4..=7 of `v` are zero: the same sums with
+/// the terms of `v4 … v7` left out. A left-out term is a product with
+/// zero added to (or subtracted from) a partial sum, which leaves that
+/// sum as it is, so every lane gets the value [`idct_lanes`] gives it
+/// (the sign of a zero aside, and a zero's sign never reaches a sample:
+/// the level shift adds 128).
+#[inline(always)]
+fn idct_lanes_low(v: &Lanes) -> Lanes {
+    let mut x = [[0f32; 8]; 8];
+    for j in 0..8 {
+        let (v0, v1, v2, v3) = (v[0][j], v[1][j], v[2][j], v[3][j]);
+        // Even-even: k = 0 alone, so both halves are `C4 · v0`.
+        let ee = C4 * v0;
+        // Even-odd: k = 2.
+        let eo0 = C2 * v2;
+        let eo1 = C6 * v2;
+        let e0 = ee + eo0;
+        let e3 = ee - eo0;
+        let e1 = ee + eo1;
+        let e2 = ee - eo1;
+        // Odd: k = 1, 3.
+        let o0 = C1 * v1 + C3 * v3;
+        let o1 = C3 * v1 - C7 * v3;
+        let o2 = C5 * v1 - C1 * v3;
+        let o3 = C7 * v1 - C5 * v3;
+        x[0][j] = e0 + o0;
+        x[7][j] = e0 - o0;
+        x[1][j] = e1 + o1;
+        x[6][j] = e1 - o1;
+        x[2][j] = e2 + o2;
+        x[5][j] = e2 - o2;
+        x[3][j] = e3 + o3;
+        x[4][j] = e3 - o3;
+    }
+    x
+}
+
 #[inline(always)]
 fn transpose(m: &Lanes) -> Lanes {
     std::array::from_fn(|r| std::array::from_fn(|c| m[c][r]))
@@ -106,6 +143,93 @@ pub fn idct8x8(block: &mut [f32; 64]) {
     let c = idct_lanes(&rows);
     // Pass two along the rows: lanes = `y` after a transpose.
     let out = transpose(&idct_lanes(&transpose(&c)));
+    for (dst, row) in block.as_chunks_mut::<8>().0.iter_mut().zip(&out) {
+        dst.copy_from_slice(row);
+    }
+}
+
+/// Where a block's non-zero coefficients are: bit `8 + v` is set when
+/// row `v` (vertical frequency) holds one, bit `u` when column `u`
+/// does. A coefficient at natural index `i` contributes
+/// [`extent_bit`]`(i)`; [`FULL_EXTENT`] claims nothing.
+pub(crate) type Extent = u16;
+
+/// The [`Extent`] of a block about which nothing is known.
+#[cfg(test)]
+pub(crate) const FULL_EXTENT: Extent = 0xFFFF;
+
+/// The [`Extent`] bits of the coefficient at natural index `i`.
+#[inline(always)]
+pub(crate) const fn extent_bit(i: usize) -> Extent {
+    (1 << (8 + (i >> 3))) | (1 << (i & 7))
+}
+
+/// The [`Extent`] of a block whose last non-zero coefficient is at
+/// zig-zag position `k` (Figure A.6): the bits of positions `0..=k`.
+pub(crate) const ZIGZAG_EXTENT_UP_TO: [Extent; 64] = {
+    let mut t = [0; 64];
+    let mut acc = 0;
+    let mut k = 0;
+    while k < 64 {
+        acc |= extent_bit(crate::jpeg::zigzag::ZIGZAG[k]);
+        t[k] = acc;
+        k += 1;
+    }
+    t
+};
+
+/// The [`Extent`] of a natural-order block, by inspection.
+#[inline]
+pub(crate) fn extent_of(block: &[i32; 64]) -> Extent {
+    let mut cols = [0i32; 8];
+    let mut ext = 0;
+    for (v, row) in block.as_chunks::<8>().0.iter().enumerate() {
+        let mut any = 0;
+        for (c, &x) in cols.iter_mut().zip(row) {
+            *c |= x;
+            any |= x;
+        }
+        ext |= Extent::from(any != 0) << (8 + v);
+    }
+    for (u, &c) in cols.iter().enumerate() {
+        ext |= Extent::from(c != 0) << u;
+    }
+    ext
+}
+
+/// [`idct8x8`] of a block whose non-zero coefficients lie within
+/// `extent`, with the work its zero rows and columns do not need left
+/// out; every sample is the value [`idct8x8`] produces. `extent` may
+/// claim more rows and columns than hold a coefficient, with one
+/// exception: a block whose AC coefficients are all zero must come with
+/// no bit beyond [`extent_bit`]`(0)`, because [`idct8x8`] gives such a
+/// block `S(0, 0) / 8` and the two passes give it `C4 · (C4 · S(0, 0))`,
+/// which is not always the same `f32`.
+///
+/// * Only the DC coefficient: the constant `S(0, 0) / 8`.
+/// * No coefficient in rows 4..=7: the column pass leaves those terms
+///   out ([`idct_lanes_low`]); none in columns 4..=7: the row pass does
+///   (its inputs in those columns are the column pass's zeros).
+#[inline]
+pub(crate) fn idct8x8_within(block: &mut [f32; 64], extent: Extent) {
+    if extent & !extent_bit(0) == 0 {
+        let v = block[0] * 0.125;
+        block.fill(v);
+        return;
+    }
+    let rows: Lanes = std::array::from_fn(|r| block[r * 8..r * 8 + 8].try_into().unwrap());
+    let c = if extent & 0xF000 == 0 {
+        idct_lanes_low(&rows)
+    } else {
+        idct_lanes(&rows)
+    };
+    let ct = transpose(&c);
+    let o = if extent & 0x00F0 == 0 {
+        idct_lanes_low(&ct)
+    } else {
+        idct_lanes(&ct)
+    };
+    let out = transpose(&o);
     for (dst, row) in block.as_chunks_mut::<8>().0.iter_mut().zip(&out) {
         dst.copy_from_slice(row);
     }
@@ -227,6 +351,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bounded_idct_is_the_full_idct() {
+        // Random blocks confined to every extent rectangle: the pruned
+        // passes give the samples of the full transform (compared as
+        // values: a zero's sign may differ).
+        let mut seed = 0x0BAD_5EEDu32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for rows in 1..=8usize {
+            for cols in 1..=8usize {
+                for round in 0..40 {
+                    let mut coef = [0i32; 64];
+                    for v in 0..rows {
+                        for u in 0..cols {
+                            // Sparse and dense fills, small and large values.
+                            if round % 4 != 0 || next() % 3 == 0 {
+                                coef[v * 8 + u] = (next() % 4001) as i32 - 2000;
+                            }
+                        }
+                    }
+                    let ext = extent_of(&coef);
+                    assert_eq!(u32::from(ext) >> (8 + rows), 0);
+                    assert_eq!((ext & 0xFF) >> cols, 0);
+                    let mut full: [f32; 64] = std::array::from_fn(|i| coef[i] as f32 * 3.0);
+                    let mut within = full;
+                    idct8x8(&mut full);
+                    idct8x8_within(&mut within, ext);
+                    assert_eq!(full, within, "{rows} x {cols}, round {round}");
+                    // A looser claim is as good, as long as a block with
+                    // only its DC coefficient is declared as one.
+                    if ext & !extent_bit(0) != 0 {
+                        let mut loose: [f32; 64] = std::array::from_fn(|i| coef[i] as f32 * 3.0);
+                        idct8x8_within(&mut loose, FULL_EXTENT);
+                        assert_eq!(full, loose);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extent_bits_follow_the_zigzag() {
+        let mut b = [0i32; 64];
+        assert_eq!(extent_of(&b), 0);
+        for k in 0..64 {
+            b[crate::jpeg::zigzag::ZIGZAG[k]] = -1;
+            assert_eq!(extent_of(&b), ZIGZAG_EXTENT_UP_TO[k]);
+            let mut one = [0i32; 64];
+            one[crate::jpeg::zigzag::ZIGZAG[k]] = 7;
+            assert_eq!(extent_of(&one) & !ZIGZAG_EXTENT_UP_TO[k], 0);
+        }
+        assert_eq!(ZIGZAG_EXTENT_UP_TO[0], extent_bit(0));
+        // Positions 0..=9 are the 4 × 4 low-frequency corner's diagonal
+        // half; position 10 is the first in row 4.
+        assert_eq!(ZIGZAG_EXTENT_UP_TO[9], 0x0F0F);
+        assert_eq!(ZIGZAG_EXTENT_UP_TO[10], 0x1F0F);
+        assert_eq!(ZIGZAG_EXTENT_UP_TO[63], FULL_EXTENT);
     }
 
     #[test]

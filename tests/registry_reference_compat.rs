@@ -12,7 +12,7 @@ use oxideav_core::{
 };
 use oxideav_mjpeg::registry::{make_decoder, register_codecs};
 use oxideav_mjpeg::{
-    ChromaUpsampling, DecodeOptions, IdctMethod, MjpegDecoderOptions, decode_with,
+    ChromaUpsampling, DecodeOptions, DecodeScale, IdctMethod, MjpegDecoderOptions, decode_with,
 };
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/libjpeg");
@@ -132,5 +132,70 @@ fn typed_options_and_schema() {
         .decoder_options_schema(&CodecId::new("mjpeg"))
         .expect("decoder schema");
     let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
-    assert_eq!(names, ["reference_compat", "idct", "upsampling", "deblock"]);
+    assert_eq!(
+        names,
+        ["reference_compat", "idct", "upsampling", "deblock", "scale"]
+    );
+    let o = MjpegDecoderOptions::new().with_scale("1/4");
+    assert_eq!(
+        o.to_decode_options().unwrap(),
+        DecodeOptions::new().with_scale(DecodeScale::Quarter)
+    );
+    assert_eq!(
+        MjpegDecoderOptions::new()
+            .with_scale("1")
+            .to_decode_options()
+            .unwrap(),
+        DecodeOptions::new()
+    );
+}
+
+/// `scale` decodes at a reduced size: the frames are the standalone
+/// reduced decode, and the decoder describes that size — before the
+/// first frame (from the frame header) and after it.
+#[test]
+fn scale_key_reduces_the_frames_and_the_description() {
+    let jpeg = read("own_37x29_k0_420_seq.jpg");
+    for (key, scale, (w, h)) in [
+        ("1", DecodeScale::Full, (37u32, 29u32)),
+        ("1/2", DecodeScale::Half, (19, 15)),
+        ("1/4", DecodeScale::Quarter, (10, 8)),
+        ("1/8", DecodeScale::Eighth, (5, 4)),
+    ] {
+        let mut dec = make_decoder(&params(&[("scale", key)])).unwrap();
+        assert!(dec.output_params().is_none());
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), jpeg.clone()))
+            .unwrap();
+        let announced = dec.output_params().expect("announced after the packet");
+        assert_eq!(
+            (announced.width, announced.height),
+            (Some(w), Some(h)),
+            "{key}"
+        );
+        let Frame::Video(frame) = dec.receive_frame().unwrap() else {
+            panic!("video frame");
+        };
+        let after = dec.output_params().expect("described after the frame");
+        assert_eq!((after.width, after.height), (Some(w), Some(h)), "{key}");
+        assert_eq!(after.pixel_format, announced.pixel_format, "{key}");
+        let want = decode_with(&jpeg, &DecodeOptions::new().with_scale(scale)).unwrap();
+        assert_eq!((want.width(), want.height()), (w, h), "{key}");
+        let got: Vec<Vec<u8>> = frame.planes.into_iter().map(|p| p.data).collect();
+        let want: Vec<Vec<u8>> = want.planes.into_iter().map(|p| p.data).collect();
+        assert_eq!(got, want, "{key}");
+        // One shape throughout: no change event, no generation bump.
+        assert_eq!(dec.output_params_generation(), 0, "{key}");
+    }
+    assert_eq!(
+        registry_planes(&[("scale", "1")], &jpeg),
+        registry_planes(&[], &jpeg)
+    );
+    assert!(make_decoder(&params(&[("scale", "1/3")])).is_err());
+    // The reduced reconstruction covers 8-bit DCT frames; a 12-bit
+    // stream is refused on its packet.
+    let twelve = read("p12_gray.jpg");
+    let mut dec = make_decoder(&params(&[("scale", "1/2")])).unwrap();
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), twelve))
+        .unwrap();
+    assert!(dec.receive_frame().is_err());
 }

@@ -452,9 +452,11 @@ impl Decoder for MjpegDecoder {
         if self.shown.is_none()
             && let Ok(info) = crate::info(&packet.data)
         {
+            // A reduced-size decode announces the size it will emit.
+            let d = self.decode.scale.denominator();
             self.announced = Some(OutputShape {
-                width: info.width,
-                height: info.height,
+                width: info.width.div_ceil(d),
+                height: info.height.div_ceil(d),
                 pixel_format: info.format.into(),
                 color: info.color.into(),
             });
@@ -981,6 +983,7 @@ impl CodecOptionsStruct for MjpegEncoderOptions {
 /// | `idct`             | `float` \| `integer`: [`crate::IdctMethod`] `Float` / `AccurateInteger` (overrides `reference_compat`) | from `reference_compat` |
 /// | `deblock`          | bool: [`crate::DecodeOptions::deblock`] | `false` |
 /// | `upsampling`       | `replicate` \| `triangular` \| `linear` \| `guided`: [`crate::ChromaUpsampling`] for the layouts the decoder resamples to 4:4:4 (overrides `reference_compat`) | from `reference_compat` |
+/// | `scale`            | `1` \| `1/2` \| `1/4` \| `1/8`: [`crate::DecodeScale`], the size of the decoded frames relative to the coded picture | `1` |
 ///
 /// The registry decoder emits planar frames, so the YCbCr → RGB kernel
 /// of `reference_compat` only matters to callers converting with
@@ -1000,6 +1003,12 @@ pub struct MjpegDecoderOptions {
     pub upsampling: String,
     /// [`crate::DecodeOptions::deblock`].
     pub deblock: bool,
+    /// Empty or `1` = the coded size; else `1/2` / `1/4` / `1/8`
+    /// ([`crate::DecodeOptions::scale`]). The frames, `output_params`
+    /// and the `Frame::StreamParams` events carry the reduced size
+    /// (`⌈W / d⌉ × ⌈H / d⌉`); a stream the reduced decode does not
+    /// cover (12-bit, lossless, hierarchical) is an error on its packet.
+    pub scale: String,
 }
 
 impl MjpegDecoderOptions {
@@ -1045,6 +1054,12 @@ impl MjpegDecoderOptions {
         self
     }
 
+    /// `"1"`, `"1/2"`, `"1/4"` or `"1/8"` (empty = `"1"`).
+    pub fn with_scale(mut self, scale: impl Into<String>) -> Self {
+        self.scale = scale.into();
+        self
+    }
+
     /// The [`crate::DecodeOptions`] these string options denote.
     pub fn to_decode_options(&self) -> Result<crate::DecodeOptions> {
         let mut o = crate::DecodeOptions::new()
@@ -1069,6 +1084,17 @@ impl MjpegDecoderOptions {
             other => {
                 return Err(Error::invalid(format!(
                     "MJPEG decoder: upsampling '{other}' (replicate / triangular / linear / guided)"
+                )));
+            }
+        }
+        match self.scale.as_str() {
+            "" | "1" => {}
+            "1/2" => o = o.with_scale(crate::DecodeScale::Half),
+            "1/4" => o = o.with_scale(crate::DecodeScale::Quarter),
+            "1/8" => o = o.with_scale(crate::DecodeScale::Eighth),
+            other => {
+                return Err(Error::invalid(format!(
+                    "MJPEG decoder: scale '{other}' (1 / 1/2 / 1/4 / 1/8)"
                 )));
             }
         }
@@ -1102,6 +1128,12 @@ impl CodecOptionsStruct for MjpegDecoderOptions {
             default: OptionValue::Bool(false),
             help: "smooth 8x8 block edges whose step is below the first AC quantiser step (opt-in; helps at low quality)",
         },
+        OptionField {
+            name: "scale",
+            kind: OptionKind::Enum(&["1", "1/2", "1/4", "1/8"]),
+            default: OptionValue::String(String::new()),
+            help: "decode 8-bit DCT frames at this fraction of the coded size (ceil(W/d) x ceil(H/d)), reconstructed from the low-frequency corner of each block; unset = 1",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -1110,6 +1142,7 @@ impl CodecOptionsStruct for MjpegDecoderOptions {
             "idct" => self.idct = v.as_str()?.to_owned(),
             "upsampling" => self.upsampling = v.as_str()?.to_owned(),
             "deblock" => self.deblock = v.as_bool()?,
+            "scale" => self.scale = v.as_str()?.to_owned(),
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())

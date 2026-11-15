@@ -57,6 +57,7 @@ if oxideav_mjpeg::probe(&bytes) {
 | `info(&[u8]) -> Result<ImageInfo>` | Header walk up to the first `SOS`: `width`, `height`, `format` (the layout `decode` will produce), `precision`, `components`, `progressive` / `lossless` / `arithmetic` / `hierarchical`, `color`, `has_jfif` / `has_adobe` / `has_icc` / `has_exif` / `has_xmp`, `comments` (the `COM` count); `frames = 1`, `has_alpha = false`. |
 | `decode(&[u8]) -> Result<JpegImage>` | Native layout, `color` + `metadata` filled. `decode_with(&[u8], &DecodeOptions)` adds limits, strict mode and a §B.5 tables stream. |
 | `decode_rgb8` / `decode_rgba8` | One call to `RgbImage { width, height, data }` / `RgbaImage` (3 / 4 bytes per pixel, alpha `255`). |
+| `decode_packed_into` | Decode and convert into the caller's buffer at the caller's stride, as `R G B`, `B G R`, `R G B A` or `B G R A` (`PackedLayout`); `JpegImage::to_packed_with` / `write_packed` do the same from a decoded image. |
 | `decode_from<R: Read>(r)` | Reads to end, then `decode`. |
 | `encode(&JpegImage, &EncodeOptions) -> Result<Vec<u8>>` | Writes the image **as given** (layout → stream table below); layouts the chosen process cannot carry are `Error::Unsupported`, never converted silently. |
 | `encode_rgb8(w, h, &[u8], &opts)` | RGB → full-range YCbCr (T.871 §7), chroma box-filtered to `opts.chroma` (4:2:0 default), JFIF APP0 written. |
@@ -248,7 +249,7 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `strict` | `false` | Reject stray bytes after `SOI`, trailing bytes after `EOI`, truncated segment lengths and malformed JFIF / Adobe / ICC segments. |
 | `tables` | `None` | A §B.5 tables-only stream (TIFF `JPEGTables`) preloaded ahead of the image. |
 | `idct` | `IdctMethod::Float` | Inverse DCT of 8- and 12-bit DCT frames: `Float` (factorised separable f32 transform, the most accurate and the fastest: 13 samples of 2 073 600 off the rounded f64 definition on a 1080p q85 frame) or `AccurateInteger` (13-bit fixed point, two passes, 2 extra fraction bits between them). |
-| `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
+| `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, the best picture and the slowest), `Linear` (centred linear, every ratio; about twice as fast as the default on a 4:2:0 `decode_rgb8`), `Triangular` (the same ¾ / ¼ weights rounded to whole samples, the reference-compatible kernel for 2:1, 1:2 and 2 × 2) or `Replicate` (nearest sample, the fastest). See *Chroma reconstruction* for the mathematics and the cost of each. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `decode_packed_into` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 | `deblock` | `false` | Opt-in block-edge smoothing of 8-bit DCT frames (see *Deblocking*). |
 | `scale` | `DecodeScale::Full` | `Half`, `Quarter` or `Eighth`: decode an 8-bit DCT frame at 1/2, 1/4 or 1/8 of its size (see *Reduced-size decode*). |
@@ -288,8 +289,10 @@ whatever `idct` says, is not deblocked, and is the same for every
 worker count. The entropy-coded data is still read in full, so the time
 saved is the transform, the sample store and everything after them
 (chroma reconstruction and colour conversion work on the small
-picture): see *Benchmarks*. The registry decoder always decodes at the
-size its stream parameters declare.
+picture): see *Benchmarks*. The registry decoder takes the same choice
+as its `scale` option (`1`, `1/2`, `1/4`, `1/8`): its frames,
+`output_params()` and the description it announces from the first
+packet's frame header then carry the reduced size.
 
 ### Chroma reconstruction
 
@@ -334,6 +337,57 @@ overshoot. On the 4:2:0 daylight crop at quality 75, Catmull-Rom loses
 0.03 dB. A back-projection step on top of either kernel also lost
 (−0.2 to −0.7 dB). `ε = 16` and the clamp were picked on the same sweep (`ε` 4…64,
 window 3 × 3 vs 5 × 5).
+
+#### The four reconstructions
+
+Along a 2:1 axis chroma sample `b` sits between output samples `2b` and
+`2b + 1` (T.871 §9), so output `2b + 1` lies a quarter of the way from
+sample `b` to sample `b + 1` and output `2b + 2` three quarters of the
+way. With `c` the chroma row and `n` its length:
+
+```text
+Replicate    s(x)      = c[x / 2]
+Linear       s(0)      = c[0]
+             s(2b + 1) = (3 c[b] + c[b + 1]) / 4
+             s(2b + 2) = (c[b] + 3 c[b + 1]) / 4
+             s(2n − 1) = c[n − 1]
+Triangular   Linear, rounded to a whole sample before the colour equations
+LumaGuided   clamp(Linear(C) + Linear(a) · (Y − Linear(Ŷ)), min₃ₓ₃ C, max₃ₓ₃ C)
+```
+
+4:2:0 applies the rule to the rows first and then along each row, so a
+pixel's chroma is `(9 a + 3 b + 3 c + d) / 16` of its four nearest
+samples. `Linear` hands that value to the colour equations in
+sixteenths of a sample (one rounding, at the end). `Triangular` rounds
+it first — `(sum + 8) >> 4` on even and `(sum + 7) >> 4` on odd output
+columns, `(sum + 1) >> 2` / `(sum + 2) >> 2` on one axis — and leaves a
+component at most two samples wide replicated. The 4:1 ratio of 4:1:1
+uses eighths (`1/8, 3/8, 5/8, 7/8` of the way) under `Linear`, and is
+replicated under `Triangular`.
+
+All four produce each output row from the chroma rows it depends on and
+its luma row, through row-sized scratch, and store it straight into the
+pixel layout asked for — `R G B`, `B G R`, `R G B A` or `B G R A`
+(`PackedLayout`), in a fresh buffer (`decode_rgb8`, `to_packed_with`) or
+in the caller's at the caller's stride (`decode_packed_into`,
+`JpegImage::write_packed`):
+
+```no_run
+# use oxideav_mjpeg::{ChromaUpsampling, DecodeOptions, PackedLayout, decode_packed_into, info};
+# let jpeg: Vec<u8> = std::fs::read("in.jpg").unwrap();
+let hdr = info(&jpeg)?;
+let stride = hdr.width as usize * 4;
+let mut frame = vec![0u8; stride * hdr.height as usize];
+let opts = DecodeOptions::new().with_upsampling(ChromaUpsampling::Linear);
+decode_packed_into(&jpeg, &opts, PackedLayout::Bgra8, &mut frame, stride)?;
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+What each costs on a 4:2:0 picture is in *Benchmarks* (*RGB output of
+subsampled pictures*): against the default, `Linear` is about 2.1×,
+`Triangular` 2.3× and `Replicate` 2.6× faster for the whole
+`decode_rgb8`. The default stays `LumaGuided`; the others are a
+per-call choice.
 
 ### Deblocking
 
@@ -436,6 +490,8 @@ Through the registry the decoder takes the same switch in
 | `reference_compat` | `true` / `false` | `false` |
 | `idct` | `float` / `integer` (overrides `reference_compat`) | from `reference_compat` |
 | `upsampling` | `replicate` / `triangular` / `linear` / `guided` (overrides `reference_compat`; used for the layouts the decoder resamples to 4:4:4) | from `reference_compat` |
+| `deblock` | `true` / `false` | `false` |
+| `scale` | `1` / `1/2` / `1/4` / `1/8` (`DecodeScale`; frames and stream description at the reduced size) | `1` |
 
 Other keys in the bag (an encoder's output parameters carry the encoder
 options) are ignored; a bad value is an error.
@@ -2242,6 +2298,85 @@ and everything after it work on the small picture.
 The `full_size` bench group has the reduced cases
 (`decode_rgb8_1600x1200_420_baseline_{half,quarter,eighth}`) next to
 the full-size and four-worker ones.
+
+### RGB output of subsampled pictures
+
+A pass on the conversion of 8-bit subsampled pictures to packed pixels,
+with every mode returning the same bytes as before (`tests/rgb_output_pins.rs`
+pins all four reconstructions under both YCbCr kernels on synthetic
+planar pictures of every layout from 1 × 1 up and on the committed
+fixtures at full and half size, RGB and RGBA, on 1, 2, 3 and 8 workers;
+the previous build and this one were also compared file by file over the
+fixture corpora and 1600 × 1200 pictures in four layouts).
+
+Before → after, serial, in ms: medians of 41 runs (15 at 12 MP) of the
+previous build and this one taken alternately in one process, in thread
+CPU time, on a machine that was running many other builds (load average
+about 50 on 18 cores) — the absolute figures are high, the ratios are
+the measurement. Pictures as above (multi-octave noise, quality 85,
+baseline 4:2:0). The last column compares against what the default cost
+before.
+
+| 1600 × 1200 `decode_rgb8` | before | after | against itself | against the previous default |
+|---|---|---|---|---|
+| `LumaGuided` (default) | 9.62 | 8.84 | 1.09× | 1.09× |
+| `Linear` | 8.79 | 4.56 | 1.93× | 2.11× |
+| `Triangular` | 17.95 | 4.19 | 4.29× | 2.30× |
+| `Replicate` | 5.76 | 3.67 | 1.57× | 2.62× |
+| planar `decode`, for scale | 3.20 | 3.18 | | |
+
+| 12 MP `decode_rgb8` | before | after | against itself | against the previous default |
+|---|---|---|---|---|
+| `LumaGuided` (default) | 61.0 | 57.0 | 1.07× | 1.07× |
+| `Linear` | 56.5 | 28.6 | 1.98× | 2.13× |
+| `Triangular` | 111.9 | 26.3 | 4.25× | 2.32× |
+| `Replicate` | 36.0 | 23.3 | 1.55× | 2.62× |
+| planar `decode`, for scale | 19.7 | 19.7 | | |
+
+The conversion alone (`to_rgb8_with` on a decoded 1600 × 1200 picture,
+best of 60 alternating runs, wall clock, ms): 4:2:0 `LumaGuided`
+6.14 → 5.51, `Linear` 4.96 → 1.26, `Triangular` 13.66 → 0.90,
+`Replicate` 2.45 → 0.44; 4:2:2 `LumaGuided` 7.87 → 7.36, `Linear`
+4.97 → 1.26, `Triangular` 13.39 → 0.92, `Replicate` 2.46 → 0.56; 4:1:1
+`Linear` 5.13 → 1.26, `Replicate` 2.09 → 0.50 (`LumaGuided` at 4:1 is
+unchanged, 14.8); 4:4:4 1.84 → 0.73.
+
+Where a serial 1600 × 1200 baseline 4:2:0 `decode_rgb8` spends its time
+now (sampling profile):
+
+| reconstruction | entropy decode | transform | chroma reconstruction | colour conversion + packing | rest |
+|---|---|---|---|---|---|
+| `LumaGuided` (default) | 22 % | 18 % | 50 % | 10 % | |
+| `Linear` | 42 % | 32 % | 4 % | 20 % | 1 % |
+| `Triangular` | 40 % | 44 % | 4 % | 12 % | |
+| `Replicate` | 42 % | 36 % | 2 % | 19 % | 1 % |
+
+What changed. Each mode forms an output row from row-sized scratch and
+stores it once, in the layout asked for; no full-resolution chroma
+plane or intermediate RGB picture exists. The row is computed one
+channel per pass over plain slices and then interleaved. Whole-sample
+chroma (`Replicate`, `Triangular`, 4:4:4, the fixed-point kernel) takes
+its colour offsets from one 32-bit multiply and shift per term, with
+constants that give the rounded T.871 §7 quotient for every `(Cb, Cr)`
+pair (all 65 536 are tested). `Replicate` forms the three offsets once
+per chroma sample and adds them to the two or four luma samples under
+it. `Linear` interpolates in integers and keeps sixteenths of a sample
+into an exact quotient kernel (every chroma value and pair tested).
+The luma-guided reconstruction keeps luma in 8 bits, forms the
+vertical interpolations of a row pair in one pass, hands each row over
+as the kernel's chroma offsets, and has its statistics in separate
+passes over slices.
+
+What did not change: the default's arithmetic. A luma-guided pixel is
+the result of about 45 single-precision operations (box statistics of
+luma and chroma, a regression slope per chroma sample, five quantities
+interpolated on both axes, the clamp) and of an exact T.871 conversion
+at `1/256` of a chroma sample; the output is pinned, so their order is
+too. That bounds the default's gain from this pass at the 1.07–1.09×
+above — its conversion went from 6.1 to 5.5 ms where the others went
+down four to fifteen times — and is why the faster reconstructions are
+offered as options instead: half of a default `decode_rgb8` is still
+the chroma reconstruction.
 
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the

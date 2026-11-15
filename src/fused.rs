@@ -1,4 +1,4 @@
-//! 8-bit planar YCbCr → packed pixels in one pass per row.
+//! 8-bit planar YCbCr → packed pixels, row by row.
 //!
 //! [`fill`] converts the 8-bit planar YCbCr layouts (4:4:4, 4:2:2,
 //! 4:2:0, 4:1:1) straight into the caller's pixel layout: every output
@@ -7,6 +7,10 @@
 //! ever built — and stored as `R G B`, `B G R`, `R G B A` or `B G R A`
 //! bytes. The bytes are those of the plane-at-a-time definitions in
 //! `crate::convert`; what changes is the arithmetic that reaches them.
+//!
+//! A row is computed one channel per pass over plain slices
+//! ([`Channels`]) and then interleaved ([`store`]): each pass is a
+//! loop of one statement over slices that cannot overlap.
 //!
 //! # Chroma at an output pixel
 //!
@@ -37,9 +41,10 @@
 //! * `Linear` keeps the sum as it is, in sixteenths of a sample, and
 //!   converts that ([`frac16_offsets`]); at the 4:1 ratio of 4:1:1 the
 //!   weights are eighths ([`widen_4_to_1`]).
-//! * `LumaGuided` streams its rows from `crate::jpeg::resample` in
-//!   blocks of sixteen pixels that go from the reconstruction to the
-//!   colour equations without touching memory.
+//! * `LumaGuided` takes its rows from `crate::jpeg::resample`, each
+//!   value already rounded to the unit of the colour equations: `1/256`
+//!   of a sample for the exact kernel ([`frac256_to_channels`]), a
+//!   whole sample for the fixed-point one.
 //!
 //! # Colour offsets
 //!
@@ -259,18 +264,18 @@ fn frac16_to_channels(y: &[u8], hb: &[u16], hr: &[u16], out: &mut Channels) {
 /// `1/256` of a sample (`Round(256 C) − 128 · 256`), one channel per
 /// pass: the arithmetic of `crate::convert::ycbcr_frac_to_rgb8_8bit`.
 #[inline(never)]
-fn frac256_to_channels(y: &[u8], cb: &[i16], cr: &[i16], out: &mut Channels) {
+fn frac256_to_channels<C: Copy + Into<i32>>(y: &[u8], cb: &[C], cr: &[C], out: &mut Channels) {
     let n = y.len().min(cb.len()).min(cr.len()).min(out.r.len());
     let (y, cb, cr) = (&y[..n], &cb[..n], &cr[..n]);
     let (r, g, b) = (&mut out.r[..n], &mut out.g[..n], &mut out.b[..n]);
     for ((o, &y), &c) in r.iter_mut().zip(y).zip(cr) {
-        *o = add_offset(y, chroma_offset::<1402, 180>(c as i32));
+        *o = add_offset(y, chroma_offset::<1402, 180>(c.into()));
     }
     for (((o, &y), &cb), &cr) in g.iter_mut().zip(y).zip(cb).zip(cr) {
-        *o = add_offset(y, green_offset(cb as i32, cr as i32));
+        *o = add_offset(y, green_offset(cb.into(), cr.into()));
     }
     for ((o, &y), &c) in b.iter_mut().zip(y).zip(cb) {
-        *o = add_offset(y, chroma_offset::<1772, 227>(c as i32));
+        *o = add_offset(y, chroma_offset::<1772, 227>(c.into()));
     }
 }
 

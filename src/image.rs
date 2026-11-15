@@ -1091,35 +1091,62 @@ pub enum IdctMethod {
 
 /// How subsampled chroma is brought to the luma grid.
 ///
-/// Every kernel but [`Self::Replicate`] honours the T.871 §9 centred
-/// siting. Measured on photographic and synthetic RGB references
-/// encoded at 4:2:0 / 4:2:2 / 4:1:1 (README, *Chroma reconstruction*),
+/// T.871 §9 sites a subsampled chroma sample at the centre of the luma
+/// samples it covers, so along a 2:1 axis sample `b` of a chroma row
+/// `c` lies between outputs `2b` and `2b + 1`. Every kernel but
+/// [`Self::Replicate`] honours that siting:
+///
+/// ```text
+/// Replicate    s(x)      = c[x / 2]
+/// Linear       s(2b + 1) = (3 c[b] + c[b + 1]) / 4
+///              s(2b + 2) = (c[b] + 3 c[b + 1]) / 4      (ends: the edge sample)
+/// Triangular   Linear, rounded to a whole sample
+/// LumaGuided   clamp(Linear(C) + Linear(a) · (Y − Linear(Ŷ)), min C, max C)
+/// ```
+///
+/// With both axes subsampled the rule runs down the rows first, then
+/// along each row: `(9 a + 3 b + 3 c + d) / 16` of the four nearest
+/// samples.
+///
+/// Measured on photographic and synthetic RGB references encoded at
+/// 4:2:0 / 4:2:2 / 4:1:1 (README, *Chroma reconstruction*),
 /// [`Self::LumaGuided`] gives the highest SSIM everywhere and the
-/// highest PSNR on photographic content, so it is the default.
+/// highest PSNR on photographic content, so it is the default. It is
+/// also the slowest: on a 4:2:0 picture a whole `decode_rgb8` is about
+/// 2.1× faster under [`Self::Linear`], 2.3× under [`Self::Triangular`]
+/// and 2.6× under [`Self::Replicate`] (README, *Benchmarks*).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ChromaUpsampling {
-    /// Sample replication: pixel `(x, y)` reads chroma sample
-    /// `(x · Hc / Hmax, y · Vc / Vmax)` (the historical default).
+    /// Sample replication (nearest sample): pixel `(x, y)` reads chroma
+    /// sample `(x · Hc / Hmax, y · Vc / Vmax)`. The fastest: each chroma
+    /// sample's colour offsets are computed once and added to the luma
+    /// samples it covers.
     Replicate,
     /// Triangular ("linear") interpolation for the 2:1 horizontal, 2:1
     /// vertical and 2 × 2 ratios: each output sample weights its two
-    /// nearest chroma samples ¾ / ¼ along every subsampled axis, honouring
-    /// the T.871 §9 centred siting, with edge samples replicated and the
-    /// rounding biases of `djpeg`'s default output. Other ratios fall back
-    /// to replication. Part of the reference-compatible set
+    /// nearest chroma samples ¾ / ¼ along every subsampled axis, with
+    /// edge samples replicated, and the sum is rounded to a whole sample
+    /// with the biases of `djpeg`'s default output — `(sum + 8) >> 4` on
+    /// even and `(sum + 7) >> 4` on odd output columns for 2 × 2,
+    /// `(sum + 1) >> 2` / `(sum + 2) >> 2` on one axis. Other ratios,
+    /// and components at most two samples wide, fall back to
+    /// replication. Part of the reference-compatible set
     /// ([`DecodeOptions::libjpeg_compatible`]).
     Triangular,
     /// Centred-siting linear interpolation for every sampling ratio
     /// (2:1, 4:1, 4:4:0's vertical 2:1, and the non-integer ratios of
     /// mixed layouts), edge samples replicated, no intermediate
     /// rounding — the interpolated chroma reaches the YCbCr kernel with
-    /// its fraction. Cheaper than [`Self::LumaGuided`].
+    /// its fraction (sixteenths of a sample at 2:1 and 2 × 2) and the
+    /// pixel is rounded once.
     Linear,
     /// [`Self::Linear`] plus the luma detail lost to subsampling, scaled
-    /// by the local chroma-on-luma regression slope and clamped to the
-    /// chroma neighbourhood's range: edges shared by luma and chroma stay
-    /// sharp, uncorrelated chroma falls back to the linear estimate
+    /// by the local chroma-on-luma regression slope
+    /// `a = cov(Ŷ, C) / (var(Ŷ) + ε)` over a 3 × 3 chroma neighbourhood
+    /// (`Ŷ` = luma averaged over each chroma cell) and clamped to that
+    /// neighbourhood's chroma range: edges shared by luma and chroma
+    /// stay sharp, uncorrelated chroma falls back to the linear estimate
     /// (default). Applies to YCbCr components at integer ratios to a
     /// full-resolution luma component; anything else (non-integer
     /// ratios, CMYK / YCCK, RGB-coded components) uses [`Self::Linear`].
@@ -1181,11 +1208,9 @@ pub struct ConvertOptions {
     pub upsampling: ChromaUpsampling,
     /// YCbCr → RGB kernel.
     pub ycbcr: YcbcrKernel,
-    /// Workers for one picture (`1` = serial, the default): the
-    /// interpolating reconstructions ([`ChromaUpsampling::LumaGuided`],
-    /// [`ChromaUpsampling::Linear`]) build the two chroma planes on two
-    /// workers and convert the rows in that many bands. The pixels are
-    /// the same for every value.
+    /// Workers for one picture (`1` = serial, the default): the planar
+    /// YCbCr layouts are converted in that many bands of rows. The
+    /// pixels are the same for every value.
     pub threads: usize,
 }
 

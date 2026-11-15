@@ -2144,6 +2144,101 @@ decode: refinement scans 47 % (50 %), dequantisation + IDCT + store
 30 % (33 %), block walk 8 %, first-pass AC 7 %, DC 4 %. It is not
 memory-bound: 3.0 and 3.3 ns per pixel at 1.9 and 12 MP.
 
+### Entropy decode and block reconstruction
+
+A later pass on the two stages the conversion work had left alone,
+with every decode mode returning the same bytes as before (fixture
+corpus, 45 377 fuzz-corpus inputs and the pictures below, compared
+against the previous build file by file; two differential tests run
+the new block and refinement steps against the checked ones on streams
+with stuffed bytes, fill bytes and markers).
+
+Where a serial decode spends its time after it (sampling profile, 5 s
+per case; pictures as above, quality 85, about 1.5 bpp). Colour
+conversion and the packing of the output pixels are one kernel, so
+they share a column; "transform" is dequantisation, the inverse DCT
+and the sample store:
+
+| stream, call | entropy decode | transform | chroma reconstruction | colour conversion + packing | rest |
+|---|---|---|---|---|---|
+| 1600 × 1200 baseline 4:2:0, `decode` | 61 % | 38 % | | | 1 % |
+| 1600 × 1200 baseline 4:2:0, `decode_rgb8` | 25 % | 17 % | 36 % | 21 % | 1 % |
+| 1600 × 1200 baseline 4:4:4, `decode_rgb8` | 46 % | 31 % | | 22 % | 1 % |
+| 12 MP baseline 4:2:0, `decode_rgb8` | 25 % | 14 % | 39 % | 22 % | 1 % |
+| 12 MP baseline 4:4:4, `decode_rgb8` | 45 % | 28 % | | 26 % | 1 % |
+| 1600 × 1200 progressive 4:2:0, `decode` | 74 % | 24 % | | | 3 % |
+| 1600 × 1200 progressive 4:2:0, `decode_rgb8` | 45 % | 15 % | 23 % | 15 % | 2 % |
+
+Before → after, serial, in ms: medians of 25 runs (9 at 12 MP) of the
+previous build and this one taken alternately in one process, in
+thread CPU time, on a machine that was running other builds — read
+them to about ±5 %.
+
+| stream | entropy only (`read_coefficients`) | `decode` (planar) | `decode_rgb8` (luma-guided) | `decode_rgb8`, `Replicate` |
+|---|---|---|---|---|
+| 1600 × 1200 baseline 4:2:0 | 2.97 → 2.71 | 4.79 → 3.98 (1.20×) | 10.71 → 9.88 (1.08×) | 7.05 → 6.50 (1.08×) |
+| 1600 × 1200 baseline 4:2:2 | | 5.05 → 4.32 (1.17×) | 11.79 → 10.84 (1.09×) | |
+| 1600 × 1200 baseline 4:4:4 | 3.77 → 3.55 | 6.69 → 5.78 (1.16×) | 8.15 → 7.40 (1.10×) | |
+| 1600 × 1200 baseline grey | | 3.68 → 3.06 (1.20×) | 3.77 → 3.31 (1.14×) | |
+| 1600 × 1200 baseline 4:2:0, quality 95 (3.3 bpp) | | 7.17 → 5.74 (1.25×) | 12.49 → 10.56 (1.18×) | |
+| 1600 × 1200 baseline 4:2:0, quality 50 (0.6 bpp) | | 2.59 → 2.22 (1.16×) | 7.74 → 7.53 (1.03×) | |
+| 1600 × 1200 progressive 4:2:0 | 7.56 → 6.36 | 10.07 → 8.91 (1.13×) | 16.28 → 15.13 (1.08×) | 12.17 → 11.47 (1.06×) |
+| 1600 × 1200 progressive 4:4:4 | | 12.47 → 11.00 (1.13×) | 14.06 → 12.65 (1.11×) | |
+| 12 MP baseline 4:2:0 | | 25.6 → 22.3 (1.15×) | 59.7 → 56.0 (1.06×) | |
+| 12 MP baseline 4:4:4 | | 29.8 → 26.4 (1.13×) | 39.6 → 36.0 (1.10×) | |
+| 12 MP progressive 4:2:0 | | 53.0 → 44.8 (1.18×) | 88.2 → 78.7 (1.12×) | |
+
+What changed. A sequential block, a progressive DC or first AC pass
+and a refinement symbol are decoded from one table load, a magnitude
+read off the buffered word and one shift; away from stuffed bytes and
+markers the bit buffer is topped up eight bytes at a time on every
+coefficient, with the next table index taken before the top-up, and
+next to a marker the checked single steps take over at the same
+position. Refinement corrections come off the buffered word, and a
+symbol whose zero run crosses no coded coefficient skips the walk over
+the block's non-zero mask. A block confined to the low-frequency
+4 × 4 corner runs half the column pass and is dequantised in the corner
+only. The end of a scan is found eight bytes at a time, and a component
+grid as wide as its plane becomes the plane instead of being copied.
+
+What did not change: the inverse transform's arithmetic (a different
+factorisation would move roundings, and the default output is pinned),
+and the chroma reconstruction and colour kernel, which are 57–61 % of a
+subsampled `decode_rgb8` and bound what the two stages above can give
+it — removing entropy decode and transform altogether would be 1.7×.
+The planar decode is the measure of this pass. In progressive frames
+the successive-approximation refinement scans remain the largest item:
+each symbol's position depends on the block's
+history, and two attempts at a decision-free form of that step measured
+no faster than the masked walk.
+
+Workers (`DecodeOptions::threads`, serial by default, same bytes for
+every count; wall-clock medians of 15 runs, ms):
+
+| stream | `decode`: 1 / 2 / 4 / 8 workers | `decode_rgb8`: 1 / 2 / 4 / 8 workers |
+|---|---|---|
+| 1600 × 1200 baseline 4:2:0, restart interval per MCU row | 3.3 / 2.4 / 1.7 / 1.3 | 8.2 / 5.6 / 3.5 / 2.3 |
+| 12 MP baseline 4:2:0, restart interval per MCU row | 20.5 / 13.1 / 9.5 / 6.8 | 51.2 / 32.1 / 21.0 / 13.0 |
+| 1600 × 1200 progressive 4:2:0 | 8.0 / 7.3 / 6.9 / 6.6 | 12.3 / 10.6 / 8.6 / 7.5 |
+| 12 MP progressive 4:2:0 | 45.4 / 41.1 / 38.3 / 36.0 | 78.4 / 62.2 / 50.4 / 43.1 |
+
+A stream with restart intervals decodes its intervals in parallel; a
+progressive (or arithmetic) frame has one serial entropy pass per scan,
+so workers share only its reconstruction and conversion.
+
+Reduced-size decode (`DecodeOptions::scale`, serial, wall-clock medians
+of 15 runs, ms): the entropy-coded data is read in full, the transform
+and everything after it work on the small picture.
+
+| stream | full | 1/2 | 1/4 | 1/8 |
+|---|---|---|---|---|
+| 1600 × 1200 baseline 4:2:0, `decode` | 3.5 | 2.8 | 2.3 | 2.4 |
+| 1600 × 1200 baseline 4:2:0, `decode_rgb8` | 8.5 | 3.5 | 2.4 | 2.5 |
+| 1600 × 1200 baseline 4:4:4, `decode_rgb8` | 6.3 | 4.2 | 3.4 | 3.0 |
+| 1600 × 1200 progressive 4:2:0, `decode_rgb8` | 13.5 | 7.6 | 6.6 | 6.2 |
+| 12 MP baseline 4:2:0, `decode` | 21.2 | 15.7 | 14.0 | 13.2 |
+| 12 MP baseline 4:2:0, `decode_rgb8` | 53.3 | 23.4 | 15.8 | 13.8 |
+
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the
 whole `docs/` fixture corpus and of the encoded bytes + decode-back

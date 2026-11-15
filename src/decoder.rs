@@ -1310,12 +1310,118 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Top the buffer up from entropy bytes ([`Self::refill_plain`], then
+    /// byte by byte across stuffed pairs) until it holds at least `want`
+    /// (≤ 57) bits; `false` when a marker or the end of the data is in
+    /// the way. Every
+    /// buffered bit is a bit of the stream (padding is only ever handed
+    /// out by [`Self::fill`], which leaves none behind), so on `true` the
+    /// next `want` bits can be taken with no further check. Reading ahead
+    /// over plain bytes moves `pos` and `nbits` together: the sequence of
+    /// bits the reader goes on to deliver is the same.
+    ///
+    /// One state does depend on how far ahead the reader has loaded:
+    /// after a restart marker was consumed inside an interval (a damaged
+    /// stream), the next interval starts at `pos`, whatever is buffered.
+    /// So from a consumed marker to that restart nothing is loaded here,
+    /// and the reader loads exactly what the checked steps load.
+    #[inline(always)]
+    fn ensure_plain(&mut self, want: u32) -> bool {
+        if self.nbits < want {
+            if self.saw_rst.is_some() {
+                return false;
+            }
+            self.refill_plain();
+            if self.nbits < want {
+                // A stuffed `0xFF 0x00` is data too; a marker is left alone.
+                self.peek_refill_slow(want);
+            }
+        }
+        self.nbits >= want
+    }
+
     /// Drop the next `n` bits that a prior `peek_bits` already validated as
     /// available. `n` must be ≤ `self.nbits`.
     #[inline]
     fn consume(&mut self, n: u32) {
         self.bits <<= n;
         self.nbits -= n;
+    }
+}
+
+/// A [`BitReader`]'s buffer taken into locals for a run of symbols away
+/// from stuffed bytes and markers, topped up with no decision to
+/// predict.
+///
+/// [`Self::top_up`] ORs the next eight bytes in below the buffered bits
+/// — the ones they overlap are the same stream bits — and counts the
+/// whole bytes that fit, which leaves at least 56 bits. A symbol and
+/// what follows it take at most 31, so after it at least 25 remain: the
+/// next table index (and a code of up to 16 bits) can be read off the
+/// buffer as it stands, before the next top-up, and the load that
+/// fetches the next table entry does not wait for the bytes being
+/// merged in.
+struct Ahead<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    /// MSB-aligned; below the counted bits, either zeros or the stream
+    /// bits that follow them.
+    bits: u64,
+    nbits: u32,
+}
+
+impl<'a> Ahead<'a> {
+    /// Bits left after a top-up and the longest symbol: enough for the
+    /// next code.
+    const AFTER_SYMBOL: u32 = 25;
+
+    /// `None` once a restart marker was consumed inside an interval
+    /// (see [`BitReader::ensure_plain`]) or when the buffer is full.
+    #[inline(always)]
+    fn open(br: &BitReader<'a>) -> Option<Self> {
+        (br.saw_rst.is_none() && br.nbits < 64).then_some(Self {
+            buf: br.buf,
+            pos: br.pos,
+            bits: br.bits,
+            nbits: br.nbits,
+        })
+    }
+
+    /// Merge the next eight bytes in; `false` (nothing changed) unless
+    /// all eight are plain entropy bytes.
+    #[inline(always)]
+    fn top_up(&mut self) -> bool {
+        let Some(chunk) = self.buf.get(self.pos..self.pos + 8) else {
+            return false;
+        };
+        let w = u64::from_be_bytes(chunk.try_into().unwrap());
+        if ff_bytes(w) != 0 {
+            return false;
+        }
+        self.bits |= w >> self.nbits;
+        self.pos += ((63 - self.nbits) >> 3) as usize;
+        self.nbits |= 56;
+        true
+    }
+
+    /// Drop `n` buffered bits.
+    #[inline(always)]
+    fn take(&mut self, n: u32) {
+        self.bits <<= n;
+        self.nbits -= n;
+    }
+
+    /// Hand the buffer back to the reader, with nothing below its
+    /// counted bits.
+    #[inline(always)]
+    fn close(self, br: &mut BitReader<'a>) {
+        br.pos = self.pos;
+        br.nbits = self.nbits;
+        br.bits = if self.nbits == 0 {
+            0
+        } else {
+            self.bits & (u64::MAX << (64 - self.nbits))
+        };
     }
 }
 
@@ -1881,14 +1987,12 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
     let mut planes: Vec<VideoPlane> = Vec::new();
     match out_format {
         PixelFormat::Gray8 => {
-            let stride = width;
-            let mut data = vec![0u8; stride * height];
-            let src_stride = comp_stride[0];
-            for y in 0..height {
-                data[y * stride..y * stride + width]
-                    .copy_from_slice(&comp_buf[0][y * src_stride..y * src_stride + width]);
-            }
-            planes.push(VideoPlane { stride, data });
+            planes.push(into_plane_8bit(
+                std::mem::take(&mut comp_buf[0]),
+                comp_stride[0],
+                width,
+                height,
+            ));
         }
         PixelFormat::Rgb24 => {
             // Pack the three full-resolution component buffers into a
@@ -1916,16 +2020,31 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
             let layout = yuv_layout(sof, width, height, false);
-            planes.extend(shape_yuv_planes(
-                sof,
-                &comp_buf,
-                &comp_stride,
-                width,
-                height,
-                layout,
-                state.upsampling,
-                emit_plane_8bit,
-            ));
+            if let YuvLayout::Native { c_w, c_h, .. } = layout {
+                // The component grids become the planes.
+                for (ci, (w, h)) in [(width, height), (c_w, c_h), (c_w, c_h)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    planes.push(into_plane_8bit(
+                        std::mem::take(&mut comp_buf[ci]),
+                        comp_stride[ci],
+                        w,
+                        h,
+                    ));
+                }
+            } else {
+                planes.extend(shape_yuv_planes(
+                    sof,
+                    &comp_buf,
+                    &comp_stride,
+                    width,
+                    height,
+                    layout,
+                    state.upsampling,
+                    emit_plane_8bit,
+                ));
+            }
         }
         _ => unreachable!(),
     }
@@ -2129,6 +2248,20 @@ fn shape_yuv_planes<T: Copy + Default + Into<u32> + TryFrom<u32>>(
     }
 }
 
+/// The top-left `w × h` window of an owned 8-bit sample grid as a plane:
+/// the grid itself, cut to length, when its rows are `w` samples wide
+/// (a picture whose width is a whole number of MCUs), a copy otherwise.
+fn into_plane_8bit(mut src: Vec<u8>, src_stride: usize, w: usize, h: usize) -> VideoPlane {
+    if src_stride == w && src.len() >= w * h {
+        src.truncate(w * h);
+        return VideoPlane {
+            stride: w,
+            data: src,
+        };
+    }
+    emit_plane_8bit(&src, src_stride, w, h)
+}
+
 /// Copy the top-left `w × h` window of an 8-bit sample grid into a plane.
 fn emit_plane_8bit(src: &[u8], src_stride: usize, w: usize, h: usize) -> VideoPlane {
     let mut data = vec![0u8; w * h];
@@ -2191,8 +2324,83 @@ fn huff_step(br: &mut BitReader<'_>, t: &HuffTable) -> Result<(u8, Option<i32>)>
     Ok((decode_huff(br, t)?, None))
 }
 
+/// The code at the top of `top` (MSB first, at least 16 real bits) by
+/// the canonical length walk of [`decode_huff_slow`], not consumed:
+/// `(symbol, code length)`, or `None` where that walk fails.
+#[inline(never)]
+fn long_code_ahead(t: &HuffTable, top: u64) -> Option<(u32, u32)> {
+    for l in 0..16u32 {
+        let code = (top >> (63 - l)) as i32;
+        if code <= t.max_code[l as usize] {
+            let idx = (t.val_offset[l as usize] + code) as usize;
+            return t.values.get(idx).map(|&sym| (sym as u32, l + 1));
+        }
+    }
+    None
+}
+
+/// The symbol at the top of `top` (at least 16 real bits), not
+/// consumed: `(symbol, code length)`. One table load for a code of up
+/// to [`crate::jpeg::huffman::LUT_BITS`] bits, [`long_code_ahead`] for
+/// a longer one. `None` when no code matches (the caller then takes the
+/// checked path, which reports it).
+#[inline(always)]
+fn symbol_ahead(t: &HuffTable, top: u64) -> Option<(u32, u32)> {
+    let e = t.lut[(top >> (64 - crate::jpeg::huffman::LUT_BITS)) as usize];
+    if e & 0xF00 != 0 {
+        Some((e & 0xFF, (e >> 8) & 0x0F))
+    } else {
+        long_code_ahead(t, top)
+    }
+}
+
+/// The next symbol of `t` once it and the `extra(symbol)` (≤ 16) bits
+/// that follow its code are buffered as real bits
+/// ([`BitReader::ensure_plain`]): `(symbol, code length, the buffer from
+/// the end of the code on)`, nothing consumed. `None` next to a marker
+/// or the end of the data, or when no code matches: the caller takes
+/// the checked steps from the same position.
+///
+/// The code itself needs 16 bits at most, so the buffer is only topped
+/// up below that, or when the symbol at hand turns out to need more
+/// than is left.
+#[inline(always)]
+fn buffered_symbol(
+    br: &mut BitReader<'_>,
+    t: &HuffTable,
+    extra: impl Fn(u32) -> u32,
+) -> Option<(u32, u32, u64)> {
+    if !br.ensure_plain(16) {
+        return None;
+    }
+    let (sym, len) = symbol_ahead(t, br.bits)?;
+    let need = len + extra(sym);
+    if br.nbits < need && !br.ensure_plain(need) {
+        return None;
+    }
+    Some((sym, len, br.bits << len))
+}
+
+/// §F.2.2.1 `EXTEND` of the `size` (`1..=16`) bits at the top of `top`.
+#[inline(always)]
+fn magnitude_ahead(top: u64, size: u32) -> i32 {
+    let v = (top >> (64 - size)) as i32;
+    // A leading 0 bit marks a negative value: `v − (2^size − 1)`.
+    let negative = (top >> 63) as i32 ^ 1;
+    v - (((1 << size) - 1) & -negative)
+}
+
 /// Decode one sequential block into `out_natural` (zeroed by the
 /// caller); returns the [`Extent`] of what was placed.
+///
+/// While a symbol and its magnitude (at most 16 + 15 bits) are buffered
+/// as real bits a coefficient is one table load, one magnitude
+/// extraction off the buffered word and one shift, with nothing to
+/// check; next to a stuffed byte, a marker or the
+/// end of the data (and for anything irregular: an undecodable code, a
+/// run past the block) the checked steps below take over at the same
+/// position, so the bits consumed and the values placed are those of the
+/// checked steps alone.
 fn decode_block(
     br: &mut BitReader<'_>,
     dc: &HuffTable,
@@ -2200,7 +2408,156 @@ fn decode_block(
     prev_dc: &mut i32,
     out_natural: &mut [i32; 64],
 ) -> Result<Extent> {
+    use crate::jpeg::huffman::LUT_BITS;
     // DC.
+    let dc_diff = 'dc: {
+        if let Some((t, len, after)) = buffered_symbol(br, dc, |t| t.min(16)) {
+            if t == 0 {
+                br.consume(len);
+                break 'dc 0;
+            }
+            if t <= 15 {
+                br.consume(len + t);
+                break 'dc magnitude_ahead(after, t);
+            }
+        }
+        let (t, v) = huff_step(br, dc)?;
+        match v {
+            Some(v) => v,
+            None if t == 0 => 0,
+            None => {
+                let t = t as u32;
+                let bits = br.get_bits(t)? as i32;
+                extend(bits, t)
+            }
+        }
+    };
+    *prev_dc = prev_dc.wrapping_add(dc_diff);
+    out_natural[0] = *prev_dc;
+    // AC: zigzag run-length decode into natural order. `last` is the
+    // zig-zag position of the last coefficient placed (a placed value is
+    // never zero: `EXTEND` of `size ≥ 1` bits is not); the DC position
+    // always counts, so a block with no AC coefficient keeps `last = 0`,
+    // which is what a DC-only block is recognised by.
+    let mut k: usize = 1;
+    let mut last: usize = 0;
+    'block: {
+        // Away from stuffed bytes and markers: the buffer in locals
+        // ([`Ahead`]), topped up on every coefficient, the table index
+        // read before the top-up.
+        if let Some(mut ahead) = Ahead::open(br) {
+            let mut ended = false;
+            let ready = ahead.nbits >= Ahead::AFTER_SYMBOL || ahead.top_up();
+            while ready && k < 64 {
+                let e = ac.lut[(ahead.bits >> (64 - LUT_BITS)) as usize];
+                if !ahead.top_up() {
+                    break;
+                }
+                let (rs, len, total) = if e & 0xF00 != 0 {
+                    (e & 0xFF, (e >> 8) & 0x0F, (e >> 12) & 0x1F)
+                } else {
+                    match long_code_ahead(ac, ahead.bits) {
+                        Some((rs, len)) => (rs, len, len + (rs & 0x0F)),
+                        None => break,
+                    }
+                };
+                let size = rs & 0x0F;
+                if size == 0 {
+                    ahead.take(len);
+                    if rs == 0xF0 {
+                        // ZRL — 16 zeros.
+                        k += 16;
+                        continue;
+                    }
+                    // EOB.
+                    ended = true;
+                    break;
+                }
+                let at = k + (rs >> 4) as usize;
+                if at >= 64 {
+                    break;
+                }
+                out_natural[ZIGZAG[at]] = magnitude_ahead(ahead.bits << len, size);
+                ahead.take(total);
+                last = at;
+                k = at + 1;
+            }
+            ahead.close(br);
+            if ended {
+                break 'block;
+            }
+        }
+        // Next to a stuffed byte: the same steps on the reader itself,
+        // topped up when it runs low.
+        while k < 64 {
+            let Some((rs, len, after)) = buffered_symbol(br, ac, |rs| rs & 0x0F) else {
+                break;
+            };
+            let size = rs & 0x0F;
+            if size == 0 {
+                br.consume(len);
+                if rs == 0xF0 {
+                    // ZRL — 16 zeros.
+                    k += 16;
+                    continue;
+                }
+                // EOB.
+                break 'block;
+            }
+            let at = k + (rs >> 4) as usize;
+            if at >= 64 {
+                break;
+            }
+            out_natural[ZIGZAG[at]] = magnitude_ahead(after, size);
+            br.consume(len + size);
+            last = at;
+            k = at + 1;
+        }
+        // At a marker, at the end of the data, or on anything irregular:
+        // the checked steps.
+        while k < 64 {
+            let (rs, v) = huff_step(br, ac)?;
+            let run = (rs >> 4) as usize;
+            let size = (rs & 0x0F) as u32;
+            if size == 0 {
+                if run == 15 {
+                    // ZRL — 16 zeros.
+                    k += 16;
+                    continue;
+                }
+                // EOB.
+                break;
+            }
+            k += run;
+            if k >= 64 {
+                return Err(Error::invalid("JPEG AC: run out of block"));
+            }
+            let val = match v {
+                Some(v) => v,
+                None => {
+                    let bits = br.get_bits(size)? as i32;
+                    extend(bits, size)
+                }
+            };
+            out_natural[ZIGZAG[k]] = val;
+            last = k;
+            k += 1;
+        }
+    }
+    Ok(ZIGZAG_EXTENT_UP_TO[last])
+}
+
+/// The checked steps of [`decode_block`] alone (every symbol through
+/// [`huff_step`], the last coefficient found by reading the block back),
+/// kept as the oracle of its differential test.
+#[cfg(test)]
+fn decode_block_reference(
+    br: &mut BitReader<'_>,
+    dc: &HuffTable,
+    ac: &HuffTable,
+    prev_dc: &mut i32,
+    out_natural: &mut [i32; 64],
+) -> Result<Extent> {
     let (t, v) = huff_step(br, dc)?;
     let dc_diff = match v {
         Some(v) => v,
@@ -2213,7 +2570,6 @@ fn decode_block(
     };
     *prev_dc = prev_dc.wrapping_add(dc_diff);
     out_natural[0] = *prev_dc;
-    // AC: zigzag run-length decode into natural order.
     let mut k: usize = 1;
     while k < 64 {
         let (rs, v) = huff_step(br, ac)?;
@@ -2221,11 +2577,9 @@ fn decode_block(
         let size = (rs & 0x0F) as u32;
         if size == 0 {
             if run == 15 {
-                // ZRL — 16 zeros.
                 k += 16;
                 continue;
             }
-            // EOB.
             break;
         }
         k += run;
@@ -2242,11 +2596,6 @@ fn decode_block(
         out_natural[ZIGZAG[k]] = val;
         k += 1;
     }
-    // The last coefficient placed is the one before `k` (a placed value
-    // is never zero: `EXTEND` of `size ≥ 1` bits is not) unless runs of
-    // 16 zeros came after it; step back over those. The DC position
-    // always counts: a block that ends up here with `last = 0` has no AC
-    // coefficient, which is what a DC-only block is recognised by.
     let mut last = k.min(64) - 1;
     while last > 0 && out_natural[ZIGZAG[last]] == 0 {
         last -= 1;
@@ -3263,12 +3612,26 @@ fn prog_decode_dc(
     differential: bool,
 ) -> Result<()> {
     if ah == 0 {
-        let (t, v) = huff_step(br, dc)?;
-        let t = t as u32;
-        let dc_diff = match v {
-            Some(v) => v,
-            None if t == 0 => 0,
-            None => extend(br.get_bits(t)? as i32, t),
+        let dc_diff = 'dc: {
+            // As in `decode_block`: one load and one extraction while
+            // enough real bits are buffered, the checked steps otherwise.
+            if let Some((t, len, after)) = buffered_symbol(br, dc, |t| t.min(16)) {
+                if t == 0 {
+                    br.consume(len);
+                    break 'dc 0;
+                }
+                if t <= 15 {
+                    br.consume(len + t);
+                    break 'dc magnitude_ahead(after, t);
+                }
+            }
+            let (t, v) = huff_step(br, dc)?;
+            let t = t as u32;
+            match v {
+                Some(v) => v,
+                None if t == 0 => 0,
+                None => extend(br.get_bits(t)? as i32, t),
+            }
         };
         if differential {
             // §J.2.3.1: a differential progressive (SOF6) frame decodes the
@@ -3310,6 +3673,96 @@ fn prog_decode_ac_first(
         return Ok(());
     }
     let mut k = ss;
+    // While a symbol and what follows it are buffered as real bits: a
+    // symbol, its magnitude (or the `r` extra bits of an EOBn run length,
+    // at most 14) and one shift, as in `decode_block`. Anything else — a
+    // marker or the end of the data ahead, an undecodable code, a run
+    // past the band — is left unconsumed for the checked steps below.
+    //
+    // What follows a code: the magnitude of a coefficient, or the extra
+    // bits of an EOBn run length (none after a run of 16 zeros).
+    let after_code = |rs: u32| match rs & 0x0F {
+        0 if rs == 0xF0 => 0,
+        0 => rs >> 4,
+        s => s,
+    };
+    if let Some(mut ahead) = Ahead::open(br) {
+        // Away from stuffed bytes and markers: as in `decode_block`.
+        let ready = ahead.nbits >= Ahead::AFTER_SYMBOL || ahead.top_up();
+        let mut ended = false;
+        while ready && k <= se {
+            let e = ac.lut[(ahead.bits >> (64 - crate::jpeg::huffman::LUT_BITS)) as usize];
+            if !ahead.top_up() {
+                break;
+            }
+            let (rs, len) = if e & 0xF00 != 0 {
+                (e & 0xFF, (e >> 8) & 0x0F)
+            } else {
+                match long_code_ahead(ac, ahead.bits) {
+                    Some(hit) => hit,
+                    None => break,
+                }
+            };
+            let after = ahead.bits << len;
+            let r = rs >> 4;
+            let s = rs & 0x0F;
+            if s == 0 {
+                if r != 15 {
+                    // EOBn: this block ends here, 2^r − 1 + extra more
+                    // follow.
+                    let extra = (after >> 1 >> (63 - r)) as u32;
+                    ahead.take(len + r);
+                    *eob_run = (1u32 << r) + extra - 1;
+                    ended = true;
+                    break;
+                }
+                // ZRL → 16 zeros.
+                ahead.take(len);
+                k += 16;
+            } else {
+                let at = k + r as usize;
+                if at > se {
+                    break;
+                }
+                block[ZIGZAG[at]] = magnitude_ahead(after, s) << al;
+                ahead.take(len + s);
+                *nz |= 1 << at;
+                k = at + 1;
+            }
+        }
+        ahead.close(br);
+        if ended {
+            return Ok(());
+        }
+    }
+    while k <= se {
+        let Some((rs, len, after)) = buffered_symbol(br, ac, after_code) else {
+            break;
+        };
+        let r = rs >> 4;
+        let s = rs & 0x0F;
+        if s == 0 {
+            if r != 15 {
+                // EOBn: this block ends here, 2^r − 1 + extra more follow.
+                let extra = (after >> 1 >> (63 - r)) as u32;
+                br.consume(len + r);
+                *eob_run = (1u32 << r) + extra - 1;
+                return Ok(());
+            }
+            // ZRL → 16 zeros.
+            br.consume(len);
+            k += 16;
+        } else {
+            let at = k + r as usize;
+            if at > se {
+                break;
+            }
+            block[ZIGZAG[at]] = magnitude_ahead(after, s) << al;
+            br.consume(len + s);
+            *nz |= 1 << at;
+            k = at + 1;
+        }
+    }
     while k <= se {
         let (rs, v) = huff_step(br, ac)?;
         let r = (rs >> 4) as usize;
@@ -3434,9 +3887,44 @@ fn prog_decode_ac_refine(
         m1: i32,
     ) -> Result<()> {
         while positions != 0 {
-            let pos = ZIGZAG[positions.trailing_zeros() as usize];
-            positions &= positions - 1;
-            let bit = br.get_bit()?;
+            // The correction bits are consecutive stream bits, one per
+            // position: they are read off the buffered word, as many as
+            // it holds, so the updates depend on one another only
+            // through the position walk and not through the reader.
+            // With nothing buffered the reader is topped up; next to a
+            // marker or the end of the data the bit comes from the
+            // checked single-bit read.
+            if br.nbits == 0 && !br.ensure_plain(1) {
+                let bit = br.get_bit()?;
+                positions = apply(block, positions, (bit as u64) << 63, 1, p1, m1);
+                continue;
+            }
+            let word = br.bits;
+            let mut taken = 0;
+            while positions != 0 && taken < br.nbits {
+                positions = apply(block, positions, word << taken, 1, p1, m1);
+                taken += 1;
+            }
+            br.consume(taken);
+        }
+        Ok(())
+    }
+    // The first `count` correction bits of `word` (MSB first) applied to
+    // the lowest `count` positions of `positions`; returns the positions
+    // left.
+    #[inline(always)]
+    fn apply(
+        block: &mut [i32; 64],
+        mut positions: u64,
+        word: u64,
+        count: u32,
+        p1: i32,
+        m1: i32,
+    ) -> u64 {
+        for i in 0..count {
+            let pos = ZIGZAG[(positions.trailing_zeros() & 63) as usize];
+            positions &= positions.wrapping_sub(1);
+            let bit = (word >> (63 - i)) & 1;
             // Figure G.7: a set correction bit moves the coefficient one
             // step away from zero unless that bit is already set. The
             // bit is as good as random, so the update is selected, not
@@ -3446,55 +3934,110 @@ fn prog_decode_ac_refine(
             let apply = (bit != 0) & (c & p1 == 0);
             block[pos] = c + (step & -(apply as i32));
         }
-        Ok(())
+        positions
     }
 
     let mut k = ss;
     if *eob_run == 0 {
         while k <= se {
-            let (rs, v) = huff_step(br, ac)?;
-            let r = (rs >> 4) as usize;
-            let s = (rs & 0x0F) as u32;
-            let new_val: i32 = if s == 0 {
-                if r != 15 {
+            // The symbol and what follows its code (the sign of a new
+            // coefficient, or the extra bits of an EOBn run length):
+            // read off the buffer while they are there as real bits, by
+            // the checked steps otherwise (which also report a
+            // code that is no symbol of this pass).
+            let fast = 'sym: {
+                let after_code = |rs: u32| match rs & 0x0F {
+                    0 if rs == 0xF0 => 0,
+                    0 => rs >> 4,
+                    _ => 1,
+                };
+                let Some((rs, len, after)) = buffered_symbol(br, ac, after_code) else {
+                    break 'sym None;
+                };
+                match rs & 0x0F {
+                    0 if rs == 0xF0 => {
+                        br.consume(len);
+                        Some((15usize, 0i32, None))
+                    }
+                    0 => {
+                        let r = rs >> 4;
+                        let extra = (after >> 1 >> (63 - r)) as u32;
+                        br.consume(len + r);
+                        Some((r as usize, 0, Some((1u32 << r) + extra)))
+                    }
+                    1 => {
+                        br.consume(len + 1);
+                        let sign = if after >> 63 == 0 { m1 } else { p1 };
+                        Some(((rs >> 4) as usize, sign, None))
+                    }
+                    _ => None,
+                }
+            };
+            let (r, new_val) = match fast {
+                Some((_, _, Some(run))) => {
                     // EOBn: refine remaining non-zeros then schedule n-1 EOB blocks.
-                    let extra = if r == 0 { 0 } else { br.get_bits(r as u32)? };
-                    *eob_run = (1u32 << r) + extra;
+                    *eob_run = run;
                     break;
                 }
-                // ZRL: skip 16 zero-history positions (refining any current nonzeros).
-                0
-            } else if s == 1 {
-                // A new nonzero: its sign bit follows the code. The
-                // lookahead's `EXTEND` of one bit is `−1` / `+1` — the
-                // same `m1` / `p1` once shifted by `Al`.
-                match v {
-                    Some(v) => v << al,
-                    None => {
-                        if br.get_bit()? == 0 {
-                            m1
-                        } else {
-                            p1
+                Some((r, new_val, None)) => (r, new_val),
+                None => {
+                    let (rs, v) = huff_step(br, ac)?;
+                    let r = (rs >> 4) as usize;
+                    let s = (rs & 0x0F) as u32;
+                    let new_val: i32 = if s == 0 {
+                        if r != 15 {
+                            // EOBn, as above.
+                            let extra = if r == 0 { 0 } else { br.get_bits(r as u32)? };
+                            *eob_run = (1u32 << r) + extra;
+                            break;
                         }
-                    }
+                        // ZRL: skip 16 zero-history positions (refining any current nonzeros).
+                        0
+                    } else if s == 1 {
+                        // A new nonzero: its sign bit follows the code. The
+                        // lookahead's `EXTEND` of one bit is `−1` / `+1` — the
+                        // same `m1` / `p1` once shifted by `Al`.
+                        match v {
+                            Some(v) => v << al,
+                            None => {
+                                if br.get_bit()? == 0 {
+                                    m1
+                                } else {
+                                    p1
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(Error::invalid("progressive AC refine: bad s"));
+                    };
+                    (r, new_val)
                 }
-            } else {
-                return Err(Error::invalid("progressive AC refine: bad s"));
             };
 
             // The position this symbol ends on: the `(r + 1)`-th zero at
             // or after `k`. Every non-zero before it is corrected.
-            let ahead = u64::MAX << k;
-            let mut zeros = !nz & band & ahead;
-            for _ in 0..r {
-                zeros &= zeros.wrapping_sub(1);
-            }
-            if zeros == 0 {
-                correct(br, block, nz & ahead, p1, m1)?;
-                return Err(Error::invalid("progressive AC refine: k past se"));
-            }
-            let target = zeros.trailing_zeros() as usize;
-            correct(br, block, nz & ahead & ((1u64 << target) - 1), p1, m1)?;
+            //
+            // Most often none of the next `r + 1` positions holds a
+            // coefficient yet: the symbol then ends `r` positions on
+            // with nothing to correct, and the reader's next step does
+            // not wait for a walk over the mask.
+            let at = k + r;
+            let target = if at <= se && (nz >> k) & ((2u64 << r) - 1) == 0 {
+                at
+            } else {
+                let ahead = u64::MAX << k;
+                let mut zeros = !nz & band & ahead;
+                for _ in 0..r {
+                    zeros &= zeros.wrapping_sub(1);
+                }
+                if zeros == 0 {
+                    correct(br, block, nz & ahead, p1, m1)?;
+                    return Err(Error::invalid("progressive AC refine: k past se"));
+                }
+                let target = zeros.trailing_zeros() as usize;
+                correct(br, block, nz & ahead & ((1u64 << target) - 1), p1, m1)?;
+                target
+            };
             k = target;
             if new_val != 0 {
                 block[ZIGZAG[k]] = new_val;
@@ -3722,14 +4265,12 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
     let mut planes: Vec<VideoPlane> = Vec::new();
     match out_format {
         PixelFormat::Gray8 => {
-            let stride = width;
-            let mut data = vec![0u8; stride * height];
-            let src_stride = comp_stride[0];
-            for y in 0..height {
-                data[y * stride..y * stride + width]
-                    .copy_from_slice(&comp_buf[0][y * src_stride..y * src_stride + width]);
-            }
-            planes.push(VideoPlane { stride, data });
+            planes.push(into_plane_8bit(
+                std::mem::take(&mut comp_buf[0]),
+                comp_stride[0],
+                width,
+                height,
+            ));
         }
         PixelFormat::Rgb24 => {
             // Pack the three full-resolution component buffers into a
@@ -3754,16 +4295,31 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         | PixelFormat::Yuv420P
         | PixelFormat::Yuv411P => {
             let layout = yuv_layout(sof, width, height, false);
-            planes.extend(shape_yuv_planes(
-                sof,
-                &comp_buf,
-                &comp_stride,
-                width,
-                height,
-                layout,
-                state.upsampling,
-                emit_plane_8bit,
-            ));
+            if let YuvLayout::Native { c_w, c_h, .. } = layout {
+                // The component grids become the planes.
+                for (ci, (w, h)) in [(width, height), (c_w, c_h), (c_w, c_h)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    planes.push(into_plane_8bit(
+                        std::mem::take(&mut comp_buf[ci]),
+                        comp_stride[ci],
+                        w,
+                        h,
+                    ));
+                }
+            } else {
+                planes.extend(shape_yuv_planes(
+                    sof,
+                    &comp_buf,
+                    &comp_stride,
+                    width,
+                    height,
+                    layout,
+                    state.upsampling,
+                    emit_plane_8bit,
+                ));
+            }
         }
         PixelFormat::Cmyk => {
             // Pack the 4 per-component planes into a single row-major
@@ -6821,6 +7377,130 @@ mod prog_tests {
         }
     }
 
+    /// Where a reader stands in its stream, however the bits are split
+    /// between the buffer and the bytes not yet loaded: its flags and
+    /// the bits it goes on to deliver (up to the first padded read, a
+    /// read error or 300 bits).
+    fn reader_position(br: &BitReader<'_>) -> (Option<u8>, bool, Vec<u8>) {
+        let mut rest = BitReader {
+            buf: br.buf,
+            pos: br.pos,
+            bits: br.bits,
+            nbits: br.nbits,
+            saw_rst: br.saw_rst,
+            padded: br.padded,
+        };
+        let mut bits = Vec::new();
+        while bits.len() < 300 && !rest.padded {
+            match rest.get_bit() {
+                Ok(b) => bits.push(b as u8),
+                Err(_) => {
+                    bits.push(2);
+                    break;
+                }
+            }
+        }
+        bits.push(3 + u8::from(rest.saw_rst.is_some()));
+        (br.saw_rst, br.padded, bits)
+    }
+
+    /// Bytes for the differential tests: random data of mixed density
+    /// with stuffed `0xFF 0x00` pairs, fill bytes, restart markers and
+    /// other markers sprinkled in.
+    fn hostile_stream(rnd: &mut impl FnMut() -> u32, trial: u32) -> Vec<u8> {
+        let len = 1 + (rnd() % 96) as usize;
+        let mut buf = Vec::with_capacity(len + 8);
+        while buf.len() < len {
+            let b = match trial % 4 {
+                0 => rnd() as u8,
+                1 => rnd() as u8 & 0x3F,
+                2 => (rnd() & rnd()) as u8,
+                _ => (rnd() | rnd()) as u8,
+            };
+            match rnd() % 64 {
+                0 => buf.extend_from_slice(&[0xFF, 0x00]),
+                1 if trial.is_multiple_of(3) => {
+                    buf.extend_from_slice(&[0xFF, 0xD0 + (rnd() % 8) as u8])
+                }
+                2 if trial.is_multiple_of(5) => buf.extend_from_slice(&[0xFF, 0xFF, 0x00]),
+                3 if trial.is_multiple_of(7) => buf.extend_from_slice(&[0xFF, 0xD9]),
+                4 if trial.is_multiple_of(11) => buf.push(0xFF),
+                _ => buf.push(b),
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn sequential_block_matches_the_checked_steps() {
+        use crate::jpeg::huffman::{
+            STD_AC_CHROMA_BITS, STD_AC_CHROMA_VALS, STD_AC_LUMA_BITS, STD_AC_LUMA_VALS,
+            STD_DC_LUMA_BITS, STD_DC_LUMA_VALS,
+        };
+        let dc = HuffTable::build(&STD_DC_LUMA_BITS, &STD_DC_LUMA_VALS).unwrap();
+        // A DC table with categories up to 15 and symbols no frame uses.
+        let mut wide_bits = [0u8; 16];
+        wide_bits[3] = 12;
+        wide_bits[7] = 6;
+        let wide_vals: Vec<u8> = (0u8..16).chain([0x10, 0x1F]).collect();
+        let dc_wide = HuffTable::build(&wide_bits, &wide_vals).unwrap();
+        let acs = [
+            HuffTable::build(&STD_AC_LUMA_BITS, &STD_AC_LUMA_VALS).unwrap(),
+            HuffTable::build(&STD_AC_CHROMA_BITS, &STD_AC_CHROMA_VALS).unwrap(),
+            // An incomplete code: some bit patterns match nothing.
+            HuffTable::build(
+                &[0, 1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 4],
+                &[
+                    0x01, 0x00, 0x02, 0x11, 0xF0, 0x03, 0x21, 0x0F, 0x1A, 0x33, 0xE1, 0x7C, 0x04,
+                    0x51, 0xFF,
+                ],
+            )
+            .unwrap(),
+        ];
+        let mut seed = 0x51ED_270Bu32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let (mut oks, mut errs) = (0u32, 0u32);
+        for trial in 0..60_000u32 {
+            let buf = hostile_stream(&mut rnd, trial);
+            let dc = if trial % 6 == 5 { &dc_wide } else { &dc };
+            let ac = &acs[(trial % 3) as usize];
+            let mut ra = BitReader::new(&buf);
+            let mut rb = BitReader::new(&buf);
+            let (mut pa, mut pb) = (0i32, 0i32);
+            // Several blocks per stream, into blocks that already hold
+            // coefficients every other trial (a repeated scan).
+            let (mut a, mut b) = ([0i32; 64], [0i32; 64]);
+            for blk in 0..6 {
+                if trial.is_multiple_of(2) {
+                    a = [0; 64];
+                    b = [0; 64];
+                }
+                let x = decode_block(&mut ra, dc, ac, &mut pa, &mut a);
+                let y = decode_block_reference(&mut rb, dc, ac, &mut pb, &mut b);
+                let tag = format!("trial {trial} block {blk}: {buf:02X?}");
+                assert_eq!(x.is_ok(), y.is_ok(), "{tag}");
+                assert_eq!(a, b, "{tag}");
+                assert_eq!(pa, pb, "{tag}");
+                if let (Ok(x), Ok(y)) = (&x, &y) {
+                    if trial.is_multiple_of(2) {
+                        assert_eq!(x, y, "{tag}");
+                    }
+                    assert_eq!(reader_position(&ra), reader_position(&rb), "{tag}");
+                    oks += 1;
+                } else {
+                    errs += 1;
+                    break;
+                }
+            }
+        }
+        assert!(oks > 20_000 && errs > 2_000, "{oks} ok / {errs} err");
+    }
+
     /// First-pass AC decode with an explicit stream: symbol (r=0,s=1) + sign
     /// bit 1, then EOB (r=0,s=0) → one nonzero coefficient at `k=1`.
     #[test]
@@ -6889,7 +7569,7 @@ mod prog_tests {
             seed
         };
         let (mut oks, mut errs) = (0, 0);
-        for trial in 0..60_000 {
+        for trial in 0..60_000u32 {
             let al = (rnd() % 4) as u8;
             let ss = 1 + (rnd() % 63) as usize;
             let se = if rnd() % 3 == 0 {
@@ -6906,12 +7586,18 @@ mod prog_tests {
             }
             // Mostly short codes (EOB / small runs) so many trials decode
             // cleanly; some all-random streams for the error paths.
-            let len = 1 + (rnd() % 24) as usize;
+            // Short streams end inside the block; long ones leave whole
+            // words ahead of the reader; every seventh has stuffed
+            // bytes and markers in it.
+            let len = 1 + (rnd() % if trial.is_multiple_of(2) { 24 } else { 120 }) as usize;
             let mut buf: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
             if trial % 4 != 0 {
                 for b in buf.iter_mut() {
                     *b &= 0x7F;
                 }
+            }
+            if trial % 7 == 3 {
+                buf = hostile_stream(&mut rnd, trial);
             }
             let eob0 = [0u32, 0, 0, 1, 5][(rnd() % 5) as usize];
             let (mut a, mut b) = (block, block);
@@ -6922,24 +7608,22 @@ mod prog_tests {
             // not maintain bit 0).
             let ac_mask = |blk: &[i32; 64]| zigzag_nonzero_mask(blk) & !1;
             let mut nz = ac_mask(&a);
-            let x = prog_decode_ac_refine(&mut ra, &ac, &mut a, &mut nz, ss, se, al, &mut ea);
-            let y = prog_decode_ac_refine_reference(&mut rb, &ac, &mut b, ss, se, al, &mut eb);
-            let tag = format!("trial {trial}: ss {ss} se {se} al {al} eob {eob0}");
-            assert_eq!(x.is_ok(), y.is_ok(), "{tag}");
-            assert_eq!(a, b, "{tag}");
-            if x.is_ok() {
+            // The same block three times over (as three blocks of a
+            // scan would follow one another in the stream).
+            for visit in 0..3 {
+                let x = prog_decode_ac_refine(&mut ra, &ac, &mut a, &mut nz, ss, se, al, &mut ea);
+                let y = prog_decode_ac_refine_reference(&mut rb, &ac, &mut b, ss, se, al, &mut eb);
+                let tag = format!("trial {trial}.{visit}: ss {ss} se {se} al {al} eob {eob0}");
+                assert_eq!(x.is_ok(), y.is_ok(), "{tag}");
+                assert_eq!(a, b, "{tag}");
+                assert_eq!(ea, eb, "{tag}");
+                if x.is_err() {
+                    errs += 1;
+                    break;
+                }
                 assert_eq!(nz, ac_mask(&a), "{tag}: running mask");
-            }
-            assert_eq!(ea, eb, "{tag}");
-            assert_eq!(
-                (ra.pos, ra.bits, ra.nbits, ra.saw_rst, ra.padded),
-                (rb.pos, rb.bits, rb.nbits, rb.saw_rst, rb.padded),
-                "{tag}"
-            );
-            if x.is_ok() {
+                assert_eq!(reader_position(&ra), reader_position(&rb), "{tag}");
                 oks += 1;
-            } else {
-                errs += 1;
             }
         }
         assert!(oks > 5_000 && errs > 500, "{oks} ok / {errs} err");

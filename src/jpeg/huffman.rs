@@ -32,8 +32,9 @@ pub const FAST_BITS: u32 = 9;
 pub const LUT_BITS: u32 = 10;
 
 /// [`HuffTable::lut`] entry layout: bits 0..8 symbol, 8..12 code length,
-/// 12..17 code length + magnitude bits, bit 17 "magnitude resolved",
-/// bits 18..32 the extended (§F.2.2.1) magnitude as a signed 14-bit value.
+/// 12..17 code length + magnitude bits (the symbol's low nibble, for
+/// every entry), bit 17 "magnitude resolved", bits 18..32 the extended
+/// (§F.2.2.1) magnitude as a signed 14-bit value when resolved.
 pub const LUT_RESOLVED: u32 = 1 << 17;
 
 /// T.81 §F.2.2.1 `EXTEND`: the `size`-bit magnitude category value `v`
@@ -184,11 +185,11 @@ impl HuffTable {
                     let base = (c << shift) as usize;
                     let size = sym & 0x0F;
                     for (j, slot) in lut[base..base + (1usize << shift)].iter_mut().enumerate() {
-                        let mut e = sym | (len << 8);
+                        let mut e = sym | (len << 8) | ((len + size) << 12);
                         if size > 0 && len + size <= LUT_BITS {
                             let v = (j as u32 >> (shift - size)) & ((1 << size) - 1);
                             let val = extend(v as i32, size);
-                            e |= ((len + size) << 12) | LUT_RESOLVED | ((val as u32) << 18);
+                            e |= LUT_RESOLVED | ((val as u32) << 18);
                         }
                         *slot = e;
                     }

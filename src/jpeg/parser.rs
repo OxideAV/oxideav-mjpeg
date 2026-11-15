@@ -252,6 +252,22 @@ impl<'a> MarkerWalker<'a> {
     pub fn read_scan_data(&mut self) -> Result<&'a [u8]> {
         let start = self.pos;
         while self.pos < self.buf.len() {
+            // Entropy bytes other than `0xFF` need no look: step over
+            // them eight at a time. A byte `b` is `0xFF` exactly when
+            // `!b` is zero, and a word has a zero byte exactly when
+            // `(v − 0x01…01) & !v & 0x80…80` is non-zero (the borrow of
+            // the subtraction reaches bit 7 of a byte only from a zero
+            // byte at or below it).
+            while let Some(chunk) = self.buf.get(self.pos..self.pos + 8) {
+                let v = !u64::from_le_bytes(chunk.try_into().unwrap());
+                if v.wrapping_sub(0x0101_0101_0101_0101) & !v & 0x8080_8080_8080_8080 != 0 {
+                    break;
+                }
+                self.pos += 8;
+            }
+            if self.pos >= self.buf.len() {
+                break;
+            }
             if self.buf[self.pos] == 0xFF {
                 // Lookahead.
                 if self.pos + 1 >= self.buf.len() {

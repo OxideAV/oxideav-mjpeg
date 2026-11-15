@@ -2338,8 +2338,8 @@ best of 60 alternating runs, wall clock, ms): 4:2:0 `LumaGuided`
 6.14 → 5.51, `Linear` 4.96 → 1.26, `Triangular` 13.66 → 0.90,
 `Replicate` 2.45 → 0.44; 4:2:2 `LumaGuided` 7.87 → 7.36, `Linear`
 4.97 → 1.26, `Triangular` 13.39 → 0.92, `Replicate` 2.46 → 0.56; 4:1:1
-`Linear` 5.13 → 1.26, `Replicate` 2.09 → 0.50 (`LumaGuided` at 4:1 is
-unchanged, 14.8); 4:4:4 1.84 → 0.73.
+`LumaGuided` 15.5 → 5.4 (its 4:1 rows were formed pixel by pixel),
+`Linear` 5.13 → 1.26, `Replicate` 2.09 → 0.50; 4:4:4 1.84 → 0.73.
 
 Where a serial 1600 × 1200 baseline 4:2:0 `decode_rgb8` spends its time
 now (sampling profile):
@@ -2364,8 +2364,9 @@ it. `Linear` interpolates in integers and keeps sixteenths of a sample
 into an exact quotient kernel (every chroma value and pair tested).
 The luma-guided reconstruction keeps luma in 8 bits, forms the
 vertical interpolations of a row pair in one pass, hands each row over
-as the kernel's chroma offsets, and has its statistics in separate
-passes over slices.
+as the kernel's chroma offsets, has its statistics in separate passes
+over slices, and treats the 4:1 ratio like 2:1 (the outputs between two
+chroma samples in one step).
 
 What did not change: the default's arithmetic. A luma-guided pixel is
 the result of about 45 single-precision operations (box statistics of

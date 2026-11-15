@@ -558,7 +558,7 @@ fn band_linear<const N: usize, const BGR: bool>(
     }
 }
 
-/// `LumaGuided` at a 2:1 horizontal ratio: the reconstruction hands
+/// `LumaGuided` at a 2:1 or 4:1 horizontal ratio: the reconstruction hands
 /// each row over as the kernel's chroma offsets (exact kernel, to
 /// `1/256` of a sample) or as whole samples (fixed-point kernel).
 fn band_guided<const N: usize, const BGR: bool, const FIXED: bool>(
@@ -592,11 +592,19 @@ fn band_guided<const N: usize, const BGR: bool, const FIXED: bool>(
         let [cb, cr] = &mut wide;
         if FIXED {
             let whole = |v: f32| round_in_range(v) as i16;
-            rows.row_2to1(&geom, &source, y, luma, [cb, cr], whole);
+            if p.dh == 2 {
+                rows.row_cells::<i16, 2>(&geom, &source, y, luma, [cb, cr], whole);
+            } else {
+                rows.row_cells::<i16, 4>(&geom, &source, y, luma, [cb, cr], whole);
+            }
             samples_to_channels::<true, i16>(luma, &wide[0], &wide[1], &mut ch);
         } else {
             let offset = |v: f32| (round_in_range(v * 256.0) - 128 * 256) as i16;
-            rows.row_2to1(&geom, &source, y, luma, [cb, cr], offset);
+            if p.dh == 2 {
+                rows.row_cells::<i16, 2>(&geom, &source, y, luma, [cb, cr], offset);
+            } else {
+                rows.row_cells::<i16, 4>(&geom, &source, y, luma, [cb, cr], offset);
+            }
             frac256_to_channels(luma, &wide[0], &wide[1], &mut ch);
         }
         store::<N, BGR>(&mut dst[..p.w * N], &ch);
@@ -627,7 +635,7 @@ fn fill_as<const N: usize, const BGR: bool>(
         (ChromaUpsampling::Triangular, 2, _) if p.cw > 2 => Plan::Triangular,
         (ChromaUpsampling::Triangular, 2 | 4, _) => Plan::Replicate,
         (ChromaUpsampling::Linear, 2, _) | (ChromaUpsampling::Linear, 4, 1) => Plan::Linear,
-        (ChromaUpsampling::LumaGuided, 2, _) => Plan::Guided,
+        (ChromaUpsampling::LumaGuided, 2, _) | (ChromaUpsampling::LumaGuided, 4, 1) => Plan::Guided,
         _ => return false,
     };
     let fixed = opts.ycbcr == YcbcrKernel::FixedPoint16;

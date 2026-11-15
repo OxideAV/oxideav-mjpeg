@@ -443,7 +443,7 @@ pub(crate) struct GuidedRows {
     col_c: Vec<f32>,
     col_a: Vec<f32>,
     detail: Vec<f32>,
-    /// [`GuidedRows::row_2to1`]: the vertically interpolated `Ŷ` and,
+    /// [`GuidedRows::row_cells`]: the vertically interpolated `Ŷ` and,
     /// per component, `C` and slope of the output rows `cols_row`
     /// (`usize::MAX` = none) — the current row and the one formed
     /// ahead with it.
@@ -508,6 +508,8 @@ impl GuidedRows {
                     let row = &data[y * stride..][..w];
                     if rh == 2 {
                         pair_sums(row, acc);
+                    } else if rh == 4 {
+                        cell_sums::<4>(row, acc);
                     } else {
                         for (a, cell) in acc.iter_mut().zip(row.chunks(rh)) {
                             for &v in cell {
@@ -741,6 +743,114 @@ fn guided_2to1<T: Copy>(
     }
 }
 
+/// [`detail_row`] at an even integer horizontal ratio `R` from an
+/// 8-bit luma row. Chroma sample `b` lies between outputs
+/// `R b + R/2 − 1` and `R b + R/2`, so the `R` outputs from
+/// `R b + R/2` on all interpolate samples `b` and `b + 1`, at the
+/// fractions `pf[R/2 ..]` then `pf[.. R/2]` (`pf[k]` being the fraction
+/// of phase `k` of a cell); the outputs before the first sample and
+/// after the last replicate it.
+#[inline(never)]
+fn detail_cells<const R: usize>(cy: &[f32], luma: &[u8], pf: &[f32; R], d: &mut [f32]) {
+    let half = R / 2;
+    let last = cy.len() - 1;
+    let w = d.len();
+    let luma = &luma[..w];
+    let between: [f32; R] = std::array::from_fn(|m| pf[(half + m) % R]);
+    // Whole groups of `R` outputs between two samples.
+    let groups = (w.saturating_sub(half) / R).min(last);
+    let body = half.min(w)..half.min(w) + groups * R;
+    // Any output by the general rule: phase `k` of cell `i`.
+    let general = |x: usize| {
+        let (i, k) = (x / R, x % R);
+        let (j0, j1) = if k < half {
+            (i.saturating_sub(1), i)
+        } else {
+            (i, (i + 1).min(last))
+        };
+        luma[x] as f32 - lerp(cy[j0], cy[j1], pf[k])
+    };
+    for x in (0..body.start).chain(body.end..w) {
+        d[x] = general(x);
+    }
+    let cells = d[body.clone()].as_chunks_mut::<R>().0;
+    let lcells = luma[body].as_chunks::<R>().0;
+    let sides = cy[..last].iter().zip(&cy[1..]);
+    for ((o, l), (&y0, &y1)) in cells.iter_mut().zip(lcells).zip(sides) {
+        for ((o, &l), &f) in o.iter_mut().zip(l).zip(&between) {
+            *o = l as f32 - lerp(y0, y1, f);
+        }
+    }
+}
+
+/// [`guided_row`] at an even integer horizontal ratio `R` (see
+/// [`detail_cells`]), each value passed through `fin` on its way out.
+/// Of the `R` outputs between samples `b` and `b + 1` the first half
+/// lie in cell `b` and take its bounds, the second half in cell
+/// `b + 1`.
+#[inline(never)]
+fn guided_cells<T: Copy, const R: usize>(
+    [cc, ca, lo, hi]: [&[f32]; 4],
+    d: &[f32],
+    pf: &[f32; R],
+    out: &mut [T],
+    fin: impl Fn(f32) -> T,
+) {
+    let half = R / 2;
+    let last = cc.len() - 1;
+    let w = out.len();
+    let (ca, lo, hi, d) = (&ca[..=last], &lo[..=last], &hi[..=last], &d[..w]);
+    let between: [f32; R] = std::array::from_fn(|m| pf[(half + m) % R]);
+    let groups = (w.saturating_sub(half) / R).min(last);
+    let body = half.min(w)..half.min(w) + groups * R;
+    let general = |x: usize| {
+        let (i, k) = (x / R, x % R);
+        let (j0, j1) = if k < half {
+            (i.saturating_sub(1), i)
+        } else {
+            (i, (i + 1).min(last))
+        };
+        let v = lerp(cc[j0], cc[j1], pf[k]) + lerp(ca[j0], ca[j1], pf[k]) * d[x];
+        fmin(fmax(v, lo[i]), hi[i])
+    };
+    for x in (0..body.start).chain(body.end..w) {
+        out[x] = fin(general(x));
+    }
+    let cells = out[body.clone()].as_chunks_mut::<R>().0;
+    let dcells = d[body].as_chunks::<R>().0;
+    let cs = cc[..last].iter().zip(&cc[1..]);
+    let slopes = ca[..last].iter().zip(&ca[1..]);
+    let los = lo[..last].iter().zip(&lo[1..]);
+    let his = hi[..last].iter().zip(&hi[1..]);
+    for (((((o, d), (&c0, &c1)), (&a0, &a1)), (&lo0, &lo1)), (&hi0, &hi1)) in cells
+        .iter_mut()
+        .zip(dcells)
+        .zip(cs)
+        .zip(slopes)
+        .zip(los)
+        .zip(his)
+    {
+        let bounds: [(f32, f32); R] =
+            std::array::from_fn(|m| if m < half { (lo0, hi0) } else { (lo1, hi1) });
+        for (((o, &d), &f), &(lo, hi)) in o.iter_mut().zip(d).zip(&between).zip(&bounds) {
+            *o = fin(fmin(fmax(lerp(c0, c1, f) + lerp(a0, a1, f) * d, lo), hi));
+        }
+    }
+}
+
+/// `acc[i] += ` the sum of the `R` samples of cell `i` of `row` (a
+/// short last cell sums what it has).
+#[inline(never)]
+fn cell_sums<const R: usize>(row: &[u8], acc: &mut [u16]) {
+    let (cells, tail) = row.as_chunks::<R>();
+    for (a, c) in acc.iter_mut().zip(cells) {
+        *a += c.iter().map(|&v| v as u16).sum::<u16>();
+    }
+    if let Some(a) = acc.get_mut(cells.len()) {
+        *a += tail.iter().map(|&v| v as u16).sum::<u16>();
+    }
+}
+
 impl GuidedRows {
     /// Bring the statistics up to output row `y`; returns its vertical
     /// tap and the chroma row whose bounds clamp it.
@@ -762,11 +872,11 @@ impl GuidedRows {
         (t, cy)
     }
 
-    /// [`GuidedRows::row`] for two components at a 2:1 horizontal ratio
-    /// under an 8-bit luma row: the same values from the same
-    /// operations, each passed through `fin` into `out` (one `w`-sample
-    /// row per component).
-    pub(crate) fn row_2to1<T: Copy>(
+    /// [`GuidedRows::row`] for two components at the even horizontal
+    /// ratio `R` (2 or 4) under an 8-bit luma row: the same values from
+    /// the same operations, each passed through `fin` into `out` (one
+    /// `w`-sample row per component).
+    pub(crate) fn row_cells<T: Copy, const R: usize>(
         &mut self,
         g: &GuidedGeom,
         src: &GuidedSource<'_>,
@@ -775,7 +885,7 @@ impl GuidedRows {
         out: [&mut [T]; 2],
         fin: impl Fn(f32) -> T + Copy,
     ) {
-        debug_assert!(g.rh == 2 && self.comps.len() == 2);
+        debug_assert!(g.rh == R && R.is_multiple_of(2) && self.comps.len() == 2);
         let (t, cy) = self.advance(g, src, y);
         let (i0, i1) = (t.i0 as usize, t.i1 as usize);
         let (cw, w) = (g.cw, g.w);
@@ -817,11 +927,16 @@ impl GuidedRows {
             }
             *cols_row = [y, if next.is_some() { y + 1 } else { usize::MAX }];
         }
-        // Fraction of the left phase (outputs `2b + 2`) and of the right
-        // phase (outputs `2b + 1`).
-        let phases = (g.px[0].f, g.px[1].f);
+        // The fraction of each phase of a cell; at 2:1 the left phase
+        // (outputs `2b + 2`) and the right phase (outputs `2b + 1`).
+        let pf: [f32; R] = std::array::from_fn(|k| g.px[k].f);
+        let phases = (pf[0], pf[R - 1]);
         let [col_y, col_c0, col_a0, col_c1, col_a1] = &cols[0];
-        detail_2to1(&col_y[..cw], luma, phases, &mut detail[..w]);
+        if R == 2 {
+            detail_2to1(&col_y[..cw], luma, phases, &mut detail[..w]);
+        } else {
+            detail_cells::<R>(&col_y[..cw], luma, &pf, &mut detail[..w]);
+        }
         let per_comp = [(col_c0, col_a0), (col_c1, col_a1)];
         for ((comp, (col_c, col_a)), out) in comps.iter().zip(per_comp).zip(out) {
             let rows = [
@@ -830,7 +945,11 @@ impl GuidedRows {
                 &comp.lo[cy % 3][..cw],
                 &comp.hi[cy % 3][..cw],
             ];
-            guided_2to1(rows, &detail[..w], phases, &mut out[..w], fin);
+            if R == 2 {
+                guided_2to1(rows, &detail[..w], phases, &mut out[..w], fin);
+            } else {
+                guided_cells::<T, R>(rows, &detail[..w], &pf, &mut out[..w], fin);
+            }
         }
         // The row formed ahead becomes the current one.
         cols.swap(0, 1);
@@ -1395,11 +1514,12 @@ mod tests {
         }
     }
 
-    /// The 2:1 row form — 8-bit luma, both components, rows of a pair
-    /// interpolated together — against [`GuidedRows::row`], value for
-    /// value, from the top and from a band start of either parity.
+    /// The even-ratio row forms — 8-bit luma, both components, rows of
+    /// a pair interpolated together — against [`GuidedRows::row`],
+    /// value for value, from the top and from a band start of either
+    /// parity.
     #[test]
-    fn two_to_one_rows_match_the_general_rows() {
+    fn even_ratio_rows_match_the_general_rows() {
         let mut seed = 0x1B87_3593u32;
         let mut next = move || {
             seed ^= seed << 13;
@@ -1407,10 +1527,10 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        for case in 0..300 {
-            let rv = 1 + case % 2;
+        for case in 0..400 {
+            let (rh, rv) = [(2, 1), (2, 2), (4, 1), (4, 2)][case % 4];
             let (w, h) = (1 + next() as usize % 45, 1 + next() as usize % 25);
-            let (cw, ch) = (w.div_ceil(2), h.div_ceil(rv));
+            let (cw, ch) = (w.div_ceil(rh), h.div_ceil(rv));
             let style = next() % 3;
             let mut field = |n: usize| -> Vec<u8> {
                 (0..n)
@@ -1424,7 +1544,7 @@ mod tests {
             let (luma, cb, cr) = (field(w * h), field(cw * ch), field(cw * ch));
             let lf: Vec<f32> = luma.iter().map(|&v| v as f32).collect();
             let planes = [&cb, &cr];
-            let g = GuidedGeom::new(cw, ch, 2, rv, w, h, 255);
+            let g = GuidedGeom::new(cw, ch, rh, rv, w, h, 255);
             let src = GuidedSource {
                 luma: &|y, r| r.copy_from_slice(&lf[y * w..][..w]),
                 luma_u8: Some((&luma, w)),
@@ -1448,13 +1568,18 @@ mod tests {
                 let (mut a, mut b) = (vec![0f32; w], vec![0f32; w]);
                 for (y, want) in rows.iter().enumerate().skip(start) {
                     let l = &luma[y * w..][..w];
-                    fast.row_2to1(&g, &src, y, l, [&mut a, &mut b], |v| v);
+                    let out = [&mut a[..], &mut b[..]];
+                    if rh == 2 {
+                        fast.row_cells::<f32, 2>(&g, &src, y, l, out, |v| v);
+                    } else {
+                        fast.row_cells::<f32, 4>(&g, &src, y, l, out, |v| v);
+                    }
                     let same = |x: &[f32], y: &[f32]| {
                         x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
                     };
                     assert!(
                         same(&a, &want[0]) && same(&b, &want[1]),
-                        "case {case}: {w}x{h} 2x{rv} from {start}, row {y}"
+                        "case {case}: {w}x{h} {rh}x{rv} from {start}, row {y}"
                     );
                 }
             }

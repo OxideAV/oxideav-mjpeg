@@ -238,6 +238,103 @@ impl RowRing {
     }
 }
 
+/// `acc[i] += row[2i] + row[2i + 1]` (a lone last sample on its own).
+#[inline(never)]
+fn pair_sums(row: &[u8], acc: &mut [u16]) {
+    let (pairs, tail) = row.as_chunks::<2>();
+    for (a, p) in acc.iter_mut().zip(pairs) {
+        *a += p[0] as u16 + p[1] as u16;
+    }
+    if let ([t], Some(a)) = (tail, acc.get_mut(pairs.len())) {
+        *a += *t as u16;
+    }
+}
+
+/// `out = acc / cells`. Dividing by a power of two only moves the
+/// exponent, as multiplying by its reciprocal does, so that case —
+/// every 2:1 and 4:1 layout — multiplies.
+#[inline(never)]
+fn cell_means(acc: &[u16], cells: usize, out: &mut [f32]) {
+    let n = out.len().min(acc.len());
+    let (acc, out) = (&acc[..n], &mut out[..n]);
+    let full = cells as f32;
+    if cells.is_power_of_two() {
+        let inv = 1.0 / full;
+        for (v, &a) in out.iter_mut().zip(acc) {
+            *v = a as f32 * inv;
+        }
+    } else {
+        for (v, &a) in out.iter_mut().zip(acc) {
+            *v = a as f32 / full;
+        }
+    }
+}
+
+/// `out = a · b`, sample by sample.
+#[inline(never)]
+fn product_row(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let n = out.len().min(a.len()).min(b.len());
+    for ((o, &a), &b) in out[..n].iter_mut().zip(&a[..n]).zip(&b[..n]) {
+        *o = a * b;
+    }
+}
+
+/// The 3 × 3 box mean of `Ŷ` and the denominator `var(Ŷ) + ε` from the
+/// horizontal sums of `Ŷ` and `Ŷ²` on three rows.
+#[inline(never)]
+fn mean_and_spread(
+    [u, m, d]: [&[f32]; 3],
+    [uu, mm, dd]: [&[f32]; 3],
+    eps: f32,
+    my: &mut [f32],
+    den: &mut [f32],
+) {
+    let n = my.len().min(den.len());
+    let (u, m, d) = (&u[..n], &m[..n], &d[..n]);
+    let (uu, mm, dd) = (&uu[..n], &mm[..n], &dd[..n]);
+    let sums = u.iter().zip(m).zip(d).zip(uu.iter().zip(mm).zip(dd));
+    for ((my, den), (((&u, &m), &d), ((&uu, &mm), &dd))) in
+        my[..n].iter_mut().zip(den[..n].iter_mut()).zip(sums)
+    {
+        let y = ((u + m) + d) * (1.0 / 9.0);
+        let yy = ((uu + mm) + dd) * (1.0 / 9.0);
+        *my = y;
+        *den = fmax(yy - y * y, 0.0) + eps;
+    }
+}
+
+/// The regression slope `cov(Ŷ, C) / (var(Ŷ) + ε)` from the horizontal
+/// sums of `C` and `Ŷ · C` on three rows, the mean of `Ŷ` and the
+/// denominator.
+#[inline(never)]
+fn slope_row(
+    [u, m, d]: [&[f32]; 3],
+    [uy, my_, dy]: [&[f32]; 3],
+    (my, den): (&[f32], &[f32]),
+    a: &mut [f32],
+) {
+    let n = a.len().min(my.len()).min(den.len());
+    let (u, m, d) = (&u[..n], &m[..n], &d[..n]);
+    let (uy, my_, dy) = (&uy[..n], &my_[..n], &dy[..n]);
+    let sums = u.iter().zip(m).zip(d).zip(uy.iter().zip(my_).zip(dy));
+    for ((a, (&my, &den)), (((&u, &m), &d), ((&uy, &myc), &dy))) in
+        a.iter_mut().zip(my[..n].iter().zip(&den[..n])).zip(sums)
+    {
+        let mc = ((u + m) + d) * (1.0 / 9.0);
+        let myc = ((uy + myc) + dy) * (1.0 / 9.0);
+        *a = (myc - my * mc) / den;
+    }
+}
+
+/// `out = op(op(u, m), d)`, sample by sample.
+#[inline(never)]
+fn fold_rows([u, m, d]: [&[f32]; 3], out: &mut [f32], op: impl Fn(f32, f32) -> f32) {
+    let n = out.len();
+    for (((v, &u), &m), &d) in out.iter_mut().zip(&u[..n]).zip(&m[..n]).zip(&d[..n]) {
+        *v = op(op(u, m), d);
+    }
+}
+
 /// Geometry of a luma-guided reconstruction (module docs) at an integer
 /// ratio `rh × rv`: `cw × ch` chroma samples under `w × h` luma samples.
 #[derive(Debug)]
@@ -401,13 +498,7 @@ impl GuidedRows {
                 for y in y0..y1 {
                     let row = &data[y * stride..][..w];
                     if rh == 2 {
-                        let (pairs, tail) = row.as_chunks::<2>();
-                        for (a, p) in acc.iter_mut().zip(pairs) {
-                            *a += p[0] as u16 + p[1] as u16;
-                        }
-                        if let [t] = tail {
-                            acc[cw - 1] += *t as u16;
-                        }
+                        pair_sums(row, acc);
                     } else {
                         for (a, cell) in acc.iter_mut().zip(row.chunks(rh)) {
                             for &v in cell {
@@ -416,10 +507,7 @@ impl GuidedRows {
                         }
                     }
                 }
-                let full = (rh * ny) as f32;
-                for (v, &a) in yd[..cw - 1].iter_mut().zip(&*acc) {
-                    *v = a as f32 / full;
-                }
+                cell_means(&acc[..cw - 1], rh * ny, &mut yd[..cw - 1]);
                 let nx = w - (cw - 1) * rh;
                 yd[cw - 1] = acc[cw - 1] as f32 / (nx * ny) as f32;
             }
@@ -453,18 +541,14 @@ impl GuidedRows {
         let yd = &self.yd[j % 3][..cw];
         let tmp = &mut self.tmp[..cw];
         three_tap(yd, self.sy.slot(j), |a, b| a + b);
-        for (s, &v) in tmp.iter_mut().zip(yd) {
-            *s = v * v;
-        }
+        product_row(yd, yd, tmp);
         three_tap(tmp, self.syy.slot(j), |a, b| a + b);
         for (k, comp) in self.comps.iter_mut().enumerate() {
             let c = &mut comp.c[j % 3][..cw];
             (src.chroma)(k, j, c);
             let c = &*c;
             three_tap(c, comp.sc.slot(j), |a, b| a + b);
-            for ((p, &y), &c) in tmp.iter_mut().zip(yd).zip(c) {
-                *p = y * c;
-            }
+            product_row(yd, c, tmp);
             three_tap(tmp, comp.syc.slot(j), |a, b| a + b);
             three_tap(c, comp.slo.slot(j), fmin);
             three_tap(c, comp.shi.slot(j), fmax);
@@ -476,39 +560,23 @@ impl GuidedRows {
     fn finish(&mut self, g: &GuidedGeom, j: usize) {
         let (cw, ch) = (g.cw, g.ch);
         let (my, den) = (&mut self.my[..cw], &mut self.den[..cw]);
-        let [u, m, d] = self.sy.window(j, ch);
-        let [uu, mm, dd] = self.syy.window(j, ch);
-        let sums = u.iter().zip(m).zip(d).zip(uu.iter().zip(mm).zip(dd));
-        for ((my, den), (((&u, &m), &d), ((&uu, &mm), &dd))) in
-            my.iter_mut().zip(den.iter_mut()).zip(sums)
-        {
-            let y = ((u + m) + d) * (1.0 / 9.0);
-            let yy = ((uu + mm) + dd) * (1.0 / 9.0);
-            *my = y;
-            *den = fmax(yy - y * y, 0.0) + g.eps;
-        }
+        mean_and_spread(
+            self.sy.window(j, ch),
+            self.syy.window(j, ch),
+            g.eps,
+            my,
+            den,
+        );
         let (my, den) = (&*my, &*den);
         for comp in self.comps.iter_mut() {
-            let [u, m, d] = comp.sc.window(j, ch);
-            let [uy, my_, dy] = comp.syc.window(j, ch);
-            let sums = u.iter().zip(m).zip(d).zip(uy.iter().zip(my_).zip(dy));
-            for ((a, (&my, &den)), (((&u, &m), &d), ((&uy, &myc), &dy))) in comp.a[j % 3][..cw]
-                .iter_mut()
-                .zip(my.iter().zip(den))
-                .zip(sums)
-            {
-                let mc = ((u + m) + d) * (1.0 / 9.0);
-                let myc = ((uy + myc) + dy) * (1.0 / 9.0);
-                *a = (myc - my * mc) / den;
-            }
-            let [u, m, d] = comp.slo.window(j, ch);
-            for (((v, &u), &m), &d) in comp.lo[j % 3][..cw].iter_mut().zip(u).zip(m).zip(d) {
-                *v = fmin(fmin(u, m), d);
-            }
-            let [u, m, d] = comp.shi.window(j, ch);
-            for (((v, &u), &m), &d) in comp.hi[j % 3][..cw].iter_mut().zip(u).zip(m).zip(d) {
-                *v = fmax(fmax(u, m), d);
-            }
+            slope_row(
+                comp.sc.window(j, ch),
+                comp.syc.window(j, ch),
+                (my, den),
+                &mut comp.a[j % 3][..cw],
+            );
+            fold_rows(comp.slo.window(j, ch), &mut comp.lo[j % 3][..cw], fmin);
+            fold_rows(comp.shi.window(j, ch), &mut comp.hi[j % 3][..cw], fmax);
         }
     }
 
@@ -565,6 +633,164 @@ impl GuidedRows {
             }
             let (lo, hi) = (&comp.lo[cy % 3][..cw], &comp.hi[cy % 3][..cw]);
             guided_row(g, &col_c[..cw], &col_a[..cw], lo, hi, detail, out);
+        }
+    }
+}
+
+/// `out = lerp(a, b, f)`, sample by sample.
+#[inline(never)]
+fn lerp_row(a: &[f32], b: &[f32], f: f32, out: &mut [f32]) {
+    let n = out.len().min(a.len()).min(b.len());
+    for ((o, &a), &b) in out[..n].iter_mut().zip(&a[..n]).zip(&b[..n]) {
+        *o = lerp(a, b, f);
+    }
+}
+
+/// [`detail_row`] at a 2:1 horizontal ratio from an 8-bit luma row:
+/// the outputs `2b + 1` and `2b + 2` on either side of the boundary
+/// between chroma samples `b` and `b + 1` interpolate that pair at
+/// `fr` and at `fl`; the first and (for an even width) last output
+/// replicate an edge sample.
+#[inline(never)]
+fn detail_2to1(cy: &[f32], luma: &[u8], (fl, fr): (f32, f32), d: &mut [f32]) {
+    let last = cy.len() - 1;
+    let w = d.len();
+    let luma = &luma[..w];
+    d[0] = luma[0] as f32 - lerp(cy[0], cy[0], fl);
+    let body = d[1..2 * last + 1].as_chunks_mut::<2>().0;
+    let lbody = luma[1..2 * last + 1].as_chunks::<2>().0;
+    let sides = cy[..last].iter().zip(&cy[1..]);
+    for ((o, l), (&y0, &y1)) in body.iter_mut().zip(lbody).zip(sides) {
+        o[0] = l[0] as f32 - lerp(y0, y1, fr);
+        o[1] = l[1] as f32 - lerp(y0, y1, fl);
+    }
+    if w == 2 * last + 2 {
+        d[w - 1] = luma[w - 1] as f32 - lerp(cy[last], cy[last], fr);
+    }
+}
+
+/// [`guided_row`] at a 2:1 horizontal ratio (see [`detail_2to1`]), each
+/// value passed through `fin` on its way out. `rows` are the row's
+/// vertically interpolated `C` and slope and the bounds `lo`, `hi` of
+/// its chroma row.
+#[inline(never)]
+fn guided_2to1<T: Copy>(
+    [cc, ca, lo, hi]: [&[f32]; 4],
+    d: &[f32],
+    (fl, fr): (f32, f32),
+    out: &mut [T],
+    fin: impl Fn(f32) -> T,
+) {
+    let last = cc.len() - 1;
+    let w = out.len();
+    let (ca, lo, hi, d) = (&ca[..=last], &lo[..=last], &hi[..=last], &d[..w]);
+    let edge = |i: usize, f: f32, d: f32| {
+        fmin(
+            fmax(lerp(cc[i], cc[i], f) + lerp(ca[i], ca[i], f) * d, lo[i]),
+            hi[i],
+        )
+    };
+    out[0] = fin(edge(0, fl, d[0]));
+    let body = out[1..2 * last + 1].as_chunks_mut::<2>().0;
+    let dbody = d[1..2 * last + 1].as_chunks::<2>().0;
+    let cs = cc[..last].iter().zip(&cc[1..]);
+    let slopes = ca[..last].iter().zip(&ca[1..]);
+    let los = lo[..last].iter().zip(&lo[1..]);
+    let his = hi[..last].iter().zip(&hi[1..]);
+    for (((((o, d), (&c0, &c1)), (&a0, &a1)), (&lo0, &lo1)), (&hi0, &hi1)) in body
+        .iter_mut()
+        .zip(dbody)
+        .zip(cs)
+        .zip(slopes)
+        .zip(los)
+        .zip(his)
+    {
+        o[0] = fin(fmin(
+            fmax(lerp(c0, c1, fr) + lerp(a0, a1, fr) * d[0], lo0),
+            hi0,
+        ));
+        o[1] = fin(fmin(
+            fmax(lerp(c0, c1, fl) + lerp(a0, a1, fl) * d[1], lo1),
+            hi1,
+        ));
+    }
+    if w == 2 * last + 2 {
+        out[w - 1] = fin(edge(last, fr, d[w - 1]));
+    }
+}
+
+impl GuidedRows {
+    /// Bring the statistics up to output row `y`; returns its vertical
+    /// tap and the chroma row whose bounds clamp it.
+    fn advance(&mut self, g: &GuidedGeom, src: &GuidedSource<'_>, y: usize) -> (Tap, usize) {
+        let t = g.ty[y];
+        // The row whose bounds clamp this output row: one of the two
+        // interpolated rows.
+        let cy = (y / g.rv).min(g.ch - 1);
+        let last = (t.i1 as usize).max(cy);
+        while self.f_next <= last {
+            let need = (self.f_next + 1).min(g.ch - 1);
+            while self.h_next <= need {
+                self.horizontal(g, src, self.h_next);
+                self.h_next += 1;
+            }
+            self.finish(g, self.f_next);
+            self.f_next += 1;
+        }
+        (t, cy)
+    }
+
+    /// [`GuidedRows::row`] for two components at a 2:1 horizontal ratio
+    /// under an 8-bit luma row: the same values from the same
+    /// operations, each passed through `fin` into `out` (one `w`-sample
+    /// row per component).
+    pub(crate) fn row_2to1<T: Copy>(
+        &mut self,
+        g: &GuidedGeom,
+        src: &GuidedSource<'_>,
+        y: usize,
+        luma: &[u8],
+        out: [&mut [T]; 2],
+        fin: impl Fn(f32) -> T + Copy,
+    ) {
+        debug_assert!(g.rh == 2 && self.comps.len() == 2);
+        let (t, cy) = self.advance(g, src, y);
+        let (i0, i1) = (t.i0 as usize, t.i1 as usize);
+        let (cw, w) = (g.cw, g.w);
+        let Self {
+            yd,
+            comps,
+            col_y,
+            col_c,
+            col_a,
+            detail,
+            ..
+        } = self;
+        // Fraction of the left phase (outputs `2b + 2`) and of the right
+        // phase (outputs `2b + 1`).
+        let phases = (g.px[0].f, g.px[1].f);
+        lerp_row(&yd[i0 % 3][..cw], &yd[i1 % 3][..cw], t.f, &mut col_y[..cw]);
+        detail_2to1(&col_y[..cw], luma, phases, &mut detail[..w]);
+        for (comp, out) in comps.iter().zip(out) {
+            lerp_row(
+                &comp.c[i0 % 3][..cw],
+                &comp.c[i1 % 3][..cw],
+                t.f,
+                &mut col_c[..cw],
+            );
+            lerp_row(
+                &comp.a[i0 % 3][..cw],
+                &comp.a[i1 % 3][..cw],
+                t.f,
+                &mut col_a[..cw],
+            );
+            let rows = [
+                &col_c[..cw],
+                &col_a[..cw],
+                &comp.lo[cy % 3][..cw],
+                &comp.hi[cy % 3][..cw],
+            ];
+            guided_2to1(rows, &detail[..w], phases, &mut out[..w], fin);
         }
     }
 }

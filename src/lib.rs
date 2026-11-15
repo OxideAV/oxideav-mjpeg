@@ -182,6 +182,7 @@ pub mod convert;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
+mod fused;
 pub mod image;
 pub mod jpeg;
 pub mod metadata;
@@ -209,7 +210,7 @@ pub use error::{Error, MjpegError, Result};
 pub use image::{
     ChromaUpsampling, ColorInfo, ColorRange, ConvertOptions, DecodeOptions, DecodeScale,
     IdctMethod, ImageInfo, JpegImage, Metadata, MjpegFrame, MjpegPixelFormat, MjpegPlane,
-    PixelFormat, Plane, RgbImage, RgbaImage, YcbcrKernel,
+    PackedLayout, PixelFormat, Plane, RgbImage, RgbaImage, YcbcrKernel,
 };
 
 // General T.81 writer surface (the one JPEG encoder sibling crates

@@ -46,7 +46,7 @@
 //! ([`ycbcr_to_rgb8_fixed16`]); both are what `djpeg` applies by default.
 
 use crate::image::{
-    ChromaUpsampling, ConvertOptions, JpegImage, MjpegPixelFormat as F, YcbcrKernel,
+    ChromaUpsampling, ConvertOptions, JpegImage, MjpegPixelFormat as F, PackedLayout, YcbcrKernel,
 };
 
 /// Convert `img` to tightly packed 8-bit RGB (`3 × width × height`
@@ -63,20 +63,103 @@ pub fn to_rgba8(img: &JpegImage) -> Vec<u8> {
 
 /// [`to_rgb8`] with explicit kernels.
 pub fn to_rgb8_with(img: &JpegImage, opts: &ConvertOptions) -> Vec<u8> {
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let mut out = vec![0u8; w * h * 3];
-    fill_rgb(img, &mut out, 3, opts);
-    out
+    to_packed_with(img, PackedLayout::Rgb8, opts)
 }
 
 /// [`to_rgba8`] with explicit kernels.
 pub fn to_rgba8_with(img: &JpegImage, opts: &ConvertOptions) -> Vec<u8> {
+    to_packed_with(img, PackedLayout::Rgba8, opts)
+}
+
+/// Convert `img` to tightly packed 8-bit pixels in `layout`
+/// (`bytes_per_pixel × width × height` bytes); alpha, where the layout
+/// has it, is opaque.
+pub fn to_packed_with(img: &JpegImage, layout: PackedLayout, opts: &ConvertOptions) -> Vec<u8> {
     let w = img.width as usize;
     let h = img.height as usize;
-    let mut out = vec![255u8; w * h * 4];
-    fill_rgb(img, &mut out, 4, opts);
+    let bpp = layout.bytes_per_pixel();
+    let mut out = vec![0u8; w * h * bpp];
+    fill_packed(img, &mut out, w * bpp, layout, opts);
     out
+}
+
+/// Convert `img` into the caller's buffer: row `y` starts at byte
+/// `y × stride` of `dst` and holds `width` pixels in `layout`; bytes of
+/// a row beyond its pixels are left as they are. The pixels are those
+/// of [`to_packed_with`].
+///
+/// Errors with [`crate::MjpegError::InvalidData`] when `stride` is less
+/// than a row of pixels or `dst` ends before the last pixel.
+pub fn write_packed(
+    img: &JpegImage,
+    layout: PackedLayout,
+    dst: &mut [u8],
+    stride: usize,
+    opts: &ConvertOptions,
+) -> crate::Result<()> {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let row = w * layout.bytes_per_pixel();
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    if stride < row || dst.len() < (h - 1) * stride + row {
+        return Err(crate::Error::invalid(format!(
+            "JPEG: a {w}×{h} {layout:?} picture needs stride ≥ {row} and {} bytes; got stride {stride} and {} bytes",
+            (h - 1) * stride + row,
+            dst.len()
+        )));
+    }
+    fill_packed(img, dst, stride, layout, opts);
+    Ok(())
+}
+
+/// Fill the pixels of `out` (rows `stride` bytes apart, long enough for
+/// the picture) in `layout`.
+fn fill_packed(
+    img: &JpegImage,
+    out: &mut [u8],
+    stride: usize,
+    layout: PackedLayout,
+    opts: &ConvertOptions,
+) {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let bpp = layout.bytes_per_pixel();
+    let bgr = layout.is_bgr();
+    if crate::fused::fill(img, out, stride, bpp, bgr, opts) {
+        return;
+    }
+    // Every other layout goes through the R, G, B kernels below; a
+    // tight R-first buffer takes them directly.
+    if stride == w * bpp && !bgr {
+        if bpp == 4 {
+            for p in out[..w * h * 4].as_chunks_mut::<4>().0 {
+                p[3] = 255;
+            }
+        }
+        fill_rgb(img, &mut out[..w * h * bpp], bpp, opts);
+        return;
+    }
+    let mut rgb = vec![0u8; w * h * 3];
+    fill_rgb(img, &mut rgb, 3, opts);
+    let (ri, bi) = if bgr { (2, 0) } else { (0, 2) };
+    for (dst, src) in out.chunks_mut(stride).zip(rgb.chunks_exact(w * 3)) {
+        for (d, s) in dst[..w * bpp]
+            .chunks_exact_mut(bpp)
+            .zip(src.as_chunks::<3>().0)
+        {
+            d[ri] = s[0];
+            d[1] = s[1];
+            d[bi] = s[2];
+            if bpp == 4 {
+                d[3] = 255;
+            }
+        }
+    }
 }
 
 /// Fill the R, G, B bytes of every `bpp`-byte pixel of `out`.
@@ -200,9 +283,6 @@ fn fill_rgb(img: &JpegImage, out: &mut [u8], bpp: usize, opts: &ConvertOptions) 
             }
             if opts.ycbcr != YcbcrKernel::Exact {
                 fill_ycbcr_with(img, out, bpp, opts, maxval);
-                return;
-            }
-            if bps == 1 && maxval == 255 && fill_ycbcr_replicate_8bit(img, out, bpp, opts.threads) {
                 return;
             }
             for y in 0..h {
@@ -329,7 +409,7 @@ const CHUNK: usize = 16;
 /// than `1 / 125`), which
 /// `v ≤ (1772 · 2^15 + 128 000 + 227 · 256 000) / 2^11 < 56 788` meets.
 #[inline(always)]
-fn chroma_offset<const K: i32, const BIAS: i32>(c: i32) -> i32 {
+pub(crate) fn chroma_offset<const K: i32, const BIAS: i32>(c: i32) -> i32 {
     let x = (K * c + 128_000 + BIAS * 256_000) as u32;
     (((x >> 11) * 33_555) >> 22) as i32 - BIAS
 }
@@ -352,7 +432,7 @@ fn chroma_offset<const K: i32, const BIAS: i32>(c: i32) -> i32 {
 /// (`< 1/143` from the shift, `< 273 / 29 267` from the multiplier), so
 /// one comparison of the remainder completes it.
 #[inline(always)]
-fn green_offset(cb: i32, cr: i32) -> i32 {
+pub(crate) fn green_offset(cb: i32, cr: i32) -> i32 {
     const BIAS: i32 = 137;
     let low = (372 * cb + 321 * cr + 512) >> 10;
     let u = (low - 99 * cb - 205 * cr + (36_687 + BIAS * 73_375)) as u32;
@@ -391,31 +471,6 @@ fn put_chunk<const N: usize>(px: &mut [[u8; N]; CHUNK], rgb: &[[u8; CHUNK]; 3]) 
     }
 }
 
-/// One row of 8-bit `Y`, `Cb`, `Cr` (equal lengths) into `N`-byte
-/// pixels with the exact kernel (`N = 4` leaves alpha as it is).
-#[inline(never)]
-fn row_ycbcr_8bit<const N: usize>(dst: &mut [u8], y: &[u8], cb: &[u8], cr: &[u8]) {
-    let (px, _) = dst.as_chunks_mut::<N>();
-    let n = px.len().min(y.len()).min(cb.len()).min(cr.len());
-    let (px, y, cb, cr) = (&mut px[..n], &y[..n], &cb[..n], &cr[..n]);
-    let (yc, yt) = y.as_chunks::<CHUNK>();
-    let (bc, bt) = cb.as_chunks::<CHUNK>();
-    let (rc, rt) = cr.as_chunks::<CHUNK>();
-    let (groups, tail) = px.as_chunks_mut::<CHUNK>();
-    for (((p, y), b), r) in groups.iter_mut().zip(yc).zip(bc).zip(rc) {
-        // The fractional kernel at a whole chroma sample: the exact
-        // rounding of the same T.871 §7 value as `ycbcr_to_rgb8`.
-        let yy: [i32; CHUNK] = std::array::from_fn(|i| y[i] as i32);
-        let bb: [i32; CHUNK] = std::array::from_fn(|i| (b[i] as i32 - 128) << 8);
-        let rr: [i32; CHUNK] = std::array::from_fn(|i| (r[i] as i32 - 128) << 8);
-        put_chunk(p, &rgb_chunk(&yy, &bb, &rr));
-    }
-    for (((p, &yy), &b), &r) in tail.iter_mut().zip(yt).zip(bt).zip(rt) {
-        let rgb = ycbcr_frac_to_rgb8_8bit(yy as i32, (b as i32) << 8, (r as i32) << 8);
-        p[..3].copy_from_slice(&rgb);
-    }
-}
-
 /// One row of 8-bit-range `Y` with fractional `Cb`, `Cr` (`f32`, equal
 /// lengths) into `N`-byte pixels: the chroma rounded to `1/256` of a
 /// sample and handed to the exact kernel, as
@@ -448,81 +503,6 @@ fn row_ycbcr_frac_8bit<const N: usize>(dst: &mut [u8], y: &[f32], cb: &[f32], cr
         );
         p[..3].copy_from_slice(&rgb);
     }
-}
-
-/// The 8-bit planar YCbCr layouts with replicated chroma and the exact
-/// kernel, row by row on slices (and in `threads` bands of rows).
-/// Returns `false`, leaving `out` alone, when a plane is shorter than
-/// its geometry (the per-sample path then reads what is there).
-fn fill_ycbcr_replicate_8bit(img: &JpegImage, out: &mut [u8], bpp: usize, threads: usize) -> bool {
-    let (w, h) = (img.width as usize, img.height as usize);
-    let (dh, dv) = img.format.chroma_divisors();
-    let (cw, ch) = (w.div_ceil(dh), h.div_ceil(dv));
-    let (py, pcb, pcr) = (&img.planes[0], &img.planes[1], &img.planes[2]);
-    let fits = |p: &crate::image::Plane, pw: usize, ph: usize| {
-        p.stride >= pw && p.data.len() >= (ph - 1) * p.stride + pw
-    };
-    if !(fits(py, w, h) && fits(pcb, cw, ch) && fits(pcr, cw, ch)) || out.len() < w * h * bpp {
-        return false;
-    }
-    let convert = |y0: usize, band: &mut [u8]| {
-        // Chroma rows widened to the luma grid (replication).
-        let mut wide = [vec![0u8; cw * dh], vec![0u8; cw * dh]];
-        for (i, dst) in band.chunks_exact_mut(w * bpp).enumerate() {
-            let y = y0 + i;
-            let lrow = &py.data[y * py.stride..][..w];
-            let cy = y / dv;
-            let (cb_row, cr_row) = (
-                &pcb.data[cy * pcb.stride..][..cw],
-                &pcr.data[cy * pcr.stride..][..cw],
-            );
-            let (cb, cr): (&[u8], &[u8]) = if dh == 1 {
-                (cb_row, cr_row)
-            } else {
-                for (src, buf) in [cb_row, cr_row].into_iter().zip(wide.iter_mut()) {
-                    // Fixed-size cells for the common ratios, so the
-                    // widening is a plain loop.
-                    match dh {
-                        2 => {
-                            for (cell, &v) in buf.as_chunks_mut::<2>().0.iter_mut().zip(src) {
-                                *cell = [v; 2];
-                            }
-                        }
-                        4 => {
-                            for (cell, &v) in buf.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                                *cell = [v; 4];
-                            }
-                        }
-                        _ => {
-                            for (cell, &v) in buf.chunks_exact_mut(dh).zip(src) {
-                                cell.fill(v);
-                            }
-                        }
-                    }
-                }
-                (&wide[0][..w], &wide[1][..w])
-            };
-            if bpp == 3 {
-                row_ycbcr_8bit::<3>(dst, lrow, cb, cr);
-            } else {
-                row_ycbcr_8bit::<4>(dst, lrow, cb, cr);
-            }
-        }
-    };
-    let out = &mut out[..w * h * bpp];
-    let workers = threads.clamp(1, h);
-    if workers <= 1 {
-        convert(0, out);
-    } else {
-        let rows_per = h.div_ceil(workers);
-        std::thread::scope(|sc| {
-            let convert = &convert;
-            for (i, band) in out.chunks_mut(rows_per * w * bpp).enumerate() {
-                sc.spawn(move || convert(i * rows_per, band));
-            }
-        });
-    }
-    true
 }
 
 /// [`fill_rgb`] for the planar YCbCr layouts under non-default
@@ -1188,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn row_kernels_match_the_scalar_kernel() {
+    fn fractional_row_kernel_matches_the_scalar_kernel() {
         let mut seed = 0x9E37_79B9u32;
         let mut next = move || {
             seed ^= seed << 13;
@@ -1200,12 +1180,6 @@ mod tests {
             let y: Vec<u8> = (0..n).map(|_| next() as u8).collect();
             let cb: Vec<u8> = (0..n).map(|_| next() as u8).collect();
             let cr: Vec<u8> = (0..n).map(|_| next() as u8).collect();
-            let mut got = vec![7u8; n * 4];
-            row_ycbcr_8bit::<4>(&mut got, &y, &cb, &cr);
-            for i in 0..n {
-                let (r, g, b) = ycbcr_to_rgb8(y[i] as u32, cb[i] as u32, cr[i] as u32, 255);
-                assert_eq!(got[i * 4..i * 4 + 4], [r, g, b, 7]);
-            }
             let yf: Vec<f32> = y.iter().map(|&v| v as f32).collect();
             let frac = |v: &[u8], next: &mut dyn FnMut() -> u32| -> Vec<f32> {
                 v.iter()

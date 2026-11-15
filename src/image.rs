@@ -853,6 +853,27 @@ impl JpegImage {
         crate::convert::to_rgba8(self)
     }
 
+    /// Convert to tightly packed 8-bit pixels in `layout`
+    /// (`bytes_per_pixel × width` bytes per row) with explicit kernels.
+    pub fn to_packed_with(&self, layout: PackedLayout, opts: &ConvertOptions) -> Vec<u8> {
+        crate::convert::to_packed_with(self, layout, opts)
+    }
+
+    /// Convert into the caller's buffer: row `y` starts at byte
+    /// `y × stride` of `dst` and holds `width` pixels in `layout`; the
+    /// padding bytes of a row are left as they are. Errors when
+    /// `stride` is less than a row of pixels or `dst` ends before the
+    /// last pixel.
+    pub fn write_packed(
+        &self,
+        layout: PackedLayout,
+        dst: &mut [u8],
+        stride: usize,
+        opts: &ConvertOptions,
+    ) -> Result<()> {
+        crate::convert::write_packed(self, layout, dst, stride, opts)
+    }
+
     /// Rebuild an image from a Motion-JPEG video frame plus the
     /// geometry the stream's parameters carry. Fails when the plane
     /// count or geometry does not match `format` (see [`Self::new`]).
@@ -1104,6 +1125,36 @@ pub enum ChromaUpsampling {
     /// ratios, CMYK / YCCK, RGB-coded components) uses [`Self::Linear`].
     #[default]
     LumaGuided,
+}
+
+/// Byte layout of a packed 8-bit picture
+/// ([`JpegImage::to_packed_with`], [`JpegImage::write_packed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PackedLayout {
+    /// `R G B`, three bytes per pixel.
+    Rgb8,
+    /// `B G R`, three bytes per pixel.
+    Bgr8,
+    /// `R G B A`, four bytes per pixel, alpha `255`.
+    Rgba8,
+    /// `B G R A`, four bytes per pixel, alpha `255`.
+    Bgra8,
+}
+
+impl PackedLayout {
+    /// Bytes per pixel: 3 or 4.
+    pub fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgb8 | Self::Bgr8 => 3,
+            Self::Rgba8 | Self::Bgra8 => 4,
+        }
+    }
+
+    /// Blue is the first byte of a pixel.
+    pub(crate) fn is_bgr(self) -> bool {
+        matches!(self, Self::Bgr8 | Self::Bgra8)
+    }
 }
 
 /// YCbCr → RGB arithmetic (T.871 §7).

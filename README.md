@@ -2239,6 +2239,10 @@ and everything after it work on the small picture.
 | 12 MP baseline 4:2:0, `decode` | 21.2 | 15.7 | 14.0 | 13.2 |
 | 12 MP baseline 4:2:0, `decode_rgb8` | 53.3 | 23.4 | 15.8 | 13.8 |
 
+The `full_size` bench group has the reduced cases
+(`decode_rgb8_1600x1200_420_baseline_{half,quarter,eighth}`) next to
+the full-size and four-worker ones.
+
 Every optimisation to these paths must be **bit-transparent**:
 `tests/golden.rs` pins FNV-1a-64 hashes of the decoded planes for the
 whole `docs/` fixture corpus and of the encoded bytes + decode-back

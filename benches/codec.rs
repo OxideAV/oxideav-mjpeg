@@ -523,8 +523,8 @@ mod registry_benches {
     fn bench_full_size(c: &mut Criterion) {
         use oxideav_mjpeg::image::Plane;
         use oxideav_mjpeg::{
-            ChromaSubsampling, ChromaUpsampling, DecodeOptions, EncodeOptions, JpegImage,
-            MjpegPixelFormat, Quantisation,
+            ChromaSubsampling, ChromaUpsampling, DecodeOptions, DecodeScale, EncodeOptions,
+            JpegImage, MjpegPixelFormat, Quantisation,
         };
         let mut group = c.benchmark_group("full_size");
         group.sample_size(20);
@@ -602,6 +602,22 @@ mod registry_benches {
                 )
             })
         });
+        // Reduced-size decode of the same stream, and its progressive
+        // coding reconstructed on four workers.
+        for (sname, scale) in [
+            ("half", DecodeScale::Half),
+            ("quarter", DecodeScale::Quarter),
+            ("eighth", DecodeScale::Eighth),
+        ] {
+            let opts = DecodeOptions::new().with_scale(scale);
+            group.bench_function(format!("decode_rgb8_1600x1200_420_baseline_{sname}"), |b| {
+                b.iter(|| {
+                    black_box(
+                        oxideav_mjpeg::decode_rgb8_with(black_box(&jpeg), &opts).expect("decode"),
+                    )
+                })
+            });
+        }
         let luma: Vec<u8> = rgb.as_chunks::<3>().0.iter().map(|p| p[1]).collect();
         let grey = JpegImage::new(
             w,

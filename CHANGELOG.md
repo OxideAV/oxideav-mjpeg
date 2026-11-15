@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/OxideAV/oxideav-mjpeg/compare/v0.1.16...v0.1.17) - 2026-11-15
+
+### Other
+
+- luma-guided rows at the 4:1 ratio of 4:1:1 formed boundary by boundary
+- README / CHANGELOG: the four chroma reconstructions by their mathematics, packed layouts, registry scale, measured RGB output times and stage shares
+- guided rows of a 4:2:0 pair interpolated together; bench cases for the opt-in reconstructions
+- decode_packed_into; Linear at 4:1 in integers; guided hand-over rounded without limiting
+- registry decoder: scale option (1, 1/2, 1/4, 1/8)
+- 8-bit YCbCr to packed pixels row by row; BGR / BGRA layouts and write into a caller buffer
+- RGB / RGBA output of every chroma reconstruction and YCbCr kernel pinned by hash
+- reduced-size decode cases in the full_size group
+- stage shares of a serial decode, before / after of the entropy and block-reconstruction pass, worker and reduced-size timings
+- coefficient frames reconstructed in block rows under the thread budget; 4 x 4 corner path in the float IDCT
+- decode at 1/2, 1/4 or 1/8 size: DecodeScale, reduced inverse transform per block
+- symbols read off a buffered word with no per-symbol checks, top-up in bulk; component grids become the output planes
+- last coefficient read off the stop position; README / CHANGELOG re-measured on a quiet machine
+- x86-64 ratios re-measured on a quiet machine
+- lossless arithmetic tail as a settled class-pair table
+- decode-mode golden pins on coefficient-built streams; SA vs SS progressive equivalence replaces the ignored debug test
+- arithmetic coding of the lossless process (SOF11) in the general writer
+- empty columns left out; bench: replicated-chroma and grey decode; README: decode tables and stage shares
+- luma-guided reconstruction as a row stream, grey / packed RGB by rows
+- settled tail of an ended lossless arithmetic code string, call-free rounding on the remaining paths, deblock on an empty frame
+- extent-bounded IDCT, call-free sample store, running non-zero masks for refinement scans
+- shared luma statistics, integer 16-pixel YCbCr kernel, call-free rounding
+- skip notes name the validators generically
+- exact transpose / mirror / rotate / crop on a coefficient record ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- t81_roundtrip samples arithmetic coding, DAC conditioning, marker orders and worker counts
+- row-slice 4:4:4 / replicated RGB conversion, ConvertOptions::threads, mask-driven progressive refinement; full_size bench group
+- exact integer RGB conversion, zig-zag 16-bit blocks with non-zero masks, monomorphised Huffman sinks, EncodeOptions::threads
+- arithmetic entropy coding (SOF9/SOF10) + DAC conditioning + marker order option ([#21](https://github.com/OxideAV/oxideav-mjpeg/pull/21))
+- metadata_embed + t81_roundtrip oracles follow COM carriage and Auto CMYK signalling
+
 ### Added
 
 - `PackedLayout` (`Rgb8`, `Bgr8`, `Rgba8`, `Bgra8`) with `JpegImage::to_packed_with`, `JpegImage::write_packed` (the caller's buffer and stride; padding bytes untouched) and `decode_packed_into` (decode and convert into the caller's buffer): the conversions write straight into the layout asked for. `to_rgb8` / `to_rgba8` and their `_with` forms are the `Rgb8` / `Rgba8` cases.

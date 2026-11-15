@@ -234,6 +234,73 @@ pub(crate) fn idct8x8_within(block: &mut [f32; 64], extent: Extent) {
     }
 }
 
+/// Reduced-size inverse DCT: the `n × n` samples (`n = 1, 2, 4`,
+/// row-major in `out[..n * n]`) of a dequantised natural-order block,
+/// from its coefficients `S(v, u)` with `u, v < n`.
+///
+/// The orthonormal `n`-point transform of a block's `8/n`-fold low-pass
+/// reduction has, per axis, the coefficients `√(n/8) · S(u)` (`u < n`)
+/// of the 8-point one, so its inverse `√(2/n) · C(u) · cos((2x+1)uπ/2n)`
+/// applied to them carries the factor `√(n/8) · √(2/n) · C(u) =
+/// C(u) / 2` — the §A.3.3 normalisation itself. Per axis:
+///
+/// * `n = 1`: `x0 = ½C(0) · S0`.
+/// * `n = 2`: `cos((2x+1)π/4) = ±1/√2`, so `x0 = ½C(0) (S0 + S1)`,
+///   `x1 = ½C(0) (S0 − S1)`.
+/// * `n = 4`: even part `e0 = ½C(0) (S0 + S2)`, `e1 = ½C(0) (S0 − S2)`
+///   (`cos((2x+1)2π/8) = ±1/√2`); odd part from `cos(π/8)` and
+///   `cos(3π/8)`: `o0 = ½cos(π/8) S1 + ½cos(3π/8) S3`,
+///   `o1 = ½cos(3π/8) S1 − ½cos(π/8) S3`; `x0 = e0 + o0`,
+///   `x1 = e1 + o1`, `x2 = e1 − o1`, `x3 = e0 − o0`.
+///
+/// `½cos(π/8)` and `½cos(3π/8)` are the 8-point constants [`C2`] and
+/// [`C6`] (`cos(2π/16)`, `cos(6π/16)`), `½C(0)` is [`C4`].
+#[inline(always)]
+pub(crate) fn idct_reduced(block: &[f32; 64], n: usize, out: &mut [f32; 16]) {
+    match n {
+        1 => out[0] = block[0] * 0.125,
+        2 => {
+            // Columns (vertical frequency), then rows.
+            let top = [C4 * (block[0] + block[8]), C4 * (block[1] + block[9])];
+            let bottom = [C4 * (block[0] - block[8]), C4 * (block[1] - block[9])];
+            out[0] = C4 * (top[0] + top[1]);
+            out[1] = C4 * (top[0] - top[1]);
+            out[2] = C4 * (bottom[0] + bottom[1]);
+            out[3] = C4 * (bottom[0] - bottom[1]);
+        }
+        _ => {
+            // Four 1-D transforms side by side, one per lane.
+            #[inline(always)]
+            fn four(s: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+                let mut x = [[0f32; 4]; 4];
+                for j in 0..4 {
+                    let e0 = C4 * (s[0][j] + s[2][j]);
+                    let e1 = C4 * (s[0][j] - s[2][j]);
+                    let o0 = C2 * s[1][j] + C6 * s[3][j];
+                    let o1 = C6 * s[1][j] - C2 * s[3][j];
+                    x[0][j] = e0 + o0;
+                    x[1][j] = e1 + o1;
+                    x[2][j] = e1 - o1;
+                    x[3][j] = e0 - o0;
+                }
+                x
+            }
+            // Column pass (lanes = horizontal frequency), then the row
+            // pass on the transposed result (lanes = rows).
+            let corner: [[f32; 4]; 4] =
+                std::array::from_fn(|v| std::array::from_fn(|u| block[v * 8 + u]));
+            let mid = four(corner);
+            let turned: [[f32; 4]; 4] = std::array::from_fn(|u| std::array::from_fn(|y| mid[y][u]));
+            let cols = four(turned);
+            for y in 0..4 {
+                for x in 0..4 {
+                    out[y * 4 + x] = cols[x][y];
+                }
+            }
+        }
+    }
+}
+
 /// Transpose of [`cos_table`]: `tt[n][k] = t[k][n]`. Gives the forward
 /// transform's row pass a contiguous 8-lane row per input sample; the
 /// values are the very same f32s, only the storage order differs.
@@ -413,6 +480,70 @@ mod tests {
         assert_eq!(ZIGZAG_EXTENT_UP_TO[9], 0x0F0F);
         assert_eq!(ZIGZAG_EXTENT_UP_TO[10], 0x1F0F);
         assert_eq!(ZIGZAG_EXTENT_UP_TO[63], FULL_EXTENT);
+    }
+
+    #[test]
+    fn reduced_idct_matches_the_n_point_definition() {
+        // Random blocks: the reduced inverse against the f64 evaluation
+        // of `¼ C(u) C(v) S(v, u) cos((2x+1)uπ/2n) cos((2y+1)vπ/2n)`
+        // over the n × n corner.
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for n in [1usize, 2, 4] {
+            for _ in 0..200 {
+                let block: [f32; 64] = std::array::from_fn(|_| (next() % 4001) as f32 - 2000.0);
+                let mut out = [0f32; 16];
+                idct_reduced(&block, n, &mut out);
+                for y in 0..n {
+                    for x in 0..n {
+                        let mut want = 0f64;
+                        for v in 0..n {
+                            for u in 0..n {
+                                let cu = if u == 0 { 0.5f64.sqrt() } else { 1.0 };
+                                let cv = if v == 0 { 0.5f64.sqrt() } else { 1.0 };
+                                let angle = std::f64::consts::PI / (2 * n) as f64;
+                                want += 0.25
+                                    * cu
+                                    * cv
+                                    * block[v * 8 + u] as f64
+                                    * (((2 * x + 1) * u) as f64 * angle).cos()
+                                    * (((2 * y + 1) * v) as f64 * angle).cos();
+                            }
+                        }
+                        let got = out[y * n + x] as f64;
+                        assert!(
+                            (got - want).abs() < 2e-3,
+                            "n {n} ({x},{y}): {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_idct_of_a_cell_constant_block_is_its_cells() {
+        // One sample per block is the block mean, whatever the block.
+        let mut block: [f32; 64] = std::array::from_fn(|i| ((i * 37) % 200) as f32 - 100.0);
+        let mean = block.iter().sum::<f32>() / 64.0;
+        fdct8x8(&mut block);
+        let mut out = [0f32; 16];
+        idct_reduced(&block, 1, &mut out);
+        assert!((out[0] - mean).abs() < 1e-3, "{} vs {mean}", out[0]);
+        // A flat block stays flat at every size.
+        let mut flat = [77.0f32; 64];
+        fdct8x8(&mut flat);
+        for n in [2usize, 4] {
+            idct_reduced(&flat, n, &mut out);
+            for &v in &out[..n * n] {
+                assert!((v - 77.0).abs() < 1e-3, "n {n}: {v}");
+            }
+        }
     }
 
     #[test]

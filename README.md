@@ -251,9 +251,45 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `upsampling` | `ChromaUpsampling::LumaGuided` | Chroma reconstruction: `LumaGuided` (centred linear + luma-guided detail, see *Chroma reconstruction*), `Linear` (centred linear, every ratio), `Triangular` (the reference-compatible ¾ / ¼ kernel for 2:1, 1:2 and 2 × 2) or `Replicate`. Used by the decoder for layouts it resamples to 4:4:4 and by `decode_rgb8` / `decode_rgba8` / `to_rgb8` and their `_with` forms. |
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 | `deblock` | `false` | Opt-in block-edge smoothing of 8-bit DCT frames (see *Deblocking*). |
+| `scale` | `DecodeScale::Full` | `Half`, `Quarter` or `Eighth`: decode an 8-bit DCT frame at 1/2, 1/4 or 1/8 of its size (see *Reduced-size decode*). |
 | `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly; `decode_rgb8_with` / `decode_rgba8_with` also convert to RGB in that many row bands (`ConvertOptions::threads`), with the same pixels. The registry decoder takes it from `Decoder::set_execution_context`. |
 
 Breaches are `Error::LimitExceeded`.
+
+### Reduced-size decode
+
+`DecodeOptions::with_scale(DecodeScale::Half | Quarter | Eighth)` decodes
+a `W × H` frame to `⌈W / d⌉ × ⌈H / d⌉` (`d = 2, 4, 8`) in the same
+layout, for thumbnails and previews. Nothing is decoded at full size and
+shrunk: each 8 × 8 block is reconstructed as 4 × 4, 2 × 2 or one sample
+from its low-frequency corner. The `N × N` coefficients with `u, v < N`
+go through the `N`-point form of the §A.3.3 inverse transform — per axis
+the terms `C(u) / 2 · cos((2x + 1) u π / 2N)`, the 8-point normalisation
+unchanged, because the orthonormal `N`-point coefficients of a block's
+low-pass reduction are `√(N/8)` times the 8-point ones. One sample per
+block is the block mean, `S(0, 0) / 8 + 128`.
+
+```no_run
+# use oxideav_mjpeg::{DecodeOptions, DecodeScale, decode_rgb8_with, info};
+# let jpeg: Vec<u8> = std::fs::read("in.jpg").unwrap();
+let hdr = info(&jpeg)?;
+// The largest reduction that still gives at least 320 × 240.
+let scale = DecodeScale::for_target(hdr.width, hdr.height, 320, 240);
+let small = decode_rgb8_with(&jpeg, &DecodeOptions::new().with_scale(scale))?;
+# let _ = small;
+# Ok::<(), oxideav_mjpeg::MjpegError>(())
+```
+
+It applies to 8-bit DCT frames — sequential and progressive, Huffman
+and arithmetic, every sampling layout, one to four components. A
+reduced decode of a 12-bit, lossless or hierarchical stream is
+`Error::Unsupported`. The reduced reconstruction uses the `f32` kernel
+whatever `idct` says, is not deblocked, and is the same for every
+worker count. The entropy-coded data is still read in full, so the time
+saved is the transform, the sample store and everything after them
+(chroma reconstruction and colour conversion work on the small
+picture): see *Benchmarks*. The registry decoder always decodes at the
+size its stream parameters declare.
 
 ### Chroma reconstruction
 

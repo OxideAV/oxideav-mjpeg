@@ -26,7 +26,7 @@ use crate::jpeg::arith::{
     settled_lossless_diff as arith_settled_lossless_diff,
 };
 use crate::jpeg::dct::{
-    Extent, ZIGZAG_EXTENT_UP_TO, extent_bit, extent_of, idct8x8, idct8x8_within,
+    Extent, ZIGZAG_EXTENT_UP_TO, extent_bit, extent_of, idct_reduced, idct8x8, idct8x8_within,
 };
 use crate::jpeg::huffman::{HuffTable, parse_dht};
 use crate::jpeg::markers::{self, *};
@@ -92,6 +92,9 @@ struct JpegState {
     threads: usize,
     /// Smooth block edges after rendering ([`crate::DecodeOptions::deblock`]).
     deblock: bool,
+    /// Divisor of the decoded size ([`crate::DecodeOptions::scale`]): 1,
+    /// 2, 4 or 8; a block is reconstructed as `8 / scale` samples a side.
+    scale: usize,
     /// Collect the quantised coefficients instead of rendering
     /// ([`read_coefficients`]): every DCT scan accumulates, EOI returns
     /// the coefficient planes.
@@ -133,6 +136,7 @@ impl JpegState {
             upsampling: ChromaUpsampling::default(),
             threads: 1,
             deblock: false,
+            scale: 1,
             coefficients_only: false,
             sof_marker: 0,
             arith_dc: Default::default(),
@@ -470,6 +474,7 @@ pub fn decode_planes_with_tables(tables: &[u8], data: &[u8]) -> Result<JpegImage
 
 /// [`decode_planes`] / [`decode_planes_with_tables`] with geometry
 /// limits enforced on every frame header (the `decode_with` core).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_planes_limited(
     tables: Option<&[u8]>,
     data: &[u8],
@@ -478,6 +483,7 @@ pub(crate) fn decode_planes_limited(
     upsampling: ChromaUpsampling,
     threads: usize,
     deblock: bool,
+    scale: usize,
 ) -> Result<JpegImage> {
     let mut state = JpegState::new();
     state.limits = limits;
@@ -485,6 +491,7 @@ pub(crate) fn decode_planes_limited(
     state.upsampling = upsampling;
     state.threads = threads.max(1);
     state.deblock = deblock;
+    state.scale = scale;
     if let Some(t) = tables {
         load_table_stream(&mut state, t)?;
     }
@@ -849,6 +856,11 @@ fn walk_stream(mut state: JpegState, data: &[u8]) -> Result<Walked> {
                 apply_dnl_height(&mut sof, dnl_height);
                 validate_sof(&sof, &state.limits)?;
                 validate_lossless_sof(&sof)?;
+                if state.scale != 1 {
+                    return Err(Error::unsupported(
+                        "reduced-size decode: a lossless frame has no DCT blocks to reduce",
+                    ));
+                }
                 state.sof = Some(sof);
                 state.sof_marker = marker;
                 state.lossless = true;
@@ -933,6 +945,11 @@ fn walk_stream(mut state: JpegState, data: &[u8]) -> Result<Walked> {
                 if state.coefficients_only {
                     return Err(Error::unsupported(
                         "JPEG coefficients: hierarchical (DHP) sequences are not exposed at the coefficient level",
+                    ));
+                }
+                if state.scale != 1 {
+                    return Err(Error::unsupported(
+                        "reduced-size decode: hierarchical (DHP) sequences decode at full size only",
                     ));
                 }
                 return decode_hierarchical(dhp_payload, &mut walker, state).map(Walked::Image);
@@ -1571,6 +1588,53 @@ fn render_block_8bit(
     }
 }
 
+/// [`render_block_8bit`] at a reduced size: the block's `n × n` samples
+/// (`n = 4, 2, 1`) from the low-frequency corner of its dequantised
+/// coefficients ([`idct_reduced`]), level-shifted, limited and rounded
+/// as the full-size samples are, stored at `(dst_x0, dst_y0)`.
+#[inline]
+fn render_block_reduced(
+    block: &[i32; 64],
+    qtf: &QuantF32,
+    n: usize,
+    buf: &mut [u8],
+    stride: usize,
+    dst_x0: usize,
+    dst_y0: usize,
+) {
+    // One body per size, so every loop has a constant length.
+    #[inline(always)]
+    fn reduce<const N: usize>(
+        block: &[i32; 64],
+        qtf: &QuantF32,
+        buf: &mut [u8],
+        stride: usize,
+        dst_x0: usize,
+        dst_y0: usize,
+    ) {
+        use crate::jpeg::fround::round_clamped;
+        let mut corner = [0.0f32; 64];
+        for v in 0..N {
+            for u in 0..N {
+                corner[v * 8 + u] = block[v * 8 + u] as f32 * qtf.q[v * 8 + u];
+            }
+        }
+        let mut samples = [0.0f32; 16];
+        idct_reduced(&corner, N, &mut samples);
+        for j in 0..N {
+            let dst = &mut buf[(dst_y0 + j) * stride + dst_x0..][..N];
+            for (out, &f) in dst.iter_mut().zip(&samples[j * N..j * N + N]) {
+                *out = round_clamped(f + 128.0, 255.0) as u8;
+            }
+        }
+    }
+    match n {
+        1 => reduce::<1>(block, qtf, buf, stride, dst_x0, dst_y0),
+        2 => reduce::<2>(block, qtf, buf, stride, dst_x0, dst_y0),
+        _ => reduce::<4>(block, qtf, buf, stride, dst_x0, dst_y0),
+    }
+}
+
 /// [`crate::DecodeOptions::deblock`]: smooth the block edges of every
 /// rendered 8-bit component grid (its real `⌈X · Hi / Hmax⌉ ×
 /// ⌈Y · Vi / Vmax⌉` extent), each with its own quantisation table.
@@ -1581,7 +1645,8 @@ fn deblock_components(
     comp_buf: &mut [Vec<u8>],
     comp_stride: &[usize],
 ) {
-    if !state.deblock {
+    // A reduced picture has no 8 × 8 block edges to smooth.
+    if !state.deblock || state.scale != 1 {
         return;
     }
     let h_max = sof.components.iter().map(|c| c.h_factor).max().unwrap_or(1) as usize;
@@ -1824,9 +1889,11 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
     let mut comp_stride: Vec<usize> = Vec::with_capacity(n_comp);
     let mut comp_w_full: Vec<usize> = Vec::with_capacity(n_comp);
     let mut comp_h_full: Vec<usize> = Vec::with_capacity(n_comp);
+    // Samples per block side: 8, or fewer for a reduced-size decode.
+    let bs = 8 / state.scale;
     for c in &sof.components {
-        let w_full = mcus_x * 8 * c.h_factor as usize;
-        let h_full = mcus_y * 8 * c.v_factor as usize;
+        let w_full = mcus_x * bs * c.h_factor as usize;
+        let h_full = mcus_y * bs * c.v_factor as usize;
         comp_buf.push(vec![0u8; w_full * h_full]);
         comp_stride.push(w_full);
         comp_w_full.push(w_full);
@@ -1878,6 +1945,7 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
     let quant_f32: Vec<QuantF32> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
 
     let parallel = state.threads > 1
+        && state.scale == 1
         && state.restart_interval != 0
         && decode_scan_parallel(
             state,
@@ -1960,8 +2028,20 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
                             &mut block,
                         )?;
                         // Dequantise + IDCT + store 8×8 at (mx * H + bx, my * V + by).
-                        let dst_x0 = mx * 8 * c.h_factor as usize + bx * 8;
-                        let dst_y0 = my * 8 * c.v_factor as usize + by * 8;
+                        let dst_x0 = (mx * c.h_factor as usize + bx) * bs;
+                        let dst_y0 = (my * c.v_factor as usize + by) * bs;
+                        if bs != 8 {
+                            render_block_reduced(
+                                &block,
+                                &quant_f32[*sof_idx],
+                                bs,
+                                &mut comp_buf[*sof_idx],
+                                comp_stride[*sof_idx],
+                                dst_x0,
+                                dst_y0,
+                            );
+                            continue;
+                        }
                         render_block_8bit(
                             &block,
                             extent,
@@ -1982,7 +2062,8 @@ fn decode_scan(state: &JpegState, sos: &SosInfo, scan: &[u8]) -> Result<JpegImag
 
     deblock_components(state, sof, &quant_tables, &mut comp_buf, &comp_stride);
 
-    // Build output VideoFrame.
+    // Build output VideoFrame, at the decoded size.
+    let (width, height) = (width.div_ceil(state.scale), height.div_ceil(state.scale));
     let out_format = pix_fmt;
     let mut planes: Vec<VideoPlane> = Vec::new();
     match out_format {
@@ -4172,6 +4253,11 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
     // 12-bit precision JPEGs take their own render path — different level
     // shift, different clamp range, 16-bit-LE output planes.
     if sof.precision == 12 {
+        if state.scale != 1 {
+            return Err(Error::unsupported(
+                "reduced-size decode: 12-bit frames decode at full size only",
+            ));
+        }
         return render_from_coefs_12bit(state, coefs);
     }
     let n_comp = sof.components.len();
@@ -4229,9 +4315,11 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
     // Per-component decoded sample buffer (full MCU coverage).
     let mut comp_buf: Vec<Vec<u8>> = Vec::with_capacity(n_comp);
     let mut comp_stride: Vec<usize> = Vec::with_capacity(n_comp);
+    // Samples per block side: 8, or fewer for a reduced-size decode.
+    let bs = 8 / state.scale;
     for c in &sof.components {
-        let w_full = mcus_x * 8 * c.h_factor as usize;
-        let h_full = mcus_y * 8 * c.v_factor as usize;
+        let w_full = mcus_x * bs * c.h_factor as usize;
+        let h_full = mcus_y * bs * c.v_factor as usize;
         comp_buf.push(vec![0u8; w_full * h_full]);
         comp_stride.push(w_full);
     }
@@ -4245,6 +4333,10 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 let block = &coefs[ci][by * blocks_x + bx];
+                if bs != 8 {
+                    render_block_reduced(block, &qtf, bs, buf, stride, bx * bs, by * bs);
+                    continue;
+                }
                 render_block_8bit(
                     block,
                     extent_of(block),
@@ -4261,7 +4353,8 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
     }
     deblock_components(state, sof, &quant_tables, &mut comp_buf, &comp_stride);
 
-    // Build output.
+    // Build output, at the decoded size.
+    let (width, height) = (width.div_ceil(state.scale), height.div_ceil(state.scale));
     let mut planes: Vec<VideoPlane> = Vec::new();
     match out_format {
         PixelFormat::Gray8 => {

@@ -143,6 +143,7 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<JpegImage> {
         opts.upsampling,
         opts.threads,
         opts.deblock,
+        opts.scale.denominator() as usize,
     )?;
     // Every YCbCr JPEG is full range (T.871 §7, T.872 §6.1): label the
     // 8-bit planar layouts `YuvJ*` whether or not a JFIF segment is

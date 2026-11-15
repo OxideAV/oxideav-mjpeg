@@ -207,9 +207,9 @@ pub use api::{
 };
 pub use error::{Error, MjpegError, Result};
 pub use image::{
-    ChromaUpsampling, ColorInfo, ColorRange, ConvertOptions, DecodeOptions, IdctMethod, ImageInfo,
-    JpegImage, Metadata, MjpegFrame, MjpegPixelFormat, MjpegPlane, PixelFormat, Plane, RgbImage,
-    RgbaImage, YcbcrKernel,
+    ChromaUpsampling, ColorInfo, ColorRange, ConvertOptions, DecodeOptions, DecodeScale,
+    IdctMethod, ImageInfo, JpegImage, Metadata, MjpegFrame, MjpegPixelFormat, MjpegPlane,
+    PixelFormat, Plane, RgbImage, RgbaImage, YcbcrKernel,
 };
 
 // General T.81 writer surface (the one JPEG encoder sibling crates

@@ -997,6 +997,56 @@ pub struct ImageInfo {
 // Reconstruction kernels
 // ---------------------------------------------------------------------------
 
+/// Size of the decoded picture relative to the coded one
+/// ([`DecodeOptions::scale`]).
+///
+/// A reduced size is reconstructed directly from the low-frequency
+/// corner of every 8 × 8 block: the `N × N` coefficients with
+/// `u, v < N` go through the `N`-point form of the T.81 §A.3.3 inverse
+/// transform (`N = 4, 2, 1`), which gives the block's `N × N` samples —
+/// each the low-pass average of an `8/N × 8/N` cell — without ever
+/// producing the full-size picture. A `W × H` frame decodes to
+/// `⌈W / d⌉ × ⌈H / d⌉` in the same layout (a 4:2:0 frame stays 4:2:0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecodeScale {
+    /// The coded size (default).
+    #[default]
+    Full,
+    /// `1/2` in each direction (4 × 4 samples per block).
+    Half,
+    /// `1/4` in each direction (2 × 2 samples per block).
+    Quarter,
+    /// `1/8` in each direction (one sample per block: its mean).
+    Eighth,
+}
+
+impl DecodeScale {
+    /// The divisor `d` of the picture size: 1, 2, 4 or 8.
+    pub fn denominator(self) -> u32 {
+        match self {
+            Self::Full => 1,
+            Self::Half => 2,
+            Self::Quarter => 4,
+            Self::Eighth => 8,
+        }
+    }
+
+    /// The smallest reduction whose output is still at least
+    /// `width × height` for a `coded_width × coded_height` frame (the
+    /// size to decode at before an exact resize to a thumbnail);
+    /// [`Self::Full`] when no reduction qualifies.
+    pub fn for_target(coded_width: u32, coded_height: u32, width: u32, height: u32) -> Self {
+        [Self::Eighth, Self::Quarter, Self::Half]
+            .into_iter()
+            .find(|s| {
+                coded_width.div_ceil(s.denominator()) >= width
+                    && coded_height.div_ceil(s.denominator()) >= height
+            })
+            .unwrap_or(Self::Full)
+    }
+}
+
 /// Inverse-DCT kernel for 8-bit DCT frames (T.81 §A.3.3 — the
 /// Recommendation fixes the transform, not the arithmetic).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1209,6 +1259,14 @@ pub struct DecodeOptions {
     /// see `crate::jpeg::deblock`). Opt-in, default `false`. It helps
     /// most at low quality (README, *Deblocking*).
     pub deblock: bool,
+    /// Decode at a reduced size ([`DecodeScale`]; default
+    /// [`DecodeScale::Full`]). Applies to 8-bit DCT frames (sequential
+    /// and progressive, Huffman or arithmetic); a reduced decode of a
+    /// 12-bit, lossless or hierarchical stream is
+    /// [`MjpegError::Unsupported`]. The reduced reconstruction always
+    /// uses the `f32` kernel ([`DecodeOptions::idct`] selects the
+    /// full-size one) and is not deblocked.
+    pub scale: DecodeScale,
 }
 
 impl Default for DecodeOptions {
@@ -1225,6 +1283,7 @@ impl Default for DecodeOptions {
             ycbcr: YcbcrKernel::Exact,
             threads: 1,
             deblock: false,
+            scale: DecodeScale::Full,
         }
     }
 }
@@ -1325,6 +1384,12 @@ impl DecodeOptions {
     /// Smooth block edges after reconstruction (see the field).
     pub fn with_deblock(mut self, deblock: bool) -> Self {
         self.deblock = deblock;
+        self
+    }
+
+    /// Decode at a reduced size (see the field).
+    pub fn with_scale(mut self, scale: DecodeScale) -> Self {
+        self.scale = scale;
         self
     }
 

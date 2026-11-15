@@ -1570,8 +1570,18 @@ fn render_block_8bit(
         return;
     }
     let mut fblock = [0.0f32; 64];
-    for k in 0..64 {
-        fblock[k] = block[k] as f32 * qtf.q[k];
+    if extent & 0xF0F0 == 0 && !qtf.has_zero {
+        // Everything outside the low-frequency corner is zero, and
+        // stays zero when dequantised: only the corner is multiplied.
+        for v in 0..4 {
+            for u in 0..4 {
+                fblock[v * 8 + u] = block[v * 8 + u] as f32 * qtf.q[v * 8 + u];
+            }
+        }
+    } else {
+        for k in 0..64 {
+            fblock[k] = block[k] as f32 * qtf.q[k];
+        }
     }
     if qtf.has_zero {
         idct8x8(&mut fblock);
@@ -4243,6 +4253,10 @@ fn prog_decode_ac_refine_reference(
     Ok(())
 }
 
+/// One row of blocks of a component and the sample rows it fills:
+/// `(component, coefficient blocks, samples)`.
+type BlockRow<'a> = (usize, &'a [[i32; 64]], &'a mut [u8]);
+
 /// After all scans land, dequantise + IDCT each component block and emit a
 /// VideoFrame. Shared by progressive and non-interleaved baseline paths.
 fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<JpegImage> {
@@ -4324,32 +4338,67 @@ fn render_from_coefs(state: &JpegState, coefs: &[Vec<[i32; 64]>]) -> Result<Jpeg
         comp_stride.push(w_full);
     }
 
-    for (ci, c) in sof.components.iter().enumerate() {
-        let blocks_x = mcus_x * c.h_factor as usize;
-        let blocks_y = mcus_y * c.v_factor as usize;
-        let qtf = quant_to_f32(quant_tables[ci]);
+    // One row of blocks of a component into its `bs` sample rows.
+    let quant_f32: Vec<QuantF32> = quant_tables.iter().map(|qt| quant_to_f32(qt)).collect();
+    let render_row = |ci: usize, blocks: &[[i32; 64]], rows: &mut [u8]| {
         let stride = comp_stride[ci];
-        let buf = &mut comp_buf[ci];
-        for by in 0..blocks_y {
-            for bx in 0..blocks_x {
-                let block = &coefs[ci][by * blocks_x + bx];
-                if bs != 8 {
-                    render_block_reduced(block, &qtf, bs, buf, stride, bx * bs, by * bs);
-                    continue;
-                }
-                render_block_8bit(
-                    block,
-                    extent_of(block),
-                    &qtf,
-                    quant_tables[ci],
-                    state.idct,
-                    buf,
-                    stride,
-                    bx * 8,
-                    by * 8,
-                );
+        for (bx, block) in blocks.iter().enumerate() {
+            if bs != 8 {
+                render_block_reduced(block, &quant_f32[ci], bs, rows, stride, bx * bs, 0);
+                continue;
             }
+            render_block_8bit(
+                block,
+                extent_of(block),
+                &quant_f32[ci],
+                quant_tables[ci],
+                state.idct,
+                rows,
+                stride,
+                bx * 8,
+                0,
+            );
         }
+    };
+    // Every block row of every component, with the sample rows it
+    // fills: independent pieces of work, shared out among the workers
+    // the caller granted (each block is reconstructed from its own
+    // coefficients, so the samples do not depend on who renders them).
+    let mut rows: Vec<BlockRow<'_>> = Vec::new();
+    for (ci, (c, buf)) in sof.components.iter().zip(comp_buf.iter_mut()).enumerate() {
+        let blocks_x = mcus_x * c.h_factor as usize;
+        if blocks_x == 0 {
+            continue;
+        }
+        rows.extend(
+            coefs[ci]
+                .chunks_exact(blocks_x)
+                .zip(buf.chunks_exact_mut(blocks_x * bs * bs))
+                .map(|(blocks, samples)| (ci, blocks, samples)),
+        );
+    }
+    let workers = state.threads.min(rows.len() / 16).max(1);
+    if workers == 1 {
+        for (ci, blocks, samples) in rows {
+            render_row(ci, blocks, samples);
+        }
+    } else {
+        let per_worker = rows.len().div_ceil(workers);
+        std::thread::scope(|sc| {
+            let mut shares = rows.chunks_mut(per_worker);
+            let first = shares.next();
+            for share in shares {
+                let render_row = &render_row;
+                sc.spawn(move || {
+                    for (ci, blocks, samples) in share {
+                        render_row(*ci, blocks, samples);
+                    }
+                });
+            }
+            for (ci, blocks, samples) in first.into_iter().flatten() {
+                render_row(*ci, blocks, samples);
+            }
+        });
     }
     deblock_components(state, sof, &quant_tables, &mut comp_buf, &comp_stride);
 

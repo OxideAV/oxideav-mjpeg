@@ -252,7 +252,7 @@ registry encoder embeds the stream's `CodecParameters::blobs`.
 | `ycbcr` | `YcbcrKernel::Exact` | YCbCr → RGB of `decode_rgb8_with` / `decode_rgba8_with`: `Exact` (T.871 §7, one rounding) or `FixedPoint16` (coefficients scaled by 2^16, each product rounded). |
 | `deblock` | `false` | Opt-in block-edge smoothing of 8-bit DCT frames (see *Deblocking*). |
 | `scale` | `DecodeScale::Full` | `Half`, `Quarter` or `Eighth`: decode an 8-bit DCT frame at 1/2, 1/4 or 1/8 of its size (see *Reduced-size decode*). |
-| `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly; `decode_rgb8_with` / `decode_rgba8_with` also convert to RGB in that many row bands (`ConvertOptions::threads`), with the same pixels. The registry decoder takes it from `Decoder::set_execution_context`. |
+| `threads` | 1 | Workers per picture: an interleaved sequential Huffman scan with a restart interval decodes its intervals in parallel (T.81 §E.1.4), byte-identical to the serial decode, which is used whenever the `RSTm` markers do not delimit the intervals exactly; a frame decoded scan by scan into coefficients (progressive, arithmetic, non-interleaved) is reconstructed in block rows shared among the workers; `decode_rgb8_with` / `decode_rgba8_with` also convert to RGB in that many row bands (`ConvertOptions::threads`), with the same pixels. The registry decoder takes it from `Decoder::set_execution_context`. |
 
 Breaches are `Error::LimitExceeded`.
 

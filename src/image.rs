@@ -1252,7 +1252,11 @@ pub struct DecodeOptions {
     /// is entropy-coded independently); the result is byte-identical to
     /// the single-threaded decode, which is used whenever the scan's
     /// `RSTm` markers do not delimit exactly the intervals the frame
-    /// implies.
+    /// implies. A frame decoded scan by scan into coefficients
+    /// (progressive, arithmetic, non-interleaved sequential) is
+    /// reconstructed — dequantisation, inverse transform, sample store —
+    /// in block rows shared out among the workers, with the same
+    /// samples.
     pub threads: usize,
     /// Smooth 8 × 8 block edges whose step is below the quantiser step
     /// of the first AC coefficient along that axis (8-bit DCT frames;

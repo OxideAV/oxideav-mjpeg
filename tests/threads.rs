@@ -60,6 +60,44 @@ fn threaded_decode_equals_serial_on_every_layout_and_interval() {
 }
 
 #[test]
+fn threaded_reconstruction_of_multi_scan_frames_equals_serial() {
+    // Frames decoded scan by scan into coefficients (progressive,
+    // arithmetic, both) are reconstructed in block rows shared out among
+    // the workers: the same planes for every budget, every layout, and
+    // sizes from one block row up.
+    for (w, h) in [(8u32, 8u32), (97, 61), (640, 400)] {
+        let rgb = picture(w, h);
+        for chroma in [
+            ChromaSubsampling::Yuv444,
+            ChromaSubsampling::Yuv422,
+            ChromaSubsampling::Yuv420,
+            ChromaSubsampling::Yuv411,
+            ChromaSubsampling::GrayscaleOnly,
+        ] {
+            let base = EncodeOptions::new().with_quality(80).with_chroma(chroma);
+            for (name, opts) in [
+                ("progressive", base.clone().with_progressive(true)),
+                ("arithmetic", base.clone().with_arithmetic(true)),
+                (
+                    "progressive arithmetic",
+                    base.clone().with_arithmetic(true).with_progressive(true),
+                ),
+            ] {
+                let jpeg = encode_rgb8(w, h, &rgb, &opts).unwrap();
+                let serial = decode_n(&jpeg, 1).unwrap();
+                for t in [2, 3, 8, 64] {
+                    assert_eq!(
+                        decode_n(&jpeg, t).unwrap(),
+                        serial,
+                        "{w}x{h} {chroma:?} {name} threads {t}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn damaged_intervals_fall_back_to_the_serial_result() {
     let (w, h) = (160u32, 96u32);
     let jpeg = encode_rgb8(

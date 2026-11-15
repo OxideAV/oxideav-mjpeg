@@ -216,6 +216,41 @@ pub(crate) fn idct8x8_within(block: &mut [f32; 64], extent: Extent) {
         block.fill(v);
         return;
     }
+    if extent & 0xF0F0 == 0 {
+        // The low-frequency 4 × 4 corner: the column pass has four
+        // non-empty lanes (the others are the zeros `idct_lanes_low`
+        // makes of zero inputs) and the row pass reads rows 0..=3 of
+        // its input only, so half the column pass and the transposes of
+        // the empty half are left out. Each lane computed is computed
+        // as below.
+        let mut ct = [[0f32; 8]; 8];
+        for u in 0..4 {
+            let (v0, v1, v2, v3) = (block[u], block[8 + u], block[16 + u], block[24 + u]);
+            let ee = C4 * v0;
+            let eo0 = C2 * v2;
+            let eo1 = C6 * v2;
+            let (e0, e3, e1, e2) = (ee + eo0, ee - eo0, ee + eo1, ee - eo1);
+            let o0 = C1 * v1 + C3 * v3;
+            let o1 = C3 * v1 - C7 * v3;
+            let o2 = C5 * v1 - C1 * v3;
+            let o3 = C7 * v1 - C5 * v3;
+            ct[u] = [
+                e0 + o0,
+                e1 + o1,
+                e2 + o2,
+                e3 + o3,
+                e3 - o3,
+                e2 - o2,
+                e1 - o1,
+                e0 - o0,
+            ];
+        }
+        let out = transpose(&idct_lanes_low(&ct));
+        for (dst, row) in block.as_chunks_mut::<8>().0.iter_mut().zip(&out) {
+            dst.copy_from_slice(row);
+        }
+        return;
+    }
     let rows: Lanes = std::array::from_fn(|r| block[r * 8..r * 8 + 8].try_into().unwrap());
     let c = if extent & 0xF000 == 0 {
         idct_lanes_low(&rows)

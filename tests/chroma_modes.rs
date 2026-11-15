@@ -445,3 +445,55 @@ fn write_packed_fills_rows_at_the_callers_stride() {
         }
     }
 }
+
+/// `decode_packed_into` is `decode_rgb8_with` in the caller's layout,
+/// at full and at reduced size, for every upsampling.
+#[test]
+fn decode_into_a_caller_buffer() {
+    use oxideav_mjpeg::{
+        ChromaSubsampling, DecodeOptions, DecodeScale, EncodeOptions, decode_packed_into,
+        decode_rgb8_with, encode_rgb8, info,
+    };
+    let (w, h) = (53u32, 31u32);
+    let mut seed = 0x1357_9BDFu32;
+    let rgb: Vec<u8> = noise((w * h * 3) as usize, &mut seed, 255)
+        .iter()
+        .map(|&v| v as u8)
+        .collect();
+    for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv422] {
+        let jpeg = encode_rgb8(w, h, &rgb, &EncodeOptions::new().with_chroma(chroma)).unwrap();
+        let hdr = info(&jpeg).unwrap();
+        for mode in MODES {
+            for scale in [DecodeScale::Full, DecodeScale::Half] {
+                let opts = DecodeOptions::new()
+                    .with_upsampling(mode)
+                    .with_scale(scale)
+                    .with_threads(2);
+                let want = decode_rgb8_with(&jpeg, &opts).unwrap();
+                let d = scale.denominator();
+                let (ow, oh) = (hdr.width.div_ceil(d), hdr.height.div_ceil(d));
+                assert_eq!((want.width, want.height), (ow, oh));
+                let stride = ow as usize * 4 + 8;
+                let mut dst = vec![0u8; stride * oh as usize];
+                let size = decode_packed_into(&jpeg, &opts, PackedLayout::Bgra8, &mut dst, stride)
+                    .expect("decode into the buffer");
+                assert_eq!(size, (ow, oh));
+                let px = want.as_bytes().as_chunks::<3>().0;
+                for (y, row) in dst.chunks_exact(stride).enumerate() {
+                    let got = row[..ow as usize * 4].as_chunks::<4>().0;
+                    let want = &px[y * ow as usize..][..ow as usize];
+                    assert!(
+                        got.iter()
+                            .zip(want)
+                            .all(|(g, w)| *g == [w[2], w[1], w[0], 255]),
+                        "{chroma:?} {mode:?} {scale:?} row {y}"
+                    );
+                }
+                let mut small = vec![0u8; 16];
+                assert!(
+                    decode_packed_into(&jpeg, &opts, PackedLayout::Rgb8, &mut small, 3).is_err()
+                );
+            }
+        }
+    }
+}

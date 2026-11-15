@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use crate::error::{MjpegError as Error, Result};
 use crate::image::{
     ColorInfo, DecodeOptions, ImageInfo, JpegImage, Metadata, MjpegPixelFormat as PixelFormat,
-    Plane, RgbImage, RgbaImage,
+    PackedLayout, Plane, RgbImage, RgbaImage,
 };
 use crate::jpeg::inspect::{ChromaSubsampling, SofKind};
 use crate::jpeg::markers;
@@ -185,6 +185,28 @@ pub fn decode_rgba8_with(bytes: &[u8], opts: &DecodeOptions) -> Result<RgbaImage
     let img = decode_with(bytes, opts)?;
     let rgba = img.to_rgba8_with(&opts.convert_options());
     Ok(RgbaImage::new(img.width, img.height, rgba))
+}
+
+/// Decode and convert straight into the caller's pixel buffer: row `y`
+/// of the picture starts at byte `y × stride` of `dst` and holds
+/// `width` pixels in `layout` (alpha, where the layout has it, is
+/// `255`); bytes of a row beyond its pixels are left as they are.
+/// Returns the picture's `(width, height)` — [`info`] gives them ahead
+/// of the call (divided by [`DecodeOptions::scale`], rounded up, for a
+/// reduced decode). The pixels are those of [`decode_rgb8_with`].
+///
+/// Errors when `stride` is less than a row of pixels or `dst` ends
+/// before the last pixel, besides the decode errors.
+pub fn decode_packed_into(
+    bytes: &[u8],
+    opts: &DecodeOptions,
+    layout: PackedLayout,
+    dst: &mut [u8],
+    stride: usize,
+) -> Result<(u32, u32)> {
+    let img = decode_with(bytes, opts)?;
+    img.write_packed(layout, dst, stride, &opts.convert_options())?;
+    Ok((img.width, img.height))
 }
 
 /// Read `r` to its end and [`decode`] the bytes.

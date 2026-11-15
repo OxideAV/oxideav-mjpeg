@@ -203,8 +203,8 @@ pub const CODEC_ID_STR: &str = "mjpeg";
 // Standalone, framework-free API. Available regardless of the
 // `registry` feature.
 pub use api::{
-    decode, decode_from, decode_rgb8, decode_rgb8_with, decode_rgba8, decode_rgba8_with,
-    decode_with, encode, encode_rgb8, encode_rgba8, encode_to, info, probe,
+    decode, decode_from, decode_packed_into, decode_rgb8, decode_rgb8_with, decode_rgba8,
+    decode_rgba8_with, decode_with, encode, encode_rgb8, encode_rgba8, encode_to, info, probe,
 };
 pub use error::{Error, MjpegError, Result};
 pub use image::{

@@ -43,6 +43,26 @@ pub(crate) fn round_clamped_by_grid(x: f32, max: f32) -> i32 {
     n + i32::from(c - (t - INT_GRID) == 0.5)
 }
 
+/// `x.round() as i32` (half away from zero) for a value already known
+/// to lie in `0.0..=2^22` — [`round_clamped`] without the limiting.
+#[inline(always)]
+pub(crate) fn round_in_range(x: f32) -> i32 {
+    debug_assert!((0.0..=4_194_304.0).contains(&x));
+    if cfg!(target_arch = "aarch64") {
+        x.round() as i32
+    } else {
+        round_in_range_by_grid(x)
+    }
+}
+
+/// [`round_in_range`] in additions (see [`round_clamped_by_grid`]).
+#[inline(always)]
+pub(crate) fn round_in_range_by_grid(x: f32) -> i32 {
+    let t = x + INT_GRID;
+    let n = (t.to_bits() & 0x007F_FFFF) as i32;
+    n + i32::from(x - (t - INT_GRID) == 0.5)
+}
+
 /// `x.round() as i32` (half away from zero) for `|x| ≤ 2^22`; a larger
 /// magnitude is taken as `2^22`. Used where the value is bounded by
 /// construction (a DCT coefficient over its quantiser step).
@@ -145,6 +165,33 @@ mod tests {
                 check(x, max);
                 check(-x, max);
             }
+        }
+    }
+
+    #[test]
+    fn in_range_rounding_is_round() {
+        let check = |x: f32| {
+            assert_eq!(round_in_range_by_grid(x), x.round() as i32, "{x:e} (grid)");
+            assert_eq!(round_in_range(x), x.round() as i32, "{x:e}");
+        };
+        // Every multiple of 1/256 a chroma sample scaled by 256 can be
+        // near, with its neighbouring floats, and the top of the range.
+        for k in 0..=65_536u32 {
+            let h = k as f32 + 0.5;
+            for x in [
+                h,
+                f32::from_bits(h.to_bits() - 1),
+                f32::from_bits(h.to_bits() + 1),
+                k as f32,
+            ] {
+                check(x);
+            }
+        }
+        for i in 0..=(256 * 4096u32) {
+            check(i as f32 / 4096.0);
+        }
+        for x in [0.0, 0.49999997, 0.5, 4_194_303.5, 4_194_304.0] {
+            check(x);
         }
     }
 

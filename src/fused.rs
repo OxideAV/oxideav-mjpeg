@@ -35,7 +35,8 @@
 //!   even and `+ 7` on odd output columns before `>> 4` for 4:2:0,
 //!   `+ 1` / `+ 2` before `>> 2` for one axis — and converts that.
 //! * `Linear` keeps the sum as it is, in sixteenths of a sample, and
-//!   converts that ([`frac16_offsets`]).
+//!   converts that ([`frac16_offsets`]); at the 4:1 ratio of 4:1:1 the
+//!   weights are eighths ([`widen_4_to_1`]).
 //! * `LumaGuided` streams its rows from `crate::jpeg::resample` in
 //!   blocks of sixteen pixels that go from the reconstruction to the
 //!   colour equations without touching memory.
@@ -59,7 +60,7 @@
 
 use crate::convert::{chroma_offset, green_offset};
 use crate::image::{ChromaUpsampling, ConvertOptions, JpegImage, Plane, YcbcrKernel};
-use crate::jpeg::fround::round_clamped;
+use crate::jpeg::fround::round_in_range;
 use crate::jpeg::resample::{GuidedGeom, GuidedRows, GuidedSource};
 
 /// One channel's offset from a whole chroma sample `c` (the value minus
@@ -352,6 +353,29 @@ fn widen_3_1(v: &[u16], out: &mut [u16], even: impl Fn(u16) -> u16, odd: impl Fn
     }
 }
 
+/// `16 s(x)` for every output `x` of a 4:1 axis. Chroma sample `b`
+/// lies between outputs `4b + 1` and `4b + 2`, so the four outputs
+/// from `4b + 2` on lie one, three, five and seven eighths of the way
+/// to sample `b + 1`; the two outputs before the first sample and
+/// after the last replicate it. `out` holds `4 · v.len()` values (the
+/// picture may use up to three fewer).
+#[inline(never)]
+fn widen_4_to_1(v: &[u16], out: &mut [u16]) {
+    let last = v.len() - 1;
+    debug_assert_eq!(out.len(), 4 * v.len());
+    out[..2].fill(16 * v[0]);
+    let (cells, _) = out[2..4 * last + 2].as_chunks_mut::<4>();
+    for ((o, &a), &b) in cells.iter_mut().zip(&v[..last]).zip(&v[1..]) {
+        *o = [
+            2 * (7 * a + b),
+            2 * (5 * a + 3 * b),
+            2 * (3 * a + 5 * b),
+            2 * (a + 7 * b),
+        ];
+    }
+    out[4 * last + 2..].fill(16 * v[last]);
+}
+
 /// The two chroma rows output row `y` of a 2:1 vertical axis reads and
 /// their weights (`4 s(y)` of the module docs): `(i0, i1, w0, w1)`.
 fn vertical_taps(y: usize, ch: usize) -> (usize, usize, u16, u16) {
@@ -471,18 +495,29 @@ fn band_rounded<const N: usize, const BGR: bool, const FIXED: bool>(
 ) {
     let mut ch = Channels::new(p.w);
     let mut v = [vec![0u16; p.cw], vec![0u16; p.cw]];
-    let mut wide = [vec![0u16; p.w], vec![0u16; p.w]];
+    let n = if p.dh == 4 { 4 * p.cw } else { p.w };
+    let mut wide = [vec![0u16; n], vec![0u16; n]];
     // Triangular on one axis works in quarters, everything else in
     // sixteenths.
     let quarters = tri && p.dv == 1;
     for (i, dst) in band.chunks_mut(stride).enumerate() {
         let y = y0 + i;
-        p.vertical(y, if quarters { 1 } else { 4 }, &mut v);
-        for (v, wide) in v.iter().zip(wide.iter_mut()) {
-            match (tri, quarters) {
-                (true, true) => widen_3_1(v, wide, |h| (h + 1) >> 2, |h| (h + 2) >> 2),
-                (true, false) => widen_3_1(v, wide, |h| (h + 8) >> 4, |h| (h + 7) >> 4),
-                _ => widen_3_1(v, wide, |h| (h + 8) >> 4, |h| (h + 8) >> 4),
+        if p.dh == 4 {
+            p.vertical(y, 1, &mut v);
+            for (v, wide) in v.iter().zip(wide.iter_mut()) {
+                widen_4_to_1(v, wide);
+                for h in wide.iter_mut() {
+                    *h = (*h + 8) >> 4;
+                }
+            }
+        } else {
+            p.vertical(y, if quarters { 1 } else { 4 }, &mut v);
+            for (v, wide) in v.iter().zip(wide.iter_mut()) {
+                match (tri, quarters) {
+                    (true, true) => widen_3_1(v, wide, |h| (h + 1) >> 2, |h| (h + 2) >> 2),
+                    (true, false) => widen_3_1(v, wide, |h| (h + 8) >> 4, |h| (h + 7) >> 4),
+                    _ => widen_3_1(v, wide, |h| (h + 8) >> 4, |h| (h + 8) >> 4),
+                }
             }
         }
         samples_to_channels::<FIXED, u16>(p.luma(y), &wide[0], &wide[1], &mut ch);
@@ -498,12 +533,20 @@ fn band_linear<const N: usize, const BGR: bool>(
 ) {
     let mut ch = Channels::new(p.w);
     let mut v = [vec![0u16; p.cw], vec![0u16; p.cw]];
-    let mut wide = [vec![0u16; p.w], vec![0u16; p.w]];
+    let n = if p.dh == 4 { 4 * p.cw } else { p.w };
+    let mut wide = [vec![0u16; n], vec![0u16; n]];
     for (i, dst) in band.chunks_mut(stride).enumerate() {
         let y = y0 + i;
-        p.vertical(y, 4, &mut v);
-        for (v, wide) in v.iter().zip(wide.iter_mut()) {
-            widen_3_1(v, wide, |h| h, |h| h);
+        if p.dh == 4 {
+            p.vertical(y, 1, &mut v);
+            for (v, wide) in v.iter().zip(wide.iter_mut()) {
+                widen_4_to_1(v, wide);
+            }
+        } else {
+            p.vertical(y, 4, &mut v);
+            for (v, wide) in v.iter().zip(wide.iter_mut()) {
+                widen_3_1(v, wide, |h| h, |h| h);
+            }
         }
         frac16_to_channels(p.luma(y), &wide[0], &wide[1], &mut ch);
         store::<N, BGR>(&mut dst[..p.w * N], &ch);
@@ -533,6 +576,9 @@ fn band_guided<const N: usize, const BGR: bool, const FIXED: bool>(
     };
     let mut rows = GuidedRows::new(&geom, 2);
     rows.seek(&geom, y0);
+    // Every reconstructed value is clamped to the range of real chroma
+    // samples around it, so it lies in `0..=255` and needs no limiting
+    // on its way to an integer.
     let mut ch = Channels::new(p.w);
     let mut wide = [vec![0i16; p.w], vec![0i16; p.w]];
     for (i, dst) in band.chunks_mut(stride).enumerate() {
@@ -540,13 +586,11 @@ fn band_guided<const N: usize, const BGR: bool, const FIXED: bool>(
         let luma = p.luma(y);
         let [cb, cr] = &mut wide;
         if FIXED {
-            let whole = |v: f32| round_clamped(v, 255.0) as i16;
+            let whole = |v: f32| round_in_range(v) as i16;
             rows.row_2to1(&geom, &source, y, luma, [cb, cr], whole);
             samples_to_channels::<true, i16>(luma, &wide[0], &wide[1], &mut ch);
         } else {
-            // The reconstruction is clamped to real chroma samples, so
-            // `256 C` is within `0..=65 280`.
-            let offset = |v: f32| (round_clamped(v * 256.0, 65_536.0) - 128 * 256) as i16;
+            let offset = |v: f32| (round_in_range(v * 256.0) - 128 * 256) as i16;
             rows.row_2to1(&geom, &source, y, luma, [cb, cr], offset);
             frac256_to_channels(luma, &wide[0], &wide[1], &mut ch);
         }
@@ -577,7 +621,7 @@ fn fill_as<const N: usize, const BGR: bool>(
         // more than two samples wide; the rest is replicated.
         (ChromaUpsampling::Triangular, 2, _) if p.cw > 2 => Plan::Triangular,
         (ChromaUpsampling::Triangular, 2 | 4, _) => Plan::Replicate,
-        (ChromaUpsampling::Linear, 2, _) => Plan::Linear,
+        (ChromaUpsampling::Linear, 2, _) | (ChromaUpsampling::Linear, 4, 1) => Plan::Linear,
         (ChromaUpsampling::LumaGuided, 2, _) => Plan::Guided,
         _ => return false,
     };
@@ -749,6 +793,18 @@ mod tests {
         let mut one = [0u16; 2];
         widen_3_1(&[7], &mut one, |h| h, |h| h);
         assert_eq!(one, [28, 28]);
+    }
+
+    #[test]
+    fn four_to_one_widening_weights_in_eighths() {
+        // Between 8 and 24: 10, 14, 18, 22 — one, three, five and seven
+        // eighths of the way — in sixteenths.
+        let mut out = [0u16; 8];
+        widen_4_to_1(&[8, 24], &mut out);
+        assert_eq!(out, [128, 128, 160, 224, 288, 352, 384, 384]);
+        let mut one = [0u16; 4];
+        widen_4_to_1(&[5], &mut one);
+        assert_eq!(one, [80; 4]);
     }
 
     #[test]

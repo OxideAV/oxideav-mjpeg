@@ -443,6 +443,12 @@ pub(crate) struct GuidedRows {
     col_c: Vec<f32>,
     col_a: Vec<f32>,
     detail: Vec<f32>,
+    /// [`GuidedRows::row_2to1`]: the vertically interpolated `Ŷ` and,
+    /// per component, `C` and slope of the output rows `cols_row`
+    /// (`usize::MAX` = none) — the current row and the one formed
+    /// ahead with it.
+    cols: [[Vec<f32>; 5]; 2],
+    cols_row: [usize; 2],
 }
 
 impl GuidedRows {
@@ -475,6 +481,8 @@ impl GuidedRows {
             col_c: vec![0.0; cw],
             col_a: vec![0.0; cw],
             detail: vec![0.0; g.w],
+            cols: std::array::from_fn(|_| std::array::from_fn(|_| vec![0.0; cw])),
+            cols_row: [usize::MAX; 2],
         }
     }
 
@@ -483,6 +491,7 @@ impl GuidedRows {
         let first = g.ty[y].i0 as usize;
         self.h_next = first.saturating_sub(1);
         self.f_next = first;
+        self.cols_row = [usize::MAX; 2];
     }
 
     /// `Ŷ` and the horizontal sums of chroma row `j`.
@@ -637,6 +646,19 @@ impl GuidedRows {
     }
 }
 
+/// [`lerp_row`] at two fractions of the same pair of rows:
+/// `lerp(a, b, f) = a + f · (b − a)`, the difference formed once.
+#[inline(never)]
+fn lerp_rows(a: &[f32], b: &[f32], (f0, f1): (f32, f32), out0: &mut [f32], out1: &mut [f32]) {
+    let n = out0.len().min(out1.len()).min(a.len()).min(b.len());
+    let rows = a[..n].iter().zip(&b[..n]);
+    for ((o0, o1), (&a, &b)) in out0[..n].iter_mut().zip(out1[..n].iter_mut()).zip(rows) {
+        let d = b - a;
+        *o0 = a + f0 * d;
+        *o1 = a + f1 * d;
+    }
+}
+
 /// `out = lerp(a, b, f)`, sample by sample.
 #[inline(never)]
 fn lerp_row(a: &[f32], b: &[f32], f: f32, out: &mut [f32]) {
@@ -760,30 +782,48 @@ impl GuidedRows {
         let Self {
             yd,
             comps,
-            col_y,
-            col_c,
-            col_a,
             detail,
+            cols,
+            cols_row,
             ..
         } = self;
+        if cols_row[0] != y {
+            // The vertically interpolated `Ŷ`, `C` and slope rows. With
+            // both axes subsampled, rows `2j + 1` and `2j + 2` read the
+            // same two chroma rows at a quarter and at three quarters:
+            // they are formed together, sharing the difference.
+            let next =
+                g.ty.get(y + 1)
+                    .filter(|n| (n.i0, n.i1) == (t.i0, t.i1) && i0 != i1);
+            let [now, then] = cols;
+            let sources = [
+                (&yd[i0 % 3], &yd[i1 % 3]),
+                (&comps[0].c[i0 % 3], &comps[0].c[i1 % 3]),
+                (&comps[0].a[i0 % 3], &comps[0].a[i1 % 3]),
+                (&comps[1].c[i0 % 3], &comps[1].c[i1 % 3]),
+                (&comps[1].a[i0 % 3], &comps[1].a[i1 % 3]),
+            ];
+            for (((a, b), now), then) in sources.into_iter().zip(now).zip(then) {
+                match next {
+                    Some(n) => lerp_rows(
+                        &a[..cw],
+                        &b[..cw],
+                        (t.f, n.f),
+                        &mut now[..cw],
+                        &mut then[..cw],
+                    ),
+                    None => lerp_row(&a[..cw], &b[..cw], t.f, &mut now[..cw]),
+                }
+            }
+            *cols_row = [y, if next.is_some() { y + 1 } else { usize::MAX }];
+        }
         // Fraction of the left phase (outputs `2b + 2`) and of the right
         // phase (outputs `2b + 1`).
         let phases = (g.px[0].f, g.px[1].f);
-        lerp_row(&yd[i0 % 3][..cw], &yd[i1 % 3][..cw], t.f, &mut col_y[..cw]);
+        let [col_y, col_c0, col_a0, col_c1, col_a1] = &cols[0];
         detail_2to1(&col_y[..cw], luma, phases, &mut detail[..w]);
-        for (comp, out) in comps.iter().zip(out) {
-            lerp_row(
-                &comp.c[i0 % 3][..cw],
-                &comp.c[i1 % 3][..cw],
-                t.f,
-                &mut col_c[..cw],
-            );
-            lerp_row(
-                &comp.a[i0 % 3][..cw],
-                &comp.a[i1 % 3][..cw],
-                t.f,
-                &mut col_a[..cw],
-            );
+        let per_comp = [(col_c0, col_a0), (col_c1, col_a1)];
+        for ((comp, (col_c, col_a)), out) in comps.iter().zip(per_comp).zip(out) {
             let rows = [
                 &col_c[..cw],
                 &col_a[..cw],
@@ -792,6 +832,9 @@ impl GuidedRows {
             ];
             guided_2to1(rows, &detail[..w], phases, &mut out[..w], fin);
         }
+        // The row formed ahead becomes the current one.
+        cols.swap(0, 1);
+        *cols_row = [cols_row[1], usize::MAX];
     }
 }
 
@@ -1348,6 +1391,72 @@ mod tests {
                 let size = (w, h);
                 let b = guided_from(&luma, &c, (cw, ch), (rh, rv), size, 255, 0, Some(&bytes));
                 assert_eq!(b, got, "case {case}: 8-bit luma plane");
+            }
+        }
+    }
+
+    /// The 2:1 row form — 8-bit luma, both components, rows of a pair
+    /// interpolated together — against [`GuidedRows::row`], value for
+    /// value, from the top and from a band start of either parity.
+    #[test]
+    fn two_to_one_rows_match_the_general_rows() {
+        let mut seed = 0x1B87_3593u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..300 {
+            let rv = 1 + case % 2;
+            let (w, h) = (1 + next() as usize % 45, 1 + next() as usize % 25);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(rv));
+            let style = next() % 3;
+            let mut field = |n: usize| -> Vec<u8> {
+                (0..n)
+                    .map(|i| match style {
+                        0 => next() as u8,
+                        1 => (i as u32 * 3 + next() % 7) as u8,
+                        _ => [0, 255][(next() % 2) as usize],
+                    })
+                    .collect()
+            };
+            let (luma, cb, cr) = (field(w * h), field(cw * ch), field(cw * ch));
+            let lf: Vec<f32> = luma.iter().map(|&v| v as f32).collect();
+            let planes = [&cb, &cr];
+            let g = GuidedGeom::new(cw, ch, 2, rv, w, h, 255);
+            let src = GuidedSource {
+                luma: &|y, r| r.copy_from_slice(&lf[y * w..][..w]),
+                luma_u8: Some((&luma, w)),
+                chroma: &|k, j, r| {
+                    for (d, &s) in r.iter_mut().zip(&planes[k][j * cw..][..cw]) {
+                        *d = s as f32;
+                    }
+                },
+            };
+            let mut general = GuidedRows::new(&g, 2);
+            general.seek(&g, 0);
+            let mut want = vec![vec![0f32; w], vec![0f32; w]];
+            let mut rows = Vec::new();
+            for y in 0..h {
+                general.row(&g, &src, y, &lf[y * w..][..w], &mut want);
+                rows.push(want.clone());
+            }
+            for start in [0, next() as usize % h, next() as usize % h] {
+                let mut fast = GuidedRows::new(&g, 2);
+                fast.seek(&g, start);
+                let (mut a, mut b) = (vec![0f32; w], vec![0f32; w]);
+                for (y, want) in rows.iter().enumerate().skip(start) {
+                    let l = &luma[y * w..][..w];
+                    fast.row_2to1(&g, &src, y, l, [&mut a, &mut b], |v| v);
+                    let same = |x: &[f32], y: &[f32]| {
+                        x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+                    };
+                    assert!(
+                        same(&a, &want[0]) && same(&b, &want[1]),
+                        "case {case}: {w}x{h} 2x{rv} from {start}, row {y}"
+                    );
+                }
             }
         }
     }

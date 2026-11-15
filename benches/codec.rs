@@ -524,7 +524,7 @@ mod registry_benches {
         use oxideav_mjpeg::image::Plane;
         use oxideav_mjpeg::{
             ChromaSubsampling, ChromaUpsampling, DecodeOptions, DecodeScale, EncodeOptions,
-            JpegImage, MjpegPixelFormat, Quantisation,
+            JpegImage, MjpegPixelFormat, PackedLayout, Quantisation,
         };
         let mut group = c.benchmark_group("full_size");
         group.sample_size(20);
@@ -594,14 +594,44 @@ mod registry_benches {
                 .with_chroma(ChromaSubsampling::Yuv420),
         )
         .expect("encode for the decode bench");
-        let replicate = DecodeOptions::new().with_upsampling(ChromaUpsampling::Replicate);
-        group.bench_function("decode_rgb8_1600x1200_420_baseline_replicate", |b| {
-            b.iter(|| {
-                black_box(
-                    oxideav_mjpeg::decode_rgb8_with(black_box(&jpeg), &replicate).expect("decode"),
-                )
-            })
-        });
+        // The opt-in chroma reconstructions (the default, luma-guided,
+        // is `decode_rgb8_1600x1200_420_baseline` above).
+        for (uname, upsampling) in [
+            ("replicate", ChromaUpsampling::Replicate),
+            ("triangular", ChromaUpsampling::Triangular),
+            ("linear", ChromaUpsampling::Linear),
+        ] {
+            let opts = DecodeOptions::new().with_upsampling(upsampling);
+            group.bench_function(format!("decode_rgb8_1600x1200_420_baseline_{uname}"), |b| {
+                b.iter(|| {
+                    black_box(
+                        oxideav_mjpeg::decode_rgb8_with(black_box(&jpeg), &opts).expect("decode"),
+                    )
+                })
+            });
+        }
+        // Straight into a caller's BGRA buffer with a padded stride.
+        let stride = w as usize * 4 + 64;
+        let mut frame = vec![0u8; stride * h as usize];
+        for (uname, upsampling) in [
+            ("guided", ChromaUpsampling::LumaGuided),
+            ("linear", ChromaUpsampling::Linear),
+        ] {
+            let opts = DecodeOptions::new().with_upsampling(upsampling);
+            group.bench_function(format!("decode_bgra8_into_1600x1200_420_{uname}"), |b| {
+                b.iter(|| {
+                    oxideav_mjpeg::decode_packed_into(
+                        black_box(&jpeg),
+                        &opts,
+                        PackedLayout::Bgra8,
+                        &mut frame,
+                        stride,
+                    )
+                    .expect("decode");
+                    black_box(&frame);
+                })
+            });
+        }
         // Reduced-size decode of the same stream, and its progressive
         // coding reconstructed on four workers.
         for (sname, scale) in [
